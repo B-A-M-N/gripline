@@ -107,6 +107,38 @@ func (p *ConcurrencyPool) Acquire() *LeaseHandle {
 	return p.AcquireN(1)
 }
 
+// AcquireCap reserves one slot and returns a lease, checking against a
+// specified concurrency cap. The effective cap is the lesser of the pool's
+// configured capacity and the supplied cap. If the current in-use count
+// already equals the effective cap, AcquireCap returns nil. This enables
+// constrained credentials (lower cap) to be blocked even while existing
+// leases remain active.
+//
+// Correctness: inUse = capacity - balance (actual slots taken from pool).
+// We compare inUse against effectiveCap so that a constrained credential
+// with cap=2 is blocked when 2 slots are held, even if the pool's capacity
+// is 32. The previous bug (inUse = effectiveCap - balance) was wrong when
+// balance < effectiveCap — it would produce a negative inUse that never
+// blocked.
+func (p *ConcurrencyPool) AcquireCap(cap int) *LeaseHandle {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if cap < 0 {
+		cap = 0
+	}
+	effectiveCap := p.capacity
+	if cap < effectiveCap {
+		effectiveCap = cap
+	}
+	// Actual slots in use (out of the pool's total capacity).
+	inUse := p.capacity - p.balance
+	if inUse >= effectiveCap {
+		return nil
+	}
+	p.balance--
+	return &LeaseHandle{st: &leaseState{mu: &p.mu, balance: &p.balance, released: false, slots: 1}}
+}
+
 // AcquireN reserves n slots atomically if all are free, else nil. The returned
 // lease owns exactly n slots and Release returns exactly n (once, across all
 // copies of the handle).
