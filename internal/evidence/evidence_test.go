@@ -55,3 +55,38 @@ func TestEvidenceScopeString(t *testing.T) {
 		t.Fatal("scope string mapping broken")
 	}
 }
+
+// Regression (§36): a zero-TTL rule means "does not self-expire" — the minted
+// evidence must carry a zero ExpiresAt (unbounded under Valid), not
+// ExpiresAt == CreatedAt (which expires the instant after creation and would
+// silently evaporate an operator IOC like MANUAL_CONFIRMED_COMPROMISE).
+func TestZeroTTLRuleMeansNeverExpires(t *testing.T) {
+	now := time.Now()
+	rule := Rule{TTL: 0} // e.g. MANUAL_CONFIRMED_COMPROMISE: until revoked
+	ev := Evidence{
+		Code:      "MANUAL_CONFIRMED_COMPROMISE",
+		Family:    FamilyOperatorIOC,
+		Score:     rule.Score,
+		CreatedAt: now,
+	}
+	if rule.TTL > 0 {
+		ev.ExpiresAt = now.Add(rule.TTL)
+	}
+	if !ev.Valid(now) {
+		t.Fatal("zero-TTL evidence must be valid at mint time")
+	}
+	if !ev.ExpiresAt.IsZero() {
+		t.Fatal("zero-TTL rule must mint a zero (unbounded) ExpiresAt")
+	}
+	if !ev.Valid(now.Add(365 * 24 * time.Hour)) {
+		t.Fatal("zero-TTL evidence must remain valid a year later")
+	}
+	// And a positive-TTL rule still expires on schedule.
+	positive := Evidence{CreatedAt: now, ExpiresAt: now.Add(7 * 24 * time.Hour)}
+	if !positive.Valid(now.Add(7*24*time.Hour - time.Second)) {
+		t.Fatal("positive-TTL evidence must be valid just before expiry")
+	}
+	if positive.Valid(now.Add(7*24*time.Hour + time.Second)) {
+		t.Fatal("positive-TTL evidence must expire on schedule")
+	}
+}

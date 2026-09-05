@@ -81,7 +81,10 @@ func Default() *Policy {
 	}
 }
 
-// IsValid reports whether a policy revision is structurally valid to load.
+// IsValid reports whether a policy revision is structurally valid to load
+// (§57: the data plane loads only validated policy). Beyond identity fields it
+// checks the risk-threshold ordering — an inverted ladder (Watch above
+// Quarantine, etc.) would silently invert the enforcement semantics.
 func (p *Policy) IsValid() bool {
 	if p == nil || p.ID == "" {
 		return false
@@ -90,6 +93,15 @@ func (p *Policy) IsValid() bool {
 		return false
 	}
 	if p.Identity.MaxTTLSeconds < 1 || p.Identity.MaxTTLSeconds > 60 {
+		return false
+	}
+	t := p.Risk
+	// Each boundary strictly increases, and all stay within the 0..100 domain.
+	if !(0 < t.Watch && t.Watch < t.Constrained && t.Constrained < t.Quarantine && t.Quarantine <= 100) {
+		return false
+	}
+	// Hard caps must not go negative (deny-by-config beats silently raising).
+	if p.Limits.Normal.ConcurrencyCap < 0 || p.Limits.Constrained.ConcurrencyCap < 0 {
 		return false
 	}
 	return true

@@ -56,6 +56,13 @@ func (s *Store) limits() Limits {
 // ErrTooManyLanes is returned when a credential already holds the max lanes.
 var ErrTooManyLanes = errors.New("lane: too many lanes for credential")
 
+// ErrLaneConflict is returned when a create would overwrite an existing lane
+// row. An overwrite here is a state-reset attack (§24): distinct feature sets
+// deriving the same caller-chosen id would replace a BLOCKED/SUSPICIOUS lane
+// with a fresh NEW record — laundering its history and evading the explosion
+// limit (the map never grows). Failing closed is the only safe answer.
+var ErrLaneConflict = errors.New("lane: lane id collision with different features")
+
 // Get returns a lane record by credential + lane id (a copy).
 func (s *Store) Get(credID, laneID string) (*LaneRecord, bool) {
 	s.mu.Lock()
@@ -118,6 +125,12 @@ func (s *Store) BorrowOrCreate(credID, newLaneID string, cand Features, th Class
 	lm := s.limits()
 	if len(m) >= lm.MaxActiveLanesPerCredential {
 		return nil, false, ErrTooManyLanes
+	}
+	// Never overwrite an existing row: if the id is taken but features were not
+	// a Match (checked above), the id derivation has collided. Insert-only
+	// keeps lane history append-only (§24); the caller fails closed.
+	if _, exists := m[newLaneID]; exists {
+		return nil, false, ErrLaneConflict
 	}
 	now := s.now()
 	rec := &LaneRecord{

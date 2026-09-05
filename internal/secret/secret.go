@@ -83,9 +83,11 @@ func (s *SealedSecret) Len() int {
 // raw bytes under a pepper key with HMAC-SHA256 to derive the verifier. It
 // keeps the key-op and the secret co-located inside the sealed boundary so
 // neither is exposed. The credential package composes this with the pepper ring
-// to derive/store/compare verifiers. Returns nil on a zeroed secret.
+// to derive/store/compare verifiers. Returns nil on a zeroed secret or an
+// empty key — an HMAC under an empty key is publicly computable, so deriving
+// under one would mint enumerable verifiers (INV-1 fails closed, not open).
 func (s *SealedSecret) DigestHMAC(key []byte) []byte {
-	if s == nil || s.zeroed {
+	if s == nil || s.zeroed || len(key) == 0 {
 		return nil
 	}
 	m := hmac.New(sha256.New, key)

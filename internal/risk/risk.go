@@ -7,7 +7,7 @@ package risk
 import (
 	"time"
 
-	"github.com/freeinference/gripline/internal/evidence"
+	"github.com/B-A-M-N/gripline/internal/evidence"
 )
 
 // Evaluate computes the total risk for a credential/lane from a set of active

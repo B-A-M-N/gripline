@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/freeinference/gripline/internal/secret"
+	"github.com/B-A-M-N/gripline/internal/secret"
 )
 
 // testKey is a pepper key used across tests.
@@ -52,7 +52,10 @@ func TestValidateSuccessAndDRotation(t *testing.T) {
 
 	// Ring with both the original and a newer pepper (migration).
 	pep2 := &PepperKey{Version: 2, Key: []byte("newer-pepper-2")}
-	ring := NewPepperRing(pep1, pep2)
+	ring, err := NewPepperRing(pep1, pep2)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	got, err := ring.Validate(raw, rec)
 	if err != nil {
@@ -69,7 +72,7 @@ func TestValidateFailsForWrongSecret(t *testing.T) {
 	rec, _ := newNormalRecord("cred_2", "acct_2", pep)
 	wrong, _ := secret.Random(32)
 	defer wrong.Zero()
-	if _, err := NewPepperRing(pep).Validate(wrong, rec); err != UnknownError {
+	if _, err := mustRing(t, pep).Validate(wrong, rec); err != UnknownError {
 		t.Fatalf("expected UnknownError, got %v", err)
 	}
 }
@@ -80,7 +83,7 @@ func TestRevokedNeverAuthenticates(t *testing.T) {
 	rec, raw := newNormalRecord("cred_3", "acct_3", pep)
 	defer raw.Zero()
 	rec.Status = StatusRevoked
-	if _, err := NewPepperRing(pep).Validate(raw, rec); err != RevokedError {
+	if _, err := mustRing(t, pep).Validate(raw, rec); err != RevokedError {
 		t.Fatalf("expected RevokedError, got %v", err)
 	}
 }
@@ -211,5 +214,58 @@ func TestHysteresisConstrainedToWatchAfterDwell(t *testing.T) {
 	sm.Observe(30)
 	if sm.Status() != StatusWatch {
 		t.Fatalf("after dwell at low risk should return to WATCH, got %v", sm.Status())
+	}
+}
+
+// mustRing builds a pepper ring that must succeed (tests).
+func mustRing(t *testing.T, keys ...*PepperKey) *PepperRing {
+	t.Helper()
+	r, err := NewPepperRing(keys...)
+	if err != nil {
+		t.Fatalf("NewPepperRing: %v", err)
+	}
+	return r
+}
+
+// Regression: empty pepper key material must be refused at construction — an
+// HMAC under an empty key is publicly computable, making stored verifiers
+// enumerable (INV-1 fails closed, not open).
+func TestEmptyPepperKeyRejected(t *testing.T) {
+	if _, err := NewPepperRing(&PepperKey{Version: 1, Key: nil}); err == nil {
+		t.Fatal("empty pepper key must be rejected")
+	}
+	if _, err := NewPepperRing(&PepperKey{Version: 1, Key: []byte{}}); err == nil {
+		t.Fatal("zero-length pepper key must be rejected")
+	}
+	// DigestHMAC must also refuse an empty key directly.
+	s := secret.NewFromBytes([]byte("sk-something"))
+	defer s.Zero()
+	if s.DigestHMAC(nil) != nil {
+		t.Fatal("DigestHMAC with empty key must return nil (fail closed)")
+	}
+}
+
+// Regression: a ring built from only invalid versions must error, not produce
+// an empty (fail-open) ring.
+func TestPepperRingRequiresAKey(t *testing.T) {
+	if _, err := NewPepperRing(nil); err == nil {
+		t.Fatal("ring with no keys must error")
+	}
+}
+
+// Regression: IsAuthenticatable must agree with CredentialRecord.Authenticatable
+// (§30) — QUARANTINED denies at authentication, not just REVOKED.
+func TestStateMachineIsAuthenticatableMatchesGate(t *testing.T) {
+	now := time.Now()
+	sm := newSM(&now)
+	if !sm.IsAuthenticatable() {
+		t.Fatal("NORMAL must be authenticatable")
+	}
+	sm.Observe(100) // direct escalation → QUARANTINED
+	if sm.Status() != StatusQuarantined {
+		t.Fatalf("want QUARANTINED, got %v", sm.Status())
+	}
+	if sm.IsAuthenticatable() {
+		t.Fatal("QUARANTINED must not be authenticatable (§30)")
 	}
 }

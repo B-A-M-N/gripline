@@ -62,3 +62,29 @@ func TestMorePermissiveLowerPolicyCannotOverride(t *testing.T) {
 		t.Fatal("revoked must deny regardless of other state")
 	}
 }
+
+// Regression (§57): an inverted risk ladder must be rejected at load time —
+// otherwise the state machine would enforce thresholds in the wrong order.
+func TestInvertedRiskThresholdsInvalid(t *testing.T) {
+	p := Default()
+	p.Risk = RiskThresholds{Watch: 90, Constrained: 40, Quarantine: 80}
+	if p.IsValid() {
+		t.Fatal("inverted threshold ladder must be invalid")
+	}
+	p2 := Default()
+	p2.Risk = RiskThresholds{Watch: 0, Constrained: 55, Quarantine: 80}
+	if p2.IsValid() {
+		t.Fatal("zero Watch threshold must be invalid")
+	}
+	p3 := Default()
+	p3.Risk = RiskThresholds{Watch: 30, Constrained: 55, Quarantine: 101}
+	if p3.IsValid() {
+		t.Fatal("quarantine above 100 must be invalid")
+	}
+	// Equal boundaries are also invalid — each step must strictly increase.
+	p4 := Default()
+	p4.Risk = RiskThresholds{Watch: 30, Constrained: 30, Quarantine: 80}
+	if p4.IsValid() {
+		t.Fatal("equal adjacent thresholds must be invalid")
+	}
+}

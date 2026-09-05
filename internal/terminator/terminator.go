@@ -1,20 +1,22 @@
 package terminator
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/freeinference/gripline/internal/credential"
-	"github.com/freeinference/gripline/internal/evidence"
-	"github.com/freeinference/gripline/internal/lane"
-	"github.com/freeinference/gripline/internal/policy"
-	"github.com/freeinference/gripline/internal/principal"
-	"github.com/freeinference/gripline/internal/resource"
-	"github.com/freeinference/gripline/internal/risk"
-	"github.com/freeinference/gripline/internal/secret"
+	"github.com/B-A-M-N/gripline/internal/credential"
+	"github.com/B-A-M-N/gripline/internal/evidence"
+	"github.com/B-A-M-N/gripline/internal/lane"
+	"github.com/B-A-M-N/gripline/internal/policy"
+	"github.com/B-A-M-N/gripline/internal/principal"
+	"github.com/B-A-M-N/gripline/internal/resource"
+	"github.com/B-A-M-N/gripline/internal/risk"
+	"github.com/B-A-M-N/gripline/internal/secret"
 )
 
 // Outcome describes one terminated request's admission decision. It never
@@ -80,6 +82,12 @@ func New(dep Dependencies) (*Terminator, error) {
 	}
 	if dep.Audience == "" {
 		return nil, errors.New("terminator: audience required (INV-11)")
+	}
+	if !dep.Policy.IsValid() {
+		// §57: the data plane loads only authenticated + validated policy. An
+		// invalid revision (bad threshold ordering, TTL out of bounds) must
+		// fail construction, not silently enforce garbage.
+		return nil, errors.New("terminator: policy revision invalid (§57)")
 	}
 	if dep.RiskNow == nil {
 		dep.RiskNow = time.Now
@@ -155,10 +163,15 @@ func (t *Terminator) Admit(headers map[string][]string, feat lane.Features) *Out
 
 	laneID, laneRec, laneNew, lerr := t.classifyLane(cred.CredentialID, feat)
 	laneState := laneStateName(laneRec)
-	// Lane explosion (§28) is an attack signal: fail closed, not open.
+	// Lane explosion (§28) and lane-id collisions (§24, insert-only) are attack
+	// signals: fail closed, not open.
 	if lerr != nil {
 		out.Authorized = false
-		out.Reason = "lane_limit_exceeded"
+		if errors.Is(lerr, lane.ErrLaneConflict) {
+			out.Reason = "lane_conflict"
+		} else {
+			out.Reason = "lane_limit_exceeded"
+		}
 		out.DenialErr = lerr
 		return out
 	}
@@ -295,30 +308,25 @@ func (t *Terminator) classifyLane(credID string, feat lane.Features) (string, *l
 	return rec.LaneID, rec, created, nil
 }
 
-// shortTag derives a stable short tag from the dominant feature for lane IDs.
+// shortTag derives a stable tag for lane IDs from the full feature vector.
+// It hashes every feature (not just the dominant one, and without truncating
+// the dominant one) so two distinct feature sets cannot derive the same lane
+// id — a truncation collision would either overwrite an existing lane's state
+// (a state-reset laundering attack, §24) or wedge the store. Lane ids remain
+// deterministic for a given feature vector (§26); the tag is opaque, and the
+// authoritative lane record keeps the readable feature classes.
 func shortTag(f lane.Features) string {
-	if f.NetworkASN != "" {
-		return safeTag(f.NetworkASN)
-	}
-	if f.RegionClass != "" {
-		return safeTag(f.RegionClass)
-	}
-	return "n"
-}
-
-func safeTag(s string) string {
 	var b strings.Builder
-	for _, r := range s {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
-			b.WriteRune(r)
-		} else {
-			b.WriteByte('x')
-		}
-		if b.Len() >= 12 {
-			break
-		}
+	for _, part := range []string{
+		f.NetworkASN, f.NetworkType, f.RegionClass, f.ClientFamily,
+		f.SDKFamily, f.HTTPVersion, f.Streaming, f.ModelFamily,
+		f.ConcurrencyPattern, f.EndpointFamily,
+	} {
+		b.WriteString(part)
+		b.WriteByte(0x1f) // unit separator: unambiguous field delimiter
 	}
-	return b.String()
+	sum := sha256.Sum256([]byte(b.String()))
+	return base64.RawURLEncoding.EncodeToString(sum[:10]) // 80-bit tag
 }
 
 // evaluatePolicy applies the fixed-precedence enforcement resolver (§58). It
@@ -421,7 +429,7 @@ func (t *Terminator) synchronousEvidence(laneNew bool) []evidence.Evidence {
 		// The table removed the rule → no evidence; never invent parameters here.
 		return nil
 	}
-	return []evidence.Evidence{{
+	ev := evidence.Evidence{
 		EvidenceID:     t.rand(),
 		Code:           rule.Code,
 		Family:         rule.Family,
@@ -430,9 +438,15 @@ func (t *Terminator) synchronousEvidence(laneNew bool) []evidence.Evidence {
 		Severity:       rule.Severity,
 		Confidence:     rule.Confidence,
 		CreatedAt:      now,
-		ExpiresAt:      now.Add(rule.TTL),
 		PolicyRevision: t.dep.Policy.Revision,
-	}}
+	}
+	// rule.TTL <= 0 means "does not self-expire": mint a zero ExpiresAt, which
+	// Evidence.Valid treats as unbounded. Minting now.Add(0) would instead
+	// create evidence that expires immediately after creation.
+	if rule.TTL > 0 {
+		ev.ExpiresAt = now.Add(rule.TTL)
+	}
+	return []evidence.Evidence{ev}
 }
 
 // evCodes reduces evidence to their codes for the Outcome's explainability.

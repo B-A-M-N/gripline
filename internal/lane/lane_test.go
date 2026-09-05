@@ -129,3 +129,34 @@ func TestPromotionGate(t *testing.T) {
 		t.Fatal("suspicious lane must never promote")
 	}
 }
+
+// Regression (§24): a lane id collision must never overwrite the existing row.
+// Overwriting would reset a BLOCKED/SUSPICIOUS lane to NEW — laundering its
+// history and evading the explosion limit. The store fails closed with
+// ErrLaneConflict instead.
+func TestLaneIdCollisionDoesNotResetState(t *testing.T) {
+	store := NewStore(func() Limits {
+		return Limits{MaxActiveLanesPerCredential: 4, MaxProvisionalLanes: 4, LaneIdleExpiration: time.Hour}
+	}, time.Now)
+	th := DefaultThresholds()
+
+	if _, _, err := store.BorrowOrCreate("cred_1", "lane_a", Features{NetworkASN: "AS1", RegionClass: "us"}, th); err != nil {
+		t.Fatalf("create lane_a: %v", err)
+	}
+	// Same id, dissimilar features (no Match) → must conflict, not overwrite.
+	_, created, err := store.BorrowOrCreate("cred_1", "lane_a", Features{NetworkASN: "AS999", RegionClass: "eu"}, th)
+	if err == nil {
+		t.Fatal("id collision with dissimilar features must error")
+	}
+	if created {
+		t.Fatal("collision must not report created")
+	}
+	// The original record must be intact.
+	rec, ok := store.Get("cred_1", "lane_a")
+	if !ok {
+		t.Fatal("original lane must survive the collision attempt")
+	}
+	if rec.NetworkClass != "AS1" || rec.RegionClass != "us" || rec.RequestCount != 1 {
+		t.Fatalf("original lane was mutated: %+v", rec)
+	}
+}

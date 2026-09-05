@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/freeinference/gripline/internal/evidence"
+	"github.com/B-A-M-N/gripline/internal/evidence"
 )
 
 func ev(code string, scope evidence.Scope, subject string, score int, grp string, createdAgo, ttl time.Duration) evidence.Evidence {

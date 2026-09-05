@@ -8,11 +8,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/freeinference/gripline/internal/credential"
-	"github.com/freeinference/gripline/internal/lane"
-	"github.com/freeinference/gripline/internal/policy"
-	"github.com/freeinference/gripline/internal/resource"
-	"github.com/freeinference/gripline/internal/secret"
+	"github.com/B-A-M-N/gripline/internal/credential"
+	"github.com/B-A-M-N/gripline/internal/lane"
+	"github.com/B-A-M-N/gripline/internal/policy"
+	"github.com/B-A-M-N/gripline/internal/resource"
+	"github.com/B-A-M-N/gripline/internal/secret"
 )
 
 // --- assertion verification: INV-10, INV-11 ---------------------------------
@@ -124,7 +124,7 @@ func buildTerminator(t *testing.T, status credential.Status, concurrency *resour
 	signer, _ := GenerateSigner()
 	dep := Dependencies{
 		Registry: tc.reg,
-		Peppers:  credential.NewPepperRing(pep),
+		Peppers:  credential.MustPepperRing(pep),
 		Lanes:    lane.NewStore(nil, time.Now),
 		Policy:   policy.Default(),
 		Signer:   signer,
@@ -237,7 +237,7 @@ func TestAdmitExpiredCredentialDenied(t *testing.T) {
 	})
 	signer, _ := GenerateSigner()
 	term, err := New(Dependencies{
-		Registry: reg, Peppers: credential.NewPepperRing(pep),
+		Registry: reg, Peppers: credential.MustPepperRing(pep),
 		Policy: policy.Default(), Signer: signer, Audience: "fi-inference",
 	})
 	if err != nil {
@@ -261,7 +261,7 @@ func TestAdmitLaneExplosionDenied(t *testing.T) {
 		return lane.Limits{MaxActiveLanesPerCredential: 2, LaneIdleExpiration: time.Hour}
 	}, time.Now)
 	term, err := New(Dependencies{
-		Registry: tc.reg, Peppers: credential.NewPepperRing(pep),
+		Registry: tc.reg, Peppers: credential.MustPepperRing(pep),
 		Lanes: store, Policy: policy.Default(), Signer: signer, Audience: "fi-inference",
 	})
 	if err != nil {
@@ -349,7 +349,7 @@ func TestAdmitReleasesLeaseWhenIdentityFails(t *testing.T) {
 	pep := &credential.PepperKey{Version: 1, Key: []byte("test-pepper")}
 	tc := makeCredentialWithStatus("cred_l", "acct_1", credential.StatusNormal, pep)
 	term, err := New(Dependencies{
-		Registry: tc.reg, Peppers: credential.NewPepperRing(pep),
+		Registry: tc.reg, Peppers: credential.MustPepperRing(pep),
 		Policy:      policy.Default(),
 		Signer:      failingSigner{}, // identity issuance fails after lease acquisition
 		Audience:    "fi-inference",
@@ -399,4 +399,47 @@ func indexOf(haystack, needle string) int {
 		}
 	}
 	return -1
+}
+
+// Regression (§24): a lane-id collision surfaces as a distinct, fail-closed
+// denial — never as a state reset of the colliding lane and never as a
+// generic "authorized" outcome.
+func TestAdmitLaneCollisionFailsClosed(t *testing.T) {
+	pep := &credential.PepperKey{Version: 1, Key: []byte("test-pepper")}
+	tc := makeCredentialWithStatus("cred_c", "acct_1", credential.StatusNormal, pep)
+	signer, _ := GenerateSigner()
+	store := lane.NewStore(func() lane.Limits {
+		return lane.Limits{MaxActiveLanesPerCredential: 8, MaxProvisionalLanes: 8, LaneIdleExpiration: time.Hour}
+	}, time.Now)
+	term, err := New(Dependencies{
+		Registry: tc.reg, Peppers: credential.MustPepperRing(pep),
+		Lanes: store, Policy: policy.Default(), Signer: signer, Audience: "fi-inference",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Force a collision: pre-create a lane whose id equals the derivation the
+	// terminator will produce for these features, with dissimilar stored
+	// features so similarity cannot Match. BorrowOrCreate takes the caller's
+	// id verbatim, so the seeded row lands exactly on the future collide id.
+	collideFeat := lane.Features{NetworkASN: "AS-ATTACK", RegionClass: "r1"}
+	collideID := "lane_cred_c_" + shortTag(collideFeat)
+	if _, created, err := store.BorrowOrCreate("cred_c", collideID,
+		lane.Features{NetworkASN: "AS-DIFFERENT", RegionClass: "r2"}, lane.DefaultThresholds()); err != nil || !created {
+		t.Fatalf("seed lane: created=%v err=%v", created, err)
+	}
+
+	out := term.Admit(bearerHeaders(tc.raw), collideFeat)
+	if out.Authorized {
+		t.Fatal("collision must fail closed")
+	}
+	if out.Reason != "lane_conflict" {
+		t.Fatalf("reason = %s, want lane_conflict", out.Reason)
+	}
+	// The seeded lane's stored features must be untouched.
+	got, _ := store.Get("cred_c", collideID)
+	if got == nil || got.NetworkClass != "AS-DIFFERENT" {
+		t.Fatalf("seeded lane was mutated: %+v", got)
+	}
 }

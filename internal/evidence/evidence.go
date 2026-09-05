@@ -125,6 +125,13 @@ func (e Evidence) TTL() time.Duration {
 // Rule defines the fixed score and metadata for a recognized evidence code.
 // Offline analysis may author these; they become explicit versioned policy
 // before affecting authorization (§38).
+//
+// A TTL of zero (or negative) means the evidence does not expire on its own —
+// it stays active until an explicit lifecycle action (e.g. MANUAL_CONFIRMED_
+// COMPROMISE holds until the credential is revoked). Minting side: rule.TTL <=
+// 0 must produce a zero ExpiresAt, which Evidence.Valid treats as unbounded.
+// Minting ExpiresAt = now.Add(0) instead would create evidence that expires
+// the moment after creation — an operator IOC that silently evaporates.
 type Rule struct {
 	Code             string
 	Family           Family

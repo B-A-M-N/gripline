@@ -14,7 +14,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/freeinference/gripline/internal/secret"
+	"github.com/B-A-M-N/gripline/internal/secret"
 )
 
 // RevokedError indicates authentication was attempted for a revoked credential.
@@ -140,12 +140,37 @@ type PepperRing struct {
 
 // NewPepperRing builds a ring from one or more versions. A later version is
 // "active" for new verifiers; all versions remain valid for comparison.
-func NewPepperRing(versions ...*PepperKey) *PepperRing {
+// Versions with empty key material are refused: an HMAC under an empty key is
+// publicly computable, which would make stored verifiers enumerable — the
+// failure INV-1 exists to prevent. A ring built from only invalid versions
+// errors rather than failing open.
+func NewPepperRing(versions ...*PepperKey) (*PepperRing, error) {
 	r := &PepperRing{active: make(map[int][]byte, len(versions)), now: time.Now}
 	for _, v := range versions {
-		if v != nil {
-			r.active[v.Version] = v.Key
+		if v == nil {
+			continue
 		}
+		if len(v.Key) == 0 {
+			return nil, fmt.Errorf("credential: pepper version %d has empty key", v.Version)
+		}
+		if _, dup := r.active[v.Version]; dup {
+			return nil, fmt.Errorf("credential: duplicate pepper version %d", v.Version)
+		}
+		r.active[v.Version] = v.Key
+	}
+	if len(r.active) == 0 {
+		return nil, fmt.Errorf("credential: pepper ring requires at least one keyed version")
+	}
+	return r, nil
+}
+
+// MustPepperRing is NewPepperRing with a panic on invalid configuration. For
+// process-startup wiring where an unusable pepper ring is a deployment error,
+// not a runtime condition to handle (fail closed at boot).
+func MustPepperRing(versions ...*PepperKey) *PepperRing {
+	r, err := NewPepperRing(versions...)
+	if err != nil {
+		panic(err)
 	}
 	return r
 }
@@ -350,6 +375,8 @@ func clamp01(v int) int {
 }
 
 // IsAuthenticatable reports whether the machine's status permits authentication.
+// It must answer identically to CredentialRecord.Authenticatable (§30): a
+// quarantined credential is denied at authentication, not only revoked.
 func (m *StateMachine) IsAuthenticatable() bool {
-	return m.status != StatusRevoked
+	return m.status != StatusRevoked && m.status != StatusQuarantined
 }

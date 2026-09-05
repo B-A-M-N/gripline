@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/freeinference/gripline/internal/secret"
+	"github.com/B-A-M-N/gripline/internal/secret"
 )
 
 // CredentialCarrier names the header that carried the credential.
@@ -42,8 +42,9 @@ func isExtractionError(err error) bool {
 
 // ExtractExternalCredential pulls a credential from a normalized view of the
 // request secret headers (carrier presence), enforcing: only one carrier;
-// exactly one credential; valid syntax; bounded size. On success it strips the
-// secret from the header map (§18) and returns the sealed credential. On
+// exactly one credential; valid syntax; bounded size. On success it returns
+// the sealed credential; the caller (Admit) is responsible for stripping the
+// secret headers (§18) — extraction does not mutate the map itself. On
 // ambiguity it fails closed.
 //
 // headers is treated as owned by the caller; the sealed copy is independent.
