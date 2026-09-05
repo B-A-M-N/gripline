@@ -40,13 +40,19 @@ The smallest release worthy of the Gripline name:
 2. ✅ credential-safe handling — `SealedSecret` forbids formatting/serialization
 3. ✅ internal principal — `internal/principal`
 4. ✅ internal signed identity — Ed25519, ≤30s TTL, audience-bound (`internal/terminator`)
-5. ⬜ private backend enforcement (proxy + network)
-6. ✅ hard per-credential concurrency (atomic leases, INV-15)
-7. ◇ hard resource velocity — token buckets present; velocity adapters pending
-8. ◇ source key-spray detection — pseudonym fingerprints present; source state pending
+5. ✅ private backend enforcement (terminate-and-forward proxy + backend verifier)
+6. ✅ hard per-credential concurrency (atomic leases, INV-15; multi-scope governor)
+7. ✅ hard resource velocity — multi-scope governor + token buckets (`internal/resource`)
+8. ✅ source key-spray detection — pseudonym fingerprints + source-spray minter
 9. ✅ lane tracking — `internal/lane` (classification, states, explosion protection)
 10. ✅ deterministic shadow evidence — `internal/evidence` + `internal/risk` (fuzzed 0..100)
-11. ⬜ audit trail (control-plane mutations)
+11. ✅ audit trail — operator control plane (`internal/control`) + decision records
+    (`internal/observability`)
+12. ✅ adaptive-state failure semantics — DEGRADED never fails open (P0.1)
+13. ✅ source-spray anomaly detector (`internal/anomaly`)
+14. ✅ acceptance gates A–J (`internal/gates`, spec §111) — all green
+15. ✅ shadow-first auto-quarantine — `Risk.EnableAutomaticQuarantine=false` default
+    (Gate H); request-level denial still fires, persisted quarantine stays operator-set
 
 ### Implemented packages
 
@@ -74,11 +80,22 @@ internal/resource      atomic token buckets with all-or-nothing Reservations, co
 internal/terminator    admission flow (§53): extract → strip secret+internal headers → authenticate →
                        policy binding → lane → evidence → risk → policy resolver → hard limit →
                        internal identity; policy snapshot at New; explicit TERMINATE/ENFORCE modes;
-                       128-bit random request ids
+                       128-bit random request ids; Ed25519 keyring with overlap rotation
+internal/resource      multi-scope governor: SOURCE/LANE/CREDENTIAL/ACCOUNT/global all-or-nothing
+                       provisioning; token buckets + atomic concurrency leases (INV-15)
+internal/lane/control  operator unblock lifecycle + audit entries (P0.35/P0.42)
+internal/control       operator control plane: emergency lockdown posture + bounded audit trail
+internal/anomaly       source-spray minter (credential ASN-spray + source credential-spray) via Mint
+internal/proxy         terminate-and-forward data plane: strip reserved headers (INV-12), re-inject
+                       signed assertion on the trusted hop, stream unchanged (INV-1/10/11)
+internal/observability DecisionRecord per admission (§97): safe, machine-readable explanation
+internal/gates         executable acceptance gates A–J (spec §111) — each fails the build on
+                       release-contract regression
 ```
 
-Verified with `go test -race ./...` (all packages) and fuzz runs on the
-risk-bounds invariant and the credential-extraction parser.
+Verified with `go vet ./...` clean and `go test -race ./...` (all packages)
+green, plus fuzz runs on the risk-bounds invariant and credential extraction,
+and the §112 latency budget (p95 ≈ 0.5ms &lt; 2ms target).
 
 ### Known gaps (audit honesty)
 
@@ -103,11 +120,15 @@ no invariant is claimed beyond what the implementation establishes:
 - **Single-process resources:** the concurrency pool and token buckets prove
   the atomic accounting invariants in-process. Cross-node leases, reservation
   TTLs, and orphan recovery need a shared backend (see `07-deployment.md`).
-- **No streaming proxy / ingress yet:** the terminator is a library; the HTTP
-  data plane that owns the lease lifecycle end-to-end is the next build phase.
-  Release is gated on the proof harness (containment canary, bypass
-  resistance, streaming equivalence, deterministic replay) rather than on
-  component tests alone.
+- **Streaming equivalence is gate-tested, not SDK-proven:** the proxy streams
+  generic HTTP + SSE pass-through unchanged (Gate C/D), but the real third-party
+  SDK matrix (OpenAI/Anthropic Python-TS, Claude Code, Codex) is not run in
+  this repo. Gate C enforces the generic-HTTP contract; connector-level
+  equivalence is verified in the hosting integration, not here.
+- **Provider adapters are stubbed:** real ASN/region attribution and
+  trusted-edge RealIP are `FeatureResolver` seams with deterministic defaults
+  (`HeaderFeatures`); a hosting provider must wire its adapter. Non-supplied
+  features are treated as unknown (never falsely matched).
 
 ## Invariants
 
