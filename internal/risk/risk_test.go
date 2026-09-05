@@ -165,3 +165,32 @@ func familyFor(code string) evidence.Family {
 	}
 	return evidence.FamilyResourceVelocity
 }
+
+// Regression (P0.11): risk correlation must never collapse evidence belonging
+// to different subjects or scopes into one bounded group. Group keys are
+// (family, subject, scope, group).
+func TestRiskCorrelationNeverCrossesSubjects(t *testing.T) {
+	now := time.Now()
+	tbl := evidence.DefaultTable()
+	mk := func(subject string, scope evidence.Scope) evidence.Evidence {
+		ev, err := evidence.Mint(tbl, "NEW_ASN", subject, now, 1) // group "location", score 10
+		if err != nil {
+			t.Fatal(err)
+		}
+		ev.Scope = scope
+		return ev
+	}
+	// Two subjects, same family+group: if the group key ignored subject,
+	// both would collapse to a single 10 instead of contributing 10+10.
+	if total := Evaluate([]evidence.Evidence{mk("cred_A", evidence.ScopeLane), mk("cred_B", evidence.ScopeLane)}, now); total != 20 {
+		t.Fatalf("risk = %d, want 20 (correlation must not cross subjects)", total)
+	}
+	// Same subject across DIFFERENT scopes also stays uncorrelated.
+	if total := Evaluate([]evidence.Evidence{mk("cred_A", evidence.ScopeLane), mk("cred_A", evidence.ScopeCredential)}, now); total != 20 {
+		t.Fatalf("risk = %d, want 20 (correlation must not cross scopes)", total)
+	}
+	// Same subject + scope + group still correlates to one contribution.
+	if total := Evaluate([]evidence.Evidence{mk("cred_A", evidence.ScopeLane), mk("cred_A", evidence.ScopeLane)}, now); total != 10 {
+		t.Fatalf("risk = %d, want 10 (same-root evidence stays bounded)", total)
+	}
+}

@@ -35,17 +35,25 @@ func (s State) String() string {
 	}
 }
 
-// LaneRecord is the persisted lane row (§75).
+// LaneRecord is the persisted lane row (§75). It retains the COMPLETE
+// normalized classification vector (P0.8): matching against a subset of the
+// vector collapses materially different manifestations into one lane (missing
+// dimensions drop out of the similarity denominator, so a single shared
+// feature can score a false 1.0). FeatSchema records the feature-schema
+// revision used at classification time so a future schema change can
+// re-classify rather than silently compare across incompatible vectors.
 type LaneRecord struct {
-	LaneID             string
-	CredentialID       string
-	State              State
-	FirstSeenAt        time.Time
-	LastSeenAt         time.Time
-	NetworkClass       string
-	RegionClass        string
-	ClientFamily       string
+	LaneID       string
+	CredentialID string
+	State        State
+	FirstSeenAt  time.Time
+	LastSeenAt   time.Time
+	Features     Features // full normalized classification vector (P0.8)
+	FeatSchema   int      // feature-schema revision the vector was classified under
+
 	RequestCount       int64
+	ActiveDays         int    // distinct active days observed (§29 clean-active-days)
+	LastActiveDay      string // "YYYY-MM-DD" of the last request (ActiveDays dedup)
 	RiskScore          int
 	EstablishmentScore int
 	Revision           int

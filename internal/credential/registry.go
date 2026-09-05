@@ -1,6 +1,7 @@
 package credential
 
 import (
+	"bytes"
 	"encoding/base64"
 	"errors"
 	"strconv"
@@ -33,6 +34,12 @@ type Registry interface {
 // ErrNotFound is returned by mutations for absent credentials.
 var ErrNotFound = errors.New("credential: not found")
 
+// ErrVerifierOwned is returned when an insert would map a verifier to a
+// credential id that already owns a different verifier under the same pepper
+// version. Two live credentials must never share a verifier — it would let
+// one credential authenticate as another.
+var ErrVerifierOwned = errors.New("credential: verifier already owned by another credential")
+
 // MemoryRegistry is a concurrency-safe in-memory Registry. For development and
 // tests only; not durable.
 type MemoryRegistry struct {
@@ -51,16 +58,42 @@ func NewMemoryRegistry() *MemoryRegistry {
 	}
 }
 
-// Insert adds (or replaces) a record. The verifier must already be derived.
-// Indexes the verifier for FindByVerifier; raw keys are never indexed.
-func (m *MemoryRegistry) Insert(rec *CredentialRecord) {
+// Insert adds a record, or replaces an existing record for the same
+// credential id. Replacement is rotation: the PREVIOUS verifier's index entry
+// is removed in the same critical section, so a replaced credential's old
+// verifier can never remain an authentication path (a stale index here is
+// exactly the rotation failure INV-13 guards against). Verifiers are never
+// indexed raw — the index key is pepper-versioned. Conflicting verifier
+// ownership (another credential already holds this verifier under the same
+// pepper version) is rejected.
+func (m *MemoryRegistry) Insert(rec *CredentialRecord) error {
+	if rec == nil {
+		return errors.New("credential: nil record")
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	newKey := ""
+	if len(rec.Verifier) > 0 {
+		newKey = verKeyFor(rec.PepperVersion, rec.Verifier)
+		if owner, taken := m.byVer[newKey]; taken && owner != rec.CredentialID {
+			return ErrVerifierOwned
+		}
+	}
+
+	if prev, exists := m.records[rec.CredentialID]; exists && len(prev.Verifier) > 0 {
+		prevKey := verKeyFor(prev.PepperVersion, prev.Verifier)
+		if prevKey != newKey { // same-key replacement keeps its index entry
+			delete(m.byVer, prevKey)
+		}
+	}
+
 	c := *rec
 	m.records[rec.CredentialID] = &c
-	if rec.Verifier != nil {
-		m.byVer[verKeyFor(rec.PepperVersion, rec.Verifier)] = rec.CredentialID
+	if newKey != "" {
+		m.byVer[newKey] = rec.CredentialID
 	}
+	return nil
 }
 
 // verKeyFor derives the index key (pepper version + verifier). The verifier is
@@ -80,7 +113,12 @@ func (m *MemoryRegistry) Lookup(credentialID string) (*CredentialRecord, bool) {
 	return cloneRecord(rec), true
 }
 
-// FindByVerifier resolves a record by derived verifier + pepper version.
+// FindByVerifier resolves a record by derived verifier + pepper version. It
+// DEFENSIVELY re-checks that the resolved record's current verifier and
+// pepper version match the lookup inputs: the index is an optimization, and
+// the record's own verifier fields are authoritative. A stale index entry
+// (e.g. from a concurrent rotation, or any future index bug) fails closed
+// instead of authenticating a replaced credential.
 func (m *MemoryRegistry) FindByVerifier(verifier []byte, pepperVersion int) (*CredentialRecord, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -90,6 +128,9 @@ func (m *MemoryRegistry) FindByVerifier(verifier []byte, pepperVersion int) (*Cr
 	}
 	rec, ok := m.records[id]
 	if !ok {
+		return nil, false
+	}
+	if rec.PepperVersion != pepperVersion || !bytes.Equal(rec.Verifier, verifier) {
 		return nil, false
 	}
 	return cloneRecord(rec), true

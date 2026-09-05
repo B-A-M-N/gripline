@@ -51,20 +51,60 @@ The smallest release worthy of the Gripline name:
 ### Implemented packages
 
 ```
-internal/secret        SealedSecret: zeroize on Zero, no String/Format/Marshaler (INV-1,2)
-internal/credential    HMAC-SHA256 pepper verifier, CredentialRecord, status machine + hysteresis, registry (INV-1,13)
-internal/pseudonym     keyed HMAC source/fingerprint IDs, rotation (key distinct from verifier pepper)
+internal/secret        SealedSecret: opaque state pointer, active redaction of every fmt verb
+                       (Format/String/GoString), no serializers, zeroize-on-Zero shared across
+                       struct copies (INV-2; canary-tested incl. log/panic/error paths)
+internal/credential    HMAC-SHA256 pepper verifier (keys copied on ingestion, empty keys refused),
+                       CredentialRecord, status machine + hysteresis, registry with rotation-safe
+                       verifier indexes + defensive re-check (INV-1,13)
+internal/pseudonym     keyed HMAC source/fingerprint IDs (fail-closed construction, key copies,
+                       negative versions refused), rotation (key distinct from verifier pepper)
 internal/principal     Principal / AuthorizedContext (no secret field)
-internal/lane          lane states NEW/PROBATION/ESTABLISHED/SUSPICIOUS/BLOCKED, similarity classifier, bounded store, promotion
-internal/evidence      bounded risk families, correlation groups, TTL
-internal/risk          deterministic 0..100 evaluation (family caps, correlated max-reduction); fuzzed
-internal/policy        versioned policy, enforcement precedence (§58), TTL bound (INV-10)
-internal/resource      atomic token buckets + concurrency leases (INV-15; race-tested)
-internal/terminator    admission flow (§53): extract → authenticate → lane → evidence → risk → hard limit → internal identity
+internal/lane          lane states NEW/PROBATION/ESTABLISHED/SUSPICIOUS/BLOCKED, full-vector
+                       similarity classifier with schema revision, deterministic tie-breaking,
+                       bounded store (insert-only rows, evict-before-limit, provisional cap), promotion
+internal/evidence      bounded risk families, correlation groups, TTL≤0 = unbounded,
+                       trusted Mint() from versioned rule table (unknown codes rejected)
+internal/risk          deterministic 0..100 evaluation (family caps, correlation bounded per
+                       subject+scope); fuzzed
+internal/policy        versioned + validated policy (threshold ladder checked), enforcement
+                       precedence (§58), TTL bound (INV-10)
+internal/resource      atomic token buckets with all-or-nothing Reservations, concurrency leases
+                       with shared release state (copy-safe, INV-15; race-tested)
+internal/terminator    admission flow (§53): extract → strip secret+internal headers → authenticate →
+                       policy binding → lane → evidence → risk → policy resolver → hard limit →
+                       internal identity; policy snapshot at New; explicit TERMINATE/ENFORCE modes;
+                       128-bit random request ids
 ```
 
-61 `test`/`Fuzz` functions. Verified with `go test -race ./...` and fuzz runs on
-the risk-bounds invariant and the credential-extraction parser.
+Verified with `go test -race ./...` (all packages) and fuzz runs on the
+risk-bounds invariant and the credential-extraction parser.
+
+### Known gaps (audit honesty)
+
+These are known-unfinished parts of the admission pipeline, stated here so
+no invariant is claimed beyond what the implementation establishes:
+
+- **Admission-state integration (P0.10):** the credential `StateMachine`,
+  lane promotion, and persistent evidence accumulation are implemented and
+  tested as components but are NOT yet driven by the live admission path.
+  Synchronous admission uses per-request evidence only (new-lane novelty);
+  WATCH/CONSTRAINED limit selection, velocity/source evidence, and
+  source-spray signals are not yet wired into authorization. Until this
+  lands, only REVOKED/QUARANTINED/BLOCKED/risk-threshold denials fire.
+- **Policy immutability:** the terminator enforces a deep-value SNAPSHOT of
+  the policy taken at construction (post-`New` mutation of the caller's
+  `*policy.Policy` cannot alter enforcement, tested), but a compiled/
+  immutable policy type with authenticated load, monotonic revision
+  enforcement, and explicit rollback authorization is not built yet.
+- **Single-process resources:** the concurrency pool and token buckets prove
+  the atomic accounting invariants in-process. Cross-node leases, reservation
+  TTLs, and orphan recovery need a shared backend (see `07-deployment.md`).
+- **No streaming proxy / ingress yet:** the terminator is a library; the HTTP
+  data plane that owns the lease lifecycle end-to-end is the next build phase.
+  Release is gated on the proof harness (containment canary, bypass
+  resistance, streaming equivalence, deterministic replay) rather than on
+  component tests alone.
 
 ## Invariants
 

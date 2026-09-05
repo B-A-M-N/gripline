@@ -1,6 +1,7 @@
 package resource
 
 import (
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -138,5 +139,129 @@ func TestTokenBucketConcurrentInvariant(t *testing.T) {
 	wg.Wait()
 	if bal := b.Balance(); bal < 0 || bal > b.Capacity() {
 		t.Fatalf("balance %v out of [0,%v]", bal, b.Capacity())
+	}
+}
+
+// Regression (P0.4): a struct COPY of a lease handle must not carry its own
+// release state. Previously the `released` flag lived in the handle itself,
+// so copy.Release() after lease.Release() refunded the same slots twice,
+// breaking INV-15.
+func TestCopiedLeaseCannotDoubleRefund(t *testing.T) {
+	pool := NewConcurrencyPool(2)
+	lease := pool.Acquire()
+	if lease == nil {
+		t.Fatal("acquire failed")
+	}
+	cp := *lease // struct copy
+
+	lease.Release()
+	cp.Release()    // through the copy — must be a no-op
+	lease.Release() // and again through the original
+
+	if got := pool.Balance(); got != 2 {
+		t.Fatalf("balance = %d, want 2 (double refund detected, INV-15)", got)
+	}
+	if !cp.Released() || !lease.Released() {
+		t.Fatal("all copies must report released")
+	}
+}
+
+// Regression (P0.4): concurrent Release through two copies of the same handle
+// must refund exactly once (race-detected).
+func TestConcurrentCopiedLeaseSingleRefund(t *testing.T) {
+	pool := NewConcurrencyPool(4)
+	lease := pool.AcquireN(4)
+	if lease == nil {
+		t.Fatal("acquire failed")
+	}
+	copies := make([]LeaseHandle, 8)
+	for i := range copies {
+		copies[i] = *lease
+	}
+	var wg sync.WaitGroup
+	for i := range copies {
+		wg.Add(1)
+		go func(h LeaseHandle) {
+			defer wg.Done()
+			h.Release()
+		}(copies[i])
+	}
+	lease.Release()
+	wg.Wait()
+
+	if got := pool.Balance(); got != 4 {
+		t.Fatalf("balance = %d, want 4 (INV-15: refund exactly once)", got)
+	}
+}
+
+// --- P0.11 hardening regressions: reservation semantics ----------------------
+
+// Regression: non-finite bucket parameters must not corrupt accounting.
+func TestTokenBucketRejectsNonFinite(t *testing.T) {
+	b := NewTokenBucket(math.NaN(), 1, time.Minute, nil)
+	if b.Capacity() != 0 {
+		t.Fatalf("NaN capacity accepted: %v", b.Capacity())
+	}
+	b2 := NewTokenBucket(10, math.Inf(1), time.Minute, nil)
+	if b2.Reserve(1) == nil {
+		t.Fatal("valid reserve on sanitized bucket must succeed")
+	}
+	if r := b2.Reserve(math.NaN()); r != nil {
+		t.Fatal("NaN reservation must be refused")
+	}
+	if r := b2.Reserve(math.Inf(-1)); r != nil {
+		t.Fatal("Inf reservation must be refused")
+	}
+}
+
+// Regression: Reserve is all-or-nothing — never a partial hold.
+func TestReserveAllOrNothing(t *testing.T) {
+	b := NewTokenBucket(10, 0, 0, nil)
+	if r := b.Reserve(6); r == nil {
+		t.Fatal("6 of 10 must reserve fully")
+	} else if r.Amount() != 6 {
+		t.Fatalf("amount = %v", r.Amount())
+	}
+	// Only 4 remain: a 6-request must fail entirely (not take 4).
+	if r := b.Reserve(6); r != nil {
+		t.Fatal("over-capacity reserve must fail, not partially take")
+	}
+	if avail := b.Available(); avail != 4 {
+		t.Fatalf("available = %v, want 4", avail)
+	}
+}
+
+// Regression: settlement is ownership-safe and idempotent — a reservation
+// releases exactly its own amount, exactly once, and Settle/Cancel are
+// mutually exclusive (settlement can never mint allowance, INV-15).
+func TestReservationSettleCancelIdempotent(t *testing.T) {
+	b := NewTokenBucket(10, 0, 0, nil)
+	r := b.Reserve(4)
+	if r == nil {
+		t.Fatal("reserve failed")
+	}
+	cp := *r // struct copy shares settlement state
+	r.Settle()
+	cp.Settle() // idempotent
+	r.Cancel()  // must be a no-op after settle
+	cp.Cancel() // through the copy too
+	if bal := b.Balance(); bal != 4 {
+		t.Fatalf("balance after settle+cancel = %v, want 4 (INV-15)", bal)
+	}
+	if !r.Done() {
+		t.Fatal("reservation must report done")
+	}
+	// A fresh reservation cancels exactly its own amount.
+	r2 := b.Reserve(3)
+	if r2 == nil {
+		t.Fatal("second reserve failed")
+	}
+	r2.Cancel()
+	r2.Cancel()
+	if bal := b.Balance(); bal != 4 {
+		t.Fatalf("balance after cancel = %v, want 4 (exactly own amount)", bal)
+	}
+	if avail := b.Available(); avail != 6 {
+		t.Fatalf("available = %v, want 6", avail)
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"crypto/hmac"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/B-A-M-N/gripline/internal/secret"
@@ -140,15 +141,20 @@ type PepperRing struct {
 
 // NewPepperRing builds a ring from one or more versions. A later version is
 // "active" for new verifiers; all versions remain valid for comparison.
-// Versions with empty key material are refused: an HMAC under an empty key is
-// publicly computable, which would make stored verifiers enumerable — the
-// failure INV-1 exists to prevent. A ring built from only invalid versions
-// errors rather than failing open.
+// Versions with empty key material or negative version numbers are refused:
+// an HMAC under an empty key is publicly computable, which would make stored
+// verifiers enumerable — the failure INV-1 exists to prevent. Key material is
+// COPIED on ingestion, so later mutation of the caller's slice cannot alter
+// live keys. A ring built from only invalid versions errors rather than
+// failing open.
 func NewPepperRing(versions ...*PepperKey) (*PepperRing, error) {
 	r := &PepperRing{active: make(map[int][]byte, len(versions)), now: time.Now}
 	for _, v := range versions {
 		if v == nil {
 			continue
+		}
+		if v.Version < 0 {
+			return nil, fmt.Errorf("credential: negative pepper version %d", v.Version)
 		}
 		if len(v.Key) == 0 {
 			return nil, fmt.Errorf("credential: pepper version %d has empty key", v.Version)
@@ -156,7 +162,7 @@ func NewPepperRing(versions ...*PepperKey) (*PepperRing, error) {
 		if _, dup := r.active[v.Version]; dup {
 			return nil, fmt.Errorf("credential: duplicate pepper version %d", v.Version)
 		}
-		r.active[v.Version] = v.Key
+		r.active[v.Version] = append([]byte(nil), v.Key...)
 	}
 	if len(r.active) == 0 {
 		return nil, fmt.Errorf("credential: pepper ring requires at least one keyed version")
@@ -198,6 +204,18 @@ func (r *PepperRing) Latest() int {
 		}
 	}
 	return best
+}
+
+// Versions returns the configured versions in ascending order. Authentication
+// iterates THIS list (never the 0..latest integer range, which is pathological
+// for sparse/high version numbers).
+func (r *PepperRing) Versions() []int {
+	out := make([]int, 0, len(r.active))
+	for v := range r.active {
+		out = append(out, v)
+	}
+	sort.Ints(out)
+	return out
 }
 
 // Validate checks a presented secret against a stored record: it derives the

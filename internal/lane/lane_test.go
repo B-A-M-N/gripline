@@ -156,7 +156,195 @@ func TestLaneIdCollisionDoesNotResetState(t *testing.T) {
 	if !ok {
 		t.Fatal("original lane must survive the collision attempt")
 	}
-	if rec.NetworkClass != "AS1" || rec.RegionClass != "us" || rec.RequestCount != 1 {
+	if rec.Features.NetworkASN != "AS1" || rec.Features.RegionClass != "us" || rec.RequestCount != 1 {
 		t.Fatalf("original lane was mutated: %+v", rec)
+	}
+}
+
+// --- P0.8/P0.9 regressions ---------------------------------------------------
+
+// Regression (P0.8): the FULL classification vector must distinguish lanes.
+// Previously only ASN/region/client were persisted, so two manifestations
+// differing in SDK/model/streaming collapsed into one lane when their three
+// stored fields matched — a single shared feature could score a false 1.0.
+func TestFullFeatureVectorDistinguishesLanes(t *testing.T) {
+	store := NewStore(func() Limits {
+		return Limits{MaxActiveLanesPerCredential: 8, MaxProvisionalLanes: 8, LaneIdleExpiration: time.Hour}
+	}, time.Now)
+	th := DefaultThresholds()
+
+	a := Features{NetworkASN: "AS1", RegionClass: "us", ClientFamily: "claude-code",
+		SDKFamily: "ts", ModelFamily: "opus", Streaming: "streaming"}
+	b := Features{NetworkASN: "AS1", RegionClass: "us", ClientFamily: "claude-code",
+		SDKFamily: "python", ModelFamily: "haiku", Streaming: "non-streaming"}
+
+	la, ca, err := store.BorrowOrCreate("cred_1", "lane_a", a, th)
+	if err != nil || !ca {
+		t.Fatalf("create a: %v", err)
+	}
+	lb, cb, err := store.BorrowOrCreate("cred_1", "lane_b", b, th)
+	if err != nil {
+		t.Fatalf("create b: %v", err)
+	}
+	if !cb {
+		t.Fatalf("differing full vectors must NOT collapse into lane %s (P0.8)", la.LaneID)
+	}
+	if lb.LaneID == la.LaneID {
+		t.Fatal("distinct vectors must produce distinct lanes")
+	}
+	// And the persisted record retains the whole vector.
+	rec, _ := store.Get("cred_1", "lane_b")
+	if rec.Features.SDKFamily != "python" || rec.Features.ModelFamily != "haiku" || rec.Features.Streaming != "non-streaming" {
+		t.Fatalf("full vector not persisted: %+v", rec.Features)
+	}
+	if rec.FeatSchema != featSchemaVersion {
+		t.Fatalf("feat schema = %d, want %d", rec.FeatSchema, featSchemaVersion)
+	}
+}
+
+// Regression (P0.9): lane selection must be deterministic under similarity
+// ties. The store previously iterated a Go map (randomized order) with strict
+// `>`, so which lane won a tie depended on hash order. Now: highest similarity,
+// then lexicographically smallest lane id — stable across store instances.
+func TestLaneSelectionDeterministicUnderTies(t *testing.T) {
+	// Two candidate lanes that tie at the same similarity from the candidate's
+	// perspective: both seeds share {ASN, region, client} with the query and
+	// each carries one extra private feature the query lacks (present-only
+	// renormalization keeps the query's view identical for both). The seeds
+	// stay mutually distinct because their private features differ. Whichever
+	// lane wins must win IDENTICALLY on every run — Go map iteration order
+	// must not decide (P0.9).
+	th := DefaultThresholds()
+	cand := Features{NetworkASN: "AS1", RegionClass: "mid", ClientFamily: "cc"}
+	newStore := func() *Store {
+		s := NewStore(func() Limits {
+			return Limits{MaxActiveLanesPerCredential: 8, MaxProvisionalLanes: 8, LaneIdleExpiration: time.Hour}
+		}, time.Now)
+		if _, created, err := s.BorrowOrCreate("cred_1", "lane_zulu", Features{NetworkASN: "AS1", RegionClass: "mid", ClientFamily: "cc", NetworkType: "residential", SDKFamily: "go", HTTPVersion: "1.1", Streaming: "streaming"}, th); err != nil || !created {
+			t.Fatalf("seed zulu: created=%v err=%v", created, err)
+		}
+		// alpha differs from zulu in four candidate-absent features (total
+		// weight 0.35): mutual similarity = 0.65/1.00 = 0.65 (below Match →
+		// distinct rows), while each scores 1.0 against the candidate
+		// (candidate-absent features drop out of the denominator).
+		if _, created, err := s.BorrowOrCreate("cred_1", "lane_alpha", Features{NetworkASN: "AS1", RegionClass: "mid", ClientFamily: "cc", NetworkType: "hosting", SDKFamily: "py", HTTPVersion: "2", Streaming: "non-streaming"}, th); err != nil || !created {
+			t.Fatalf("seed alpha: created=%v err=%v", created, err)
+		}
+		if s.ActiveLaneCount("cred_1") != 2 {
+			t.Fatalf("seed lanes collapsed: %d", s.ActiveLaneCount("cred_1"))
+		}
+		return s
+	}
+	want := ""
+	for i := 0; i < 200; i++ {
+		s := newStore()
+		rec, created, err := s.BorrowOrCreate("cred_1", "lane_new_"+string(rune('a'+i%26)), cand, th)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if created {
+			t.Fatalf("iteration %d: tie must borrow, not create", i)
+		}
+		if want == "" {
+			want = rec.LaneID
+		} else if rec.LaneID != want {
+			t.Fatalf("iteration %d: nondeterministic selection %s, want %s", i, rec.LaneID, want)
+		}
+		if rec.LaneID != "lane_alpha" {
+			t.Fatalf("tie must deterministically pick the lexicographically smallest id, got %s", rec.LaneID)
+		}
+	}
+}
+
+// Regression (P0.9 follow-up): expired lanes are evicted BEFORE the explosion
+// limit is evaluated, so a lane whose idle expiration has passed cannot wedge
+// creation of the request that would have evicted it.
+func TestExpiredLanesEvictedBeforeLimitRejection(t *testing.T) {
+	base := time.Now()
+	clock := base
+	store := NewStore(func() Limits {
+		return Limits{MaxActiveLanesPerCredential: 2, MaxProvisionalLanes: 2, LaneIdleExpiration: 10 * time.Minute}
+	}, func() time.Time { return clock })
+	th := DefaultThresholds()
+
+	for _, id := range []string{"lane_1", "lane_2"} {
+		if _, _, err := store.BorrowOrCreate("cred_1", id, Features{NetworkASN: id}, th); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// At the limit — a third lane must be rejected NOW.
+	if _, _, err := store.BorrowOrCreate("cred_1", "lane_3", Features{NetworkASN: "AS3"}, th); err != ErrTooManyLanes {
+		t.Fatalf("at-limit create must fail: %v", err)
+	}
+	// Advance past idle expiration: the same create must now SUCCEED because
+	// eviction runs before the limit check.
+	clock = base.Add(11 * time.Minute)
+	rec, created, err := store.BorrowOrCreate("cred_1", "lane_3", Features{NetworkASN: "AS3"}, th)
+	if err != nil || !created {
+		t.Fatalf("expired lanes must free capacity before limit check: created=%v err=%v", created, err)
+	}
+	if store.ActiveLaneCount("cred_1") != 1 {
+		t.Fatalf("count = %d, want 1", store.ActiveLaneCount("cred_1"))
+	}
+	_ = rec
+}
+
+// Regression: MaxProvisionalLanes must actually bound NEW+PROBATION lanes.
+func TestMaxProvisionalLanesEnforced(t *testing.T) {
+	store := NewStore(func() Limits {
+		return Limits{MaxActiveLanesPerCredential: 10, MaxProvisionalLanes: 2, LaneIdleExpiration: time.Hour}
+	}, time.Now)
+	th := DefaultThresholds()
+	for i, id := range []string{"p1", "p2"} {
+		if _, _, err := store.BorrowOrCreate("cred_1", id, Features{NetworkASN: id}, th); err != nil {
+			t.Fatalf("provisional %d: %v", i, err)
+		}
+	}
+	if _, _, err := store.BorrowOrCreate("cred_1", "p3", Features{NetworkASN: "p3"}, th); err != ErrTooManyLanes {
+		t.Fatalf("third provisional lane must be refused, got %v", err)
+	}
+}
+
+// Regression: ActiveDays must count DISTINCT active days (§29
+// clean-active-days), not requests.
+func TestActiveDaysCountDistinctDays(t *testing.T) {
+	base := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+	clock := base
+	store := NewStore(func() Limits {
+		return Limits{MaxActiveLanesPerCredential: 4, MaxProvisionalLanes: 4, LaneIdleExpiration: 48 * time.Hour}
+	}, func() time.Time { return clock })
+	th := DefaultThresholds()
+
+	rec, _, err := store.BorrowOrCreate("cred_1", "lane_d", Features{NetworkASN: "AS1"}, th)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.ActiveDays != 1 {
+		t.Fatalf("first day ActiveDays = %d, want 1", rec.ActiveDays)
+	}
+	// Same day: no change. The re-request must BORROW lane_d (identical
+	// features) and not advance ActiveDays.
+	clock = base.Add(2 * time.Hour)
+	rec, created, err := store.BorrowOrCreate("cred_1", "lane_d", Features{NetworkASN: "AS1"}, th)
+	if err != nil || created {
+		t.Fatalf("same-day borrow: created=%v err=%v", created, err)
+	}
+	if rec.LaneID != "lane_d" {
+		t.Fatalf("same-day request must borrow lane_d, got %s", rec.LaneID)
+	}
+	if rec.ActiveDays != 1 {
+		t.Fatalf("same-day ActiveDays = %d, want 1", rec.ActiveDays)
+	}
+	// Next day: +1 (borrow again, a day later).
+	clock = base.Add(26 * time.Hour)
+	rec, created, err = store.BorrowOrCreate("cred_1", "lane_d", Features{NetworkASN: "AS1"}, th)
+	if err != nil || created {
+		t.Fatalf("next-day borrow: created=%v err=%v", created, err)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.ActiveDays != 2 {
+		t.Fatalf("next-day ActiveDays = %d, want 2", rec.ActiveDays)
 	}
 }

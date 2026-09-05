@@ -98,13 +98,31 @@ func TestOverTTLAssertionRejected(t *testing.T) {
 	now := time.Now()
 	claims := Claims{
 		Issuer: "gripline", Subject: "s", CredID: "cred_1", Audience: "aud", JTI: "j",
-		IssuedAt: now.Add(-2 * time.Hour).Unix(), ExpiresAt: now.Unix(),
+		// Valid "now" window but a 2-hour lifetime — over the TTL bound.
+		IssuedAt:  now.Unix(),
+		ExpiresAt: now.Add(2 * time.Hour).Unix(),
 	}
 	payload, _ := json.Marshal(claims)
 	sig := ed25519.Sign(signer.priv, payload)
 	enc := base64.RawURLEncoding.EncodeToString(payload) + "." + base64.RawURLEncoding.EncodeToString(sig)
 	if _, err := ParseAndVerify(enc, signer.Public(), "aud", now); err != ErrTTLTooLong {
 		t.Fatalf("want ErrTTLTooLong, got %v", err)
+	}
+}
+
+// Regression: exp is inclusive-invalid — an assertion is expired AT its expiry
+// second (now == exp), not only after it.
+func TestAssertionExpiredAtExactExpiry(t *testing.T) {
+	signer, _ := GenerateSigner()
+	a, _ := signer.Issue(Claims{Subject: "s", CredID: "cred_x", Audience: "aud", JTI: "j"}, 30*time.Second)
+	enc := a.Encode()
+	atExp := time.Unix(a.Claims().ExpiresAt, 0)
+	if _, err := ParseAndVerify(enc, signer.Public(), "aud", atExp); err != ErrExpired {
+		t.Fatalf("want ErrExpired at now==exp, got %v", err)
+	}
+	// One second before expiry it is still valid.
+	if _, err := ParseAndVerify(enc, signer.Public(), "aud", atExp.Add(-time.Second)); err != nil {
+		t.Fatalf("valid one second before expiry: %v", err)
 	}
 }
 
@@ -152,12 +170,14 @@ func makeCredentialWithStatus(id, account string, status credential.Status, pep 
 	raw := "sk-test-" + string(rawBytes)
 	sealed := secret.NewFromBytes([]byte(raw))
 	reg := credential.NewMemoryRegistry()
-	reg.Insert(&credential.CredentialRecord{
+	if err := reg.Insert(&credential.CredentialRecord{
 		CredentialID: id, AccountID: account,
 		Verifier: credential.Verifier(sealed, pep), VerifierVersion: 1, PepperVersion: pep.Version,
 		Status: status, PolicyID: "fi-default-v1", PlanID: "plan-a",
 		CreatedAt: time.Now().Add(-time.Hour), Revision: 1,
-	})
+	}); err != nil {
+		panic(err) // test fixture construction must succeed
+	}
 	return struct {
 		reg *credential.MemoryRegistry
 		raw string
@@ -228,13 +248,15 @@ func TestAdmitExpiredCredentialDenied(t *testing.T) {
 	raw := "sk-test-" + string(rawBytes)
 	sealed := secret.NewFromBytes([]byte(raw))
 	reg := credential.NewMemoryRegistry()
-	reg.Insert(&credential.CredentialRecord{
+	if err := reg.Insert(&credential.CredentialRecord{
 		CredentialID: "cred_e", AccountID: "acct_1",
 		Verifier: credential.Verifier(sealed, pep), PepperVersion: 1,
 		Status:    credential.StatusNormal,
 		ExpiresAt: time.Now().Add(-time.Minute), // already expired
 		Revision:  1,
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 	signer, _ := GenerateSigner()
 	term, err := New(Dependencies{
 		Registry: reg, Peppers: credential.MustPepperRing(pep),
@@ -439,7 +461,184 @@ func TestAdmitLaneCollisionFailsClosed(t *testing.T) {
 	}
 	// The seeded lane's stored features must be untouched.
 	got, _ := store.Get("cred_c", collideID)
-	if got == nil || got.NetworkClass != "AS-DIFFERENT" {
+	if got == nil || got.Features.NetworkASN != "AS-DIFFERENT" {
 		t.Fatalf("seeded lane was mutated: %+v", got)
+	}
+}
+
+// --- P0.5/P0.6/P0.12 regressions --------------------------------------------
+
+// Regression (P0.5): mutating the caller's *policy.Policy after New must not
+// alter live enforcement — the terminator enforces a snapshot taken at
+// construction.
+func TestPolicyMutationAfterNewCannotAlterEnforcement(t *testing.T) {
+	pep := &credential.PepperKey{Version: 1, Key: []byte("test-pepper")}
+	tc := makeCredentialWithStatus("cred_pm", "acct_1", credential.StatusNormal, pep)
+	pol := policy.Default()
+	signer, _ := GenerateSigner()
+	term, err := New(Dependencies{
+		Registry: tc.reg, Peppers: credential.MustPepperRing(pep),
+		Policy: pol, Signer: signer, Audience: "fi-inference",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Mutate every security-relevant field of the live policy object.
+	pol.Risk.Quarantine = 1 // would deny everything at any risk
+	pol.Identity.MaxTTLSeconds = 60
+	pol.Revision = 999
+
+	out := term.Admit(bearerHeaders(tc.raw), lane.Features{})
+	if !out.Authorized {
+		t.Fatalf("snapshot policy must still authorize a clean request: %s %v", out.Reason, out.DenialErr)
+	}
+	if out.Context.Principal.CredentialID != "cred_pm" {
+		t.Fatalf("wrong principal: %+v", out.Context.Principal)
+	}
+	if out.Assertion.Claims().PolicyRev != 1 {
+		t.Fatalf("assertion must carry the snapshot revision 1, got %d", out.Assertion.Claims().PolicyRev)
+	}
+	if out.Assertion.Claims().CredID == "" {
+		t.Fatal("assertion must carry the credential id")
+	}
+}
+
+// Regression (P0.5): a credential whose PolicyID differs from the loaded
+// policy must fail closed — never be evaluated under the wrong policy.
+func TestCredentialUnderWrongPolicyDenied(t *testing.T) {
+	pep := &credential.PepperKey{Version: 1, Key: []byte("test-pepper")}
+	rawBytes := make([]byte, 32)
+	for i := range rawBytes {
+		rawBytes[i] = byte('k' + i%26)
+	}
+	raw := "sk-test-" + string(rawBytes)
+	sealed := secret.NewFromBytes([]byte(raw))
+	reg := credential.NewMemoryRegistry()
+	if err := reg.Insert(&credential.CredentialRecord{
+		CredentialID: "cred_wp", AccountID: "acct_1",
+		Verifier: credential.Verifier(sealed, pep), PepperVersion: pep.Version,
+		Status: credential.StatusNormal, PolicyID: "some-OTHER-policy", Revision: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	signer, _ := GenerateSigner()
+	term, err := New(Dependencies{
+		Registry: reg, Peppers: credential.MustPepperRing(pep),
+		Policy: policy.Default(), Signer: signer, Audience: "fi-inference",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := term.Admit(bearerHeaders(raw), lane.Features{})
+	if out.Authorized {
+		t.Fatal("credential bound to another policy must be denied")
+	}
+	if out.Reason != "policy_unavailable" {
+		t.Fatalf("reason = %s, want policy_unavailable", out.Reason)
+	}
+	// P0.12: a denied outcome must not carry a populated context.
+	if out.Context.Principal.CredentialID != "" || out.Context.LaneID != "" {
+		t.Fatalf("denied outcome must not expose an AuthorizedContext: %+v", out.Context)
+	}
+}
+
+// Regression (P0.6): ENFORCE mode must refuse construction without its
+// security-critical dependencies instead of silently degrading enforcement.
+func TestEnforceModeRequiresLanesAndConcurrency(t *testing.T) {
+	pep := &credential.PepperKey{Version: 1, Key: []byte("test-pepper")}
+	tc := makeCredentialWithStatus("cred_m", "acct_1", credential.StatusNormal, pep)
+	signer, _ := GenerateSigner()
+	base := Dependencies{
+		Registry: tc.reg, Peppers: credential.MustPepperRing(pep),
+		Policy: policy.Default(), Signer: signer, Audience: "fi-inference",
+	}
+
+	noLanes := base
+	noLanes.Mode = ModeEnforce
+	if _, err := New(noLanes); err == nil {
+		t.Fatal("ENFORCE without a lane store must fail construction")
+	}
+	// With lanes but no concurrency controller → still refused.
+	withLanes := base
+	withLanes.Mode = ModeEnforce
+	withLanes.Lanes = lane.NewStore(nil, time.Now)
+	if _, err := New(withLanes); err == nil {
+		t.Fatal("ENFORCE without a concurrency controller must fail construction")
+	}
+	// Complete ENFORCE wiring succeeds.
+	full := withLanes
+	full.Concurrency = &fakePool{resource.NewConcurrencyPool(4)}
+	if _, err := New(full); err != nil {
+		t.Fatalf("complete ENFORCE wiring must construct: %v", err)
+	}
+	// Unknown modes are rejected.
+	unknown := base
+	unknown.Mode = Mode("OBSERVE")
+	if _, err := New(unknown); err == nil {
+		t.Fatal("unknown mode must fail construction")
+	}
+	// Empty mode defaults to TERMINATE and constructs.
+	termMode := base
+	termMode.Mode = ""
+	if _, err := New(termMode); err != nil {
+		t.Fatalf("empty mode must default to TERMINATE: %v", err)
+	}
+}
+
+// Regression (P0.12): a denied Outcome (concurrency) must not expose a
+// populated Principal/Context — an AuthorizedContext exists only for an
+// authorized request.
+func TestDeniedOutcomeExposesNoContext(t *testing.T) {
+	pool := resource.NewConcurrencyPool(1)
+	term, raw := buildTerminator(t, credential.StatusNormal, pool)
+	held := pool.Acquire()
+	defer held.Release()
+	out := term.Admit(bearerHeaders(raw), lane.Features{})
+	if out.Authorized {
+		t.Fatal("must deny over concurrency")
+	}
+	if out.Context.Principal.CredentialID != "" || out.Context.LaneID != "" || out.Principal.CredentialID != "" {
+		t.Fatalf("denied outcome carries identity: principal=%+v ctx=%+v", out.Principal, out.Context)
+	}
+	if out.Lease != nil || out.Assertion != nil {
+		t.Fatal("denied outcome must not carry a lease or assertion")
+	}
+}
+
+// --- P0.11 hardening regressions: signer + request ids -----------------------
+
+// Regression (hardening): NewSigner validates key material — a truncated or
+// mis-typed key fails at construction, not at signing time.
+func TestNewSignerValidatesKeySize(t *testing.T) {
+	if _, err := NewSigner(ed25519.PrivateKey(make([]byte, 10))); err == nil {
+		t.Fatal("short private key must be rejected")
+	}
+	if _, err := NewSigner(nil); err == nil {
+		t.Fatal("nil private key must be rejected")
+	}
+	signer, err := GenerateSigner()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewSigner(signer.priv); err != nil {
+		t.Fatalf("valid key rejected: %v", err)
+	}
+}
+
+// Regression (hardening): request ids are 128-bit CSPRNG values — globally
+// unique across nodes/restarts, not process-local counters (an
+// attacker-guessable jti is replay ammunition).
+func TestRequestIDEntropy(t *testing.T) {
+	seen := make(map[string]bool)
+	for i := 0; i < 1000; i++ {
+		id := newRequestID()
+		if len(id) != len("req_")+22 { // 128 bits base64url raw = 22 chars
+			t.Fatalf("id %q has unexpected length %d", id, len(id))
+		}
+		if seen[id] {
+			t.Fatalf("duplicate request id %q", id)
+		}
+		seen[id] = true
 	}
 }

@@ -31,9 +31,14 @@ type Signer struct {
 }
 
 // NewSigner creates a signer from an Ed25519 private key. Use GenerateSigner
-// for a fresh key.
-func NewSigner(priv ed25519.PrivateKey) *Signer {
-	return &Signer{priv: priv}
+// for a fresh key. The key size is validated (ed25519.PrivateKeySize) so a
+// truncated or mis-typed key fails loudly at construction instead of at
+// signing time.
+func NewSigner(priv ed25519.PrivateKey) (*Signer, error) {
+	if len(priv) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("terminator: invalid ed25519 private key size %d, want %d", len(priv), ed25519.PrivateKeySize)
+	}
+	return &Signer{priv: priv}, nil
 }
 
 // GenerateSigner produces a new random Ed25519 key.
@@ -134,7 +139,9 @@ func ParseAndVerify(encoded string, pub ed25519.PublicKey, expectedAudience stri
 	if c.Audience != expectedAudience {
 		return nil, ErrWrongAudience
 	}
-	if now.Unix() > c.ExpiresAt {
+	// exp is inclusive-invalid: an assertion is expired AT its expiry second
+	// (now == exp fails), matching standard JWT semantics.
+	if now.Unix() >= c.ExpiresAt {
 		return nil, ErrExpired
 	}
 	if now.Unix() < c.IssuedAt-5 { // allow small clock skew; never future-mint

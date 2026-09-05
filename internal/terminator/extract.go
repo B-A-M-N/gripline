@@ -122,14 +122,23 @@ func parseBearer(v string) (*secret.SealedSecret, error) {
 	return secret.NewFromBytes([]byte(raw)), nil
 }
 
-// StripSecretHeaders removes the reserved external-secret headers from a header
-// map so no middleware downstream sees them (§18). Runs immediately after
-// extraction.
+// StripSecretHeaders removes every header an external caller must never
+// inject past the terminator: the external-secret carriers (§18) AND the
+// reserved internal-identity namespace (INV-12 — a forged "Gripline-*" header
+// arriving from the public side could otherwise impersonate an admitted
+// request at the protected backend). Internal headers are minted by the
+// terminator after admission; anything presenting them at ingress is forgery
+// and is deleted before authentication.
 func StripSecretHeaders(headers map[string][]string) {
 	for name := range headers {
 		ln := strings.ToLower(name)
-		switch ln {
-		case "authorization", "proxy-authorization", "x-api-key", "api-key":
+		switch {
+		case ln == "authorization" || ln == "proxy-authorization" ||
+			ln == "x-api-key" || ln == "api-key":
+			delete(headers, name)
+		case strings.HasPrefix(ln, "gripline-") || strings.HasPrefix(ln, "x-gripline-"):
+			// Reserved internal namespace, any capitalization or suffix
+			// (Gripline-Principal, X-Gripline-Assertion, ...).
 			delete(headers, name)
 		}
 	}

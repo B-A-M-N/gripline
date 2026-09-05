@@ -41,16 +41,20 @@ type Ring struct {
 }
 
 // NewRing builds a Ring from one or more keys (latest wins for new psys).
-// Keys with empty secret material are refused: an HMAC under an empty key is
-// publicly computable, which would silently turn the pseudonym into an
-// enumerable value (§45, §73 — the exact failure this package exists to
-// prevent). A Ring built from only invalid keys errors rather than failing
-// open into an unkeyed transform.
+// Keys with empty secret material or negative versions are refused: an HMAC
+// under an empty key is publicly computable, which would silently turn the
+// pseudonym into an enumerable value (§45, §73 — the exact failure this
+// package exists to prevent). Key material is COPIED on ingestion so later
+// mutation of the caller's slice cannot alter live keys. A Ring built from
+// only invalid keys errors rather than failing open into an unkeyed transform.
 func NewRing(keys ...*Key) (*Ring, error) {
 	r := &Ring{active: make(map[int][]byte, len(keys))}
 	for _, k := range keys {
 		if k == nil {
 			continue
+		}
+		if k.Version < 0 {
+			return nil, fmt.Errorf("pseudonym: negative key version %d", k.Version)
 		}
 		if len(k.Secret) == 0 {
 			return nil, fmt.Errorf("pseudonym: key version %d has empty secret", k.Version)
@@ -58,7 +62,7 @@ func NewRing(keys ...*Key) (*Ring, error) {
 		if _, dup := r.active[k.Version]; dup {
 			return nil, fmt.Errorf("pseudonym: duplicate key version %d", k.Version)
 		}
-		r.active[k.Version] = k.Secret
+		r.active[k.Version] = append([]byte(nil), k.Secret...)
 	}
 	if len(r.active) == 0 {
 		return nil, fmt.Errorf("pseudonym: ring requires at least one keyed version")

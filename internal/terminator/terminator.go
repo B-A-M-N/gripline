@@ -1,12 +1,12 @@
 package terminator
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/B-A-M-N/gripline/internal/credential"
@@ -35,6 +35,23 @@ type Outcome struct {
 	LaneNew    bool
 }
 
+// Mode is the explicit deployment posture (P0.6). Each mode declares which
+// dependencies are security-critical; New fails construction when any is
+// missing, so an ENFORCE instance can never silently start without its
+// hard-limit backend ("optional field forgotten" is a boot-time error, not a
+// runtime fail-open).
+type Mode string
+
+const (
+	// ModeTerminate: credential termination + internal identity issuance
+	// without lane/explosion or concurrency enforcement. Minimum viable
+	// posture; policy-driven risk denials still apply.
+	ModeTerminate Mode = "TERMINATE"
+	// ModeEnforce: full enforcement — lane classification/explosion limits and
+	// hard concurrency control are REQUIRED and verified at construction.
+	ModeEnforce Mode = "ENFORCE"
+)
+
 // Dependencies are the seams the terminator needs. Provider-specific behavior
 // lives behind these interfaces (spec §66-69) so the security core stays
 // agnostic.
@@ -46,12 +63,19 @@ type Dependencies struct {
 	Signer   AssertionSigner
 	Audience string
 
+	// Mode selects the required-dependency contract. Zero value "" is treated
+	// as ModeTerminate (the minimum posture) with a validation of the same
+	// required seams.
+	Mode Mode
+
 	RiskNow func() time.Time
 	LaneNow func() time.Time
 
 	// Concurrency is the hard-limit seam: acquire and release concurrency for a
 	// scope. Implementations bound per scope, keyed by scope id. INV-9: hard
-	// limits remain active even if adaptive risk is unavailable.
+	// limits remain active even if adaptive risk is unavailable. REQUIRED in
+	// ModeEnforce; optional (admission without hard concurrency control) in
+	// ModeTerminate.
 	Concurrency resourceController
 }
 
@@ -64,9 +88,17 @@ type resourceController interface {
 type Terminator struct {
 	dep  Dependencies
 	rand func() string // injectable request-id generator for deterministic tests
+	// pol is a deep-value SNAPSHOT of the policy taken at New (P0.5). The
+	// terminator enforces this snapshot; later mutation of the caller's
+	// *policy.Policy cannot alter live enforcement without an explicit
+	// re-configuration (New). It bounds the blast radius of the mutable public
+	// config object until a compiled/immutable policy type lands.
+	pol policy.Policy
 }
 
-// New builds a Terminator and validates the critical seams.
+// New builds a Terminator and validates the critical seams for the requested
+// Mode (P0.6): security-critical dependencies are mandatory per mode, and a
+// missing one fails construction instead of degrading enforcement silently.
 func New(dep Dependencies) (*Terminator, error) {
 	if dep.Registry == nil {
 		return nil, errors.New("terminator: registry required")
@@ -89,35 +121,40 @@ func New(dep Dependencies) (*Terminator, error) {
 		// fail construction, not silently enforce garbage.
 		return nil, errors.New("terminator: policy revision invalid (§57)")
 	}
+	switch dep.Mode {
+	case "", ModeTerminate:
+		dep.Mode = ModeTerminate
+	case ModeEnforce:
+		if dep.Lanes == nil {
+			return nil, errors.New("terminator: ENFORCE mode requires a lane store")
+		}
+		if dep.Concurrency == nil {
+			return nil, errors.New("terminator: ENFORCE mode requires a hard concurrency controller (fail-closed config)")
+		}
+	default:
+		return nil, fmt.Errorf("terminator: unknown mode %q", dep.Mode)
+	}
 	if dep.RiskNow == nil {
 		dep.RiskNow = time.Now
 	}
 	if dep.LaneNow == nil {
 		dep.LaneNow = time.Now
 	}
-	return &Terminator{dep: dep, rand: newRequestID}, nil
+	return &Terminator{dep: dep, rand: newRequestID, pol: *dep.Policy}, nil
 }
 
-// seqGen is a concurrency-safe monotonic counter for request-id uniqueness.
-type seqGen struct {
-	mu sync.Mutex
-	n  int64
-}
-
-func (s *seqGen) next() int64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.n++
-	return s.n
-}
-
-// newRequestID returns a unique, non-secret request id (§71).
+// newRequestID returns a unique, non-secret request id (§71): 128 bits of
+// CSPRNG entropy so ids are globally unique across nodes and restarts — a
+// process-local timestamp+counter collides across replicas and is
+// predictable (an attacker-guessable jti is replay ammunition).
 func newRequestID() string {
-	return fmt.Sprintf("req_%d_%d", time.Now().UnixNano(), seqShared.next())
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// CSPRNG unavailable is a process-fatal condition; fail closed.
+		panic("terminator: entropy unavailable for request id: " + err.Error())
+	}
+	return "req_" + base64.RawURLEncoding.EncodeToString(b[:])
 }
-
-// seqShared is the package-level counter behind the default request-id generator.
-var seqShared = &seqGen{}
 
 // Admit runs the fast-path admission flow (spec §53) for a request's secret
 // carriers and normalized feature set. The returned Outcome carries the
@@ -149,6 +186,18 @@ func (t *Terminator) Admit(headers map[string][]string, feat lane.Features) *Out
 		out.Authorized = false
 		out.Reason = safeReason(err)
 		out.DenialErr = err
+		return out
+	}
+
+	// Policy binding (P0.5): the credential must resolve under the policy
+	// revision this terminator was constructed with. A credential pointing at
+	// a different policy id must not be evaluated under the wrong (possibly
+	// more permissive) policy — it fails closed here until the process loads
+	// that policy revision.
+	if cred.PolicyID != t.pol.ID {
+		out.Authorized = false
+		out.Reason = "policy_unavailable"
+		out.DenialErr = fmt.Errorf("terminator: credential policy %q not loaded (loaded %q)", cred.PolicyID, t.pol.ID)
 		return out
 	}
 
@@ -198,13 +247,13 @@ func (t *Terminator) Admit(headers map[string][]string, feat lane.Features) *Out
 		LaneState:          laneState,
 		AuthorizationScope: principal.ScopeLane,
 		RiskState:          val,
-		AuthorizedAt:       time.Now(),
+		AuthorizedAt:       t.dep.RiskNow(),
 	}
-	out.Principal = prin
-	out.Context = ctx
-	out.LaneNew = laneNew
 
-	// Hard concurrency admission (INV-6, INV-9): verify before lease.
+	// Hard concurrency admission (INV-6, INV-9): verify before lease. The
+	// Principal/Context fields on the Outcome are populated ONLY after every
+	// gate has passed (P0.12): a denied Outcome must never carry a usable
+	// AuthorizedContext a caller could consume without checking Authorized.
 	if t.dep.Concurrency != nil {
 		lease := t.dep.Concurrency.Acquire("cred:" + cred.CredentialID)
 		if lease == nil {
@@ -213,18 +262,17 @@ func (t *Terminator) Admit(headers map[string][]string, feat lane.Features) *Out
 			out.DenialErr = ErrorConcurrencyLimit
 			return out
 		}
-		out.Lease = lease
 		// INV-15 / §48: a failure after lease acquisition must not leak the
 		// slot. If assertion issuance fails, release before returning.
 		assertion, err := t.issueAssertion(ctx, reqID, cred)
 		if err != nil {
 			lease.Release()
-			out.Lease = nil
 			out.Authorized = false
 			out.Reason = "internal_identity_failure"
 			out.DenialErr = err
 			return out
 		}
+		out.Lease = lease
 		out.Assertion = assertion
 	} else {
 		assertion, err := t.issueAssertion(ctx, reqID, cred)
@@ -236,6 +284,10 @@ func (t *Terminator) Admit(headers map[string][]string, feat lane.Features) *Out
 		}
 		out.Assertion = assertion
 	}
+	// Every gate passed: only now does the Outcome carry an identity/context.
+	out.Principal = prin
+	out.Context = ctx
+	out.LaneNew = laneNew
 	out.Authorized = true
 	out.Reason = "authorized"
 	return out
@@ -268,16 +320,23 @@ func (t *Terminator) authenticate(presented *secret.SealedSecret) (*credential.C
 		}
 		return credFrom(rec), nil
 	}
-	// During pepper rotation, try older active versions.
-	for v := 0; v < latest; v++ {
-		if k, ok := t.dep.Peppers.Get(v); ok {
-			vv := presented.DigestHMAC(k)
-			if rec, found := t.dep.Registry.FindByVerifier(vv, v); found {
-				if err := rec.Authenticatable(t.dep.RiskNow()); err != nil {
-					return nil, err
-				}
-				return credFrom(rec), nil
+	// During pepper rotation, try the OLDER CONFIGURED versions (newest to
+	// oldest, skipping the just-tried latest). Iterating the ring's actual
+	// version list — never the 0..latest integer range, which is pathological
+	// for sparse/high version numbers.
+	versions := t.dep.Peppers.Versions()
+	for i := len(versions) - 2; i >= 0; i-- {
+		v := versions[i]
+		k, ok := t.dep.Peppers.Get(v)
+		if !ok {
+			continue
+		}
+		vv := presented.DigestHMAC(k)
+		if rec, found := t.dep.Registry.FindByVerifier(vv, v); found {
+			if err := rec.Authenticatable(t.dep.RiskNow()); err != nil {
+				return nil, err
 			}
+			return credFrom(rec), nil
 		}
 	}
 	return nil, credential.UnknownError
@@ -335,7 +394,7 @@ func shortTag(f lane.Features) string {
 // (BLOCKED → lane hard denial), and the current risk score against the
 // policy's risk-state boundaries (§31 thresholds from policy, not constants).
 func (t *Terminator) evaluatePolicy(laneRec *lane.LaneRecord, cred *credential.Credential, riskScore int) error {
-	thresholds := t.dep.Policy.Risk
+	thresholds := t.pol.Risk
 	in := policy.EvalInput{
 		CredentialRevoked: cred.Status == credential.StatusRevoked,
 		// QUARANTINED credential → credential-scope denial (§30).
@@ -346,7 +405,7 @@ func (t *Terminator) evaluatePolicy(laneRec *lane.LaneRecord, cred *credential.C
 		// boundary restricts; at/above quarantine denies outright.
 		RiskDenied: riskScore >= thresholds.Quarantine,
 	}
-	return t.dep.Policy.Evaluate(in)
+	return t.pol.Evaluate(in)
 }
 
 // denialReason maps a policy denial to a safe external reason string (§70: no
@@ -401,14 +460,14 @@ func laneStateName(rec *lane.LaneRecord) string {
 
 // issueAssertion mints and signs the internal identity for the context.
 func (t *Terminator) issueAssertion(ctx principal.AuthorizedContext, reqID string, cred *credential.Credential) (*Assertion, error) {
-	ttl := time.Duration(t.dep.Policy.MaxIdentityTTLSeconds()) * time.Second
+	ttl := time.Duration(t.pol.MaxIdentityTTLSeconds()) * time.Second
 	return t.dep.Signer.Issue(Claims{
 		Subject:   ctx.Principal.AccountID,
 		CredID:    ctx.Principal.CredentialID,
 		LaneID:    ctx.LaneID,
 		Audience:  t.dep.Audience,
 		JTI:       reqID,
-		PolicyRev: t.dep.Policy.Revision,
+		PolicyRev: t.pol.Revision,
 		CredRev:   cred.Revision,
 		Scope:     []string{"inference"},
 	}, ttl)
@@ -438,7 +497,7 @@ func (t *Terminator) synchronousEvidence(laneNew bool) []evidence.Evidence {
 		Severity:       rule.Severity,
 		Confidence:     rule.Confidence,
 		CreatedAt:      now,
-		PolicyRevision: t.dep.Policy.Revision,
+		PolicyRevision: t.pol.Revision,
 	}
 	// rule.TTL <= 0 means "does not self-expire": mint a zero ExpiresAt, which
 	// Evidence.Valid treats as unbounded. Minting now.Add(0) would instead

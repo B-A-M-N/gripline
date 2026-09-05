@@ -4,7 +4,11 @@
 // same root observation are bounded, §35), and an explicit TTL (§37).
 package evidence
 
-import "time"
+import (
+	"errors"
+	"fmt"
+	"time"
+)
 
 // Family is the bounded risk family an evidence belongs to (§34).
 type Family int
@@ -100,18 +104,80 @@ type Evidence struct {
 	PolicyRevision   int
 }
 
-// Valid reports structural validity (time bounds, score bounds, confidence).
+// Valid reports structural validity: recognized enum values, non-empty code
+// and subject, sane score/confidence bounds, no future creation, and expiry
+// not before creation (§37). It does NOT attest that the parameters match a
+// policy rule — that guarantee comes from Mint; hand-constructed evidence can
+// still be structurally valid, which is why risk input should only ever come
+// from Mint.
 func (e Evidence) Valid(now time.Time) bool {
-	if e.Score < 0 {
+	if e.Code == "" || e.SubjectID == "" {
+		return false
+	}
+	if e.Family < FamilySourceDiscontinuity || e.Family > FamilyOperatorIOC {
+		return false
+	}
+	if e.Scope < ScopeRequest || e.Scope > ScopeGlobal {
+		return false
+	}
+	if e.Score < 0 || e.Score > 100 {
 		return false
 	}
 	if e.Confidence < 0 || e.Confidence > 100 {
 		return false
 	}
+	if e.CreatedAt.IsZero() || e.CreatedAt.After(now) {
+		return false // future-minted evidence is never valid (§37)
+	}
+	if !e.ExpiresAt.IsZero() && e.ExpiresAt.Before(e.CreatedAt) {
+		return false // impossible TTL
+	}
 	if !e.ExpiresAt.IsZero() && e.ExpiresAt.Before(now) {
 		return false // expired evidence no longer counts (§37)
 	}
 	return true
+}
+
+// Mint is the ONLY sanctioned way to produce evidence for the risk engine
+// (P0.11): every security-relevant field — family, scope, score, severity,
+// confidence, correlation group, TTL — is populated from the versioned rule
+// table, never from the caller. An unrecognized code is rejected instead of
+// invented. Operator IOC rules (e.g. MANUAL_CONFIRMED_COMPROMISE) mint through
+// this same path; gating WHO may call it for those codes is a control-plane
+// authorization concern enforced at the API that exposes Mint.
+func Mint(table Table, code string, subjectID string, now time.Time, policyRevision int) (Evidence, error) {
+	if table == nil {
+		return Evidence{}, errors.New("evidence: nil rule table")
+	}
+	rule, ok := table[code]
+	if !ok {
+		return Evidence{}, fmt.Errorf("evidence: unrecognized code %q", code)
+	}
+	if subjectID == "" {
+		return Evidence{}, errors.New("evidence: subject required")
+	}
+	ev := Evidence{
+		EvidenceID:       fmt.Sprintf("ev_%d", now.UnixNano()),
+		Code:             rule.Code,
+		Family:           rule.Family,
+		Scope:            rule.Scope,
+		SubjectID:        subjectID,
+		Score:            rule.Score,
+		Severity:         rule.Severity,
+		Confidence:       rule.Confidence,
+		CorrelationGroup: rule.CorrelationGroup,
+		CreatedAt:        now,
+		PolicyRevision:   policyRevision,
+	}
+	// rule.TTL <= 0 means "does not self-expire" (e.g. operator IOC until
+	// revoked): a zero ExpiresAt, which Valid treats as unbounded.
+	if rule.TTL > 0 {
+		ev.ExpiresAt = now.Add(rule.TTL)
+	}
+	if !ev.Valid(now) {
+		return Evidence{}, fmt.Errorf("evidence: rule %q produced invalid evidence", code)
+	}
+	return ev, nil
 }
 
 // TTL returns e.ExpiresAt - e.CreatedAt when both set; zero otherwise.

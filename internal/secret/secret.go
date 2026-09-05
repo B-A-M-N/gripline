@@ -3,18 +3,34 @@
 // a raw credential may exist at most inside a *SealedSecret, and never in a
 // generic request context, log, trace, or internal header (INV-1..INV-3).
 //
-// The type intentionally has a minimal API:
+// Redaction here is an ACTIVE property, not the absence of an interface. Go's
+// fmt package formats unexported fields by default (%v on a naive struct
+// prints its byte values), so a type that merely lacks String() leaks through
+// every generic format call. SealedSecret therefore implements the full
+// formatting surface as deliberate redaction:
 //
-//   - it does not implement fmt.Formatter, Stringer, or Error, so accidental
-//     formatting via %v / %s / %q cannot leak the raw bytes (INV-2);
-//   - it has no MarshalJSON / MarshalBinary / GobEncode, so no serializer can
-//     ship the raw bytes out of the boundary;
-//   - the only escape hatch, DigestHMAC, is the deliberate keyed one-way
-//     transform that derives the stored verifier (internal/credential). It
-//     never exposes the raw bytes.
+//   - Format handles every verb: output is always "<redacted>", never the
+//     bytes, for %v %+v %#v %s %q %x %d and everything else;
+//   - String and GoString cover implicit conversion and %#v;
+//   - errors created from a secret (or an error carrying one) never render it;
+//   - json/gob/text marshaling is absent by design (marshalers would ship the
+//     raw bytes out of the boundary), and the redacting Format intercepts the
+//     reflection fallback that serializers use.
 //
-// Zero() wipes the backing array so the raw representation does not survive
-// beyond authentication. Every terminator code path reaches Zero (deferred).
+// The exported struct holds ONLY an opaque pointer to unexported state. A
+// struct copy (copy := *s) carries no bytes and no copyable flag — copies
+// share the same zeroization state, so a stale copy cannot resurrect data or
+// out-live a wipe.
+//
+// Memory-lifetime honesty (threat-model boundary): Go strings and header maps
+// handed to ExtractExternalCredential already contain the credential as
+// immutable memory this package cannot reach. Zero() wipes every buffer this
+// package OWNS (best effort — the runtime may still have moved or copied
+// them). The guarantee Gripline makes is architectural: the credential never
+// propagates past the terminator into storage, telemetry, queues, or
+// downstream services, and every owned mutable copy is wiped on exit. It is
+// NOT a claim that zero copies exist in process memory. See
+// docs/design/01-containment.md.
 package secret
 
 import (
@@ -25,14 +41,23 @@ import (
 	"fmt"
 )
 
-// SealedSecret holds raw credential bytes in an opaque, non-formatting,
-// non-serializing container.
+// redacted is the only thing any formatter ever emits.
+const redacted = "<redacted>"
+
+// SealedSecret holds raw credential bytes in an opaque, actively-redacting
+// container. The zero value is not usable; construct with NewFromBytes or
+// Random.
 type SealedSecret struct {
-	// buf is owned exclusively by the SealedSecret. Unexported: nothing outside
-	// this package can read it except through the deliberate DigestHMAC
-	// operation.
-	buf []byte
-	// zeroed is set once Zero is applied. Operations on a zeroed secret fail.
+	// state is unexported and pointer-typed on purpose:
+	//   - fmt cannot reach the bytes through the struct (Format redacts first);
+	//   - a struct copy shares the same state (no independent stale copy).
+	state *secretState
+}
+
+// secretState is the owned backing buffer plus the zeroization flag. All
+// copies of a SealedSecret alias one state, so Zero affects every alias.
+type secretState struct {
+	buf    []byte
 	zeroed bool
 }
 
@@ -46,73 +71,113 @@ var digestDomain = []byte("gripline:secret:digest:v1")
 func NewFromBytes(src []byte) *SealedSecret {
 	buf := make([]byte, len(src))
 	copy(buf, src)
-	return &SealedSecret{buf: buf}
+	return &SealedSecret{state: &secretState{buf: buf}}
 }
 
-// Zero wipes the backing memory and marks the secret unusable. Idempotent
-// (releases at most once); returns true if it actually wiped a live buffer.
+// Zero wipes the owned backing memory and marks the secret unusable. Every
+// copy of the SealedSecret (they alias the same state) becomes unusable too.
+// Idempotent; returns true if it actually wiped a live buffer. Best effort at
+// the memory layer: the Go runtime may have moved or duplicated the buffer
+// internally; see the package comment for the honest boundary.
 func (s *SealedSecret) Zero() bool {
-	if s == nil || s.zeroed {
+	if s == nil || s.state == nil || s.state.zeroed {
 		return false
 	}
-	for i := range s.buf {
-		s.buf[i] = 0
+	st := s.state
+	for i := range st.buf {
+		st.buf[i] = 0
 	}
-	s.buf = nil
-	s.zeroed = true
+	st.buf = nil
+	st.zeroed = true
 	return true
 }
 
-// Zeroed reports whether the secret has been wiped. Used by tests and by the
-// terminator to assert the raw secret is destroyed after authentication.
+// Zeroed reports whether the secret has been wiped (or was never constructed).
 func (s *SealedSecret) Zeroed() bool {
-	return s == nil || s.zeroed
+	return s == nil || s.state == nil || s.state.zeroed
 }
 
 // Len returns the byte length of the held secret. Revealing only the length is
 // safe within this boundary (it does not reveal the secret). A zeroed secret
 // reports 0.
 func (s *SealedSecret) Len() int {
-	if s == nil || s.zeroed {
+	if s.Zeroed() {
 		return 0
 	}
-	return len(s.buf)
+	return len(s.state.buf)
 }
 
 // DigestHMAC is the single deliberate transform on a sealed secret: fold the
 // raw bytes under a pepper key with HMAC-SHA256 to derive the verifier. It
 // keeps the key-op and the secret co-located inside the sealed boundary so
-// neither is exposed. The credential package composes this with the pepper ring
-// to derive/store/compare verifiers. Returns nil on a zeroed secret or an
-// empty key — an HMAC under an empty key is publicly computable, so deriving
-// under one would mint enumerable verifiers (INV-1 fails closed, not open).
+// neither is exposed. Returns nil on a zeroed secret or an empty key — an HMAC
+// under an empty key is publicly computable, so deriving under one would mint
+// enumerable verifiers (INV-1 fails closed, not open).
 func (s *SealedSecret) DigestHMAC(key []byte) []byte {
-	if s == nil || s.zeroed || len(key) == 0 {
+	if s == nil || s.state == nil || s.state.zeroed || len(key) == 0 {
 		return nil
 	}
 	m := hmac.New(sha256.New, key)
 	_, _ = m.Write(digestDomain)
-	_, _ = m.Write(s.buf)
+	_, _ = m.Write(s.state.buf)
 	return m.Sum(nil)
 }
 
-// Random returns n random bytes sealed for test/key-generation use.
+// Random returns n random bytes sealed for test/key-generation use. The
+// temporary staging buffer is wiped after the sealed copy is made (P0.2: the
+// staging copy must not outlive the call unowned).
 func Random(n int) (*SealedSecret, error) {
 	if n <= 0 {
 		return nil, errors.New("secret: Random requires n > 0")
 	}
 	buf := make([]byte, n)
 	if _, err := rand.Read(buf); err != nil {
+		for i := range buf { // don't leak entropy-sized garbage on failure either
+			buf[i] = 0
+		}
 		return nil, fmt.Errorf("secret: random read: %w", err)
 	}
-	return NewFromBytes(buf), nil
+	s := NewFromBytes(buf)
+	for i := range buf { // wipe the staging copy
+		buf[i] = 0
+	}
+	return s, nil
 }
 
-// Compile-time interfaces the secret must NOT satisfy. The commented asserts
-// document the contract; a future contributor who adds a String() method will
-// find the property test "secret never formats/serializes" failing.
+// --- active redaction surface ------------------------------------------------
 //
-//	// var _ fmt.Stringer = (*SealedSecret)(nil)        // must stay absent
-//	// var _ fmt.Formatter = (*SealedSecret)(nil)       // must stay absent
-//	// var _ json.Marshaler = (*SealedSecret)(nil)      // must stay absent
-//	// var _ encoding.BinaryMarshaler = (*SealedSecret)(nil) // must stay absent
+// Every method below REPLACES a reflection fallback fmt would otherwise use.
+// They use VALUE receivers deliberately: pointer-receiver methods are not in
+// the method set of a struct copy, so `copy := *s` formatted with %v would
+// fall back to raw-field reflection. With value receivers both SealedSecret
+// and *SealedSecret carry the redaction surface. No verb, flag, width, or
+// precision combination reaches the bytes. (Formatting a nil *SealedSecret
+// derefs nil before the body runs; fmt recovers panics from these specific
+// methods and prints a panic notice — still no bytes.)
+
+// Format implements fmt.Formatter for every verb. It always emits the
+// redaction marker: even %x/%d/%q/%s must not reveal or encode the bytes.
+func (s SealedSecret) Format(f fmt.State, verb rune) {
+	// Ignore all flags — any flag-sensitive rendering would be a side channel
+	// on the content.
+	fmt.Fprint(f, redacted)
+}
+
+// String implements fmt.Stringer (implicit %s/%v paths).
+func (s SealedSecret) String() string { return redacted }
+
+// GoString implements fmt.GoStringer (%#v).
+func (s SealedSecret) GoString() string { return redacted }
+
+// MarshalJSON is deliberately ABSENT. Serializers must not be able to ship the
+// raw bytes; with no Marshaler defined, encoding/json falls back to reflection
+// — which fmt.Formatter-style redaction cannot intercept. The compile-time
+// contract is enforced by TestSealedSecretHasNoFormattingOrSerializationSurface
+// asserting both that redaction methods EXIST and marshalers DO NOT.
+//
+// Compile-time proof that the redaction surface is present:
+var (
+	_ fmt.Formatter  = (*SealedSecret)(nil)
+	_ fmt.Stringer   = (*SealedSecret)(nil)
+	_ fmt.GoStringer = (*SealedSecret)(nil)
+)

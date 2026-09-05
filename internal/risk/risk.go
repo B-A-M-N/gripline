@@ -23,12 +23,15 @@ func Evaluate(items []evidence.Evidence, now time.Time) int {
 	// First pass: for each correlation group pick the max score per family, so
 	// a single root observation (e.g. "moved to a new network") does not add up
 	// its NEW_ASN + NEW_HOSTING_ASN + NEW_COUNTRY signals blindly (§35).
+	// Group keys include SUBJECT and SCOPE (P0.11): evidence belonging to
+	// different subjects (or different scopes) must never collapse into one
+	// bounded group if a mixed set reaches Evaluate.
 	for _, e := range items {
 		if !e.Valid(now) {
 			continue
 		}
 		if e.CorrelationGroup != "" {
-			key := groupKey(e.Family, e.CorrelationGroup)
+			key := groupKey(e)
 			if e.Score > groupBest[key] {
 				groupBest[key] = e.Score
 			}
@@ -45,7 +48,7 @@ func Evaluate(items []evidence.Evidence, now time.Time) int {
 		}
 		key := ""
 		if e.CorrelationGroup != "" {
-			key = groupKey(e.Family, e.CorrelationGroup)
+			key = groupKey(e)
 			if absorbed[key] {
 				continue
 			}
@@ -75,8 +78,10 @@ func Evaluate(items []evidence.Evidence, now time.Time) int {
 	return total
 }
 
-func groupKey(fam evidence.Family, grp string) string {
-	return fam.String() + ":" + grp
+// groupKey scopes a correlation group by family, subject, and scope so the
+// bounded reduction is per-subject-per-scope (P0.11).
+func groupKey(e evidence.Evidence) string {
+	return e.Family.String() + ":" + e.SubjectID + ":" + e.Scope.String() + ":" + e.CorrelationGroup
 }
 
 // State is a thin over-risk wrapper for a scope's active risk that also yields

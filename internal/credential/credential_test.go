@@ -2,6 +2,8 @@ package credential
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
 	"strings"
 	"testing"
 	"time"
@@ -95,7 +97,9 @@ func TestRegistryNeverStoresRaw(t *testing.T) {
 	defer raw.Zero()
 
 	reg := NewMemoryRegistry()
-	reg.Insert(rec)
+	if err := reg.Insert(rec); err != nil {
+		t.Fatal(err)
+	}
 
 	// The raw secret must never appear in what the registry retains.
 	// Invert: the verifier IS in storage; raw digest is not, and there is no
@@ -117,7 +121,9 @@ func TestMemoryRegistryRevokeAndRevision(t *testing.T) {
 	pep := testKey()
 	rec, _ := newNormalRecord("cred_5", "acct_5", pep)
 	reg := NewMemoryRegistry()
-	reg.Insert(rec)
+	if err := reg.Insert(rec); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := reg.Revoke("cred_5"); err != nil {
 		t.Fatalf("revoke: %v", err)
@@ -267,5 +273,123 @@ func TestStateMachineIsAuthenticatableMatchesGate(t *testing.T) {
 	}
 	if sm.IsAuthenticatable() {
 		t.Fatal("QUARANTINED must not be authenticatable (§30)")
+	}
+}
+
+// Regression (P0.3): replacing a credential's record (rotation) must
+// invalidate the previous verifier as an authentication path. The old flow
+// left a stale byVerifier index entry, so the old key kept authenticating.
+func TestCredentialReplacementInvalidatesOldVerifier(t *testing.T) {
+	pep := testKey()
+	raw1, _ := secret.Random(32)
+	defer raw1.Zero()
+	raw2, _ := secret.Random(32)
+	defer raw2.Zero()
+
+	reg := NewMemoryRegistry()
+	rec1 := &CredentialRecord{
+		CredentialID: "cred_rot", AccountID: "acct_1",
+		Verifier: Verifier(raw1, pep), PepperVersion: pep.Version,
+		Status: StatusNormal, Revision: 1,
+	}
+	if err := reg.Insert(rec1); err != nil {
+		t.Fatal(err)
+	}
+
+	// old key authenticates
+	if _, ok := reg.FindByVerifier(Verifier(raw1, pep), pep.Version); !ok {
+		t.Fatal("old verifier must resolve before replacement")
+	}
+
+	// replace with a new verifier (rotation)
+	rec2 := *rec1
+	rec2.Verifier = Verifier(raw2, pep)
+	rec2.Revision = 2
+	if err := reg.Insert(&rec2); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := reg.FindByVerifier(Verifier(raw2, pep), pep.Version); !ok {
+		t.Fatal("new verifier must resolve after replacement")
+	}
+	if _, ok := reg.FindByVerifier(Verifier(raw1, pep), pep.Version); ok {
+		t.Fatal("old verifier MUST NOT resolve after replacement (P0.3)")
+	}
+	// and the record itself was updated, not duplicated
+	stored, _ := reg.Lookup("cred_rot")
+	if !bytes.Equal(stored.Verifier, rec2.Verifier) || stored.Revision != 2 {
+		t.Fatalf("record not replaced: rev=%d", stored.Revision)
+	}
+}
+
+// Regression (P0.3 defense in depth): a poisoned index entry pointing at a
+// record whose verifier has since changed must fail closed.
+func TestFindByVerifierDefensivelyRechecks(t *testing.T) {
+	pep := testKey()
+	raw, _ := secret.Random(32)
+	defer raw.Zero()
+	reg := NewMemoryRegistry()
+	if err := reg.Insert(&CredentialRecord{
+		CredentialID: "cred_d", AccountID: "a",
+		Verifier: Verifier(raw, pep), PepperVersion: pep.Version,
+		Status: StatusNormal, Revision: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate index/record divergence: record rotates without going through
+	// Insert's index maintenance (a future bug) — the defensive re-check must
+	// catch any stale entry.
+	oldVer := Verifier(raw, pep)
+	raw2, _ := secret.Random(32)
+	defer raw2.Zero()
+	reg.mu.Lock()
+	rec := reg.records["cred_d"]
+	rec.Verifier = Verifier(raw2, pep)
+	rec.Revision++
+	reg.mu.Unlock()
+
+	if _, ok := reg.FindByVerifier(oldVer, pep.Version); ok {
+		t.Fatal("stale index entry must not authenticate (defensive re-check)")
+	}
+}
+
+// Regression (P0.3): two different credentials must never share a verifier
+// under the same pepper version.
+func TestConflictingVerifierOwnershipRejected(t *testing.T) {
+	pep := testKey()
+	raw, _ := secret.Random(32)
+	defer raw.Zero()
+	ver := Verifier(raw, pep)
+	reg := NewMemoryRegistry()
+	if err := reg.Insert(&CredentialRecord{
+		CredentialID: "cred_a", Verifier: ver, PepperVersion: 1, Status: StatusNormal,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Insert(&CredentialRecord{
+		CredentialID: "cred_b", Verifier: ver, PepperVersion: 1, Status: StatusNormal,
+	}); err != ErrVerifierOwned {
+		t.Fatalf("want ErrVerifierOwned, got %v", err)
+	}
+}
+
+// Regression (hardening): negative pepper versions are refused, and key
+// material is copied on ingestion — later mutation of the caller's slice
+// cannot alter live keys.
+func TestPepperRingNegativeVersionAndCopySafety(t *testing.T) {
+	if _, err := NewPepperRing(&PepperKey{Version: -1, Key: []byte("k")}); err == nil {
+		t.Fatal("negative pepper version must be rejected")
+	}
+	key := []byte("mutable-key")
+	r := mustRing(t, &PepperKey{Version: 1, Key: key})
+	key[0] = 'X' // caller mutates its slice after construction
+	s := secret.NewFromBytes([]byte("raw"))
+	defer s.Zero()
+	// The digest must still be computed under the ORIGINAL key bytes.
+	m := hmac.New(sha256.New, []byte("mutable-key"))
+	m.Write([]byte("gripline:secret:digest:v1"))
+	m.Write([]byte("raw"))
+	if !bytes.Equal(s.DigestHMAC(r.active[1]), m.Sum(nil)) {
+		t.Fatal("ring must copy key material on ingestion")
 	}
 }

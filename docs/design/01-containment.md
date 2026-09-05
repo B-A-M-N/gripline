@@ -52,14 +52,31 @@ request arrives
 
 The secret SHALL be exposed only through a container that by its API:
 
-- **prohibits accidental formatting** — no `String()`, `Format`, `%v` leakage;
-- **prohibits debug output and serialization** — no `MarshalJSON`/`MarshalBinary`;
-- **zeroes memory on destruction** — explicit `Zero()` before returning to a pool, plus `defer Zero()` on the active path;
+- **actively redacts formatting** — `Format`/`String`/`GoString` are implemented as redaction (`<redacted>` for every verb, `%v` `%+v` `%#v` `%s` `%q` `%x` and all others). Go's `fmt` prints unexported struct fields by default, so merely *omitting* these methods is a leak, not protection. Methods use value receivers so struct copies carry the redaction surface too.
+- **prohibits serialization** — no `MarshalJSON`/`MarshalBinary`/`GobEncode`/`MarshalText`; serializers cannot ship the bytes out of the boundary.
+- **holds no copyable bytes** — the exported struct carries only an opaque state pointer; a struct copy aliases the same owned buffer and the same zeroization state.
+- **zeroes owned memory on destruction** — explicit `Zero()` before returning to a pool, plus `defer Zero()` on the active path; idempotent across copies.
 - **exposes only the verifier operation** needed for authentication.
 
-Enforced in `internal/secret` with a `SealedSecret` wrapper over an owned
-`[]byte`, plus property tests that assert a zeroed secret reads back all-zero
-and that formatting/serialization are excluded at the type level.
+Enforced in `internal/secret` with canary tests that format a live secret
+under every verb, through `fmt.Sprint`, `log.Printf`, error wrapping, and
+panic recovery, and assert the canary never appears.
+
+### 3.1 Memory-lifetime honesty (threat-model boundary)
+
+Go strings and header maps handed to the terminator already contain the
+credential as immutable memory no library can reach, and the Go runtime may
+move or duplicate buffers. Gripline's guarantee is therefore **architectural,
+not cryptographic-zeroization**:
+
+> the raw credential never propagates past the terminator — it cannot enter
+> storage, telemetry, logs, queues, or downstream services — and every
+> mutable buffer the process OWNS is wiped on exit (best effort).
+
+The system does NOT claim "zero copies exist in process memory"; that claim
+is not honestly achievable over std-lib HTTP in Go. Proving containment
+means the canary appears only on the pre-termination side of the boundary
+(see the release-gate plan, Gate A), not heap introspection.
 
 ## 4. Credential extraction (ambigacity fails)
 
@@ -114,7 +131,7 @@ Each maps to a test:
 | # | Invariant | Enforcement |
 |---|---|---|
 | INV-1 | raw credentials never persisted | verifier-only storage; property test on store |
-| INV-2 | never in logs/traces/metrics/events/panics | SealedSecret + no `String()`; no secret type reaches telemetry |
+| INV-2 | never in logs/traces/metrics/events/panics | SealedSecret active redaction (`Format`/`String`/`GoString`); no serializer; canary-tested across all fmt verbs + log/panic/error paths |
 | INV-3 | never leave the termination boundary | `Principal` carries no secret; captured downstream request has none |
 | INV-4 | untrusted forwarding metadata never influences security | provenance-gated source metadata |
 | INV-5 | protected backends not publicly reachable around Gripline | deployment/network; Gate B |

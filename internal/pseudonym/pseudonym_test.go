@@ -144,3 +144,31 @@ func TestDuplicateVersionRejected(t *testing.T) {
 		t.Fatal("duplicate key version must be rejected")
 	}
 }
+
+// Regression (hardening): negative versions refused; key material copied on
+// ingestion.
+func TestNegativeVersionAndCopySafety(t *testing.T) {
+	if _, err := NewRing(&Key{Version: -3, Secret: []byte("k")}); err == nil {
+		t.Fatal("negative key version must be rejected")
+	}
+	secret1 := []byte("mutable-secret")
+	r := mustRing(t, &Key{Version: 1, Secret: secret1})
+	secret1[0] = 'X'
+	got, err := r.Derive(FamilySource, []byte("in"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := mustRing(t, &Key{Version: 1, Secret: []byte("mutable-secret")}).mustDerive(t, FamilySource, []byte("in"))
+	if got != want {
+		t.Fatal("ring must copy key material on ingestion")
+	}
+}
+
+func (r *Ring) mustDerive(t *testing.T, family Family, raw []byte) string {
+	t.Helper()
+	v, err := r.Derive(family, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return v
+}

@@ -10,35 +10,48 @@ import "sync"
 // Release is idempotent: releasing more than once never returns more
 // concurrency than was acquired (INV-15 — accounting cannot go negative;
 // settlement cannot mint allowance).
+//
+// The idempotency state lives in a shared *leaseState, NOT in the struct
+// itself: Go structs are freely copyable, and a `copy := *lease` with inline
+// state would carry its own `released` flag while pointing at the same pool —
+// enabling a double refund through the copy. With shared state, every copy of
+// the handle releases the same lease exactly once.
 type LeaseHandle struct {
+	st *leaseState
+}
+
+// leaseState is the release-once record shared by all copies of a handle.
+type leaseState struct {
 	mu       *sync.Mutex
 	balance  *int
 	released bool
 	slots    int // how many slots this lease owns
 }
 
-// Release returns exactly the leased slots to the pool. Idempotent.
+// Release returns exactly the leased slots to the pool. Idempotent — across
+// every copy of the handle.
 func (h *LeaseHandle) Release() {
-	if h == nil {
+	if h == nil || h.st == nil {
 		return
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.released {
+	h.st.mu.Lock()
+	defer h.st.mu.Unlock()
+	if h.st.released {
 		return
 	}
-	*h.balance += h.slots
-	h.released = true
+	*h.st.balance += h.st.slots
+	h.st.released = true
 }
 
-// Released reports whether the lease has already been released.
+// Released reports whether the lease has already been released (through any
+// copy of the handle).
 func (h *LeaseHandle) Released() bool {
-	if h == nil {
+	if h == nil || h.st == nil {
 		return true
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.released
+	h.st.mu.Lock()
+	defer h.st.mu.Unlock()
+	return h.st.released
 }
 
 // ConcurrencyPool is an atomic, capacity-bounded lease pool for one resource
@@ -95,7 +108,8 @@ func (p *ConcurrencyPool) Acquire() *LeaseHandle {
 }
 
 // AcquireN reserves n slots atomically if all are free, else nil. The returned
-// lease owns exactly n slots and Release returns exactly n.
+// lease owns exactly n slots and Release returns exactly n (once, across all
+// copies of the handle).
 func (p *ConcurrencyPool) AcquireN(n int) *LeaseHandle {
 	if n < 0 {
 		n = 0
@@ -103,11 +117,11 @@ func (p *ConcurrencyPool) AcquireN(n int) *LeaseHandle {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if n == 0 {
-		return &LeaseHandle{mu: &p.mu, balance: &p.balance, released: true, slots: 0}
+		return &LeaseHandle{st: &leaseState{mu: &p.mu, balance: &p.balance, released: true, slots: 0}}
 	}
 	if p.balance < n {
 		return nil
 	}
 	p.balance -= n
-	return &LeaseHandle{mu: &p.mu, balance: &p.balance, released: false, slots: n}
+	return &LeaseHandle{st: &leaseState{mu: &p.mu, balance: &p.balance, released: false, slots: n}}
 }
