@@ -1,0 +1,16 @@
+# Go build/test artifacts
+/gripline
+*.test
+*.out
+/testbin/
+
+# Coverage
+coverage.out
+coverage.html
+
+# Editor/OS
+.DS_Store
+*.swp
+
+# Fuzz corpus is committed (it documents found edge cases); ignore transient:
+internal/**/testdata/fuzz/*/cache/
