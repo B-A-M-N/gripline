@@ -86,12 +86,15 @@ These are known-unfinished parts of the admission pipeline, stated here so
 no invariant is claimed beyond what the implementation establishes:
 
 - **Admission-state integration (P0.10):** the credential `StateMachine`,
-  lane promotion, and persistent evidence accumulation are implemented and
-  tested as components but are NOT yet driven by the live admission path.
-  Synchronous admission uses per-request evidence only (new-lane novelty);
-  WATCH/CONSTRAINED limit selection, velocity/source evidence, and
-  source-spray signals are not yet wired into authorization. Until this
-  lands, only REVOKED/QUARANTINED/BLOCKED/risk-threshold denials fire.
+  lane promotion, and persistent evidence accumulation are wired into the
+  live admission path (`Admit`). Evidence persists across requests; credential
+  risk and lane risk are computed independently; CONSTRAINED credentials
+  receive restricted concurrency caps; lanes promote through
+  NEW→PROBATION→ESTABLISHED. However, WATCH/CONSTRAINED limit selection
+  uses the credential status (persisted), not the live state-machine
+  observation — so an immediate downgrade from a single high-risk request
+  requires the CAS path to succeed first. Velocity/source-spray signals
+  are collected as evidence but not yet used as dynamic gates.
 - **Policy immutability:** the terminator enforces a deep-value SNAPSHOT of
   the policy taken at construction (post-`New` mutation of the caller's
   `*policy.Policy` cannot alter enforcement, tested), but a compiled/

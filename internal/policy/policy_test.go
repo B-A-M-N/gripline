@@ -3,6 +3,7 @@ package policy
 import (
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestDefaultPolicyValid(t *testing.T) {
@@ -86,5 +87,48 @@ func TestInvertedRiskThresholdsInvalid(t *testing.T) {
 	p4.Risk = RiskThresholds{Watch: 30, Constrained: 30, Quarantine: 80}
 	if p4.IsValid() {
 		t.Fatal("equal adjacent thresholds must be invalid")
+	}
+
+	// Down-thresholds must be below escalation thresholds.
+	p5 := Default()
+	p5.Risk.WatchDownThresh = 40 // above Watch=30
+	if p5.IsValid() {
+		t.Fatal("WatchDownThresh must be below Watch")
+	}
+	p6 := Default()
+	p6.Risk.ConstrainedDownThresh = 60 // above Constrained=55
+	if p6.IsValid() {
+		t.Fatal("ConstrainedDownThresh must be below Constrained")
+	}
+
+	// Dwell times must be positive.
+	p7 := Default()
+	p7.Risk.WatchDwell = 0
+	if p7.IsValid() {
+		t.Fatal("zero WatchDwell must be invalid")
+	}
+	p8 := Default()
+	p8.Risk.ConstrainedDwell = -time.Minute
+	if p8.IsValid() {
+		t.Fatal("negative ConstrainedDwell must be invalid")
+	}
+
+	// WatchObs must be at least 1.
+	p9 := Default()
+	p9.Risk.WatchObs = 0
+	if p9.IsValid() {
+		t.Fatal("WatchObs=0 must be invalid")
+	}
+
+	// Promotion criteria validation.
+	p10 := Default()
+	p10.Learning.MaxEstablishmentRisk = 101
+	if p10.IsValid() {
+		t.Fatal("MaxEstablishmentRisk above 100 must be invalid")
+	}
+	p11 := Default()
+	p11.Learning.MaxEstablishmentRisk = -1
+	if p11.IsValid() {
+		t.Fatal("negative MaxEstablishmentRisk must be invalid")
 	}
 }
