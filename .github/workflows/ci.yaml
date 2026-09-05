@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  testify:
+    name: vet + race + gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22.x"
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test -race (full)
+        run: go test -race ./...
+
+      - name: Acceptance gates (spec §111)
+        run: go test -run TestGate -v ./internal/gates/
+
+      - name: Decision-record credential-safety (Gate A / INV-2)
+        run: go test -v ./internal/observability/
+
+      - name: Latency keyword gate (§112)
+        run: go test -run TestAdmissionLatencyBudget -v ./internal/terminator/
