@@ -18,16 +18,23 @@ import (
 
 const testAudience = "fi-inference"
 
-// buildTerminator wires a full terminator + multi-scope governor with the given
-// (shared) signer, and returns the raw external credential that authenticates.
-func buildTerminator(t *testing.T, signer *terminator.Signer) *terminator.Terminator {
-	t.Helper()
-	pep := &credential.PepperKey{Version: 1, Key: []byte("dp-pepper")}
+// dpRaw returns the raw external credential the test terminator embeds.
+func dpRaw() string {
 	rawBytes := make([]byte, 32)
 	for i := range rawBytes {
 		rawBytes[i] = byte('d' + i%26)
 	}
-	raw := "sk-dp-" + string(rawBytes)
+	return "sk-dp-" + string(rawBytes)
+}
+
+// buildTerminatorWithSigner wires a full terminator + multi-scope governor with
+// the given (shared) signer. signer is the AssertionSigner interface so either a
+// *terminator.Signer (fixed key) or a *terminator.Keyring (rotation, P0.59) can
+// be supplied.
+func buildTerminatorWithSigner(t *testing.T, signer terminator.AssertionSigner) *terminator.Terminator {
+	t.Helper()
+	pep := &credential.PepperKey{Version: 1, Key: []byte("dp-pepper")}
+	raw := dpRaw()
 	reg := credential.NewMemoryRegistry()
 	if err := reg.Insert(&credential.CredentialRecord{
 		CredentialID: "cred_dp", AccountID: "acct_dp",
@@ -51,6 +58,11 @@ func buildTerminator(t *testing.T, signer *terminator.Signer) *terminator.Termin
 		t.Fatal(err)
 	}
 	return term
+}
+
+// buildTerminator is the fixed-key convenience wrapper.
+func buildTerminator(t *testing.T, signer *terminator.Signer) *terminator.Terminator {
+	return buildTerminatorWithSigner(t, signer)
 }
 
 // TestDataPlaneExternalSecretNeverCrosses is the capstone containment proof:
@@ -91,11 +103,7 @@ func TestDataPlaneExternalSecretNeverCrosses(t *testing.T) {
 	}
 
 	// The raw external credential for the request.
-	rawBytes := make([]byte, 32)
-	for i := range rawBytes {
-		rawBytes[i] = byte('d' + i%26)
-	}
-	raw := "sk-dp-" + string(rawBytes)
+	raw := dpRaw()
 
 	// Client request carries the EXTERNAL credential AND a forged reserved
 	// internal header (INV-12 impersonation attempt).
@@ -112,6 +120,64 @@ func TestDataPlaneExternalSecretNeverCrosses(t *testing.T) {
 	}
 	if body := rec.Body.String(); !strings.Contains(body, "accepted:acct_dp") {
 		t.Fatalf("backend must accept the internal assertion (INV-10/11): body %q", body)
+	}
+}
+
+// TestDataPlaneBackendFollowsSignerRotation proves P0.59 end-to-end: the
+// proxy signs under a Keyring, the keyring ROTATES mid-flight, and the private
+// backend (verifying via the same Keyring's retained public keys) still
+// accepts a request signed under the rotated generation. Old and new
+// generations coexist during the overlap.
+func TestDataPlaneBackendFollowsSignerRotation(t *testing.T) {
+	keyring, err := terminator.NewKeyring()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Rotate once BEFORE the backend starts, so the backend has both pubs.
+	if _, err := keyring.Rotate(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Private backend verifies via the keyring (rotation-aware, P0.59).
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if len(r.Header.Values("Authorization")) > 0 {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte("external-secret-leaked"))
+			return
+		}
+		ver := NewBackendVerifierKeyring(keyring, testAudience)
+		claims, verr := ver.Verify(r)
+		if verr != nil {
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(verr.Error()))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("accepted:" + claims.Subject))
+	}))
+	defer backend.Close()
+
+	dp, err := New(Config{
+		Terminator: buildTerminatorWithSigner(t, keyring),
+		Backend:    http.DefaultTransport,
+		Audience:   testAudience,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	raw := dpRaw()
+
+	req := httptest.NewRequest("POST", backend.URL+"/v1/messages", strings.NewReader(`{"x":1}`))
+	req.Header.Set("Authorization", "Bearer "+raw)
+	rec := httptest.NewRecorder()
+	dp.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("rotated-signature request rejected by backend: %d %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "accepted:acct_dp") {
+		t.Fatalf("backend must accept assertion signed by the rotated keyring: %q", rec.Body.String())
 	}
 }
 

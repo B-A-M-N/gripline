@@ -25,29 +25,43 @@ type AssertionSigner interface {
 
 // Signer holds the Ed25519 key used to sign internal assertions. In production
 // the signer is isolated from the Internet-facing parser and keys support
-// rotation (§21).
+// rotation (§21, P0.59).
+//
+// Version is the signer's generation (kid), stamped into every assertion it
+// issues so a rotating verifier keyring can select the right public key during
+// the rotation overlap window (P0.59/P0.60). A signer created with the default
+// zero version issues version-1 assertions (backward compatible).
 type Signer struct {
-	priv ed25519.PrivateKey
+	priv    ed25519.PrivateKey
+	Version int
 }
 
 // NewSigner creates a signer from an Ed25519 private key. Use GenerateSigner
 // for a fresh key. The key size is validated (ed25519.PrivateKeySize) so a
 // truncated or mis-typed key fails loudly at construction instead of at
-// signing time.
+// signing time. A zero Version is normalized to 1.
 func NewSigner(priv ed25519.PrivateKey) (*Signer, error) {
 	if len(priv) != ed25519.PrivateKeySize {
 		return nil, fmt.Errorf("terminator: invalid ed25519 private key size %d, want %d", len(priv), ed25519.PrivateKeySize)
 	}
-	return &Signer{priv: priv}, nil
+	return &Signer{priv: priv, Version: 1}, nil
 }
 
-// GenerateSigner produces a new random Ed25519 key.
+// GenerateSigner produces a new random Ed25519 key at version 1.
 func GenerateSigner() (*Signer, error) {
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, fmt.Errorf("terminator: generate signer: %w", err)
 	}
-	return &Signer{priv: priv}, nil
+	return &Signer{priv: priv, Version: 1}, nil
+}
+
+// Kid returns the signer's generation (its assertion key id).
+func (s *Signer) Kid() int {
+	if s == nil || s.Version < 1 {
+		return 1
+	}
+	return s.Version
 }
 
 // Public returns the public key (for configuring verifiers). The public key is
@@ -85,6 +99,9 @@ type Claims struct {
 	PolicyRev int      `json:"policy_rev"`
 	CredRev   int      `json:"cred_rev"`
 	Scope     []string `json:"scope"`
+	// KeyID is the signer generation (kid). The verifier selects its public key
+	// by this id, enabling key rotation with overlap (P0.59).
+	KeyID int `json:"kid"`
 }
 
 // Assertion is a signed, self-contained internal identity. It is a short-lived
@@ -124,6 +141,10 @@ func (s *Signer) Issue(c Claims, ttl time.Duration) (*Assertion, error) {
 	c.Issuer = "gripline"
 	c.IssuedAt = now.Unix()
 	c.ExpiresAt = now.Add(ttl).Unix()
+	// Stamp the signer's generation so the verifier selects the right key during
+	// rotation (P0.59). A zero/absent key id stays 0 for backward compat; the
+	// verifier keyring treats 0 as version 1.
+	c.KeyID = s.Kid()
 	if c.JTI == "" {
 		return nil, fmt.Errorf("terminator: jti (request id) required")
 	}
