@@ -35,9 +35,14 @@ type Outcome struct {
 	Context    principal.AuthorizedContext
 	Assertion  *Assertion
 	Lease      *resource.LeaseHandle // non-nil when authorized; proxy releases on completion
-	RiskAfter  int                    // effectiveRisk = max(credentialRisk, laneRisk)
-	Evidence   []string              // evidence codes that contributed (explainability)
-	LaneNew    bool
+	// ResourceRes is the multi-scope resource hold (P0.23-P0.27) when a resource
+	// governor is configured. The proxy MUST release it (or the scoped leases)
+	// when the upstream request completes; until then the capacity is held for
+	// this request only.
+	ResourceRes *resource.MultiReservation
+	RiskAfter   int // effectiveRisk = max(credentialRisk, laneRisk)
+	Evidence    []string // evidence codes that contributed (explainability)
+	LaneNew     bool
 	// Degraded reports that the decision ran in AdaptiveDegraded posture: some
 	// authoritative history/state was unavailable, so the outcome preserved
 	// persisted restrictions rather than transitioning (P0.1).
@@ -92,6 +97,17 @@ type Dependencies struct {
 	// ModeEnforce; optional (admission without hard concurrency control) in
 	// ModeTerminate.
 	Concurrency resourceController
+
+	// Resource is an OPTIONAL multi-scope resource governor (spec §04, P0.23-
+	// P0.27). When set, admission provisions SOURCE/LANE/CREDENTIAL/ACCOUNT
+	// capacity all-or-nothing at the hard-limit gate; a denial names the
+	// highest-priority scope that exceeded its limit. When nil, only the
+	// per-credential Concurrency seam applies (back-compat).
+	Resource *resource.Governor
+
+	// SourceID keys the SOURCE scope (network origin). Empty disables the SOURCE
+	// scope in multi-scope provisioning. Default: "" (SOURCE skipped).
+	SourceID string
 }
 
 // resourceController abstracts concurrency admission per scope.
@@ -522,7 +538,20 @@ func (t *Terminator) Admit(headers map[string][]string, feat lane.Features) *Out
 		AuthorizedAt:       now,
 	}
 
-	if t.dep.Concurrency != nil {
+	// 12. Hard resource admission — MULTI-SCOPE (P0.23-P0.27) when a governor is
+	// configured, else the legacy per-credential concurrency seam.
+	//
+	// DEFAULT FLAG (P0.23): when Resource is set it takes over the hard gate; the
+	// legacy Concurrency seam is then NOT also charged, so a request sees exactly
+	// one hard concurrency enforcement. This prevents double-accounting the same
+	// slot against two different reservoirs. A caller wanting BOTH must compose
+	// two governors/inspect the outcome, which is not the default posture.
+	if t.dep.Resource != nil {
+		provErr := t.provisionMultiscope(cred, laneID, laneSec, limits, ctx, reqID, out, adaptiveForObservation, laneRisk, credentialRisk, effectiveRisk, evidenceCodes)
+		if provErr != nil {
+			return provErr
+		}
+	} else if t.dep.Concurrency != nil {
 		lease := t.dep.Concurrency.Acquire("cred:"+cred.CredentialID, limits.ConcurrencyCap)
 		if lease == nil {
 			out.Authorized = false
@@ -609,6 +638,105 @@ func (t *Terminator) Admit(headers map[string][]string, feat lane.Features) *Out
 	out.Adaptive = adaptiveForObservation
 	out.Degraded = adaptiveForObservation == AdaptiveDegraded
 	return out
+}
+
+// provisionMultiscope is the hard multi-scope resource gate (P0.23-P0.27). It
+// provisions SOURCE/LANE/CREDENTIAL/ACCOUNT capacity all-or-nothing through the
+// configured Governor, issues the internal assertion while holding the
+// reservation, and attaches the reservation to the Outcome for proxy release.
+//
+// It returns a non-nil *Outcome to short-circuit Admit when the gate denies or
+// issuance fails; nil means the request cleared every scope and proceeds.
+//
+// DEFAULT FLAG (P0.23): the SOURCE and ACCOUNT scopes share the credential's
+// concurrency cap, because the policy model currently exposes a single
+// per-credential cap (ScopedLimits.Normal/Constrained), not distinct per-scope
+// budget tables. The Governor accepts a distinct cap per scope; when per-scope
+// tables land in the policy, only the spec construction here changes. Today a
+// single hostile actor cannot exceed the credential cap across its lanes/sources
+// without tripping the shared budget — a conservative first posture.
+func (t *Terminator) provisionMultiscope(cred *credential.Credential, laneID string, laneSec lane.SecurityStatus, limits policy.Limits, ctx principal.AuthorizedContext, reqID string, out *Outcome, adaptiveForObservation AdaptiveStateStatus, laneRisk, credentialRisk, effectiveRisk int, evidenceCodes []string) *Outcome {
+	cap := limits.ConcurrencyCap
+	// Precedence order is preserved by the Governor; we build the list so the
+	// highest-priority scope is first (SOURCE > LANE > CREDENTIAL > ACCOUNT).
+	specs := []resource.ScopeSpec{}
+	if t.dep.SourceID != "" {
+		specs = append(specs, resource.ScopeSpec{Scope: resource.ScopeSource, ID: t.dep.SourceID, Buckets: resource.BucketSpec{ConcurrencyCap: cap}})
+	}
+	if laneID != "" {
+		specs = append(specs, resource.ScopeSpec{Scope: resource.ScopeLane, ID: laneID, Buckets: resource.BucketSpec{ConcurrencyCap: cap}})
+	}
+	specs = append(specs,
+		resource.ScopeSpec{Scope: resource.ScopeCredential, ID: cred.CredentialID, Buckets: resource.BucketSpec{ConcurrencyCap: cap}},
+		resource.ScopeSpec{Scope: resource.ScopeAccount, ID: cred.AccountID, Buckets: resource.BucketSpec{ConcurrencyCap: cap}},
+	)
+
+	deny := func(reason string, err error) *Outcome {
+		out.Authorized = false
+		out.Reason = reason
+		out.DenialErr = err
+		out.CredentialRisk = credentialRisk
+		out.LaneRisk = laneRisk
+		out.RiskAfter = effectiveRisk
+		out.Evidence = evidenceCodes
+		out.Adaptive = adaptiveForObservation
+		out.Degraded = adaptiveForObservation == AdaptiveDegraded
+		return out
+	}
+
+	res, err := t.dep.Resource.Provision(specs, nil, resource.ProvisionAmt{Concurrency: 1})
+	if err != nil {
+		var sle *resource.ScopeLimitError
+		if errors.As(err, &sle) {
+			return deny(resourceScopeReason(sle.Scope), resourceScopeErr(sle.Scope))
+		}
+		return deny("resource_unavailable", err)
+	}
+	// Every scope provisioned. Issue the assertion; if it fails, release the
+	// reservation so held capacity is refunded (never a leaked hold).
+	assertion, aerr := t.issueAssertion(ctx, reqID, cred)
+	if aerr != nil {
+		res.Release()
+		return deny("internal_identity_failure", aerr)
+	}
+	out.Assertion = assertion
+	out.ResourceRes = res // proxy releases on completion (M4)
+	return nil
+}
+
+// resourceScopeReason maps a resource scope denial to the external reason, per
+// the policy precedence (§58): account/cap denials read as rate limits, lane as
+// restricted, credential as restricted, source as source-restricted.
+func resourceScopeReason(s resource.Scope) string {
+	switch s {
+	case resource.ScopeSource:
+		return "source_restricted"
+	case resource.ScopeLane:
+		return "lane_restricted"
+	case resource.ScopeCredential:
+		return "credential_restricted"
+	case resource.ScopeAccount:
+		return "rate_limit"
+	default:
+		return "resource_limit"
+	}
+}
+
+// resourceScopeErr maps a resource scope denial to the highest-precedence policy
+// error so denialReason/denial errors stay consistent with §58.
+func resourceScopeErr(s resource.Scope) error {
+	switch s {
+	case resource.ScopeSource:
+		return policy.ErrSourceBlock
+	case resource.ScopeLane:
+		return policy.ErrLaneLimit
+	case resource.ScopeCredential:
+		return policy.ErrCredentialLimit
+	case resource.ScopeAccount:
+		return policy.ErrAccountLimit
+	default:
+		return policy.ErrRiskDenial
+	}
 }
 
 // pruneEvidence prunes expired evidence for the relevant subjects. It is a
