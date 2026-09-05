@@ -409,12 +409,26 @@ func (t *Terminator) Admit(headers map[string][]string, feat lane.Features) *Out
 	adaptiveForObservation := adaptive
 
 	if adaptiveForObservation == AdaptiveAvailable && t.dep.Evidence != nil {
+		// Gate H / §102 phase 6: automatic quarantine is DISABLED until shadow
+		// validation. When off, cap the score fed into the authoritative state
+		// machine below the quarantine threshold so a high risk observation can
+		// elevate to at most CONSTRAINED — never auto-persist QUARANTINED. The
+		// request-level policy denial below still uses the UNclamped risk to
+		// reject a genuinely hot credential via temporarily_restricted; we just
+		// do not commit an operator-unvalidated quarantine status.
+		observeScore := credentialRisk
+		if !t.pol.Risk.EnableAutomaticQuarantine && observeScore >= t.pol.Risk.Quarantine {
+			observeScore = t.pol.Risk.Constrained - 1
+			if observeScore < 0 {
+				observeScore = 0
+			}
+		}
 		// ObserveAndCommit via the registry-as-repository. Double-source the
 		// remaining risk into the machine only when we have authoritative
 		// history.
 		tr, oerr := t.dep.Registry.ObserveAndCommit(
 			ctxFor(now), cred.CredentialID,
-			credentialRisk, t.credentialHysteresis(), now,
+			observeScore, t.credentialHysteresis(), now,
 		)
 		if oerr != nil {
 			// Outage / not found: the observation could not be committed

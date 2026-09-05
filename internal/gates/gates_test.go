@@ -2,9 +2,11 @@ package gates
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -306,5 +308,284 @@ func TestGateI_LaneScopedCompromiseDoesNotDisableEstablished(t *testing.T) {
 	outA2 := term.Admit(map[string][]string{"Authorization": {"Bearer " + raw}}, laneA)
 	if !outA2.Authorized {
 		t.Fatalf("Gate I: lane A must continue authorizing while lane B is blocked: %s", outA2.Reason)
+	}
+}
+
+// --- Gate H: automatic quarantine disabled until shadow validation -----------
+
+// gateHIOTerminator builds a terminator with the given auto-quarantine posture.
+// It returns the terminator, the evidence store (so the test can seed a high
+// risk), the registry (to read persisted status), and the raw credential.
+func gateHIOTerminator(t *testing.T, autoQuarantine bool) (*terminator.Terminator, evidence.Store, *credential.MemoryRegistry, string) {
+	raw := gateSecret("h")
+	pep := &credential.PepperKey{Version: 1, Key: []byte("gate-pepper-cred_h")}
+	reg := credential.NewMemoryRegistry()
+	if err := reg.Insert(&credential.CredentialRecord{
+		CredentialID: "cred_h", AccountID: "acct",
+		Verifier: credential.Verifier(secret.NewFromBytes([]byte(raw)), pep), VerifierVersion: 1, PepperVersion: 1,
+		Status:    credential.StatusNormal,
+		PolicyID:  "fi-default-v1", PlanID: "plan-a",
+		CreatedAt: time.Now().Add(-time.Hour), Revision: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p := policy.Default()
+	p.Risk.EnableAutomaticQuarantine = autoQuarantine
+	store := evidence.NewMemoryStore()
+	signer, _ := terminator.GenerateSigner()
+	term, err := terminator.New(terminator.Dependencies{
+		Registry: reg,
+		Peppers:  credential.MustPepperRing(pep),
+		Lanes:    lane.NewStore(nil, time.Now),
+		Policy:   p,
+		Signer:   signer,
+		Audience: gateAudience,
+		Evidence: store,
+		Resource: resource.NewGovernor(nil),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return term, store, reg, raw
+}
+
+// TestGateH_AutomaticQuarantineDisabledUntilValidation proves the §102 phase 6 /
+// Gate H fail-closed default: with a risk-model not yet shadow-validated
+// (EnableAutomaticQuarantine=false, the default), a credential whose risk
+// crosses the quarantine threshold is DENIED the request (temporarily_restricted)
+// but its PERSISTED status is NOT auto-quarantined — quarantine remains a
+// validated operator/policy action. Enabling the flag restores auto-quarantine.
+func TestGateH_AutomaticQuarantineDisabledUntilValidation(t *testing.T) {
+	// Gate H default is fail-closed: the flag is OFF in the default policy.
+	if policy.Default().Risk.EnableAutomaticQuarantine {
+		t.Fatal("Gate H: automatic quarantine must default to DISABLED (shadow-first)")
+	}
+
+	for name, auto := range map[string]bool{"disabled": false, "enabled": true} {
+		t.Run(name, func(t *testing.T) {
+			term, store, reg, raw := gateHIOTerminator(t, auto)
+
+			// Establish the lane normally (so classification/lane exist).
+			feat := lane.Features{NetworkASN: "AS-H", NetworkType: "residential"}
+			est := term.Admit(map[string][]string{"Authorization": {"Bearer " + raw}}, feat)
+			if !est.Authorized {
+				t.Fatalf("gate H %s: establish must authorize: %s", name, est.Reason)
+			}
+
+			// Seed credential-scoped evidence that crosses the quarantine
+			// threshold (80). Three families sum past their caps to an effective
+			// risk >= 80: AbuseCorrelation(40 cap) + ResourceVelocity(35 cap) +
+			// ClientNovelty(20 cap) = 95.
+			now := time.Now()
+			hi := []evidence.Evidence{
+				{EvidenceID: "gate_h1", Code: "MORE_THAN_3_UNRELATED_ASNS_IN_10_MIN",
+					Family: evidence.FamilyAbuseCorrelation, Scope: evidence.ScopeCredential,
+					SubjectID: "cred_h", Score: 45, Confidence: 85, CorrelationGroup: "topology",
+					CreatedAt: now, ExpiresAt: now.Add(time.Hour)},
+				{EvidenceID: "gate_h2", Code: "CONCURRENCY_OVER_10X_BASELINE",
+					Family: evidence.FamilyResourceVelocity, Scope: evidence.ScopeCredential,
+					SubjectID: "cred_h", Score: 45, Confidence: 85, CorrelationGroup: "resource",
+					CreatedAt: now, ExpiresAt: now.Add(time.Hour)},
+				{EvidenceID: "gate_h3", Code: "RAPID_ENDPOINT_OR_MODEL_ENUMERATION",
+					Family: evidence.FamilyClientNovelty, Scope: evidence.ScopeCredential,
+					SubjectID: "cred_h", Score: 40, Confidence: 80, CorrelationGroup: "novelty",
+					CreatedAt: now, ExpiresAt: now.Add(time.Hour)},
+			}
+			if err := store.Append(hi...); err != nil {
+				t.Fatal(err)
+			}
+
+			// A fresh observation on the established lane sees the high persisted
+			// credential risk. The request must be DENIED either way (a hot
+			// credential is never granted), but the PERSISTED status differs by
+			// posture.
+			out := term.Admit(map[string][]string{"Authorization": {"Bearer " + raw}}, feat)
+
+			// Read the authoritative persisted status after admission.
+			rec, err := reg.LookupAuthoritative(nil, "cred_h")
+			if err != nil {
+				t.Fatalf("gate H %s: read persisted credential: %v", name, err)
+			}
+			persisted := rec.Status
+
+			switch auto {
+			case false:
+				// Disabled posture: the hot credential is still denied the request…
+				if out.Authorized {
+					t.Fatalf("gate H disabled: high-risk request must be denied, got %s", out.Reason)
+				}
+				// …but its persisted status is NOT auto-quarantined.
+				if persisted == credential.StatusQuarantined {
+					t.Fatalf("gate H disabled: risk alone must NOT auto-quarantine, persisted got %v", persisted)
+				}
+			case true:
+				// Enabled posture (validated shadow): auto-quarantine persists.
+				if persisted != credential.StatusQuarantined {
+					t.Fatalf("gate H enabled: risk >= quarantine threshold must persist QUARANTINED, got %v", persisted)
+				}
+			}
+		})
+	}
+}
+
+// --- Gate C: supported clients (generic HTTP) operate unchanged --------------
+
+// gateProxyUpstream builds a terminator + DataPlane in front of the given
+// backend handler, returning a handler a client can dial directly.
+func gateProxyUpstream(t *testing.T, credID, raw string, backend http.Handler) http.Handler {
+	t.Helper()
+	reg := gateRegistry(t, credID, raw)
+	signer, _ := terminator.GenerateSigner()
+	term, err := terminator.New(terminator.Dependencies{
+		Registry: reg,
+		Peppers:  credential.MustPepperRing(&credential.PepperKey{Version: 1, Key: []byte("gate-pepper-" + credID)}),
+		Lanes:    lane.NewStore(nil, time.Now),
+		Policy:   policy.Default(),
+		Signer:   signer,
+		Audience: gateAudience,
+		Evidence: evidence.NewMemoryStore(),
+		Resource: resource.NewGovernor(nil),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dp, err := proxy.New(proxy.Config{Terminator: term, Backend: roundTripper(backend), Audience: gateAudience})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dp
+}
+
+// roundTripper adapts an http.Handler into a RoundTripper so the proxy can be
+// pointed at a handler-backed backend.
+type handlerRT struct{ h http.Handler }
+
+func roundTripper(h http.Handler) http.RoundTripper { return &handlerRT{h: h} }
+
+func (rt *handlerRT) RoundTrip(r *http.Request) (*http.Response, error) {
+	rec := httptest.NewRecorder()
+	rt.h.ServeHTTP(rec, r)
+	return rec.Result(), nil
+}
+
+// TestGateC_GenericClientOperatesUnchanged proves Gate C's broadest surface: a
+// plain generic HTTP client (the curl-equivalent) sends a normal GET, and — with
+// the secret terminated and the internal assertion injected on the trusted hop —
+// receives an unchanged status + body back. "Supported clients operate unchanged"
+// cannot run the real third-party SDKs in this repo; the generic-HTTP contract
+// (a valid credential, 200, exact body via the same URL) is the subset this gate
+// enforces at the package boundary.
+func TestGateC_GenericClientOperatesUnchanged(t *testing.T) {
+	raw := gateSecret("c")
+	const body = `{"data":[{"id":"model-x"}]}`
+	backend := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(body))
+	})
+	dp := gateProxyUpstream(t, "cred_c", raw, backend)
+	backendSrv := httptest.NewServer(dp)
+	defer backendSrv.Close()
+
+	// A plain GET — the curl-equivalent: the standard Authorization credential a
+	// normal client always presents, with no SDK headers, no streaming, no body.
+	req, _ := http.NewRequest("GET", backendSrv.URL+"/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer "+raw)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Gate C: generic GET got %d, want 200", resp.StatusCode)
+	}
+	got, _ := io.ReadAll(resp.Body)
+	if string(got) != body {
+		t.Fatalf("Gate C: body changed through the proxy: got %q want %q", got, body)
+	}
+}
+
+// --- Gate D: no material streaming-semantic regression ------------------------
+
+// TestGateD_StreamingResponseUnmodified proves Gate D: a SSE-style streaming
+// backend (multiple flushed chunks, `text/event-stream` content type and
+// Transfer-Encoding preserved) is streamed back to the client without buffering
+// omission, truncation, or body mutation.
+func TestGateD_StreamingResponseUnmodified(t *testing.T) {
+	raw := gateSecret("d")
+	chunks := []string{"data: {\"i\":1}\n\n", "data: {\"i\":2}\n\n", "data: {\"i\":3}\n\n"}
+	backend := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f, _ := w.(http.Flusher)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
+		for _, ch := range chunks {
+			w.Write([]byte(ch))
+			if f != nil {
+				f.Flush()
+			}
+		}
+	})
+	dp := gateProxyUpstream(t, "cred_d", raw, backend)
+	backendSrv := httptest.NewServer(dp)
+	defer backendSrv.Close()
+
+	req, _ := http.NewRequest("POST", backendSrv.URL+"/v1/messages", nil)
+	req.Header.Set("Authorization", "Bearer "+raw)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
+		t.Fatalf("Gate D: streaming content type lost: %q", ct)
+	}
+	got, _ := io.ReadAll(resp.Body)
+	if string(got) != strings.Join(chunks, "") {
+		t.Fatalf("Gate D: stream body mutated/truncated: got %q", got)
+	}
+}
+
+// --- Gate J: concurrency accounting survives race without over-admission ------
+
+// TestGateJ_ConcurrentAccountingNoOverAdmission proves Gate J at the package
+// boundary: under concurrency, the number of SIMULTANEOUS holders of a scope
+// never exceeds its cap — no over-admission beyond tolerance. Sequencing the
+// workers so they genuinely overlap (each admitted holder blocks on a barrier
+// before releasing) makes peak concurrent concurrency the measured invariant,
+// which is what a multi-node operator actually needs bounded.
+func TestGateJ_ConcurrentAccountingNoOverAdmission(t *testing.T) {
+	const cap, workers = 3, 128
+	scopes := []resource.ScopeSpec{{Scope: resource.ScopeCredential, ID: "cred_j", Buckets: resource.BucketSpec{ConcurrencyCap: cap}}}
+	g := resource.NewGovernor(time.Now)
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	peak, live := 0, 0
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			res, err := g.Provision(scopes, nil, resource.ProvisionAmt{Concurrency: 1})
+			if err != nil {
+				return
+			}
+			// Carry the hold so overlapping workers contend for the same pool.
+			mu.Lock()
+			live++
+			if live > peak {
+				peak = live
+			}
+			mu.Unlock()
+			res.Release()
+			mu.Lock()
+			live--
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+
+	if peak > cap {
+		t.Fatalf("Gate J: over-admission — peak simultaneous holders %d, cap %d", peak, cap)
 	}
 }

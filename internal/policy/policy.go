@@ -22,6 +22,15 @@ type RiskThresholds struct {
 	ConstrainedDwell  time.Duration // dwell time for CONSTRAINED→WATCH recovery
 	WatchDwell        time.Duration // dwell time for WATCH→NORMAL recovery
 	WatchObs          int           // qualifying observations needed for WATCH entry
+
+	// EnableAutomaticQuarantine gates the durable QUARANTINED status escalation
+	// (§102 phase 6, Gate H). Automatic quarantine MUST be disabled until shadow
+	// validation proves the risk model — a high risk score may deny the request
+	// (temporarily_restricted) but must NOT persist a quarantine the operator did
+	// not validate. Default false = fail-closed shadow-first posture. When false,
+	// the risk state machine caps auto-escalation at CONSTRAINED; quarantine is
+	// operator-set only.
+	EnableAutomaticQuarantine bool
 }
 
 // Limits captures hard resource limits per scope as policy.
