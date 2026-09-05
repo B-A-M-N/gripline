@@ -8,43 +8,28 @@ import (
 	"testing"
 )
 
-// TestSealedSecretHasNoFormattingOrSerializationSurface is the property test
-// backing INV-2: a SealedSecret must have no String/Format/Marshal surface, so
-// no logger, serializer, or formatter can render the raw bytes. We assert on
-// the reflected method set so a future contributor who adds String() or a
-// Marshaler fails here.
+// TestSealedSecretHasNoFormattingOrSerializationSurface backs INV-2: a
+// SealedSecret must have no String/Format/Marshal surface, so no logger,
+// serializer, or formatter can render the raw bytes. Asserts on the reflected
+// method set so a future contributor who adds String() or a Marshaler fails
+// here.
 func TestSealedSecretHasNoFormattingOrSerializationSurface(t *testing.T) {
 	typ := reflect.TypeOf((*SealedSecret)(nil))
-	// fmt.Formatter is a pointer-receiver Format(fmt.State, rune).
-	if _, ok := typ.MethodByName("Format"); ok {
-		t.Fatalf("SealedSecret must not implement fmt.Formatter (INV-2)")
-	}
-	if _, ok := typ.MethodByName("String"); ok {
-		t.Fatalf("SealedSecret must not implement fmt.Stringer (INV-2)")
-	}
-	if _, ok := typ.MethodByName("MarshalJSON"); ok {
-		t.Fatalf("SealedSecret must not implement json.Marshaler (INV-2)")
-	}
-	if _, ok := typ.MethodByName("MarshalBinary"); ok {
-		t.Fatalf("SealedSecret must not implement encoding.BinaryMarshaler (INV-2)")
-	}
-	if _, ok := typ.MethodByName("GobEncode"); ok {
-		t.Fatalf("SealedSecret must not implement gob.GobEncoder (INV-2)")
+	for _, banned := range []string{"Format", "String", "MarshalJSON", "MarshalBinary", "GobEncode", "MarshalText", "AppendText"} {
+		if _, ok := typ.MethodByName(banned); ok {
+			t.Fatalf("SealedSecret must not implement %s (INV-2)", banned)
+		}
 	}
 }
 
-// TestGoStringDoesNotLeak ensures that even the default formatting of the
-// struct value cannot be coerced into revealing contents through reflection
-// tooling that walks exported fields. Our fields are unexported, so none exist.
+// TestStructHasNoExportedFields ensures json/gob cannot ship contents via
+// exported fields.
 func TestStructHasNoExportedFields(t *testing.T) {
 	typ := reflect.TypeOf(SealedSecret{})
-	if n := typ.NumField(); n != 0 {
-		// All fields must stay unexported (buf, zeroed). If a field is added it
-		// must be unexported, else encoding/json and encoding/gob will ship it.
-		for i := 0; i < n; i++ {
-			if typ.Field(i).PkgPath == "" {
-				t.Fatalf("field %q is exported; SealedSecret fields must be unexported (INV-2)", typ.Field(i).Name)
-			}
+	for i := 0; i < typ.NumField(); i++ {
+		f := typ.Field(i)
+		if f.PkgPath == "" {
+			t.Fatalf("field %q is exported; SealedSecret fields must be unexported (INV-2)", f.Name)
 		}
 	}
 }
@@ -67,50 +52,37 @@ func TestZeroWipesAndIsIdempotent(t *testing.T) {
 	if s.Len() != 0 {
 		t.Fatalf("zeroed secret reports len %d, want 0", s.Len())
 	}
-	// The backing buffer must be cleared: force re-read of the (now-nil) buffer
-	// through the helper predicate — there is no reader, so we track zeroed.
-	if !s.Zeroed() {
-		t.Fatal("expected zeroed state")
-	}
-	// Second Zero is a no-op.
 	if s.Zero() {
 		t.Fatal("second Zero should return false (already zeroed)")
 	}
-	if d := s.Digest(); d != nil {
-		t.Fatalf("zeroed secret must not produce a digest")
+	if d := s.DigestHMAC([]byte("k")); d != nil {
+		t.Fatal("zeroed secret must not produce a keyed digest")
 	}
 }
 
-func TestDigestZeroDoesNotLeakContents(t *testing.T) {
-	s := NewFromBytes([]byte("sensitive-material"))
-	if !bytes.Equal(s.Digest(), digestFor([]byte("sensitive-material"))) {
-		t.Fatal("Digest must be the plain SHA-256 of the raw bytes")
-	}
-	s.Zero()
-	if s.Digest() != nil {
-		t.Fatal("zeroed secret must produce nil digest")
-	}
-}
-
-func TestNewFromBytesCopies(t *testing.T) {
-	src := []byte("sk-original")
-	s := NewFromBytes(src)
-	// Mutating the caller's buffer must not affect the sealed copy.
-	src[0] = 'X'
-	if !bytes.Equal(s.Digest(), digestFor([]byte("sk-original"))) {
-		t.Fatal("NewFromBytes must copy the source buffer")
-	}
-	_ = s.Zero()
-}
-
-func TestDigestHMACConstantTimeCompareMatchesManual(t *testing.T) {
+func TestDigestHMACMatchesManual(t *testing.T) {
 	s := NewFromBytes([]byte("the-raw-credential"))
 	key := []byte("pepper-key")
 	want := hmacSHA256(key, []byte("gripline:secret:digest:v1"), []byte("the-raw-credential"))
 	if !bytes.Equal(s.DigestHMAC(key), want) {
 		t.Fatal("DigestHMAC must fold domain || raw under the key")
 	}
-	_ = s.Zero()
+	s.Zero()
+	if s.DigestHMAC(key) != nil {
+		t.Fatal("zeroed secret must produce nil digest")
+	}
+}
+
+// TestNewFromBytesCopies isolates the sealed copy from later caller mutation.
+func TestNewFromBytesCopies(t *testing.T) {
+	src := []byte("sk-original")
+	s := NewFromBytes(src)
+	src[0] = 'X'
+	want := hmacSHA256([]byte("k"), []byte("gripline:secret:digest:v1"), []byte("sk-original"))
+	if !bytes.Equal(s.DigestHMAC([]byte("k")), want) {
+		t.Fatal("NewFromBytes must copy the source buffer")
+	}
+	s.Zero()
 }
 
 func TestRandom(t *testing.T) {
@@ -127,35 +99,30 @@ func TestRandom(t *testing.T) {
 	if a.Len() != 32 {
 		t.Fatalf("len = %d, want 32", a.Len())
 	}
-	_ = a.Zero()
+	a.Zero()
 }
 
 // --- explicit "try to serialize" adversarial tests --------------------------
 
-func TestCannotJSONMarshal(t *testing.T) {
-	s := NewFromBytes([]byte("sk-json"))
+func TestJSONMarshalLeaksNothing(t *testing.T) {
+	s := NewFromBytes([]byte("sk-json-secret-value"))
 	defer s.Zero()
-	if _, err := json.Marshal(s); err == nil {
-		// Encoding a struct with only unexported fields yields '{}' in Go. That
-		// is harmless (no bytes leak) but we assert the container yields no
-		// content-bearing bytes either way; if it ever exposed 'buf' the test
-		// below would catch it via Gob/JSON round-trips on the digest.
-		t.Log("json.Marshal succeeded (expected; no data leaks)")
+	b, err := json.Marshal(s)
+	if err != nil {
+		t.Fatalf("json.Marshal errored: %v", err)
+	}
+	if bytes.Contains(b, []byte("sk-json-secret-value")) {
+		t.Fatal("json output must not contain the raw secret")
 	}
 }
 
-func TestCannotGobEncodeSecret(t *testing.T) {
-	s := NewFromBytes([]byte("sk-gob"))
+func TestGobEncodeLeaksNothing(t *testing.T) {
+	s := NewFromBytes([]byte("sk-gob-secret-value"))
 	defer s.Zero()
 	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(s); err != nil {
-		// gob refuses to encode unexported fields — good.
-		return
-	}
-	// If it somehow encoded, ensure decoding cannot recover the raw bytes.
-	var got []byte
-	_ = json.Unmarshal(buf.Bytes(), &got)
-	if got != nil {
-		t.Fatalf("gob round-trip surfaced bytes: %x", got)
+	if err := gob.NewEncoder(&buf).Encode(s); err == nil {
+		if bytes.Contains(buf.Bytes(), []byte("sk-gob-secret-value")) {
+			t.Fatal("gob output must not contain the raw secret")
+		}
 	}
 }

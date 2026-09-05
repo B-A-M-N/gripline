@@ -37,18 +37,18 @@ func (s State) String() string {
 
 // LaneRecord is the persisted lane row (§75).
 type LaneRecord struct {
-	LaneID            string
-	CredentialID      string
-	State             State
-	FirstSeenAt       time.Time
-	LastSeenAt        time.Time
-	NetworkClass      string
-	RegionClass       string
-	ClientFamily      string
-	RequestCount      int64
-	RiskScore         int
+	LaneID             string
+	CredentialID       string
+	State              State
+	FirstSeenAt        time.Time
+	LastSeenAt         time.Time
+	NetworkClass       string
+	RegionClass        string
+	ClientFamily       string
+	RequestCount       int64
+	RiskScore          int
 	EstablishmentScore int
-	Revision          int
+	Revision           int
 }
 
 // Features is the normalized metadata vector used for classification. Missing
@@ -56,16 +56,16 @@ type LaneRecord struct {
 // weight renormalization over present features (§27). No prompt or completion
 // semantics are included (§G10).
 type Features struct {
-	NetworkASN     string
-	NetworkType    string // residential / hosting / mobile / ...
-	RegionClass    string // coarse geographic region
-	ClientFamily   string // claude-code / python-sdk / ...
-	SDKFamily      string
-	HTTPVersion    string // "1.1", "2"
-	Streaming      string // "", "streaming", "non-streaming" (empty = unknown)
-	ModelFamily    string
+	NetworkASN         string
+	NetworkType        string // residential / hosting / mobile / ...
+	RegionClass        string // coarse geographic region
+	ClientFamily       string // claude-code / python-sdk / ...
+	SDKFamily          string
+	HTTPVersion        string // "1.1", "2"
+	Streaming          string // "", "streaming", "non-streaming" (empty = unknown)
+	ModelFamily        string
 	ConcurrencyPattern string // interactive / automation / burst / ...
-	EndpointFamily string
+	EndpointFamily     string
 }
 
 // has reports whether a feature atom is present (non-empty). Every feature is a
@@ -98,16 +98,17 @@ func (f Features) has(field string) bool {
 	}
 }
 
-// ClassificationThresholds carries the similarity cutoffs (policy-controlled).
+// ClassificationThresholds carries the similarity cutoffs (policy-controlled):
+// similarity >= Match → candidate existing lane; >= Related → related context /
+// candidate new lane; below Related → novel lane.
 type ClassificationThresholds struct {
-	Match    float64 // >= this → candidate existing lane
-	Related  float64 // >= this → related context / candidate new lane
-	Novel    float64 // < this → novel lane
+	Match   float64 // >= this → candidate existing lane
+	Related float64 // floor; below this → novel lane
 }
 
 // DefaultThresholds are the spec §26 example defaults.
 func DefaultThresholds() ClassificationThresholds {
-	return ClassificationThresholds{Match: 0.80, Related: 0.55, Novel: 0.55}
+	return ClassificationThresholds{Match: 0.80, Related: 0.55}
 }
 
 // Weights multiply per-feature similarity; they are renormalized over present

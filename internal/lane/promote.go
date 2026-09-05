@@ -5,12 +5,12 @@ import "time"
 // PromotionCriteria is the explicit policy a lane must satisfy to become
 // ESTABLISHED (§29, §8 of the spec's lane doc).
 type PromotionCriteria struct {
-	MinCleanAge        time.Duration
-	MinCleanRequests   int64
-	MinCleanActiveDays  int
+	MinCleanAge          time.Duration
+	MinCleanRequests     int64
+	MinCleanActiveDays   int
 	MaxEstablishmentRisk int
-	AllowNewLanes      bool // if false, new lanes stay NEW and never promote
-	AllowSuspicious    bool // if false, SUSPICIOUS lanes cannot promote
+	AllowNewLanes        bool // if false, new lanes stay NEW and never promote
+	AllowSuspicious      bool // if false, SUSPICIOUS lanes cannot promote
 }
 
 // DefaultPromotionCriteria returns conservative defaults. Options mirror the
@@ -18,12 +18,12 @@ type PromotionCriteria struct {
 // periods, risk below establishment threshold, no active high-confidence abuse.
 func DefaultPromotionCriteria() PromotionCriteria {
 	return PromotionCriteria{
-		MinCleanAge:         7 * 24 * time.Hour,
-		MinCleanRequests:    200,
-		MinCleanActiveDays:  3,
+		MinCleanAge:          7 * 24 * time.Hour,
+		MinCleanRequests:     200,
+		MinCleanActiveDays:   3,
 		MaxEstablishmentRisk: 15,
-		AllowNewLanes:       false,
-		AllowSuspicious:     false,
+		AllowNewLanes:        false,
+		AllowSuspicious:      false,
 	}
 }
 
@@ -60,6 +60,14 @@ func PromoteIfEligible(rec *LaneRecord, crit PromotionCriteria, now time.Time) (
 		return rec.State, false
 	}
 
+	// establishment_score tracks clean-history progress for the persisted
+	// LaneRecord row (§75): 100 at full criteria satisfaction, else the
+	// proportion of satisfied criteria.
+	cleanAge := age >= crit.MinCleanAge
+	cleanReqs := rec.RequestCount >= crit.MinCleanRequests
+	cleanRisk := rec.RiskScore <= crit.MaxEstablishmentRisk
+	rec.EstablishmentScore = 100 / 3 * (boolToInt(cleanAge) + boolToInt(cleanReqs) + boolToInt(cleanRisk))
+
 	if rec.State == StateNew {
 		rec.State = StateProbation
 		rec.Revision++
@@ -69,4 +77,11 @@ func PromoteIfEligible(rec *LaneRecord, crit PromotionCriteria, now time.Time) (
 	rec.State = StateEstablished
 	rec.Revision++
 	return rec.State, true
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }

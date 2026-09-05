@@ -20,8 +20,8 @@ const (
 
 // extracted holds the sealed credential plus the carrier that supplied it.
 type extracted struct {
-	secret     *secret.SealedSecret
-	carrier    CredentialCarrier
+	secret       *secret.SealedSecret
+	carrier      CredentialCarrier
 	credentialID string // reserved-internal id only after lookup; empty until then
 }
 
@@ -133,4 +133,3 @@ func StripSecretHeaders(headers map[string][]string) {
 		}
 	}
 }
-

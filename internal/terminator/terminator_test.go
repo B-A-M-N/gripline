@@ -1,6 +1,10 @@
 package terminator
 
 import (
+	"crypto/ed25519"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -62,6 +66,45 @@ func TestTamperedAssertionFails(t *testing.T) {
 	a, _ := signer.Issue(Claims{Subject: "s", Audience: "aud", JTI: "j"}, 30*time.Second)
 	if _, err := ParseAndVerify(a.Encode()+"x", signer.Public(), "aud", time.Now()); err == nil {
 		t.Fatal("tampered assertion must fail verification")
+	}
+}
+
+// Regression: the verifier must reject assertions minted by a different issuer
+// even when correctly signed with a trusted key (internal-identity spoofing).
+func TestWrongIssuerRejected(t *testing.T) {
+	signer, _ := GenerateSigner()
+	a, err := signer.Issue(Claims{Subject: "s", Audience: "aud", JTI: "j"}, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The issuer is forced to "gripline" on Issue; craft a foreign-issuer
+	// payload by re-signing claims with a different issuer value.
+	forged := Claims{Issuer: "other-service", Subject: "s", Audience: "aud", JTI: "j",
+		IssuedAt: time.Now().Unix(), ExpiresAt: time.Now().Add(30 * time.Second).Unix()}
+	payload, _ := json.Marshal(forged)
+	sig := ed25519.Sign(signer.priv, payload)
+	enc := base64.RawURLEncoding.EncodeToString(payload) + "." + base64.RawURLEncoding.EncodeToString(sig)
+	if _, err := ParseAndVerify(enc, signer.Public(), "aud", time.Now()); err != ErrWrongIssuer {
+		t.Fatalf("want ErrWrongIssuer, got %v", err)
+	}
+	_ = a
+}
+
+// Regression: a signed assertion claiming a lifetime beyond the supported TTL
+// bound must be rejected — defends against signer-key misuse minting
+// long-lived identities (INV-10 defense in depth).
+func TestOverTTLAssertionRejected(t *testing.T) {
+	signer, _ := GenerateSigner()
+	now := time.Now()
+	claims := Claims{
+		Issuer: "gripline", Subject: "s", CredID: "cred_1", Audience: "aud", JTI: "j",
+		IssuedAt: now.Add(-2 * time.Hour).Unix(), ExpiresAt: now.Unix(),
+	}
+	payload, _ := json.Marshal(claims)
+	sig := ed25519.Sign(signer.priv, payload)
+	enc := base64.RawURLEncoding.EncodeToString(payload) + "." + base64.RawURLEncoding.EncodeToString(sig)
+	if _, err := ParseAndVerify(enc, signer.Public(), "aud", now); err != ErrTTLTooLong {
+		t.Fatalf("want ErrTTLTooLong, got %v", err)
 	}
 }
 
@@ -129,7 +172,7 @@ func TestAdmitValidCredential(t *testing.T) {
 	term, raw := buildTerminator(t, credential.StatusNormal, nil)
 	out := term.Admit(bearerHeaders(raw), lane.Features{NetworkASN: "AS1"})
 	if !out.Authorized {
-		t.Fatalf("valid credential denied: %s", out.Reason)
+		t.Fatalf("valid credential denied: %s err=%v", out.Reason, out.DenialErr)
 	}
 	if out.Assertion == nil {
 		t.Fatal("authorized request must carry an internal assertion")
@@ -159,6 +202,89 @@ func TestAdmitRevokedCredential(t *testing.T) {
 	out := term.Admit(bearerHeaders(raw), lane.Features{})
 	if out.Authorized {
 		t.Fatal("revoked credential must never authenticate (INV-13)")
+	}
+}
+
+// Regression: quarantine must deny at authentication (§30), not ride through
+// to policy with a permissive lane.
+func TestAdmitQuarantinedCredentialDenied(t *testing.T) {
+	term, raw := buildTerminator(t, credential.StatusQuarantined, nil)
+	out := term.Admit(bearerHeaders(raw), lane.Features{})
+	if out.Authorized {
+		t.Fatal("quarantined credential must be denied at authentication (§30)")
+	}
+	if out.Reason != "credential_restricted" {
+		t.Fatalf("reason = %s, want credential_restricted", out.Reason)
+	}
+}
+
+// Regression: an expired credential record must fail authentication (§75).
+func TestAdmitExpiredCredentialDenied(t *testing.T) {
+	pep := &credential.PepperKey{Version: 1, Key: []byte("test-pepper")}
+	rawBytes := make([]byte, 32)
+	for i := range rawBytes {
+		rawBytes[i] = byte('a' + i%26)
+	}
+	raw := "sk-test-" + string(rawBytes)
+	sealed := secret.NewFromBytes([]byte(raw))
+	reg := credential.NewMemoryRegistry()
+	reg.Insert(&credential.CredentialRecord{
+		CredentialID: "cred_e", AccountID: "acct_1",
+		Verifier: credential.Verifier(sealed, pep), PepperVersion: 1,
+		Status:    credential.StatusNormal,
+		ExpiresAt: time.Now().Add(-time.Minute), // already expired
+		Revision:  1,
+	})
+	signer, _ := GenerateSigner()
+	term, err := New(Dependencies{
+		Registry: reg, Peppers: credential.NewPepperRing(pep),
+		Policy: policy.Default(), Signer: signer, Audience: "fi-inference",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := term.Admit(bearerHeaders(raw), lane.Features{})
+	if out.Authorized {
+		t.Fatal("expired credential must never authenticate (§75)")
+	}
+	if out.Reason != "credential_expired" {
+		t.Fatalf("reason = %s, want credential_expired", out.Reason)
+	}
+}
+
+// Regression: lane explosion is an attack signal and must fail closed (§28).
+func TestAdmitLaneExplosionDenied(t *testing.T) {
+	pep := &credential.PepperKey{Version: 1, Key: []byte("test-pepper")}
+	tc := makeCredentialWithStatus("cred_x", "acct_1", credential.StatusNormal, pep)
+	signer, _ := GenerateSigner()
+	store := lane.NewStore(func() lane.Limits {
+		return lane.Limits{MaxActiveLanesPerCredential: 2, LaneIdleExpiration: time.Hour}
+	}, time.Now)
+	term, err := New(Dependencies{
+		Registry: tc.reg, Peppers: credential.NewPepperRing(pep),
+		Lanes: store, Policy: policy.Default(), Signer: signer, Audience: "fi-inference",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Fill the two lane slots with distinct networks.
+	feats := []lane.Features{
+		{NetworkASN: "AS1", RegionClass: "r1"},
+		{NetworkASN: "AS2", RegionClass: "r2"},
+	}
+	for _, f := range feats {
+		out := term.Admit(bearerHeaders(tc.raw), f)
+		if !out.Authorized {
+			t.Fatalf("expected first lanes to authorize: %s", out.Reason)
+		}
+	}
+	// Third distinct network → explosion limit → deny (not silently allow).
+	out := term.Admit(bearerHeaders(tc.raw), lane.Features{NetworkASN: "AS3", RegionClass: "r3"})
+	if out.Authorized {
+		t.Fatal("lane explosion must fail closed (§28)")
+	}
+	if out.Reason != "lane_limit_exceeded" {
+		t.Fatalf("reason = %s, want lane_limit_exceeded", out.Reason)
 	}
 }
 
@@ -213,6 +339,40 @@ func TestAdmitReleasesLeaseOnCompletion(t *testing.T) {
 	if pool.Balance() != 1 {
 		t.Fatalf("after release balance = %d, want 1 (INV-15)", pool.Balance())
 	}
+}
+
+// Regression (INV-15 / §48): when assertion issuance fails after the lease is
+// acquired, the lease must be released — a failed admit must never leak a
+// concurrency slot permanently.
+func TestAdmitReleasesLeaseWhenIdentityFails(t *testing.T) {
+	pool := resource.NewConcurrencyPool(1)
+	pep := &credential.PepperKey{Version: 1, Key: []byte("test-pepper")}
+	tc := makeCredentialWithStatus("cred_l", "acct_1", credential.StatusNormal, pep)
+	term, err := New(Dependencies{
+		Registry: tc.reg, Peppers: credential.NewPepperRing(pep),
+		Policy:      policy.Default(),
+		Signer:      failingSigner{}, // identity issuance fails after lease acquisition
+		Audience:    "fi-inference",
+		Concurrency: &fakePool{pool},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := term.Admit(bearerHeaders(tc.raw), lane.Features{})
+	if out.Authorized {
+		t.Fatal("admit must fail when identity cannot be issued")
+	}
+	if pool.Balance() != 1 {
+		t.Fatalf("lease leaked on identity failure: balance = %d, want 1 (INV-15)", pool.Balance())
+	}
+}
+
+// failingSigner always fails to mint an assertion (§60: signer outage fails
+// closed).
+type failingSigner struct{}
+
+func (failingSigner) Issue(_ Claims, _ time.Duration) (*Assertion, error) {
+	return nil, errors.New("signer unavailable")
 }
 
 func TestAdmitStripsSecretAndZeroes(t *testing.T) {

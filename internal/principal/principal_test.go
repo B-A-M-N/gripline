@@ -24,11 +24,11 @@ func TestPrincipalNeverCarriesSecret(t *testing.T) {
 
 func TestAuthorizedContext(t *testing.T) {
 	ctx := AuthorizedContext{
-		Principal:         Principal{CredentialID: "cred_1"},
-		LaneID:            "lane_1",
-		LaneState:         "ESTABLISHED",
+		Principal:          Principal{CredentialID: "cred_1"},
+		LaneID:             "lane_1",
+		LaneState:          "ESTABLISHED",
 		AuthorizationScope: ScopeLane,
-		RiskState:         12,
+		RiskState:          12,
 	}
 	if ctx.AuthorizationScope != ScopeLane {
 		t.Fatalf("scope = %s, want LANE", ctx.AuthorizationScope)

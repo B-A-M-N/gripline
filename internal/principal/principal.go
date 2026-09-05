@@ -8,11 +8,11 @@ import "time"
 
 // Principal is the stable identity resolved from a verified credential.
 type Principal struct {
-	AccountID         string
-	CredentialID      string
-	PolicyID          string
-	PlanID            string
-	CredentialStatus  string // NORMAL / WATCH / CONSTRAINED / QUARANTINED / REVOKED
+	AccountID          string
+	CredentialID       string
+	PolicyID           string
+	PlanID             string
+	CredentialStatus   string // NORMAL / WATCH / CONSTRAINED / QUARANTINED / REVOKED
 	CredentialRevision int
 }
 
@@ -32,12 +32,12 @@ const (
 // risk. It is what the rest of the provider stack is authorized as — with no
 // raw external secret present anywhere.
 type AuthorizedContext struct {
-	Principal         Principal
-	LaneID            string
-	LaneState         string // NEW / PROBATION / ESTABLISHED / SUSPICIOUS / BLOCKED
+	Principal          Principal
+	LaneID             string
+	LaneState          string // NEW / PROBATION / ESTABLISHED / SUSPICIOUS / BLOCKED
 	AuthorizationScope Scope
-	RiskState         int // 0..100
-	AuthorizedAt      time.Time
+	RiskState          int // 0..100
+	AuthorizedAt       time.Time
 }
 
 // Resolver resolves a verified credential into a Principal. The terminator

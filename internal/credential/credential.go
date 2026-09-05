@@ -88,6 +88,34 @@ type Credential struct {
 	Revision     int
 }
 
+// CredentialExpiredError indicates the record's ExpiresAt has passed (§75).
+var CredentialExpiredError = errors.New("credential: expired")
+
+// Authenticatable reports whether a record in its current state may attempt
+// authentication: not revoked (INV-13), not quarantined (§30 — requests from a
+// quarantined credential are denied), and not expired (§75). Presentation of a
+// quarantined credential must fail authentication BEFORE any policy lookup, so
+// it cannot bypass credential-level policy (INV-6).
+func (rec *CredentialRecord) Authenticatable(now time.Time) error {
+	if rec == nil {
+		return UnknownError
+	}
+	switch rec.Status {
+	case StatusRevoked:
+		return RevokedError
+	case StatusQuarantined:
+		return CredentialQuarantinedError
+	}
+	if !rec.ExpiresAt.IsZero() && now.After(rec.ExpiresAt) {
+		return CredentialExpiredError
+	}
+	return nil
+}
+
+// CredentialQuarantinedError indicates authentication was attempted for a
+// quarantined credential (§30: requests from the affected scope are denied).
+var CredentialQuarantinedError = errors.New("credential: quarantined")
+
 // Verifier derives the stored verifier for a raw secret under a pepper key set.
 // The returned digest is what a CredentialStore persists and what lookup
 // compares against, sealed within the secret boundary.
@@ -107,16 +135,25 @@ type PepperKey struct {
 // introduces a newer one.
 type PepperRing struct {
 	active map[int][]byte
+	now    func() time.Time
 }
 
 // NewPepperRing builds a ring from one or more versions. A later version is
 // "active" for new verifiers; all versions remain valid for comparison.
 func NewPepperRing(versions ...*PepperKey) *PepperRing {
-	r := &PepperRing{active: make(map[int][]byte, len(versions))}
+	r := &PepperRing{active: make(map[int][]byte, len(versions)), now: time.Now}
 	for _, v := range versions {
 		if v != nil {
 			r.active[v.Version] = v.Key
 		}
+	}
+	return r
+}
+
+// WithClock injects a clock (tests).
+func (r *PepperRing) WithClock(now func() time.Time) *PepperRing {
+	if now != nil {
+		r.now = now
 	}
 	return r
 }
@@ -140,13 +177,13 @@ func (r *PepperRing) Latest() int {
 
 // Validate checks a presented secret against a stored record: it derives the
 // verifier with the pepper version recorded on the record and compares
-// constant-time. A revoked record fails (INV-13).
+// constant-time. Revoked and expired credentials fail (INV-13 + §75).
 func (r *PepperRing) Validate(presented *secret.SealedSecret, rec *CredentialRecord) (*Credential, error) {
 	if rec == nil || presented == nil || presented.Zeroed() {
 		return nil, UnknownError
 	}
-	if rec.Status == StatusRevoked {
-		return nil, RevokedError
+	if err := rec.Authenticatable(r.now()); err != nil {
+		return nil, err
 	}
 	key, ok := r.Get(rec.PepperVersion)
 	if !ok {
@@ -171,14 +208,14 @@ func (r *PepperRing) Validate(presented *secret.SealedSecret, rec *CredentialRec
 // Hysteresis holds the risk thresholds and dwell requirements governing
 // credential-state transitions. All values are policy-controlled.
 type Hysteresis struct {
-	WatchThresh          int           // risk >= this for >=2 obs → WATCH
-	ConstrainedThresh    int           // risk >= this → CONSTRAINED
-	QuarantineThresh     int           // risk >= this → QUARANTINED
-	ConstrainedDownThresh int          // risk < this for dwell → CONSTRAINED→WATCH
-	WatchDownThresh      int           // risk < this for dwell → WATCH→NORMAL
-	ConstrainedDwell     time.Duration // WATCH→CONSTRAINED→WATCH dwell
-	WatchDwell           time.Duration // WATCH→NORMAL dwell
-	WatchObs             int           // qualifying observations to enter WATCH
+	WatchThresh           int           // risk >= this for >=2 obs → WATCH
+	ConstrainedThresh     int           // risk >= this → CONSTRAINED
+	QuarantineThresh      int           // risk >= this → QUARANTINED
+	ConstrainedDownThresh int           // risk < this for dwell → CONSTRAINED→WATCH
+	WatchDownThresh       int           // risk < this for dwell → WATCH→NORMAL
+	ConstrainedDwell      time.Duration // WATCH→CONSTRAINED→WATCH dwell
+	WatchDwell            time.Duration // WATCH→NORMAL dwell
+	WatchObs              int           // qualifying observations to enter WATCH
 }
 
 // DefaultHysteresis returns the spec §31 example defaults.
@@ -235,6 +272,17 @@ func (m *StateMachine) Score() int { return m.score }
 func (m *StateMachine) Observe(score int) Status {
 	now := m.now()
 	m.score = clamp01(score)
+
+	// Direct escalation: a score at or above the quarantine threshold escalates
+	// immediately from any active state (spec §36: MANUAL_CONFIRMED_COMPROMISE
+	// = 100 quarantines; a low-confidence novelty signal must never). This
+	// honors the quarantine boundary without waiting through the ladder.
+	if m.status != StatusQuarantined && m.status != StatusRevoked && m.score >= m.hy.QuarantineThresh {
+		m.status = StatusQuarantined
+		m.belowSince = time.Time{}
+		m.lastScoreTime = now
+		return m.status
+	}
 
 	switch m.status {
 	case StatusNormal:

@@ -19,17 +19,17 @@ type RiskThresholds struct {
 
 // Limits captures hard resource limits per scope as policy.
 type Limits struct {
-	ConcurrencyCap     int
-	RequestBurstCap    int
-	TokenVelocityMult  float64
-	CostVelocityMult   float64
-	RequestRate        int // requests / minute
+	ConcurrencyCap    int
+	RequestBurstCap   int
+	TokenVelocityMult float64
+	CostVelocityMult  float64
+	RequestRate       int // requests / minute
 }
 
 // Learning controls baseline seeding (§29, §42).
 type Learning struct {
-	MaximumRisk       int
-	AllowNewLanes     bool
+	MaximumRisk          int
+	AllowNewLanes        bool
 	AllowSuspiciousLanes bool
 }
 
@@ -46,7 +46,7 @@ type Identity struct {
 
 // ScopedLimits are per-scope policy overrides (plan / credential / lane).
 type ScopedLimits struct {
-	Normal     Limits
+	Normal      Limits
 	Constrained Limits
 }
 
@@ -72,7 +72,7 @@ func Default() *Policy {
 		Revision: 1,
 		Risk:     RiskThresholds{Watch: 30, Constrained: 55, Quarantine: 80},
 		Limits: ScopedLimits{
-			Normal:     Limits{ConcurrencyCap: 32, RequestBurstCap: 64, TokenVelocityMult: 1.0, CostVelocityMult: 1.0, RequestRate: 300},
+			Normal:      Limits{ConcurrencyCap: 32, RequestBurstCap: 64, TokenVelocityMult: 1.0, CostVelocityMult: 1.0, RequestRate: 300},
 			Constrained: Limits{ConcurrencyCap: 2, RequestBurstCap: 8, TokenVelocityMult: 1.25, CostVelocityMult: 1.25, RequestRate: 20},
 		},
 		Learning: Learning{MaximumRisk: 20, AllowNewLanes: false, AllowSuspiciousLanes: false},
@@ -112,13 +112,13 @@ func (p *Policy) MaxIdentityTTLSeconds() int {
 // precedence outcomes (ordered highest → lowest). The evaluator returns the
 // most severe applicable denial, or nil.
 var (
-	ErrRevoked        = errors.New("policy: credential revoked")
-	ErrEmergencyBlock = errors.New("policy: emergency block")
-	ErrSourceBlock    = errors.New("policy: source block")
-	ErrAccountLimit   = errors.New("policy: account hard limit")
+	ErrRevoked         = errors.New("policy: credential revoked")
+	ErrEmergencyBlock  = errors.New("policy: emergency block")
+	ErrSourceBlock     = errors.New("policy: source block")
+	ErrAccountLimit    = errors.New("policy: account hard limit")
 	ErrCredentialLimit = errors.New("policy: credential hard limit")
-	ErrLaneLimit      = errors.New("policy: lane hard limit")
-	ErrRiskDenial     = errors.New("policy: risk-state restriction")
+	ErrLaneLimit       = errors.New("policy: lane hard limit")
+	ErrRiskDenial      = errors.New("policy: risk-state restriction")
 )
 
 // Evaluate is the enforcement-precedence resolver (§58). Callers feed a fully
@@ -153,11 +153,11 @@ func (p *Policy) Evaluate(in EvalInput) error {
 // EvalInput carries the state the fast path has resolved, before issuing an
 // internal identity.
 type EvalInput struct {
-	CredentialRevoked bool
-	Emergency         bool
-	SourceBlocked     bool
-	AccountOverLimit  bool
+	CredentialRevoked   bool
+	Emergency           bool
+	SourceBlocked       bool
+	AccountOverLimit    bool
 	CredentialOverLimit bool
-	LaneOverLimit     bool
-	RiskDenied        bool
+	LaneOverLimit       bool
+	RiskDenied          bool
 }

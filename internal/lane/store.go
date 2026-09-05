@@ -30,10 +30,10 @@ type GetConfig func() Limits
 // eviction (§28, §81 bounded memory). Overflow low-value variants are folded
 // into an overflow bucket instead of unbounded growth.
 type Store struct {
-	mu          sync.Mutex
-	cfg         GetConfig
-	now         func() time.Time
-	byCred      map[string]map[string]*LaneRecord // credentialID -> laneID -> record
+	mu     sync.Mutex
+	cfg    GetConfig
+	now    func() time.Time
+	byCred map[string]map[string]*LaneRecord // credentialID -> laneID -> record
 }
 
 // NewStore builds a Store. cfg may be nil (defaults apply).
@@ -96,9 +96,9 @@ func (s *Store) BorrowOrCreate(credID, newLaneID string, cand Features, th Class
 		// Compare against representative feature vector stored on the record;
 		// here we use the network/client/region classes persisted on the row.
 		rf := Features{
-			NetworkASN:     rec.NetworkClass,
-			RegionClass:    rec.RegionClass,
-			ClientFamily:   rec.ClientFamily,
+			NetworkASN:   rec.NetworkClass,
+			RegionClass:  rec.RegionClass,
+			ClientFamily: rec.ClientFamily,
 		}
 		if sim := Similarity(cand, rf); sim > bestSim {
 			bestSim = sim
@@ -134,7 +134,9 @@ func (s *Store) BorrowOrCreate(credID, newLaneID string, cand Features, th Class
 	}
 	m[newLaneID] = rec
 	s.evictIdleLocked()
-	return rec, true, nil
+	// Return a copy: the internal record must not escape the store's mutex.
+	c := *rec
+	return &c, true, nil
 }
 
 // evictIdleLocked removes lanes idle beyond the configured expiration.

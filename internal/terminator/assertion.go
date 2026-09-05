@@ -15,6 +15,14 @@ import (
 	"time"
 )
 
+// AssertionSigner is the seam the terminator uses to mint internal identity.
+// Indirected as an interface so production deployments can isolate the real
+// signer (HSM-backed, remote signer service) and rotation behind it (§21), and
+// so admission-failure paths are exercisable in tests.
+type AssertionSigner interface {
+	Issue(c Claims, ttl time.Duration) (*Assertion, error)
+}
+
 // Signer holds the Ed25519 key used to sign internal assertions. In production
 // the signer is isolated from the Internet-facing parser and keys support
 // rotation (§21).
@@ -30,11 +38,10 @@ func NewSigner(priv ed25519.PrivateKey) *Signer {
 
 // GenerateSigner produces a new random Ed25519 key.
 func GenerateSigner() (*Signer, error) {
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, fmt.Errorf("terminator: generate signer: %w", err)
 	}
-	_ = pub
 	return &Signer{priv: priv}, nil
 }
 
@@ -121,6 +128,9 @@ func ParseAndVerify(encoded string, pub ed25519.PublicKey, expectedAudience stri
 	if err := json.Unmarshal(payload, &c); err != nil {
 		return nil, ErrBadAssertion
 	}
+	if c.Issuer != assertionIssuer {
+		return nil, ErrWrongIssuer
+	}
 	if c.Audience != expectedAudience {
 		return nil, ErrWrongAudience
 	}
@@ -130,17 +140,32 @@ func ParseAndVerify(encoded string, pub ed25519.PublicKey, expectedAudience stri
 	if now.Unix() < c.IssuedAt-5 { // allow small clock skew; never future-mint
 		return nil, ErrNotYetValid
 	}
-	if c.CredID == "" {
+	// Defensive bound: a signed assertion claiming a lifetime beyond the
+	// maximum supported TTL is rejected even if correctly signed — protects
+	// against signer-key misuse minting long-lived identities.
+	if c.ExpiresAt-c.IssuedAt > maxAssertionTTLSeconds {
+		return nil, ErrTTLTooLong
+	}
+	if c.CredID == "" || c.JTI == "" {
 		return nil, ErrBadAssertion
 	}
 	return &c, nil
 }
 
+// assertionIssuer is the only issuer internal verifiers accept.
+const assertionIssuer = "gripline"
+
+// maxAssertionTTLSeconds is the defensive upper bound on accepted assertion
+// lifetimes (INV-10; matches Issue's hard cap of 60s).
+const maxAssertionTTLSeconds = 60
+
 // Errors returned by assertion verification.
 var (
 	ErrBadAssertion  = errors.New("terminator: bad assertion format")
 	ErrBadSignature  = errors.New("terminator: bad signature")
+	ErrWrongIssuer   = errors.New("terminator: wrong issuer")
 	ErrWrongAudience = errors.New("terminator: wrong audience (INV-11)")
 	ErrExpired       = errors.New("terminator: assertion expired (INV-10)")
 	ErrNotYetValid   = errors.New("terminator: assertion not yet valid")
+	ErrTTLTooLong    = errors.New("terminator: assertion TTL exceeds bound (INV-10)")
 )

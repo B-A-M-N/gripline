@@ -9,8 +9,8 @@
 //     formatting via %v / %s / %q cannot leak the raw bytes (INV-2);
 //   - it has no MarshalJSON / MarshalBinary / GobEncode, so no serializer can
 //     ship the raw bytes out of the boundary;
-//   - the only escape hatch, Digest, is a deliberate one-way transform (the
-//     pre-image for the keyed verifier computed in internal/credential). It
+//   - the only escape hatch, DigestHMAC, is the deliberate keyed one-way
+//     transform that derives the stored verifier (internal/credential). It
 //     never exposes the raw bytes.
 //
 // Zero() wipes the backing array so the raw representation does not survive
@@ -29,14 +29,15 @@ import (
 // non-serializing container.
 type SealedSecret struct {
 	// buf is owned exclusively by the SealedSecret. Unexported: nothing outside
-	// this package can read it except through the deliberate Digest operation.
+	// this package can read it except through the deliberate DigestHMAC
+	// operation.
 	buf []byte
 	// zeroed is set once Zero is applied. Operations on a zeroed secret fail.
 	zeroed bool
 }
 
-// domain constant passed to HMAC so the secret digest is separated from other
-// HMAC uses (e.g. the pepper-keyed verifier) in the same program.
+// digestDomain separates this HMAC use from every other HMAC in the program
+// (the pepper-keyed verifier derives under this exact domain).
 var digestDomain = []byte("gripline:secret:digest:v1")
 
 // NewFromBytes builds a SealedSecret from a caller-owned byte slice, copying
@@ -78,20 +79,11 @@ func (s *SealedSecret) Len() int {
 	return len(s.buf)
 }
 
-// Digest returns a one-way, domain-separated SHA-256-based digest of the raw
-// bytes without exposing them. The credential package composes this with the
-// pepper key to derive the stored verifier. Returns nil on a zeroed secret.
-func (s *SealedSecret) Digest() []byte {
-	if s == nil || s.zeroed {
-		return nil
-	}
-	sum := sha256.Sum256(s.buf)
-	return sum[:]
-}
-
-// DigestHMAC is a compact helper used by the verifier path to fold the secret
-// under a pepper key with HMAC-SHA256. It keeps the key-op and the secret
-// co-located inside the sealed boundary so neither is exposed.
+// DigestHMAC is the single deliberate transform on a sealed secret: fold the
+// raw bytes under a pepper key with HMAC-SHA256 to derive the verifier. It
+// keeps the key-op and the secret co-located inside the sealed boundary so
+// neither is exposed. The credential package composes this with the pepper ring
+// to derive/store/compare verifiers. Returns nil on a zeroed secret.
 func (s *SealedSecret) DigestHMAC(key []byte) []byte {
 	if s == nil || s.zeroed {
 		return nil

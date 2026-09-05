@@ -22,7 +22,7 @@ import (
 type Outcome struct {
 	RequestID  string
 	Authorized bool
-	Reason     string       // safe, non-secret denial/status reason
+	Reason     string // safe, non-secret denial/status reason
 	DenialErr  error
 	Principal  principal.Principal
 	Context    principal.AuthorizedContext
@@ -41,7 +41,7 @@ type Dependencies struct {
 	Peppers  *credential.PepperRing
 	Lanes    *lane.Store
 	Policy   *policy.Policy
-	Signer   *Signer
+	Signer   AssertionSigner
 	Audience string
 
 	RiskNow func() time.Time
@@ -62,7 +62,6 @@ type resourceController interface {
 type Terminator struct {
 	dep  Dependencies
 	rand func() string // injectable request-id generator for deterministic tests
-	seq  *seqGen
 }
 
 // New builds a Terminator and validates the critical seams.
@@ -88,7 +87,7 @@ func New(dep Dependencies) (*Terminator, error) {
 	if dep.LaneNow == nil {
 		dep.LaneNow = time.Now
 	}
-	return &Terminator{dep: dep, rand: newRequestID, seq: &seqGen{}}, nil
+	return &Terminator{dep: dep, rand: newRequestID}, nil
 }
 
 // seqGen is a concurrency-safe monotonic counter for request-id uniqueness.
@@ -156,21 +155,29 @@ func (t *Terminator) Admit(headers map[string][]string, feat lane.Features) *Out
 
 	laneID, laneRec, laneNew, lerr := t.classifyLane(cred.CredentialID, feat)
 	laneState := laneStateName(laneRec)
-	_ = lerr
-
-	// Policy gates with fixed precedence (§58): blocked lane → deny.
-	if !t.policyOk(laneRec, cred) {
+	// Lane explosion (§28) is an attack signal: fail closed, not open.
+	if lerr != nil {
 		out.Authorized = false
-		out.Reason = "denied_by_policy"
-		out.DenialErr = ErrorPolicyDenied
+		out.Reason = "lane_limit_exceeded"
+		out.DenialErr = lerr
 		return out
 	}
 
-	// Synchronous evidence + deterministic risk (§38).
+	// Policy gates with fixed precedence (§58). Synchronous evidence and risk
+	// are derived first so the risk-state gate sees the current request; the
+	// resolver then picks the most severe applicable denial, and a more
+	// permissive lower-level rule can never override it.
 	syncEv := t.synchronousEvidence(laneNew)
 	val := risk.Evaluate(syncEv, t.dep.RiskNow())
 	out.RiskAfter = val
 	out.Evidence = evCodes(syncEv)
+
+	if denial := t.evaluatePolicy(laneRec, cred, val); denial != nil {
+		out.Authorized = false
+		out.Reason = denialReason(denial)
+		out.DenialErr = denial
+		return out
+	}
 
 	ctx := principal.AuthorizedContext{
 		Principal:          prin,
@@ -194,16 +201,28 @@ func (t *Terminator) Admit(headers map[string][]string, feat lane.Features) *Out
 			return out
 		}
 		out.Lease = lease
+		// INV-15 / §48: a failure after lease acquisition must not leak the
+		// slot. If assertion issuance fails, release before returning.
+		assertion, err := t.issueAssertion(ctx, reqID, cred)
+		if err != nil {
+			lease.Release()
+			out.Lease = nil
+			out.Authorized = false
+			out.Reason = "internal_identity_failure"
+			out.DenialErr = err
+			return out
+		}
+		out.Assertion = assertion
+	} else {
+		assertion, err := t.issueAssertion(ctx, reqID, cred)
+		if err != nil {
+			out.Authorized = false
+			out.Reason = "internal_identity_failure"
+			out.DenialErr = err
+			return out
+		}
+		out.Assertion = assertion
 	}
-
-	assertion, err := t.issueAssertion(ctx, reqID, cred)
-	if err != nil {
-		out.Authorized = false
-		out.Reason = "internal_identity_failure"
-		out.DenialErr = err
-		return out
-	}
-	out.Assertion = assertion
 	out.Authorized = true
 	out.Reason = "authorized"
 	return out
@@ -211,12 +230,15 @@ func (t *Terminator) Admit(headers map[string][]string, feat lane.Features) *Out
 
 // SDK-facing errors.
 var (
-	ErrorPolicyDenied       = errors.New("terminator: denied by policy")
-	ErrorConcurrencyLimit   = errors.New("terminator: concurrency limit")
+	ErrorPolicyDenied     = errors.New("terminator: denied by policy")
+	ErrorConcurrencyLimit = errors.New("terminator: concurrency limit")
 )
 
 // authenticate derives the verifier under each active pepper version and
-// resolves the credential (INV-13: revoked never authenticates).
+// resolves the credential. INV-13 (revoked never authenticates), §30
+// (quarantined denied at authentication), and §75 (expired denied) all gate
+// BEFORE any lane/resource/policy state — a credential that fails its own gate
+// cannot ride on permissive downstream state (INV-6).
 func (t *Terminator) authenticate(presented *secret.SealedSecret) (*credential.Credential, error) {
 	latest := t.dep.Peppers.Latest()
 	if latest < 0 {
@@ -228,8 +250,8 @@ func (t *Terminator) authenticate(presented *secret.SealedSecret) (*credential.C
 	}
 	verifier := presented.DigestHMAC(key)
 	if rec, found := t.dep.Registry.FindByVerifier(verifier, latest); found {
-		if rec.Status == credential.StatusRevoked {
-			return nil, credential.RevokedError
+		if err := rec.Authenticatable(t.dep.RiskNow()); err != nil {
+			return nil, err
 		}
 		return credFrom(rec), nil
 	}
@@ -238,8 +260,8 @@ func (t *Terminator) authenticate(presented *secret.SealedSecret) (*credential.C
 		if k, ok := t.dep.Peppers.Get(v); ok {
 			vv := presented.DigestHMAC(k)
 			if rec, found := t.dep.Registry.FindByVerifier(vv, v); found {
-				if rec.Status == credential.StatusRevoked {
-					return nil, credential.RevokedError
+				if err := rec.Authenticatable(t.dep.RiskNow()); err != nil {
+					return nil, err
 				}
 				return credFrom(rec), nil
 			}
@@ -299,24 +321,65 @@ func safeTag(s string) string {
 	return b.String()
 }
 
-// policyOk applies fixed-precedence policy gates (§58): a BLOCKED lane denies.
-func (t *Terminator) policyOk(laneRec *lane.LaneRecord, _ *credential.Credential) bool {
-	return laneRec == nil || laneRec.State != lane.StateBlocked
+// evaluatePolicy applies the fixed-precedence enforcement resolver (§58). It
+// consults only the state the fast path has already resolved: credential status
+// (revoked/quarantined were already denied at authentication), lane state
+// (BLOCKED → lane hard denial), and the current risk score against the
+// policy's risk-state boundaries (§31 thresholds from policy, not constants).
+func (t *Terminator) evaluatePolicy(laneRec *lane.LaneRecord, cred *credential.Credential, riskScore int) error {
+	thresholds := t.dep.Policy.Risk
+	in := policy.EvalInput{
+		CredentialRevoked: cred.Status == credential.StatusRevoked,
+		// QUARANTINED credential → credential-scope denial (§30).
+		Emergency: cred.Status == credential.StatusQuarantined,
+		// A BLOCKED lane is a lane-scope hard denial (§24).
+		LaneOverLimit: laneRec != nil && laneRec.State == lane.StateBlocked,
+		// Risk-state restriction: risk at/above the policy's constrained
+		// boundary restricts; at/above quarantine denies outright.
+		RiskDenied: riskScore >= thresholds.Quarantine,
+	}
+	return t.dep.Policy.Evaluate(in)
+}
+
+// denialReason maps a policy denial to a safe external reason string (§70: no
+// detailed security reasoning is disclosed).
+func denialReason(err error) string {
+	switch {
+	case errors.Is(err, policy.ErrRevoked):
+		return "credential_revoked"
+	case errors.Is(err, policy.ErrEmergencyBlock):
+		return "credential_restricted"
+	case errors.Is(err, policy.ErrSourceBlock):
+		return "source_restricted"
+	case errors.Is(err, policy.ErrAccountLimit):
+		return "rate_limit"
+	case errors.Is(err, policy.ErrCredentialLimit):
+		return "rate_limit"
+	case errors.Is(err, policy.ErrLaneLimit):
+		return "lane_restricted"
+	case errors.Is(err, policy.ErrRiskDenial):
+		return "temporarily_restricted"
+	default:
+		return "denied_by_policy"
+	}
 }
 
 func safeReason(err error) string {
 	if err == nil {
 		return ""
 	}
-	switch err {
-	case credential.RevokedError:
+	switch {
+	case errors.Is(err, credential.RevokedError):
 		return "credential_revoked"
-	case credential.UnknownError:
+	case errors.Is(err, credential.CredentialQuarantinedError):
+		return "credential_restricted"
+	case errors.Is(err, credential.CredentialExpiredError):
+		return "credential_expired"
+	case errors.Is(err, credential.UnknownError):
 		return "invalid_credential"
+	case isExtractionError(err):
+		return "invalid_authentication"
 	default:
-		if isExtractionError(err) {
-			return "invalid_authentication"
-		}
 		return "denied"
 	}
 }
@@ -344,15 +407,31 @@ func (t *Terminator) issueAssertion(ctx principal.AuthorizedContext, reqID strin
 }
 
 // synchronousEvidence derives the minimal request-shaped evidence for the MVP:
-// a novelty signal when a new lane was first observed.
+// a novelty signal when a new lane was first observed. Evidence parameters come
+// from the versioned evidence table — not hardcoded — so policy tuning applies
+// (§38: offline recommendations become explicit versioned policy before they
+// affect authorization).
 func (t *Terminator) synchronousEvidence(laneNew bool) []evidence.Evidence {
 	if !laneNew {
 		return nil
 	}
 	now := t.dep.RiskNow()
+	rule, ok := evidence.DefaultTable()["NEW_LANE"]
+	if !ok {
+		// The table removed the rule → no evidence; never invent parameters here.
+		return nil
+	}
 	return []evidence.Evidence{{
-		Code: "NEW_LANE", Family: evidence.FamilyClientNovelty, Scope: evidence.ScopeLane,
-		Score: 5, Confidence: 40, CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour),
+		EvidenceID:     t.rand(),
+		Code:           rule.Code,
+		Family:         rule.Family,
+		Scope:          rule.Scope,
+		Score:          rule.Score,
+		Severity:       rule.Severity,
+		Confidence:     rule.Confidence,
+		CreatedAt:      now,
+		ExpiresAt:      now.Add(rule.TTL),
+		PolicyRevision: t.dep.Policy.Revision,
 	}}
 }
 

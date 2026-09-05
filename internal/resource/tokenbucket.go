@@ -11,14 +11,14 @@ import (
 // unavailable-tokens (what's been spent); Take decrements, Return
 // increments, never below 0.
 type TokenBucket struct {
-	mu        sync.Mutex
-	now       func() time.Time
-	capacity  float64
-	refillPer float64 // per refill interval
-	refillIn  time.Duration
-	balance   float64 // spent/unavailable amount (0..capacity)
+	mu         sync.Mutex
+	now        func() time.Time
+	capacity   float64
+	refillPer  float64 // per refill interval
+	refillIn   time.Duration
+	balance    float64 // spent/unavailable amount (0..capacity)
 	lastRefill time.Time
-	revision  int
+	revision   int
 }
 
 // NewTokenBucket creates a bucket with the given capacity and rate.

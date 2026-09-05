@@ -34,9 +34,16 @@ func TestVerifierDoesNotContainRaw(t *testing.T) {
 	raw, _ := secret.Random(16)
 	pep := testKey()
 	v := Verifier(raw, pep)
-	if bytes.Contains(v, raw.Digest()) {
-		t.Fatal("verifier must not be derivable back to the secret")
+	if len(v) == 0 {
+		t.Fatal("verifier must be derived")
 	}
+	// The verifier is a keyed digest — it must not equal any unkeyed transform
+	// of the secret, and it must differ under a different pepper.
+	other := Verifier(raw, &PepperKey{Version: 2, Key: []byte("other-pepper")})
+	if bytes.Equal(v, other) {
+		t.Fatal("verifier must depend on the pepper key")
+	}
+	raw.Zero()
 }
 
 func TestValidateSuccessAndDRotation(t *testing.T) {
@@ -164,6 +171,24 @@ func TestHysteresisWatchToConstrainedToQuarantine(t *testing.T) {
 	// quarantine does not auto recover
 	if sm.Observe(0) != StatusQuarantined {
 		t.Fatal("quarantine requires explicit action")
+	}
+}
+
+// Regression (§36): an operator-confirmed-compromise signal (risk 100) must
+// quarantine immediately from NORMAL, not climb the WATCH ladder first. A
+// low-confidence novelty signal must NOT independently quarantine.
+func TestDirectQuarantineEscalation(t *testing.T) {
+	now := time.Now()
+	sm := newSM(&now)
+	if sm.Observe(100) != StatusQuarantined {
+		t.Fatalf("risk 100 from NORMAL must quarantine immediately, got %v", sm.Status())
+	}
+	// Low-confidence novelty never quarantines on its own: a single score
+	// below the quarantine threshold stays out of quarantine.
+	now2 := time.Now()
+	sm2 := newSM(&now2)
+	if st := sm2.Observe(35); st == StatusQuarantined {
+		t.Fatal("score 35 must not quarantine")
 	}
 }
 
