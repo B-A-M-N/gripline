@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/B-A-M-N/gripline/internal/credential"
+	"github.com/B-A-M-N/gripline/internal/control"
 	"github.com/B-A-M-N/gripline/internal/evidence"
 	"github.com/B-A-M-N/gripline/internal/lane"
 	"github.com/B-A-M-N/gripline/internal/policy"
@@ -108,6 +109,12 @@ type Dependencies struct {
 	// SourceID keys the SOURCE scope (network origin). Empty disables the SOURCE
 	// scope in multi-scope provisioning. Default: "" (SOURCE skipped).
 	SourceID string
+
+	// Control is an OPTIONAL operator control plane (P0.39-P0.41). When set, the
+	// admission pipeline consults it: EMERGENCY_LOCKDOWN denies NEW lane creation
+	// and throttles traffic, and every decision is written to its audit trail
+	// (P0.35). Nil disables both. Keep it nil unless a control plane is wired.
+	Control *control.ControlPlane
 }
 
 // resourceController abstracts concurrency admission per scope.
@@ -251,6 +258,23 @@ func (t *Terminator) Admit(headers map[string][]string, feat lane.Features) *Out
 	// Record last-seen on successful authentication (P0.22). Analytics-grade and
 	// best-effort; must never influence the authorization outcome.
 	markLastSeen(t.dep.Registry, cred.CredentialID, now)
+
+	// Audit each decision once, at exit, from the fully-populated outcome
+	// (P0.35). Non-secret fields only; the audit trail never sees a raw secret
+	// or the internal assertion (INV-3).
+	if t.dep.Control != nil {
+		credID, acctID := cred.CredentialID, cred.AccountID
+		defer func() {
+			t.dep.Control.RecordAdmission(control.Event{
+				RequestID:    out.RequestID,
+				CredentialID: credID,
+				AccountID:    acctID,
+				LaneID:       out.Context.LaneID,
+				Authorized:   out.Authorized,
+				Reason:       out.Reason,
+			})
+		}()
+	}
 
 	// 3. Policy binding.
 	if cred.PolicyID != t.pol.ID {
@@ -432,6 +456,24 @@ func (t *Terminator) Admit(headers map[string][]string, feat lane.Features) *Out
 		out.RiskAfter = effectiveRisk
 		out.Evidence = evidenceCodes
 		out.Adaptive = adaptiveForObservation
+		return out
+	}
+
+	// Emergency-lockdown gate (P0.40/P0.41): in EMERGENCY_LOCKDOWN the operator
+	// switch denies NEW lane creation outright (reduce attack surface immediately)
+	// while ESTABLISHED lanes and persisted restrictions remain in force. The
+	// authoritative risk observation above still ran (so elevation is durable even
+	// during the firefight); only NEW lanes are refused.
+	if laneNew && t.dep.Control != nil && t.dep.Control.InEmergency() {
+		out.Authorized = false
+		out.Reason = "emergency_lockdown"
+		out.DenialErr = ErrorEmergencyLockdown
+		out.CredentialRisk = credentialRisk
+		out.LaneRisk = laneRisk
+		out.RiskAfter = effectiveRisk
+		out.Evidence = evidenceCodes
+		out.Adaptive = adaptiveForObservation
+		out.Degraded = adaptiveForObservation == AdaptiveDegraded
 		return out
 	}
 
@@ -772,6 +814,9 @@ var (
 	// ErrorLaneBlocked is returned when a lane's risk-driven security status is
 	// BLOCKED (lane-scoped block, P0.7).
 	ErrorLaneBlocked = errors.New("terminator: lane blocked")
+	// ErrorEmergencyLockdown is returned when the operator control plane is in
+	// EMERGENCY_LOCKDOWN and the request demands a NEW lane (P0.40).
+	ErrorEmergencyLockdown = errors.New("terminator: emergency lockdown denies new lanes")
 )
 
 // authenticate derives the verifier under each active pepper version and
