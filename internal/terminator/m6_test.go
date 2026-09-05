@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/B-A-M-N/gripline/internal/anomaly"
 	"github.com/B-A-M-N/gripline/internal/control"
 	"github.com/B-A-M-N/gripline/internal/credential"
 	"github.com/B-A-M-N/gripline/internal/evidence"
@@ -139,5 +140,68 @@ func TestControlPlaneAuditTrailRecordsDecisions(t *testing.T) {
 	}
 	if !admissionDenied {
 		t.Fatal("P0.35: audit trail must record the lockdown denial")
+	}
+}
+
+// TestM6SprayDetectorPersistsEvidence proves the P0.67 wiring: with a Spray
+// detector configured, a credential that establishes many distinct ASNs within
+// the window persists MORE_THAN_3_UNRELATED_ASNS_IN_10_MIN evidence into the
+// store (across admissions), while the current request's lane risk is not
+// inflated by that credential-scoped signal.
+func TestM6SprayDetectorPersistsEvidence(t *testing.T) {
+	reg := credential.NewMemoryRegistry()
+	pep := &credential.PepperKey{Version: 1, Key: []byte("m6-pepper-spray")}
+	rawBytes := make([]byte, 32)
+	for i := range rawBytes {
+		rawBytes[i] = byte('s' + i%26)
+	}
+	raw := "sk-m6-spray-" + string(rawBytes)
+	sealed := secret.NewFromBytes([]byte(raw))
+	if err := reg.Insert(&credential.CredentialRecord{
+		CredentialID: "cred_m6s", AccountID: "acct_1",
+		Verifier: credential.Verifier(sealed, pep), VerifierVersion: 1, PepperVersion: 1,
+		Status:    credential.StatusNormal,
+		PolicyID:  "fi-default-v1", PlanID: "plan-a",
+		CreatedAt: time.Now().Add(-time.Hour), Revision: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	signer, _ := GenerateSigner()
+	store := evidence.NewMemoryStore()
+	spray := anomaly.NewDetector(func() time.Time { return time.Now() }, nil, anomaly.DefaultThresholds())
+	term, err := New(Dependencies{
+		Registry: reg, Peppers: credential.MustPepperRing(pep),
+		Lanes:    lane.NewStore(nil, time.Now),
+		Policy:   policy.Default(),
+		Signer:   signer,
+		Audience: "fi-inference",
+		Evidence: store,
+		Resource: resource.NewGovernor(nil),
+		SourceID: "src-m6",
+		Spray:    spray,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Establish 5 distinct ASNs for the same credential; the 4th+ crosses the
+	// spray threshold and must persist the evidence.
+	for _, asn := range []string{"AS1", "AS2", "AS3", "AS4", "AS5"} {
+		feat := lane.Features{NetworkASN: asn, NetworkType: "residential", RegionClass: "us"}
+		out := term.Admit(bearerHeaders(raw), feat)
+		if !out.Authorized {
+			t.Fatalf("spray-establish request on %s should authorize: %s", asn, out.Reason)
+		}
+	}
+
+	snap, _ := store.Snapshot([]evidence.SubjectKey{{Scope: evidence.ScopeCredential, ID: "cred_m6s"}}, time.Now())
+	found := false
+	for _, e := range snap {
+		if e.Code == "MORE_THAN_3_UNRELATED_ASNS_IN_10_MIN" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("P0.67: credential ASN-spray evidence must be persisted by the terminator's detector")
 	}
 }

@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/B-A-M-N/gripline/internal/anomaly"
 	"github.com/B-A-M-N/gripline/internal/credential"
 	"github.com/B-A-M-N/gripline/internal/control"
 	"github.com/B-A-M-N/gripline/internal/evidence"
@@ -115,6 +116,12 @@ type Dependencies struct {
 	// and throttles traffic, and every decision is written to its audit trail
 	// (P0.35). Nil disables both. Keep it nil unless a control plane is wired.
 	Control *control.ControlPlane
+
+	// Spray is an OPTIONAL source-spray / velocity detector (P0.67). When set,
+	// each admission observes (SourceID, credential, feature ASN) and any spray
+	// signature that crosses its window threshold is minted into the evidence
+	// store — feeding the risk engine. Nil disables (no spray evidence).
+	Spray *anomaly.Detector
 }
 
 // resourceController abstracts concurrency admission per scope.
@@ -297,17 +304,33 @@ func (t *Terminator) Admit(headers map[string][]string, feat lane.Features) *Out
 		return out
 	}
 
-	// 5. Mint synchronous evidence (P0.4) and persist it. Multiplex NO other
-	// evidence producer here yet — NEW_LANE is the only synchronous signal the
-	// core mints today; source-spray/velocity producers are wired in M6 (P0.67).
+	// 5. Mint synchronous evidence (P0.4) and persist it. NEW_LANE is the
+	// synchronous lane-establishment signal; an optional source-spray detector
+	// (P0.67) contributes its signature evidence when a threshold crosses.
+	//
+	// SCOPING (P0.11): syncEv is the lane-scoped evidence that feeds THIS
+	// request's lane-risk evaluation (dedup'd into the lane snapshot below).
+	// Spray evidence is CREDENTIAL/SOURCE-scoped — it is a pattern observed OVER
+	// TIME, not an instantaneous per-request signal — so it is persisted for
+	// future credential/source snapshots but NOT folded into the current request's
+	// lane evaluation set (risk.Evaluate scores whatever it's given regardless of
+	// scope, so mixing scopes here would over-attribute a credential-spray to the
+	// lane).
 	syncEv := t.synchronousEvidence(laneNew, laneID)
-	if len(syncEv) > 0 && t.dep.Evidence != nil {
+	var persistOnly []evidence.Evidence
+	if t.dep.Spray != nil {
+		if sp := t.dep.Spray.Observe(t.dep.SourceID, cred.CredentialID, feat.NetworkASN, now); len(sp) > 0 {
+			persistOnly = sp
+		}
+	}
+	if (len(syncEv) > 0 || len(persistOnly) > 0) && t.dep.Evidence != nil {
 		// Append is an observation, not enforcement. A failure neither fails
 		// open nor is conflated with a snapshot outage (P0.3): evaluation never
 		// depends on read-after-write, so the per-request evidence is still
 		// evaluated below via the synchronous dedup path whether or not the
 		// append landed.
-		_ = t.dep.Evidence.Append(syncEv...)
+		allEv := append(append([]evidence.Evidence{}, syncEv...), persistOnly...)
+		_ = t.dep.Evidence.Append(allEv...)
 	}
 
 	// 6. Snapshot evidence by subject (credential + lane INDEPENDENTLY, with
