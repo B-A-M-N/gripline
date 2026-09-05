@@ -172,3 +172,54 @@ func (r *Ring) mustDerive(t *testing.T, family Family, raw []byte) string {
 	}
 	return v
 }
+
+// --- P0.38: key-bearing structs never format secret bytes --------------------
+
+func TestKeyFormatRedacts(t *testing.T) {
+	k := Key{Version: 1, Secret: []byte("super-secret-pseudonym-material")}
+	for _, s := range []string{k.String(), k.GoString()} {
+		if contains(s, "super-secret") || contains(s, "material") {
+			t.Fatalf("P0.38: Key formatting leaked bytes: %q", s)
+		}
+	}
+	if got := k.String(); got != "<redacted>" {
+		t.Fatalf("P0.38: Key.String() = %q, want <redacted>", got)
+	}
+}
+
+// --- P0.37: derive output carries the key version for storage continuity -----
+
+func TestDeriveOutputIsVersionPrefixed(t *testing.T) {
+	k := &Key{Version: 3, Secret: []byte("some-key")}
+	r, err := NewRing(k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := r.Derive(FamilySource, []byte("1.2.3.4"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasPrefix(out, "v3.") {
+		t.Fatalf("P0.37: derive output %q must carry the key version prefix v3.", out)
+	}
+	// Verify must still match despite the prefix.
+	if !r.Verify(FamilySource, []byte("1.2.3.4"), out) {
+		t.Fatal("P0.37: Verify must match a version-prefixed derive output")
+	}
+}
+
+func contains(s, sub string) bool {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}
+
+func hasPrefix(s, p string) bool {
+	if len(s) < len(p) {
+		return false
+	}
+	return s[:len(p)] == p
+}

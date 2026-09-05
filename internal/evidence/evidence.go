@@ -132,10 +132,31 @@ func (e Evidence) Valid(now time.Time) bool {
 	if !e.ExpiresAt.IsZero() && e.ExpiresAt.Before(e.CreatedAt) {
 		return false // impossible TTL
 	}
-	if !e.ExpiresAt.IsZero() && e.ExpiresAt.Before(now) {
+	// Expiry is inclusive-invalid: evidence is expired exactly AT ExpiresAt
+	// (now == ExpiresAt fails), matching credential/assertion semantics (P0.14).
+	if !e.ExpiresAt.IsZero() && !now.Before(e.ExpiresAt) {
 		return false // expired evidence no longer counts (§37)
 	}
 	return true
+}
+
+// NonEvictable reports whether an evidence item is in a security-critical class
+// that must survive generic eviction pressure (P0.12): operator IOC
+// (manual compromise, explicit block, operator hold) and non-expiring security
+// evidence. The store's bounded-fifo compaction MUST NOT drop these.
+func (e Evidence) NonEvictable() bool {
+	// FamilyOperatorIOC evidence (MANUAL_CONFIRMED_COMPROMISE, operator-hold
+	// blocks) is manual/operator-authored and non-expiring; it is authoritative
+	// and must never be evicted by low-value churn.
+	if e.Family == FamilyOperatorIOC {
+		return true
+	}
+	// Explicit non-expiring security evidence is retained until a lifecycle
+	// action revokes it; generic eviction must not silently drop it.
+	if e.ExpiresAt.IsZero() {
+		return true
+	}
+	return false
 }
 
 // Mint is the ONLY sanctioned way to produce evidence for the risk engine

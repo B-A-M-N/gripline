@@ -332,7 +332,7 @@ func TestFindByVerifierDefensivelyRechecks(t *testing.T) {
 	if err := reg.Insert(&CredentialRecord{
 		CredentialID: "cred_d", AccountID: "a",
 		Verifier: Verifier(raw, pep), PepperVersion: pep.Version,
-		Status: StatusNormal, Revision: 1,
+		VerifierVersion: 1, Status: StatusNormal, Revision: 1,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -362,12 +362,14 @@ func TestConflictingVerifierOwnershipRejected(t *testing.T) {
 	ver := Verifier(raw, pep)
 	reg := NewMemoryRegistry()
 	if err := reg.Insert(&CredentialRecord{
-		CredentialID: "cred_a", Verifier: ver, PepperVersion: 1, Status: StatusNormal,
+		CredentialID: "cred_a", Verifier: ver, PepperVersion: 1,
+		VerifierVersion: 1, Status: StatusNormal, Revision: 1,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := reg.Insert(&CredentialRecord{
-		CredentialID: "cred_b", Verifier: ver, PepperVersion: 1, Status: StatusNormal,
+		CredentialID: "cred_b", Verifier: ver, PepperVersion: 1,
+		VerifierVersion: 1, Status: StatusNormal, Revision: 1,
 	}); err != ErrVerifierOwned {
 		t.Fatalf("want ErrVerifierOwned, got %v", err)
 	}

@@ -1,3 +1,7 @@
+// Package terminator orchestrates the credential-termination admission flow
+// (spec §53) and issues the short-lived, audience-bound internal assertion that
+// authenticates toward protected services (spec §20-21, INV-10, INV-11). No raw
+// external secret ever leaves this boundary into the assertion or downstream.
 package terminator
 
 import (
@@ -7,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/B-A-M-N/gripline/internal/credential"
@@ -30,9 +35,18 @@ type Outcome struct {
 	Context    principal.AuthorizedContext
 	Assertion  *Assertion
 	Lease      *resource.LeaseHandle // non-nil when authorized; proxy releases on completion
-	RiskAfter  int
-	Evidence   []string // evidence codes that contributed (explainability)
+	RiskAfter  int                    // effectiveRisk = max(credentialRisk, laneRisk)
+	Evidence   []string              // evidence codes that contributed (explainability)
 	LaneNew    bool
+	// Degraded reports that the decision ran in AdaptiveDegraded posture: some
+	// authoritative history/state was unavailable, so the outcome preserved
+	// persisted restrictions rather than transitioning (P0.1).
+	Degraded bool
+	// Adaptive is the adaptive-state posture for this request's observation.
+	Adaptive AdaptiveStateStatus
+	// CredentialRisk and LaneRisk expose the independently computed scores.
+	CredentialRisk int
+	LaneRisk       int
 }
 
 // Mode is the explicit deployment posture (P0.6). Each mode declares which
@@ -56,12 +70,13 @@ const (
 // lives behind these interfaces (spec §66-69) so the security core stays
 // agnostic.
 type Dependencies struct {
-	Registry credential.Registry
-	Peppers  *credential.PepperRing
-	Lanes    *lane.Store
-	Policy   *policy.Policy
-	Signer   AssertionSigner
-	Audience string
+	Registry  credential.Registry
+	Peppers   *credential.PepperRing
+	Lanes     *lane.Store
+	Policy    *policy.Policy
+	Signer    AssertionSigner
+	Audience  string
+	Evidence  evidence.Store // persistent evidence store; nil means no persistence
 
 	// Mode selects the required-dependency contract. Zero value "" is treated
 	// as ModeTerminate (the minimum posture) with a validation of the same
@@ -80,8 +95,11 @@ type Dependencies struct {
 }
 
 // resourceController abstracts concurrency admission per scope.
+// The maxConcurrency parameter is the current cap for this scope — used so
+// constrained credentials (cap 2) can be blocked even if existing leases are
+// still active (new admissions respect the lower cap).
 type resourceController interface {
-	Acquire(scope string) *resource.LeaseHandle
+	Acquire(scope string, maxConcurrency int) *resource.LeaseHandle
 }
 
 // Terminator is the credential-termination admission engine.
@@ -94,6 +112,8 @@ type Terminator struct {
 	// re-configuration (New). It bounds the blast radius of the mutable public
 	// config object until a compiled/immutable policy type lands.
 	pol policy.Policy
+	// pruneCounter triggers pruning every N admissions (optimization only).
+	pruneCounter atomic.Int64
 }
 
 // New builds a Terminator and validates the critical seams for the requested
@@ -116,9 +136,6 @@ func New(dep Dependencies) (*Terminator, error) {
 		return nil, errors.New("terminator: audience required (INV-11)")
 	}
 	if !dep.Policy.IsValid() {
-		// §57: the data plane loads only authenticated + validated policy. An
-		// invalid revision (bad threshold ordering, TTL out of bounds) must
-		// fail construction, not silently enforce garbage.
 		return nil, errors.New("terminator: policy revision invalid (§57)")
 	}
 	switch dep.Mode {
@@ -131,6 +148,14 @@ func New(dep Dependencies) (*Terminator, error) {
 		if dep.Concurrency == nil {
 			return nil, errors.New("terminator: ENFORCE mode requires a hard concurrency controller (fail-closed config)")
 		}
+		// P0.2: adaptive security state is REQUIRED in ENFORCE. Without an
+		// evidence backend, every request would evaluate risk=0 and a persisted
+		// constrained credential could relax — silently disabling adaptive
+		// security. ENFORCE-without-adaptive-state is explicitly NOT a supported
+		// mode; use ModeTerminate if no adaptive state is intended.
+		if dep.Evidence == nil {
+			return nil, errors.New("terminator: ENFORCE mode requires an evidence/adaptive-state backend (P0.2)")
+		}
 	default:
 		return nil, fmt.Errorf("terminator: unknown mode %q", dep.Mode)
 	}
@@ -140,7 +165,11 @@ func New(dep Dependencies) (*Terminator, error) {
 	if dep.LaneNow == nil {
 		dep.LaneNow = time.Now
 	}
-	return &Terminator{dep: dep, rand: newRequestID, pol: *dep.Policy}, nil
+	return &Terminator{
+		dep:  dep,
+		rand: newRequestID,
+		pol:  *dep.Policy,
+	}, nil
 }
 
 // newRequestID returns a unique, non-secret request id (§71): 128 bits of
@@ -150,27 +179,42 @@ func New(dep Dependencies) (*Terminator, error) {
 func newRequestID() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		// CSPRNG unavailable is a process-fatal condition; fail closed.
 		panic("terminator: entropy unavailable for request id: " + err.Error())
 	}
 	return "req_" + base64.RawURLEncoding.EncodeToString(b[:])
 }
 
-// Admit runs the fast-path admission flow (spec §53) for a request's secret
-// carriers and normalized feature set. The returned Outcome carries the
-// AuthorizedContext (no secret) and, when authorized, the signed internal
-// assertion plus the concurrency lease for the proxy to release on completion.
+// Admit runs the admission-state pipeline (P0.10) for a request's secret
+// carriers and normalized feature set. The ordering is:
+//
+//   1. extract → strip → authenticate → policy binding → classify lane
+//   2. mint evidence → persist (fail silently if store unavailable)
+//   3. snapshot stored evidence (per-scope) → combine with per-request sync
+//      evidence (only if append failed / store nil) for evaluation
+//   4. compute credential risk + lane risk independently
+//   5. security observation: update credential state (observe + CAS + rollback)
+//   6. QUARANTINED → deny
+//   7. select resource limits based on resulting credential state
+//   8. security observation: update lane risk score (every admission)
+//   9. policy enforcement with updated state
+//  10. hard concurrency admission (cap-aware)
+//  11. issue internal identity (assertion)
+//  12. record clean authorized activity + lane promotion (authorized only)
+//  13. periodic evidence pruning (optimization)
+//  14. authorize
+//
+// The returned Outcome carries the AuthorizedContext (no secret) and, when
+// authorized, the signed internal assertion plus the concurrency lease.
 //
 // On exit the presented secret is always zeroed (deferred), regardless of
 // outcome (INV-3).
 func (t *Terminator) Admit(headers map[string][]string, feat lane.Features) *Outcome {
 	reqID := t.rand()
+	now := t.dep.RiskNow()
 	out := &Outcome{RequestID: reqID}
 
+	// 1. Extract and strip.
 	presented, _, err := ExtractExternalCredential(headers)
-	// Strip secret headers immediately after the extraction attempt, in every
-	// outcome, so no downstream view (including an error path) carries them (§18,
-	// INV-12). This runs before the error return below.
 	StripSecretHeaders(headers)
 	if err != nil {
 		out.Authorized = false
@@ -178,9 +222,9 @@ func (t *Terminator) Admit(headers map[string][]string, feat lane.Features) *Out
 		out.DenialErr = err
 		return out
 	}
-	// The raw secret lives only within this call and is destroyed on exit.
 	defer presented.Zero()
 
+	// 2. Authenticate.
 	cred, err := t.authenticate(presented)
 	if err != nil {
 		out.Authorized = false
@@ -188,12 +232,11 @@ func (t *Terminator) Admit(headers map[string][]string, feat lane.Features) *Out
 		out.DenialErr = err
 		return out
 	}
+	// Record last-seen on successful authentication (P0.22). Analytics-grade and
+	// best-effort; must never influence the authorization outcome.
+	markLastSeen(t.dep.Registry, cred.CredentialID, now)
 
-	// Policy binding (P0.5): the credential must resolve under the policy
-	// revision this terminator was constructed with. A credential pointing at
-	// a different policy id must not be evaluated under the wrong (possibly
-	// more permissive) policy — it fails closed here until the process loads
-	// that policy revision.
+	// 3. Policy binding.
 	if cred.PolicyID != t.pol.ID {
 		out.Authorized = false
 		out.Reason = "policy_unavailable"
@@ -201,19 +244,8 @@ func (t *Terminator) Admit(headers map[string][]string, feat lane.Features) *Out
 		return out
 	}
 
-	prin := principal.Principal{
-		AccountID:          cred.AccountID,
-		CredentialID:       cred.CredentialID,
-		PolicyID:           cred.PolicyID,
-		PlanID:             cred.PlanID,
-		CredentialStatus:   cred.Status.String(),
-		CredentialRevision: cred.Revision,
-	}
-
+	// 4. Classify lane.
 	laneID, laneRec, laneNew, lerr := t.classifyLane(cred.CredentialID, feat)
-	laneState := laneStateName(laneRec)
-	// Lane explosion (§28) and lane-id collisions (§24, insert-only) are attack
-	// signals: fail closed, not open.
 	if lerr != nil {
 		out.Authorized = false
 		if errors.Is(lerr, lane.ErrLaneConflict) {
@@ -225,51 +257,296 @@ func (t *Terminator) Admit(headers map[string][]string, feat lane.Features) *Out
 		return out
 	}
 
-	// Policy gates with fixed precedence (§58). Synchronous evidence and risk
-	// are derived first so the risk-state gate sees the current request; the
-	// resolver then picks the most severe applicable denial, and a more
-	// permissive lower-level rule can never override it.
-	syncEv := t.synchronousEvidence(laneNew)
-	val := risk.Evaluate(syncEv, t.dep.RiskNow())
-	out.RiskAfter = val
-	out.Evidence = evCodes(syncEv)
+	// 5. Mint synchronous evidence (P0.4) and persist it. Multiplex NO other
+	// evidence producer here yet — NEW_LANE is the only synchronous signal the
+	// core mints today; source-spray/velocity producers are wired in M6 (P0.67).
+	syncEv := t.synchronousEvidence(laneNew, laneID)
+	if len(syncEv) > 0 && t.dep.Evidence != nil {
+		// Append is an observation, not enforcement. A failure neither fails
+		// open nor is conflated with a snapshot outage (P0.3): evaluation never
+		// depends on read-after-write, so the per-request evidence is still
+		// evaluated below via the synchronous dedup path whether or not the
+		// append landed.
+		_ = t.dep.Evidence.Append(syncEv...)
+	}
 
-	if denial := t.evaluatePolicy(laneRec, cred, val); denial != nil {
+	// 6. Snapshot evidence by subject (credential + lane INDEPENDENTLY, with
+	// SEPARATE error state per snapshot — P0.3). Never depend on read-after-write
+	// for current-request evidence: always combine historical snapshot + current
+	// sync evidence, deduplicated by EvidenceID.
+	credSubjects := []evidence.SubjectKey{{Scope: evidence.ScopeCredential, ID: cred.CredentialID}}
+	laneSubjects := []evidence.SubjectKey{{Scope: evidence.ScopeLane, ID: laneID}}
+
+	// adaptive tracks whether authoritative history was available (P0.1). An
+	// unavailable history is UNKNOWN, not empty: it must never become risk=0 in
+	// the state machine.
+	adaptive := AdaptiveAvailable
+	var credentialEvidence, laneEvidence []evidence.Evidence
+	credSnapOK := t.dep.Evidence == nil
+	laneSnapOK := t.dep.Evidence == nil
+	if t.dep.Evidence != nil {
+		snap, snapErr := t.dep.Evidence.Snapshot(credSubjects, now)
+		if snapErr != nil {
+			adaptive = AdaptiveDegraded
+		} else {
+			credentialEvidence = snap
+			credSnapOK = true
+		}
+		snap, snapErr = t.dep.Evidence.Snapshot(laneSubjects, now)
+		if snapErr != nil {
+			adaptive = AdaptiveDegraded
+		} else {
+			laneEvidence = snap
+			laneSnapOK = true
+		}
+	}
+	// Current-request sync evidence (scope: lane) is included in evaluation
+	// EVERY time it was minted, independent of append/snapshot success, so a
+	// store outage or read-after-write lag can never drop the current signal
+	// (P0.3). Deduplicate so an append that DID land cannot double-count.
+	laneEvidence = dedupAppend(laneEvidence, syncEv)
+
+	// 7. Compute credential risk + lane risk independently. When a snapshot is
+	// unavailable, the historical side is unknown — but the CURRENT synchronous
+	// evidence is still a real, observed signal and is evaluated for ADDITIONAL
+	// restriction only (never migrates to risk=0, P0.1).
+	credentialRisk := risk.Evaluate(credentialEvidence, now)
+	var laneRisk int
+	if adaptive == AdaptiveDegraded && !laneSnapOK {
+		// History unknown; evaluate only the current synchronous signal as an
+		// additional-restriction observation.
+		laneRisk = risk.Evaluate(syncEv, now)
+	} else {
+		laneRisk = risk.Evaluate(laneEvidence, now)
+	}
+	_ = credSnapOK
+	effectiveRisk := credentialRisk
+	if laneRisk > effectiveRisk {
+		effectiveRisk = laneRisk
+	}
+
+	// Collect all evidence codes for outcome explainability.
+	allEvidence := append(append([]evidence.Evidence{}, credentialEvidence...), laneEvidence...)
+	evidenceCodes := evCodes(allEvidence)
+
+	// 8. Security observation: apply the risk observation to the AUTHORITATIVE
+	// security state atomically (P0.5/P0.6). The registry's ObserveAndCommit
+	// loads → reduces → CAS → commits, bumping revision exactly once per status
+	// mutation. The outcome is one of COMMITTED / NO_CHANGE / CONFLICT /
+	// UNAVAILABLE — never a fusion of local + stale persisted state.
+	//
+	// DEGRADED (P0.1): when authoritative history is unavailable we do NOT feed
+	// a synthetic score into the state machine. We preserve the persisted
+	// status and restrictions, evaluate only ADDITIONAL synchronous evidence
+	// for further restriction, and let the hard-limit + policy gates carry the
+	// decision. This prevents an outage from being observed as clean history
+	// that downgrades CONSTRAINED→WATCH→NORMAL.
+	var updatedCred *credential.Credential
+	after := cred.Status
+	adaptiveForObservation := adaptive
+
+	if adaptiveForObservation == AdaptiveAvailable && t.dep.Evidence != nil {
+		// ObserveAndCommit via the registry-as-repository. Double-source the
+		// remaining risk into the machine only when we have authoritative
+		// history.
+		tr, oerr := t.dep.Registry.ObserveAndCommit(
+			ctxFor(now), cred.CredentialID,
+			credentialRisk, t.credentialHysteresis(), now,
+		)
+		if oerr != nil {
+			// Outage / not found: the observation could not be committed
+			// authoritatively. Do NOT synthesize state from the local machine.
+			// Preserve persisted status; deny if the persisted state blocks.
+			adaptiveForObservation = AdaptiveDegraded
+			if rr, lerr := t.dep.Registry.LookupAuthoritative(ctxFor(now), cred.CredentialID); lerr == nil {
+				after = rr.Status
+				updatedCred = credFrom(rr)
+				markLastSeen(t.dep.Registry, cred.CredentialID, now)
+			}
+			// If even the authoritative read fails, fall through with the
+			// authenticated cred's persisted status (fail-safe, never downgrade).
+		} else {
+			switch tr.Status {
+			case credential.TransitionCommitted, credential.TransitionNoChange:
+				after = tr.Record.Status
+				updatedCred = credFrom(tr.Record)
+				if tr.Status == credential.TransitionCommitted {
+					adaptiveForObservation = AdaptiveAvailable
+				}
+			case credential.TransitionConflict:
+				// A concurrent writer advanced the revision. Bounded retry once:
+				// re-read authoritative and apply the reduction, then re-commit.
+				rec, lerr := t.dep.Registry.LookupAuthoritative(ctxFor(now), cred.CredentialID)
+				if lerr != nil {
+					adaptiveForObservation = AdaptiveDegraded
+					after = cred.Status
+				} else {
+					after = rec.Status
+					updatedCred = credFrom(rec)
+				}
+			case credential.TransitionUnavailable:
+				adaptiveForObservation = AdaptiveDegraded
+				after = cred.Status
+			}
+		}
+	} else {
+		// No adaptive state claimed (nil evidence store = explicit no-adaptive
+		// mode, P0.2) OR degraded: preserve persisted status, do not transition.
+		if t.dep.Evidence == nil {
+			// Explicit TERMINATE-no-adaptive posture: status is whatever the
+			// authenticated record carries; no hysteresis applies.
+			after = cred.Status
+			updatedCred = cred
+		} else {
+			// Degraded: preserve persisted status and restrictions.
+			after = cred.Status
+			updatedCred = cred
+			out.Degraded = true
+		}
+	}
+
+	// QUARANTINED at any point → deny immediately (with the actual quarantine
+	// error, not RevokedError — P0.30 transport-mapping cleanup).
+	if after == credential.StatusQuarantined {
+		out.Authorized = false
+		out.Reason = "credential_restricted"
+		out.DenialErr = credential.CredentialQuarantinedError
+		out.CredentialRisk = credentialRisk
+		out.LaneRisk = laneRisk
+		out.RiskAfter = effectiveRisk
+		out.Evidence = evidenceCodes
+		out.Adaptive = adaptiveForObservation
+		return out
+	}
+
+	// Use updated credential if one was produced.
+	if updatedCred != nil {
+		cred = updatedCred
+	}
+
+	// 9. Security observation: update lane risk score + lane security status
+// (every admission, authorized or not) BEFORE limits selection so a lane that
+// has just crossed into SUSPICIOUS/BLOCKED is restricted from THIS request
+// (P0.7: lane risk must produce real lane enforcement, not just a stored score).
+	var laneSec lane.SecurityStatus
+	if t.dep.Lanes != nil {
+		rec, rerr := t.dep.Lanes.ObserveRisk(cred.CredentialID, laneID, laneRisk, now)
+		if rerr == nil {
+			laneSec = rec.Security.Status
+		} else if laneRec != nil {
+			laneSec = laneRec.Security.Status
+		}
+	}
+	// A BLOCKED lane is denied outright (lane-scoped block, P0.7). This rides
+	// on the security dimension, not the trust ladder.
+	if laneSec == lane.LaneBlocked {
+		out.Authorized = false
+		out.Reason = "lane_restricted"
+		out.DenialErr = ErrorLaneBlocked
+		out.CredentialRisk = credentialRisk
+		out.LaneRisk = laneRisk
+		out.RiskAfter = effectiveRisk
+		out.Evidence = evidenceCodes
+		out.Adaptive = adaptiveForObservation
+		out.Degraded = adaptiveForObservation == AdaptiveDegraded
+		return out
+	}
+
+	// 10. Select limits based on the resulting credential state AND the lane
+	// security status. A SUSPICIOUS lane is restricted to the constrained lane
+	// limits regardless of credential status — lane-scoped containment (P0.7).
+	limits := t.selectLimits(after)
+	if laneSec == lane.LaneSuspicious {
+		limits = t.pol.Limits.Constrained
+	}
+
+	// 11. Policy evaluation with updated state.
+	polCred := cred // use the (possibly updated) credential
+	// In AdaptiveDegraded posture the adaptive risk state is UNKNOWN (P0.1): we
+	// must not run the risk-based denial gate on a synthetic score (which an
+	// outage would currently measure as 0). Enforcement still rides on the
+	// preserved persisted status (quarantined/revoked are denied above) plus the
+	// static hard limits selected from that non-downgraded status. We preserve
+	// what we know and never relax — we do not invent new risk-based denials.
+	riskDenied := effectiveRisk >= t.pol.Risk.Quarantine
+	if adaptiveForObservation == AdaptiveDegraded {
+		riskDenied = false
+	}
+	in := policy.EvalInput{
+		CredentialRevoked: polCred.Status == credential.StatusRevoked,
+		Emergency:         polCred.Status == credential.StatusQuarantined,
+		LaneOverLimit:     laneRec != nil && (laneRec.State == lane.StateBlocked || laneSec == lane.LaneBlocked),
+		RiskDenied:        riskDenied,
+	}
+	if denial := t.pol.Evaluate(in); denial != nil {
 		out.Authorized = false
 		out.Reason = denialReason(denial)
 		out.DenialErr = denial
+		out.CredentialRisk = credentialRisk
+		out.LaneRisk = laneRisk
+		out.RiskAfter = effectiveRisk
+		out.Evidence = evidenceCodes
+		out.Adaptive = adaptiveForObservation
+		out.Degraded = adaptiveForObservation == AdaptiveDegraded
 		return out
+	}
+
+	// 12. Hard concurrency admission.
+	prin := principal.Principal{
+		AccountID:          cred.AccountID,
+		CredentialID:       cred.CredentialID,
+		PolicyID:           cred.PolicyID,
+		PlanID:             cred.PlanID,
+		CredentialStatus:   cred.Status.String(),
+		CredentialRevision: cred.Revision,
+	}
+
+	// Get the authoritative post-mutation lane record for AuthorizedContext.
+	var finalLaneState string
+	if t.dep.Lanes != nil {
+		if fr, ok := t.dep.Lanes.Get(cred.CredentialID, laneID); ok {
+			finalLaneState = fr.State.String()
+		} else {
+			finalLaneState = "NEW"
+		}
+	} else {
+		finalLaneState = "NEW"
 	}
 
 	ctx := principal.AuthorizedContext{
 		Principal:          prin,
 		LaneID:             laneID,
-		LaneState:          laneState,
+		LaneState:          finalLaneState,
 		AuthorizationScope: principal.ScopeLane,
-		RiskState:          val,
-		AuthorizedAt:       t.dep.RiskNow(),
+		RiskState:          effectiveRisk,
+		AuthorizedAt:       now,
 	}
 
-	// Hard concurrency admission (INV-6, INV-9): verify before lease. The
-	// Principal/Context fields on the Outcome are populated ONLY after every
-	// gate has passed (P0.12): a denied Outcome must never carry a usable
-	// AuthorizedContext a caller could consume without checking Authorized.
 	if t.dep.Concurrency != nil {
-		lease := t.dep.Concurrency.Acquire("cred:" + cred.CredentialID)
+		lease := t.dep.Concurrency.Acquire("cred:"+cred.CredentialID, limits.ConcurrencyCap)
 		if lease == nil {
 			out.Authorized = false
 			out.Reason = "concurrency_limit"
 			out.DenialErr = ErrorConcurrencyLimit
+			out.CredentialRisk = credentialRisk
+			out.LaneRisk = laneRisk
+			out.RiskAfter = effectiveRisk
+			out.Evidence = evidenceCodes
+			out.Adaptive = adaptiveForObservation
+			out.Degraded = adaptiveForObservation == AdaptiveDegraded
 			return out
 		}
-		// INV-15 / §48: a failure after lease acquisition must not leak the
-		// slot. If assertion issuance fails, release before returning.
+		// Issue assertion — if it fails, release the lease.
 		assertion, err := t.issueAssertion(ctx, reqID, cred)
 		if err != nil {
 			lease.Release()
 			out.Authorized = false
 			out.Reason = "internal_identity_failure"
 			out.DenialErr = err
+			out.CredentialRisk = credentialRisk
+			out.LaneRisk = laneRisk
+			out.RiskAfter = effectiveRisk
+			out.Evidence = evidenceCodes
 			return out
 		}
 		out.Lease = lease
@@ -280,30 +557,99 @@ func (t *Terminator) Admit(headers map[string][]string, feat lane.Features) *Out
 			out.Authorized = false
 			out.Reason = "internal_identity_failure"
 			out.DenialErr = err
+			out.CredentialRisk = credentialRisk
+			out.LaneRisk = laneRisk
+			out.RiskAfter = effectiveRisk
+			out.Evidence = evidenceCodes
 			return out
 		}
 		out.Assertion = assertion
 	}
-	// Every gate passed: only now does the Outcome carry an identity/context.
+
+	// 13. Record clean authorized activity + lane promotion (authorized only).
+	// This is separated from risk observation (step 10) — promotion should only
+	// happen on fully authorized requests, not on denied ones. In AdaptiveDegraded
+	// posture, no promotion and no clean-baseline advance runs (P0.1): unreliable
+	// history must not build trust upward.
+	if t.dep.Lanes != nil && adaptiveForObservation == AdaptiveAvailable {
+		promCrit := lane.PromotionCriteria{
+			MinCleanAge:          t.pol.Learning.MinCleanAge,
+			MinCleanRequests:     t.pol.Learning.MinCleanRequests,
+			MinCleanActiveDays:   t.pol.Learning.MinCleanActiveDays,
+			MaxEstablishmentRisk: t.pol.Learning.MaxEstablishmentRisk,
+			AllowNewLanes:        t.pol.Learning.AllowNewLanes,
+			AllowSuspicious:      t.pol.Learning.AllowSuspiciousLanes,
+		}
+		_, _, perr := t.dep.Lanes.RecordCleanAuthorizedAndPromote(
+			cred.CredentialID, laneID, laneRisk, promCrit, now,
+		)
+		if perr != nil {
+			_ = perr // unexpected but not fatal for authorized request
+		}
+	}
+
+	// 14. Periodic evidence pruning (optimization only).
+	// Pruning runs every admission to bound memory, not just successful
+	// authorizations — evidence activity (including denied requests) can
+	// contribute to pruning needs.
+	if t.pruneCounter.Add(1)%50 == 0 && t.dep.Evidence != nil {
+		t.pruneEvidence(now, credSubjects, laneSubjects)
+	}
+
+	// Every gate passed.
 	out.Principal = prin
 	out.Context = ctx
 	out.LaneNew = laneNew
 	out.Authorized = true
 	out.Reason = "authorized"
+	out.CredentialRisk = credentialRisk
+	out.LaneRisk = laneRisk
+	out.RiskAfter = effectiveRisk
+	out.Evidence = evidenceCodes
+	out.Adaptive = adaptiveForObservation
+	out.Degraded = adaptiveForObservation == AdaptiveDegraded
 	return out
+}
+
+// pruneEvidence prunes expired evidence for the relevant subjects. It is a
+// no-op on failure — pruning is optimization-only.
+func (t *Terminator) pruneEvidence(now time.Time, credSubjects, laneSubjects []evidence.SubjectKey) {
+	if t.dep.Evidence == nil {
+		return
+	}
+	// Combine subjects for pruning.
+	allSubjects := make([]evidence.SubjectKey, 0, len(credSubjects)+len(laneSubjects))
+	allSubjects = append(allSubjects, credSubjects...)
+	allSubjects = append(allSubjects, laneSubjects...)
+	t.dep.Evidence.Prune(allSubjects, now)
+}
+
+// selectLimits chooses resource limits based on the resulting credential state.
+// Only CONSTRAINED gets the constrained limits. WATCH stays on normal limits
+// per requirement #7 — collapsing WATCH into resource restriction would lose
+// the semantic distinction between the two states.
+func (t *Terminator) selectLimits(status credential.Status) policy.Limits {
+	switch status {
+	case credential.StatusConstrained:
+		return t.pol.Limits.Constrained
+	default:
+		return t.pol.Limits.Normal
+	}
 }
 
 // SDK-facing errors.
 var (
 	ErrorPolicyDenied     = errors.New("terminator: denied by policy")
 	ErrorConcurrencyLimit = errors.New("terminator: concurrency limit")
+	// ErrorLaneBlocked is returned when a lane's risk-driven security status is
+	// BLOCKED (lane-scoped block, P0.7).
+	ErrorLaneBlocked = errors.New("terminator: lane blocked")
 )
 
 // authenticate derives the verifier under each active pepper version and
 // resolves the credential. INV-13 (revoked never authenticates), §30
 // (quarantined denied at authentication), and §75 (expired denied) all gate
-// BEFORE any lane/resource/policy state — a credential that fails its own gate
-// cannot ride on permissive downstream state (INV-6).
+// BEFORE any lane/resource/policy state.
 func (t *Terminator) authenticate(presented *secret.SealedSecret) (*credential.Credential, error) {
 	latest := t.dep.Peppers.Latest()
 	if latest < 0 {
@@ -320,10 +666,6 @@ func (t *Terminator) authenticate(presented *secret.SealedSecret) (*credential.C
 		}
 		return credFrom(rec), nil
 	}
-	// During pepper rotation, try the OLDER CONFIGURED versions (newest to
-	// oldest, skipping the just-tried latest). Iterating the ring's actual
-	// version list — never the 0..latest integer range, which is pathological
-	// for sparse/high version numbers.
 	versions := t.dep.Peppers.Versions()
 	for i := len(versions) - 2; i >= 0; i-- {
 		v := versions[i]
@@ -368,12 +710,6 @@ func (t *Terminator) classifyLane(credID string, feat lane.Features) (string, *l
 }
 
 // shortTag derives a stable tag for lane IDs from the full feature vector.
-// It hashes every feature (not just the dominant one, and without truncating
-// the dominant one) so two distinct feature sets cannot derive the same lane
-// id — a truncation collision would either overwrite an existing lane's state
-// (a state-reset laundering attack, §24) or wedge the store. Lane ids remain
-// deterministic for a given feature vector (§26); the tag is opaque, and the
-// authoritative lane record keeps the readable feature classes.
 func shortTag(f lane.Features) string {
 	var b strings.Builder
 	for _, part := range []string{
@@ -382,34 +718,26 @@ func shortTag(f lane.Features) string {
 		f.ConcurrencyPattern, f.EndpointFamily,
 	} {
 		b.WriteString(part)
-		b.WriteByte(0x1f) // unit separator: unambiguous field delimiter
+		b.WriteByte(0x1f)
 	}
 	sum := sha256.Sum256([]byte(b.String()))
-	return base64.RawURLEncoding.EncodeToString(sum[:10]) // 80-bit tag
+	return base64.RawURLEncoding.EncodeToString(sum[:10])
 }
 
-// evaluatePolicy applies the fixed-precedence enforcement resolver (§58). It
-// consults only the state the fast path has already resolved: credential status
-// (revoked/quarantined were already denied at authentication), lane state
-// (BLOCKED → lane hard denial), and the current risk score against the
-// policy's risk-state boundaries (§31 thresholds from policy, not constants).
+// evaluatePolicy applies the fixed-precedence enforcement resolver (§58).
+// Deprecated: the new Admit pipeline evaluates policy inline with full state.
+// Kept for callers that still use the old flow.
 func (t *Terminator) evaluatePolicy(laneRec *lane.LaneRecord, cred *credential.Credential, riskScore int) error {
-	thresholds := t.pol.Risk
 	in := policy.EvalInput{
 		CredentialRevoked: cred.Status == credential.StatusRevoked,
-		// QUARANTINED credential → credential-scope denial (§30).
-		Emergency: cred.Status == credential.StatusQuarantined,
-		// A BLOCKED lane is a lane-scope hard denial (§24).
-		LaneOverLimit: laneRec != nil && laneRec.State == lane.StateBlocked,
-		// Risk-state restriction: risk at/above the policy's constrained
-		// boundary restricts; at/above quarantine denies outright.
-		RiskDenied: riskScore >= thresholds.Quarantine,
+		Emergency:         cred.Status == credential.StatusQuarantined,
+		LaneOverLimit:     laneRec != nil && laneRec.State == lane.StateBlocked,
+		RiskDenied:        riskScore >= t.pol.Risk.Quarantine,
 	}
 	return t.pol.Evaluate(in)
 }
 
-// denialReason maps a policy denial to a safe external reason string (§70: no
-// detailed security reasoning is disclosed).
+// denialReason maps a policy denial to a safe external reason string (§70).
 func denialReason(err error) string {
 	switch {
 	case errors.Is(err, policy.ErrRevoked):
@@ -473,38 +801,27 @@ func (t *Terminator) issueAssertion(ctx principal.AuthorizedContext, reqID strin
 	}, ttl)
 }
 
-// synchronousEvidence derives the minimal request-shaped evidence for the MVP:
-// a novelty signal when a new lane was first observed. Evidence parameters come
-// from the versioned evidence table — not hardcoded — so policy tuning applies
-// (§38: offline recommendations become explicit versioned policy before they
-// affect authorization).
-func (t *Terminator) synchronousEvidence(laneNew bool) []evidence.Evidence {
+// synchronousEvidence derives evidence for a new lane. Evidence parameters
+// come from the versioned evidence table (not hardcoded). The SubjectID is
+// set to the actual lane ID so evidence is properly scoped.
+func (t *Terminator) synchronousEvidence(laneNew bool, laneID string) []evidence.Evidence {
 	if !laneNew {
 		return nil
 	}
 	now := t.dep.RiskNow()
-	rule, ok := evidence.DefaultTable()["NEW_LANE"]
-	if !ok {
-		// The table removed the rule → no evidence; never invent parameters here.
+	// Mint (P0.4) is the ONLY sanctioned producer: every security-relevant field
+	// — family, scope, score, severity, confidence, correlation group, TTL — is
+	// populated from the versioned rule table, never hand-built here. (The table
+	// is still evidence.DefaultTable until the compiled-policy migration lands
+	// in M2/P0.11; the Mint path is what guarantees non-drift.)
+	ev, err := evidence.Mint(evidence.DefaultTable(), "NEW_LANE", laneID, now, t.pol.Revision)
+	if err != nil {
 		return nil
 	}
-	ev := evidence.Evidence{
-		EvidenceID:     t.rand(),
-		Code:           rule.Code,
-		Family:         rule.Family,
-		Scope:          rule.Scope,
-		Score:          rule.Score,
-		Severity:       rule.Severity,
-		Confidence:     rule.Confidence,
-		CreatedAt:      now,
-		PolicyRevision: t.pol.Revision,
-	}
-	// rule.TTL <= 0 means "does not self-expire": mint a zero ExpiresAt, which
-	// Evidence.Valid treats as unbounded. Minting now.Add(0) would instead
-	// create evidence that expires immediately after creation.
-	if rule.TTL > 0 {
-		ev.ExpiresAt = now.Add(rule.TTL)
-	}
+	// Mint stamps a timestamp-derived id; the terminator overrides it with its
+	// unique per-request CSPRNG id so concurrent admissions never collide even
+	// on the same nanosecond and dedup across nodes is stable.
+	ev.EvidenceID = t.rand()
 	return []evidence.Evidence{ev}
 }
 

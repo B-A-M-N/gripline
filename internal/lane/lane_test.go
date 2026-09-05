@@ -108,7 +108,15 @@ func TestPromotionGate(t *testing.T) {
 	now := time.Now()
 	crit := DefaultPromotionCriteria()
 	// New lane must not promote unless seeding allowed.
-	rec := &LaneRecord{LaneID: "l", CredentialID: "c", State: StateNew, FirstSeenAt: now.Add(-10 * 24 * time.Hour), RequestCount: 500, RiskScore: 5}
+	rec := &LaneRecord{
+		LaneID: "l", CredentialID: "c", State: StateNew,
+		FirstSeenAt: now.Add(-10 * 24 * time.Hour),
+		RequestCount: 500, RiskScore: 5,
+		AuthorizedCleanRequests: 500, // Meets MinCleanRequests
+		ActiveDays:              5,
+		CleanActiveDays:         5, // Meets MinCleanActiveDays
+		LastActiveDay:           now.Format("2006-01-02"),
+	}
 	if _, promoted := PromoteIfEligible(rec, crit, now); promoted {
 		t.Fatal("new lane must not auto-promote without AllowNewLanes")
 	}

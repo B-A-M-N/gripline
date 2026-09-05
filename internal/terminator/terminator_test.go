@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/B-A-M-N/gripline/internal/credential"
+	"github.com/B-A-M-N/gripline/internal/evidence"
 	"github.com/B-A-M-N/gripline/internal/lane"
 	"github.com/B-A-M-N/gripline/internal/policy"
 	"github.com/B-A-M-N/gripline/internal/resource"
@@ -130,7 +131,9 @@ func TestAssertionExpiredAtExactExpiry(t *testing.T) {
 
 type fakePool struct{ p *resource.ConcurrencyPool }
 
-func (f *fakePool) Acquire(scope string) *resource.LeaseHandle { return f.p.Acquire() }
+func (f *fakePool) Acquire(scope string, maxConcurrency int) *resource.LeaseHandle {
+	return f.p.AcquireCap(maxConcurrency)
+}
 
 // buildTerminator wires a terminator around a single credential and returns the
 // raw token string the test uses to act as the client.
@@ -566,9 +569,12 @@ func TestEnforceModeRequiresLanesAndConcurrency(t *testing.T) {
 	if _, err := New(withLanes); err == nil {
 		t.Fatal("ENFORCE without a concurrency controller must fail construction")
 	}
-	// Complete ENFORCE wiring succeeds.
+	// Complete ENFORCE wiring succeeds: lanes + concurrency controller AND an
+	// evidence/adaptive-state backend (P0.2 — ENFORCE-without-adaptive-state is
+	// not a supported posture).
 	full := withLanes
 	full.Concurrency = &fakePool{resource.NewConcurrencyPool(4)}
+	full.Evidence = evidence.NewMemoryStore()
 	if _, err := New(full); err != nil {
 		t.Fatalf("complete ENFORCE wiring must construct: %v", err)
 	}

@@ -11,10 +11,17 @@ import (
 )
 
 // RiskThresholds are the credential/lane risk-state boundaries (§31).
+// All thresholds must be strictly ordered: 0 < Watch < Constrained < Quarantine <= 100.
+// Down-thresholds govern automatic recovery from elevated states.
 type RiskThresholds struct {
-	Watch       int
-	Constrained int
-	Quarantine  int
+	Watch             int // escalate to WATCH if risk >= this
+	Constrained       int // escalate to CONSTRAINED if risk >= this
+	Quarantine        int // escalate to QUARANTINED if risk >= this
+	ConstrainedDownThresh int // CONSTRAINED→WATCH if risk < this
+	WatchDownThresh   int // WATCH→NORMAL if risk < this
+	ConstrainedDwell  time.Duration // dwell time for CONSTRAINED→WATCH recovery
+	WatchDwell        time.Duration // dwell time for WATCH→NORMAL recovery
+	WatchObs          int           // qualifying observations needed for WATCH entry
 }
 
 // Limits captures hard resource limits per scope as policy.
@@ -26,11 +33,21 @@ type Limits struct {
 	RequestRate       int // requests / minute
 }
 
-// Learning controls baseline seeding (§29, §42).
+// Learning controls baseline seeding (§29, §42) and lane promotion criteria.
 type Learning struct {
 	MaximumRisk          int
 	AllowNewLanes        bool
-	AllowSuspiciousLanes bool
+	// AllowSuspiciousLanes is DEPRECATED and has no effect. SUSPICIOUS/BLOCKED
+	// lanes NEVER promote (INV-8). This field is retained for wire compatibility
+	// but is ignored by PromoteIfEligible — it remains here so existing policy
+	// serializations do not break. Remove in a future breaking change.
+	AllowSuspiciousLanes bool // DEPRECATED: no effect, INV-8 forbids suspicious promotion
+
+	// Promotion criteria for lanes. These are policy-controlled, not hardcoded.
+	MinCleanAge          time.Duration // minimum continuous clean age
+	MinCleanRequests     int64         // minimum authorized clean requests
+	MinCleanActiveDays   int           // minimum distinct active days with clean history
+	MaxEstablishmentRisk int           // risk below this threshold for promotion
 }
 
 // Privacy flags retention policy (§72).
@@ -70,12 +87,29 @@ func Default() *Policy {
 	return &Policy{
 		ID:       "fi-default-v1",
 		Revision: 1,
-		Risk:     RiskThresholds{Watch: 30, Constrained: 55, Quarantine: 80},
+		Risk: RiskThresholds{
+			Watch:                30,
+			Constrained:          55,
+			Quarantine:           80,
+			ConstrainedDownThresh: 40,
+			WatchDownThresh:      20,
+			ConstrainedDwell:     15 * time.Minute,
+			WatchDwell:           30 * time.Minute,
+			WatchObs:             2,
+		},
 		Limits: ScopedLimits{
 			Normal:      Limits{ConcurrencyCap: 32, RequestBurstCap: 64, TokenVelocityMult: 1.0, CostVelocityMult: 1.0, RequestRate: 300},
 			Constrained: Limits{ConcurrencyCap: 2, RequestBurstCap: 8, TokenVelocityMult: 1.25, CostVelocityMult: 1.25, RequestRate: 20},
 		},
-		Learning: Learning{MaximumRisk: 20, AllowNewLanes: false, AllowSuspiciousLanes: false},
+		Learning: Learning{
+			MaximumRisk:          20,
+			AllowNewLanes:        false,
+			AllowSuspiciousLanes: false,
+			MinCleanAge:          7 * 24 * time.Hour,
+			MinCleanRequests:     200,
+			MinCleanActiveDays:   3,
+			MaxEstablishmentRisk: 15,
+		},
 		Privacy:  Privacy{PromptRetention: false, CompletionRetention: false},
 		Identity: Identity{MaxTTLSeconds: 30},
 	}
@@ -83,8 +117,8 @@ func Default() *Policy {
 
 // IsValid reports whether a policy revision is structurally valid to load
 // (§57: the data plane loads only validated policy). Beyond identity fields it
-// checks the risk-threshold ordering — an inverted ladder (Watch above
-// Quarantine, etc.) would silently invert the enforcement semantics.
+// checks the risk-threshold ordering, down-thresholds, dwell times, observation
+// count, and promotion criteria bounds.
 func (p *Policy) IsValid() bool {
 	if p == nil || p.ID == "" {
 		return false
@@ -92,15 +126,46 @@ func (p *Policy) IsValid() bool {
 	if p.Revision < 1 {
 		return false
 	}
-	if p.Identity.MaxTTLSeconds < 1 || p.Identity.MaxTTLSeconds > 60 {
+	// INV-10: internal assertions are short-lived, hard-capped at 30s (P0.28
+	// closes the doc-vs-code 60s gap; the stated invariant is ≤30).
+	if p.Identity.MaxTTLSeconds < 1 || p.Identity.MaxTTLSeconds > 30 {
 		return false
 	}
 	t := p.Risk
-	// Each boundary strictly increases, and all stay within the 0..100 domain.
+	// Escalation thresholds strictly ordered: 0 < Watch < Constrained < Quarantine <= 100.
 	if !(0 < t.Watch && t.Watch < t.Constrained && t.Constrained < t.Quarantine && t.Quarantine <= 100) {
 		return false
 	}
-	// Hard caps must not go negative (deny-by-config beats silently raising).
+	// Down-thresholds strictly below their escalation thresholds.
+	if !(t.WatchDownThresh < t.Watch) {
+		return false
+	}
+	if !(t.ConstrainedDownThresh < t.Constrained) {
+		return false
+	}
+	// All thresholds within 0..100.
+	if t.WatchDownThresh < 0 || t.WatchDownThresh > 100 {
+		return false
+	}
+	if t.ConstrainedDownThresh < 0 || t.ConstrainedDownThresh > 100 {
+		return false
+	}
+	// Dwell times must be positive.
+	if t.ConstrainedDwell <= 0 || t.WatchDwell <= 0 {
+		return false
+	}
+	// WatchObs must be at least 1.
+	if t.WatchObs < 1 {
+		return false
+	}
+	// Promotion criteria must be non-negative and within bounds.
+	if p.Learning.MaxEstablishmentRisk < 0 || p.Learning.MaxEstablishmentRisk > 100 {
+		return false
+	}
+	if p.Learning.MinCleanAge < 0 || p.Learning.MinCleanRequests < 0 || p.Learning.MinCleanActiveDays < 0 {
+		return false
+	}
+	// Hard caps must not go negative.
 	if p.Limits.Normal.ConcurrencyCap < 0 || p.Limits.Constrained.ConcurrencyCap < 0 {
 		return false
 	}
@@ -108,17 +173,17 @@ func (p *Policy) IsValid() bool {
 }
 
 // MaxIdentityTTLSeconds returns the assertion lifetime in seconds, clamped to
-// INV-10 (short-lived). Default 30; config may raise up to 60 for operational
-// convenience but never below 1.
+// INV-10 (short-lived, ≤30s per P0.28). Default 30; config may not exceed 30.
 func (p *Policy) MaxIdentityTTLSeconds() int {
 	if p == nil || p.Identity.MaxTTLSeconds < 1 {
 		return 30
 	}
-	if p.Identity.MaxTTLSeconds > 60 {
-		return 60
+	if p.Identity.MaxTTLSeconds > 30 {
+		return 30
 	}
 	return p.Identity.MaxTTLSeconds
 }
+
 
 // ErrRevoked / ErrEmergency / ErrSourceBlocked / ErrHardLimit / ErrRisk are the
 // precedence outcomes (ordered highest → lowest). The evaluator returns the

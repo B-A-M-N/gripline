@@ -51,12 +51,26 @@ type LaneRecord struct {
 	Features     Features // full normalized classification vector (P0.8)
 	FeatSchema   int      // feature-schema revision the vector was classified under
 
-	RequestCount       int64
-	ActiveDays         int    // distinct active days observed (§29 clean-active-days)
-	LastActiveDay      string // "YYYY-MM-DD" of the last request (ActiveDays dedup)
-	RiskScore          int
-	EstablishmentScore int
-	Revision           int
+	RequestCount          int64  // total requests seen (includes denied)
+	ActiveDays            int    // distinct active days observed (§29 clean-active-days)
+	LastActiveDay         string // "YYYY-MM-DD" of the last request (ActiveDays dedup)
+	RiskScore             int
+	EstablishmentScore    int
+	// Security is the RISK-DRIVEN enforcement dimension (P0.7): a separate axis
+	// from the trust ladder (State). It drives lane-scoped limits and denial.
+	Security SecurityState
+
+	// Clean counters for promotion — only incremented on fully authorized requests.
+	// Denied requests contribute evidence but NOT baseline progress (INV-8).
+	AuthorizedCleanRequests int64  // requests that passed all admission gates
+	CleanActiveDays         int    // distinct active days with clean history
+	LastCleanActiveDay      string // "YYYY-MM-DD" of the last clean active day
+	// CleanSince is the start of the current CONTIGUOUS clean window (P0.42).
+	// MinCleanAge compares against this, not FirstSeenAt (which measures lane
+	// age, not clean age). It is reset when disqualifying security evidence
+	// becomes active, or when the lane's security status elevates.
+	CleanSince time.Time
+	Revision   int
 }
 
 // Features is the normalized metadata vector used for classification. Missing

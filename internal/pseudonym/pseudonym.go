@@ -23,6 +23,25 @@ type Key struct {
 	Secret []byte
 }
 
+// Format implements fmt.Formatter and always redacts (P0.38): formatting this
+// key-bearing config struct must never reach the secret bytes. The ring copies
+// the bytes at ingestion, so this construction-time handle is not retained.
+func (k Key) Format(f fmt.State, verb rune) {
+	fmt.Fprint(f, "<redacted>")
+}
+
+// String implements fmt.Stringer (%s/%v).
+func (k Key) String() string { return "<redacted>" }
+
+// GoString implements fmt.GoStringer (%#v).
+func (k Key) GoString() string { return "<redacted>" }
+
+var (
+	_ fmt.Formatter  = Key{}
+	_ fmt.Stringer   = Key{}
+	_ fmt.GoStringer = Key{}
+)
+
 // Family distinguishes identifier domains so the same raw value in different
 // contexts yields different pseudonyms.
 type Family string
@@ -122,9 +141,15 @@ func (r *Ring) Verify(family Family, raw []byte, value string) bool {
 
 // deriveWith is the single keyed-transform implementation; every derive path
 // funnels through it so the keying is enforced in one place.
+//
+// The output is version-prefixed (P0.37): "v<N>.<b64>" so a store keyed by
+// pseudonym can route a lookup to the key version that minted it, giving
+// storage continuity across rotation instead of a wholesale re-key. Verify
+// recomputes under every active version and matches the prefixed form, so a
+// rotated ring still accepts the older-version value.
 func deriveWith(family Family, raw []byte, v int, k []byte) string {
 	h := hmac.New(sha256.New, k)
 	_, _ = h.Write([]byte(fmt.Sprintf("gripline:%s:v%d:", family, v)))
 	_, _ = h.Write(raw)
-	return base64.RawURLEncoding.EncodeToString(h.Sum(nil))
+	return fmt.Sprintf("v%d.%s", v, base64.RawURLEncoding.EncodeToString(h.Sum(nil)))
 }

@@ -13,6 +13,9 @@ type Limits struct {
 	MaxActiveLanesPerCredential int
 	MaxProvisionalLanes         int
 	LaneIdleExpiration          time.Duration
+	// Security carries the lane risk→security-status hysteresis (P0.7/P0.11).
+	// Zero value falls back to DefaultSecurityHysteresis.
+	Security SecurityHysteresis
 }
 
 // DefaultLimits returns conservative defaults (policy-tunable).
@@ -21,6 +24,7 @@ func DefaultLimits() Limits {
 		MaxActiveLanesPerCredential: 16,
 		MaxProvisionalLanes:         8,
 		LaneIdleExpiration:          30 * 24 * time.Hour,
+		Security:                    DefaultSecurityHysteresis(),
 	}
 }
 
@@ -171,6 +175,7 @@ func (s *Store) BorrowOrCreate(credID, newLaneID string, cand Features, th Class
 		Features:     cand, // full vector persisted (P0.8)
 		FeatSchema:   featSchemaVersion,
 		RequestCount: 1,
+		CleanSince:   now, // the clean window starts at lane creation (P0.42)
 		Revision:     1,
 	}
 	rec.trackActiveDayLocked(now)
@@ -216,6 +221,21 @@ func (s *Store) ActiveLaneCount(credID string) int {
 	return len(s.byCred[credID])
 }
 
+// ListLaneIDs returns the lane IDs for a credential (a copy).
+func (s *Store) ListLaneIDs(credID string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m := s.byCred[credID]
+	if m == nil {
+		return nil
+	}
+	ids := make([]string, 0, len(m))
+	for id := range m {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
 // sortRecords is retained for deterministic iteration by callers that must
 // enumerate lanes (diagnostics/sweeper use); store internals never depend on
 // map order for decisions.
@@ -230,4 +250,113 @@ func sortRecords(m map[string]*LaneRecord) []*LaneRecord {
 		out = append(out, m[id])
 	}
 	return out
+}
+
+// ObserveRisk atomically updates a lane's risk score AND drives the lane
+// security-status dimension (P0.7) under the store lock. This prevents lost
+// updates from concurrent admissions and ensures lane-scoped enforcement.
+// Call this on EVERY admission (authorized or denied) — risk observation is a
+// security function that happens before authorization decisions.
+//
+// The returned LaneRecord carries the updated RiskScore, the resulting
+// SecurityStatus, and a bumped Revision (one authoritative mutation).
+func (s *Store) ObserveRisk(credID, laneID string, riskScore int, now time.Time) (*LaneRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rec, ok := s.lookupLocked(credID, laneID)
+	if !ok {
+		return nil, errors.New("lane: not found")
+	}
+	hy := s.securityHys()
+	before := rec.Security.Status
+	rec.RiskScore = riskScore
+	// Persist the risk-driven security state (P0.7): this is what makes a
+	// suspicious/blocked lane actually restricted or denied. The reducer is
+	// pure over the persisted SecurityState, so restart/multi-node preserve
+	// lane elevation history.
+	rec.Security = ReduceLaneSecurity(hy, rec.Security, riskScore, now)
+	// P0.42: when the lane's security ELEVATES (NORMAL→SUSPICIOUS/BLOCKED), the
+	// contiguous clean window is invalidated. MinCleanAge must restart from the
+	// next clean period, not include the pre-elevation quiet time.
+	if rec.Security.Status != LaneNormal && before == LaneNormal {
+		rec.CleanSince = time.Time{}
+	}
+	rec.Revision++
+	c := *rec
+	return &c, nil
+}
+
+// securityHys returns the configured lane security hysteresis, defaulting
+// conservatively when unset.
+func (s *Store) securityHys() SecurityHysteresis {
+	lm := s.limits()
+	if lm.Security.SuspectThresh > 0 && lm.Security.BlockThresh > 0 {
+		return lm.Security
+	}
+	return DefaultSecurityHysteresis()
+}
+
+// RecordCleanAuthorizedAndPromote updates clean counters and checks promotion
+// criteria under the store lock. This is called AFTER a request has been fully
+// authorized (passed all gates). Denied requests must NOT call this — they
+// contribute evidence but not baseline progress.
+//
+// Returns whether a promotion occurred. The returned LaneRecord (if any) has
+// the updated state and Revision.
+func (s *Store) RecordCleanAuthorizedAndPromote(credID, laneID string, riskScore int, crit PromotionCriteria, now time.Time) (*LaneRecord, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rec, ok := s.lookupLocked(credID, laneID)
+	if !ok {
+		return nil, false, errors.New("lane: not found")
+	}
+
+	// Update risk score (always).
+	rec.RiskScore = riskScore
+
+	// Increment clean counters.
+	rec.AuthorizedCleanRequests++
+	day := now.Format("2006-01-02")
+	if rec.LastCleanActiveDay != day {
+		rec.LastCleanActiveDay = day
+		rec.CleanActiveDays++
+	}
+	rec.trackActiveDayLocked(now)
+
+	// Attempt promotion only for eligible states.
+	var promoted bool
+	var newState State
+	switch rec.State {
+	case StateNew, StateProbation:
+		if newState, promoted = PromoteIfEligible(rec, crit, now); promoted {
+			rec.State = newState
+			c := *rec
+			return &c, true, nil
+		}
+	}
+
+	// No promotion; return updated record with risk + clean counters.
+	c := *rec
+	return &c, false, nil
+}
+
+// RecordCleanAuthorized increments the authorized clean request counter and
+// tracks the active day for promotion purposes. This is called AFTER a
+// request has been fully authorized (passed all gates). Denied requests must
+// NOT call this — they contribute evidence but not baseline progress.
+func (s *Store) RecordCleanAuthorized(credID, laneID string, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok := s.lookupLocked(credID, laneID)
+	if !ok {
+		return
+	}
+	rec.AuthorizedCleanRequests++
+	day := now.Format("2006-01-02")
+	if rec.LastCleanActiveDay != day {
+		rec.LastCleanActiveDay = day
+		rec.CleanActiveDays++
+	}
 }

@@ -69,13 +69,17 @@ type CredentialRecord struct {
 	VerifierVersion int // verifier algorithm version
 	PepperVersion   int // active pepper key version used to derive Verifier
 	Status          Status
-	PolicyID        string
-	PlanID          string
-	CreatedAt       time.Time
-	ExpiresAt       time.Time
-	RotatedAt       time.Time
-	LastSeenAt      time.Time
-	Revision        int // monotonic; echoed as cred_rev in internal assertions
+	// Security is the persisted hysteresis state (P0.5): the durable, reproducible
+	// record of risk observations that drive status transitions. It lives on the
+	// credential row so restart and replication do not erase escalation history.
+	Security SecurityState
+	PolicyID string
+	PlanID   string
+	CreatedAt time.Time
+	ExpiresAt time.Time
+	RotatedAt time.Time
+	LastSeenAt time.Time
+	Revision  int // monotonic; echoed as cred_rev in internal assertions
 }
 
 // Credential is the resolved authentication outcome handed to the terminator.
@@ -107,7 +111,10 @@ func (rec *CredentialRecord) Authenticatable(now time.Time) error {
 	case StatusQuarantined:
 		return CredentialQuarantinedError
 	}
-	if !rec.ExpiresAt.IsZero() && now.After(rec.ExpiresAt) {
+	// Expiry is inclusive-invalid: a credential is expired AT its expiration
+	// instant (now == ExpiresAt fails), matching assertion/evidence semantics
+	// (P0.21/P0.14).
+	if !rec.ExpiresAt.IsZero() && !now.Before(rec.ExpiresAt) {
 		return CredentialExpiredError
 	}
 	return nil
@@ -117,6 +124,39 @@ func (rec *CredentialRecord) Authenticatable(now time.Time) error {
 // quarantined credential (§30: requests from the affected scope are denied).
 var CredentialQuarantinedError = errors.New("credential: quarantined")
 
+// supportedVerifierVersion is the only verifier algorithm this build accepts.
+// Unknown algorithm versions fail closed (P0.18).
+const supportedVerifierVersion = 1
+
+// Validate reports whether a record is structurally sound enough to persist or
+// authenticate (P0.17/P0.18). It refuses malformed records rather than letting
+// them occupy storage: empty id, no verifier, an unknown verifier algorithm,
+// revision < 1, or an impossible createdAt.
+func (rec *CredentialRecord) Validate() error {
+	if rec == nil {
+		return errors.New("credential: nil record")
+	}
+	if rec.CredentialID == "" {
+		return errors.New("credential: empty credential id")
+	}
+	if len(rec.Verifier) == 0 {
+		return errors.New("credential: record has no verifier")
+	}
+	// Version 0 is the legacy "unversioned" marker used by pre-P0.18 persisted
+	// records; version 1 is the modern HMAC-SHA256 verifier. Any other explicit
+	// version is an unknown algorithm and fails closed (P0.18).
+	if rec.VerifierVersion != 0 && rec.VerifierVersion != supportedVerifierVersion {
+		return fmt.Errorf("credential: unsupported verifier algorithm version %d (fail closed, P0.18)", rec.VerifierVersion)
+	}
+	if rec.Revision < 1 {
+		return errors.New("credential: revision must be >= 1")
+	}
+	if !rec.CreatedAt.IsZero() && rec.CreatedAt.After(time.Now()) {
+		return errors.New("credential: createdAt in the future")
+	}
+	return nil
+}
+
 // Verifier derives the stored verifier for a raw secret under a pepper key set.
 // The returned digest is what a CredentialStore persists and what lookup
 // compares against, sealed within the secret boundary.
@@ -125,11 +165,34 @@ func Verifier(secret *secret.SealedSecret, key *PepperKey) []byte {
 }
 
 // PepperKey is one active pepper version's key material. Key lives in the
-// secret store; the struct is a handle.
+// secret store; the struct is a handle. It deliberately carries key bytes only
+// so NewPepperRing can ingest them at construction — and it implements an
+// active redaction surface (P0.15) so that if the config struct is ever
+// formatted, logged, or %#v'd, it emits "<redacted>" instead of the key bytes.
+// The ring copies the bytes at ingestion and this construction-time handle is
+// not retained.
 type PepperKey struct {
 	Version int
 	Key     []byte
 }
+
+// Format implements fmt.Formatter and always redacts (P0.15): no flag, verb,
+// or width combination may reach the key bytes.
+func (k PepperKey) Format(f fmt.State, verb rune) {
+	fmt.Fprint(f, "<redacted>")
+}
+
+// String implements fmt.Stringer (%s/%v).
+func (k PepperKey) String() string { return "<redacted>" }
+
+// GoString implements fmt.GoStringer (%#v).
+func (k PepperKey) GoString() string { return "<redacted>" }
+
+var (
+	_ fmt.Formatter  = PepperKey{}
+	_ fmt.Stringer   = PepperKey{}
+	_ fmt.GoStringer = PepperKey{}
+)
 
 // PepperRing holds the active pepper versions for rotation (§16). Lookup must
 // accept the version recorded on each stored verifier even after rotation
@@ -189,10 +252,43 @@ func (r *PepperRing) WithClock(now func() time.Time) *PepperRing {
 	return r
 }
 
-// Get returns the key for a version, or false if unknown.
+// Get returns a COPY of the key material for a version, or false if unknown.
+// Returning the internal slice would let a caller mutate the live pepper ring
+// (P0.16); callers that only need a verifier should use DeriveVerifier instead
+// so key bytes never leave the ring.
 func (r *PepperRing) Get(version int) ([]byte, bool) {
 	k, ok := r.active[version]
-	return k, ok
+	if !ok {
+		return nil, false
+	}
+	return append([]byte(nil), k...), true
+}
+
+// DeriveVerifier folds a sealed secret under the pepper key for a version,
+// returning the verifier digest. The pepper key bytes never leave the ring
+// (P0.16): the caller hands in the sealed secret and gets back only the one-way
+// digest that a registry persists. Returns nil if the secret or key is unusable
+// (matches SealedSecret.DigestHMAC fail-closed behavior).
+func (r *PepperRing) DeriveVerifier(presented *secret.SealedSecret, version int) []byte {
+	k, ok := r.active[version]
+	if !ok || len(k) == 0 {
+		return nil
+	}
+	return presented.DigestHMAC(k)
+}
+
+// DeriveAllActiveVerifiers folds a sealed secret under every active pepper
+// version, returning a map version->verifier digest. Used at lookup time to
+// test presentation across the rotation window without extracting key bytes.
+func (r *PepperRing) DeriveAllActiveVerifiers(presented *secret.SealedSecret) map[int][]byte {
+	out := make(map[int][]byte, len(r.active))
+	for v, k := range r.active {
+		if len(k) == 0 {
+			continue
+		}
+		out[v] = presented.DigestHMAC(k)
+	}
+	return out
 }
 
 // Latest returns the highest configured version.
@@ -306,6 +402,11 @@ func NewStateMachine(hy Hysteresis, now func() time.Time) *StateMachine {
 
 // Status returns the current credential status.
 func (m *StateMachine) Status() Status { return m.status }
+
+// SetStatus sets the machine's status to a specific value (seed from persisted
+// state). It does not affect hysteresis metadata like belowSince — that
+// metadata is process-local until retrained through observations.
+func (m *StateMachine) SetStatus(s Status) { m.status = s }
 
 // Score returns the current risk score.
 func (m *StateMachine) Score() int { return m.score }

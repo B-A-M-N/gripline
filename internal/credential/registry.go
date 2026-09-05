@@ -2,6 +2,7 @@ package credential
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"errors"
 	"strconv"
@@ -29,7 +30,35 @@ type Registry interface {
 	// BumpRevision increments a credential's monotonic revision (used on any
 	// lifecycle mutation so internal assertions minted earlier become stale).
 	BumpRevision(credentialID string) error
+
+	// UpdateStatusCAS atomically transitions a credential's status, bumping
+	// revision exactly once. Requirements:
+	//   - fromStatus must match the current record status (CAS semantics)
+	//   - expectedRevision must match the current record revision
+	//   - status must not be downgraded from QUARANTINED or REVOKED through
+	//     this path (QUARANTINED requires explicit lifecycle action)
+	//   - revision is incremented by exactly 1
+	//   - returns the authoritative record with updated status and revision
+	//   - stale concurrent writers return ErrStaleCAS
+	//
+	// This is the ONLY state-transition path. Do NOT call BumpRevision
+	// separately from this.
+	UpdateStatusCAS(credentialID string, expectedRevision int, fromStatus Status, toStatus Status) (*CredentialRecord, error)
+
+	// SecurityStateRepository is embedded so any Registry can serve as the
+	// authoritative, atomic security-state store (P0.5/P0.6/P0.20).
+	SecurityStateRepository
+
+	// TouchLastSeen records the timestamp of the last authenticated activity.
+	// It is analytics-grade: it must NOT be able to fail an admission and is
+	// intentionally outside the strong authorization transaction (P0.22). A
+	// registry MAY no-op if it does not track last-seen.
+	TouchLastSeen(credentialID string, at time.Time)
 }
+
+// ErrStaleCAS indicates a concurrent revision conflict — the caller's
+// expected revision is older than what's stored.
+var ErrStaleCAS = errors.New("credential: stale concurrent CAS")
 
 // ErrNotFound is returned by mutations for absent credentials.
 var ErrNotFound = errors.New("credential: not found")
@@ -70,6 +99,11 @@ func (m *MemoryRegistry) Insert(rec *CredentialRecord) error {
 	if rec == nil {
 		return errors.New("credential: nil record")
 	}
+	// Refuse malformed records rather than letting them occupy storage
+	// (P0.17): unknown verifier algorithm, empty verifier, revision < 1.
+	if err := rec.Validate(); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -88,12 +122,92 @@ func (m *MemoryRegistry) Insert(rec *CredentialRecord) error {
 		}
 	}
 
-	c := *rec
-	m.records[rec.CredentialID] = &c
+	// Clone verifier bytes so the caller and the registry never alias the same
+	// slice; a post-insert mutation must not diverge the byVer index from the
+	// stored record (P0.17).
+	c := cloneRecord(rec)
+	m.records[rec.CredentialID] = c
 	if newKey != "" {
 		m.byVer[newKey] = rec.CredentialID
 	}
 	return nil
+}
+
+// Lookup implements SecurityStateRepository with typed errors (P0.20): the
+// caller can distinguish ErrNotFound (credential absent) from the outage classes.
+func (m *MemoryRegistry) LookupAuthoritative(ctx context.Context, credentialID string) (*CredentialRecord, error) {
+	rec, ok := m.Lookup(credentialID)
+	if !ok {
+		return nil, ErrNotFound
+	}
+	_ = ctx
+	return rec, nil
+}
+
+// ObserveAndCommit implements the authoritative, atomic risk-observation apply
+// (P0.5/P0.6/P0.44). It loads the credential + its persisted SecurityState,
+// reduces one observation via the pure transition function, and if the status
+// changed, CASes status/security/revision all in one critical section with a
+// single revision bump. No change leaves the record untouched (NoChange). A
+// stale revision or concurrent writer yields Conflict.
+//
+// The in-memory registry is non-failing, so Unavailable is never produced here;
+// a durable/remote implementation returns it on outage (M6). The caller of a
+// remote registry must treat Unavailable as fail-safe, never as risk=0.
+func (m *MemoryRegistry) ObserveAndCommit(
+	ctx context.Context,
+	credentialID string,
+	score int,
+	hy Hysteresis,
+	now time.Time,
+) (TransitionResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	rec, ok := m.records[credentialID]
+	if !ok {
+		return TransitionResult{}, ErrNotFound
+	}
+
+	before := cloneRecord(rec)
+	reduced := ReduceTransition(hy, rec.Status, rec.Security, score, now)
+
+	if !reduced.Changed {
+		// Observation applied but no status change: persist only the security
+		// state (risk score, streaks, timestamps) — the durable hysteresis
+		// record must reflect the observation even when status is stable. This
+		// does not bump Revision (no lifecycle transition; P0.44 keeps one
+		// bump per state mutation).
+		rec.Security = reduced.Next
+		return TransitionResult{
+			Status: TransitionNoChange,
+			Before: before,
+			Record: cloneRecord(rec),
+		}, nil
+	}
+
+	// Status changed — serial CAS: guard against a stale concurrent transition.
+	if rec.Revision != before.Revision {
+		return TransitionResult{}, ErrStaleCAS
+	}
+	if rec.Status != before.Status {
+		return TransitionResult{}, ErrStaleCAS
+	}
+	// QUARANTINED and REVOKED never automatically downgrade through admission.
+	if rec.Status == StatusQuarantined || rec.Status == StatusRevoked {
+		return TransitionResult{}, errors.New("credential: terminal/elevated state cannot be transitioned through admission")
+	}
+
+	rec.Status = reduced.Status
+	rec.Security = reduced.Next
+	rec.Revision++
+	rec.Security.LastStateChangeAt = now
+	rec.RotatedAt = now // preserved: RotatedAt is the last lifecycle mutation time
+	return TransitionResult{
+		Status: TransitionCommitted,
+		Before: before,
+		Record: cloneRecord(rec),
+	}, nil
 }
 
 // verKeyFor derives the index key (pepper version + verifier). The verifier is
@@ -144,6 +258,18 @@ func cloneRecord(rec *CredentialRecord) *CredentialRecord {
 	return &c
 }
 
+// TouchLastSeen updates LastSeenAt. Best-effort and out of the critical path:
+// a record absent here is not an error the admission loop must handle (P0.22).
+func (m *MemoryRegistry) TouchLastSeen(credentialID string, at time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rec, ok := m.records[credentialID]
+	if !ok {
+		return
+	}
+	rec.LastSeenAt = at
+}
+
 // Revoke marks a credential revoked and bumps revision.
 func (m *MemoryRegistry) Revoke(credentialID string) error {
 	m.mu.Lock()
@@ -168,4 +294,46 @@ func (m *MemoryRegistry) BumpRevision(credentialID string) error {
 	}
 	rec.Revision++
 	return nil
+}
+
+// UpdateStatusCAS atomically transitions status, incrementing revision by 1.
+// Rejected if:
+//   - credential not found
+//   - expectedRevision != current revision
+//   - fromStatus != current status
+//   - fromStatus is QUARANTINED (no automatic downgrade)
+//   - fromStatus is REVOKED (terminal)
+//   - toStatus is REVOKED → allowed (escalation is fine)
+//   - toStatus == fromStatus → rejected (no-op transition)
+func (m *MemoryRegistry) UpdateStatusCAS(credentialID string, expectedRevision int, fromStatus, toStatus Status) (*CredentialRecord, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	rec, ok := m.records[credentialID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	if rec.Revision != expectedRevision {
+		return nil, ErrStaleCAS
+	}
+	if rec.Status != fromStatus {
+		return nil, ErrStaleCAS
+	}
+	if toStatus == fromStatus {
+		return nil, errors.New("credential: no status change requested")
+	}
+	// QUARANTINED never automatically downgrades.
+	if fromStatus == StatusQuarantined {
+		return nil, errors.New("credential: quarantined status cannot be downgraded through admission")
+	}
+	// REVOKED is terminal — nothing can exit it.
+	if fromStatus == StatusRevoked {
+		return nil, errors.New("credential: revoked is terminal")
+	}
+
+	rec.Status = toStatus
+	rec.Revision++
+	rec.RotatedAt = m.now()
+	c := cloneRecord(rec)
+	return c, nil
 }

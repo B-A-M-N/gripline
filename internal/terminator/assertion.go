@@ -50,10 +50,27 @@ func GenerateSigner() (*Signer, error) {
 	return &Signer{priv: priv}, nil
 }
 
-// Public returns the public key (for configuring verifiers).
+// Public returns the public key (for configuring verifiers). The public key is
+// not secret; the private key is.
 func (s *Signer) Public() ed25519.PublicKey {
 	return s.priv.Public().(ed25519.PublicKey)
 }
+
+// Format implements fmt.Formatter and always redacts (P0.15/P0.31): formatting a
+// Signer must never reach the private key bytes.
+func (s *Signer) Format(f fmt.State, verb rune) { fmt.Fprint(f, "<redacted>") }
+
+// String implements fmt.Stringer.
+func (s *Signer) String() string { return "<redacted>" }
+
+// GoString implements fmt.GoStringer (%#v).
+func (s *Signer) GoString() string { return "<redacted>" }
+
+var (
+	_ fmt.Formatter  = (*Signer)(nil)
+	_ fmt.Stringer   = (*Signer)(nil)
+	_ fmt.GoStringer = (*Signer)(nil)
+)
 
 // Claims is the internal-identity payload (§20).
 type Claims struct {
@@ -70,17 +87,37 @@ type Claims struct {
 	Scope     []string `json:"scope"`
 }
 
-// Assertion is a signed, self-contained internal identity.
+// Assertion is a signed, self-contained internal identity. It is a short-lived
+// internal bearer capability, not a reusable external credential — but it is
+// still sensitive: formatting it must never reconstruct the wire token (P0.31).
 type Assertion struct {
 	raw       []byte // canonical JSON to sign; never the raw secret
 	signature []byte
 	claims    Claims
 }
 
+// Format implements fmt.Formatter and always redacts (P0.31): generic logging
+// of an Assertion must not leak the wire token or its signature.
+func (a *Assertion) Format(f fmt.State, verb rune) { fmt.Fprint(f, "<redacted>") }
+
+// String implements fmt.Stringer.
+func (a *Assertion) String() string { return "<redacted>" }
+
+// GoString implements fmt.GoStringer (%#v).
+func (a *Assertion) GoString() string { return "<redacted>" }
+
+var (
+	_ fmt.Formatter  = (*Assertion)(nil)
+	_ fmt.Stringer   = (*Assertion)(nil)
+	_ fmt.GoStringer = (*Assertion)(nil)
+)
+
 // Issue builds and signs an internal assertion with the configured TTL and
 // audience. jti must be a unique request id. iat/exp are wall-clock bounded.
 func (s *Signer) Issue(c Claims, ttl time.Duration) (*Assertion, error) {
-	if ttl <= 0 || ttl > 60*time.Second {
+	// INV-10 / P0.28: internal assertions are hard-capped at 30s. The signer
+	// refuses a longer lifetime even if policy is somehow misconfigured upward.
+	if ttl <= 0 || ttl > maxAssertionTTLSeconds*time.Second {
 		return nil, fmt.Errorf("terminator: TTL out of bounds (INV-10): %v", ttl)
 	}
 	now := time.Now()
@@ -163,8 +200,9 @@ func ParseAndVerify(encoded string, pub ed25519.PublicKey, expectedAudience stri
 const assertionIssuer = "gripline"
 
 // maxAssertionTTLSeconds is the defensive upper bound on accepted assertion
-// lifetimes (INV-10; matches Issue's hard cap of 60s).
-const maxAssertionTTLSeconds = 60
+// lifetimes (INV-10, P0.28): the stated invariant is ≤30s, so both Issue and
+// ParseAndVerify hard-cap here.
+const maxAssertionTTLSeconds = 30
 
 // Errors returned by assertion verification.
 var (
