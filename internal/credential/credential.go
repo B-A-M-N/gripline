@@ -373,6 +373,17 @@ type Hysteresis struct {
 	ConstrainedDwell      time.Duration // WATCH→CONSTRAINED→WATCH dwell
 	WatchDwell            time.Duration // WATCH→NORMAL dwell
 	WatchObs              int           // qualifying observations to enter WATCH
+	// MaxAutomaticStatus is the ceiling on AUTOMATIC escalation (P0.14). Zero
+	// means no ceiling (QUARANTINE reachable). Gate H: while automatic
+	// quarantine is policy-disabled, the terminator sets this to CONSTRAINED so
+	// a hot observation escalates normally up to CONSTRAINED but never commits
+	// an operator-unvalidated QUARANTINED status. The REAL score always flows
+	// into the machine — the old code mutilated the score to Constrained-1,
+	// which could never cross the CONSTRAINED threshold, so high-risk
+	// credentials stuck at WATCH forever and recorded a falsified risk history.
+	// The reducer decides states; policy gating decides which transitions are
+	// permitted.
+	MaxAutomaticStatus Status
 }
 
 // DefaultHysteresis returns the spec §31 example defaults.

@@ -156,21 +156,39 @@ func ReduceTransition(
 	status := currentStatus
 	orig := status
 
+	// MaxAutomaticStatus caps AUTOMATIC escalation only (P0.14). The score is
+	// recorded truthfully; transitions beyond the ceiling are withheld. A
+	// quarantine-warranting score escalates DIRECTLY to the ceiling status when
+	// the ceiling withholds QUARANTINE — a hot credential is resource-
+	// restricted NOW (CONSTRAINED under the Gate H default), not held at WATCH
+	// waiting for streaks (the old score-mutilation bug) and not committed to
+	// an operator-unvalidated QUARANTINED status. When the ceiling sits at or
+	// below the current status, no automatic escalation occurs but the truthful
+	// score is still recorded. QUARANTINED/REVOKED remain terminal regardless.
+	//
 	// Direct escalation: a score at or above the quarantine threshold escalates
-	// immediately from any active state (spec §36).
+	// immediately from any active state (spec §36), capped by the ceiling.
 	if status != StatusQuarantined && status != StatusRevoked && score >= hy.QuarantineThresh {
-		status = StatusQuarantined
-		after.BelowSince = time.Time{}
-		after.WatchStreak = 0
-		after.LastStateChangeAt = now
-		return Reduced{Next: after, Status: status, Changed: true}
+		target := StatusQuarantined
+		if escalationExceedsCeiling(target, hy.MaxAutomaticStatus) {
+			target = hy.MaxAutomaticStatus
+		}
+		if statusRank(target) > statusRank(status) {
+			status = target
+			after.BelowSince = time.Time{}
+			after.WatchStreak = 0
+			after.LastStateChangeAt = now
+			return Reduced{Next: after, Status: status, Changed: true}
+		}
+		// Ceiling at/below current status: record the score, change nothing.
+		return Reduced{Next: after, Status: status, Changed: status != orig}
 	}
 
 	switch status {
 	case StatusNormal:
 		if score >= hy.WatchThresh {
 			after.WatchStreak++
-			if after.WatchStreak >= hy.WatchObs {
+			if after.WatchStreak >= hy.WatchObs && !escalationExceedsCeiling(StatusWatch, hy.MaxAutomaticStatus) {
 				status = StatusWatch
 				after.BelowSince = time.Time{}
 				after.LastStateChangeAt = now
@@ -180,7 +198,7 @@ func ReduceTransition(
 		}
 
 	case StatusWatch:
-		if score >= hy.ConstrainedThresh {
+		if score >= hy.ConstrainedThresh && !escalationExceedsCeiling(StatusConstrained, hy.MaxAutomaticStatus) {
 			status = StatusConstrained
 			after.BelowSince = time.Time{}
 			after.LastStateChangeAt = now
@@ -198,7 +216,7 @@ func ReduceTransition(
 		}
 
 	case StatusConstrained:
-		if score >= hy.QuarantineThresh {
+		if score >= hy.QuarantineThresh && !escalationExceedsCeiling(StatusQuarantined, hy.MaxAutomaticStatus) {
 			status = StatusQuarantined
 			after.BelowSince = time.Time{}
 			after.LastStateChangeAt = now
@@ -220,4 +238,30 @@ func ReduceTransition(
 	}
 
 	return Reduced{Next: after, Status: status, Changed: status != orig}
+}
+
+// statusRank orders the escalation ladder for ceiling comparisons.
+func statusRank(s Status) int {
+	switch s {
+	case StatusNormal:
+		return 0
+	case StatusWatch:
+		return 1
+	case StatusConstrained:
+		return 2
+	case StatusQuarantined, StatusRevoked:
+		return 3
+	default:
+		return 0
+	}
+}
+
+// escalationExceedsCeiling reports whether an automatic transition to target
+// would exceed the configured MaxAutomaticStatus ceiling. A zero ceiling means
+// unbounded (no Gate H restriction configured).
+func escalationExceedsCeiling(target, ceiling Status) bool {
+	if ceiling == 0 {
+		return false
+	}
+	return statusRank(target) > statusRank(ceiling)
 }
