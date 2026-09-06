@@ -47,7 +47,7 @@ across all 15 packages.
 | P0.12 | RESOLVED | `Evidence.NonEvictable` marks FamilyOperatorIOC + zero-ExpiresAt critical; `compactLocked` skips them and fails safe (keeps all) if nothing evictable. `TestM1CriticalEvidenceNotEvictedByFlood`. |
 | P0.13 | RESOLVED | `Append` validates the whole batch under one lock before storing anything (atomic gate → `ErrInvalidEvidence`); per-subject bound `maxEvidencePerSubject=2048`; empty-subject pruned. `TestAppendAtomicBatchRejectsPartial`. |
 | P0.14 | RESOLVED | `Evidence.Valid` rejects `!now.Before(ExpiresAt)` — inclusive-invalid at the boundary; `purgeExpiredLocked` + `Snapshot`/`Prune` reuse it. `TestExpiryIsInclusiveInvalidAtBoundary`. |
-| P0.15 | PARTIAL | Terminator sync evidence uses a CSPRNG id (`t.rand`, 128-bit). BUT `evidence.Mint` stamps a predictable `ev_<UnixNano>` id and `anomaly.Detector.Observe` does not override it; `Append` accepts any non-empty id with no entropy check, and dedup is per-subject so the same id under two subjects double-counts in `risk.Evaluate`. |
+| P0.15 | RESOLVED | `evidence.Mint` stamps a CSPRNG id; `MintID` accepts an explicit idgen (nil fails closed); terminator + spray detector all produce uniform, unpredictable `ev_...` ids. **Closed by commit 5b644ee.** |
 | P0.16 | RESOLVED | `PepperRing.Get` returns a copy; key bytes never leave the ring; ring copies on ingestion. |
 | P0.17 | RESOLVED | `CredentialRecord.Validate` rejects empty id/verifier, unknown verifier version, invalid revision, future CreatedAt; `Insert` clones verifier bytes. |
 | P0.18 | RESOLVED | Unknown verifier algorithm fails closed (`Validate` rejects VerifierVersion ∉ {0,1}). |
@@ -167,8 +167,7 @@ TLS.
 
 ## Open / partial work queue (ordered by what blocks the e2e goal)
 
-1. P0.15 — give `evidence.Mint` a CSPRNG id (or an injectable idgen); reject
-   low-entropy ids in `validate`.
+1. ~~P0.15~~ CLOSED — CSPRNG evidence ids (commit 5b644ee).
 2. P0.48/P0.10 — gate clean-counter increments on adaptive status; implement the
    single-request conflict re-observe.
 3. P0.45 — mix `t.pol.Revision` into `shortTag` (or filter evidence by revision)
