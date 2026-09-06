@@ -168,7 +168,7 @@ func TestM6SprayDetectorPersistsEvidence(t *testing.T) {
 	}
 	signer, _ := GenerateSigner()
 	store := evidence.NewMemoryStore()
-	spray := anomaly.NewDetector(func() time.Time { return time.Now() }, nil, anomaly.DefaultThresholds())
+	spray := anomaly.NewDetector(func() time.Time { return time.Now() }, anomaly.DefaultThresholds())
 	term, err := New(Dependencies{
 		Registry: reg, Peppers: credential.MustPepperRing(pep),
 		Lanes:    lane.NewStore(nil, time.Now),

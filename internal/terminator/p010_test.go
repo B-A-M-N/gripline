@@ -854,11 +854,13 @@ func TestNewRejectsPolicyWithoutEvidenceTable(t *testing.T) {
 	}
 }
 
-// P0.45: stale-revision evidence must NOT drive the authoritative state machine.
-// Evidence minted under a PREVIOUS policy revision carried scores from an older
-// rule table; after a policy change it must be dropped (fail-closed) rather than
-// evaluated under new thresholds. Only evidence at the CURRENT revision (and
-// untagged/operator evidence) drives enforcement.
+// P0.11: evidence minted under a PREVIOUS policy revision REMAINS ACTIVE until
+// its TTL ends — it keeps the concrete score/family/scope assigned by the
+// revision that minted it. A routine policy deployment must never wipe
+// accumulated risk: the old filter dropped evidence minted under any other
+// revision, so deploying revision N+1 silently pardoned every unexpired event
+// from revision N. If a future revision must invalidate/reinterpret old
+// evidence, that is an explicit migration rule — never a filter side effect.
 func TestStalePolicyRevisionEvidenceFilteredFromStateMachine(t *testing.T) {
 	pep := &credential.PepperKey{Version: 1, Key: []byte("p45-pepper")}
 	rawBytes := make([]byte, 24)
@@ -923,12 +925,16 @@ func TestStalePolicyRevisionEvidenceFilteredFromStateMachine(t *testing.T) {
 	// is per-test). Each seed drives high lane risk that would BLOCK the lane
 	// IF it were evaluated.
 
-	// Case 1: STALE-revision evidence is filtered out → the lane must NOT be
-	// blocked by it (a policy landed after it was minted; it is not trusted).
+	// Case 1: STALE-revision evidence REMAINS ACTIVE (P0.11) — it drives the
+	// same block as current-revision evidence. Deploying a new policy revision
+	// must not pardon it.
 	seed(true)
 	outS := term.Admit(bearerHeaders(raw), feat)
-	if !outS.Authorized {
-		t.Fatalf("P0.45: stale-revision evidence must be filtered; admission denied: %s", outS.Reason)
+	if outS.Authorized {
+		t.Fatal("P0.11: unexpired evidence minted under an older revision must still drive the block (no risk reset on policy deploy)")
+	}
+	if outS.Reason != "lane_restricted" {
+		t.Fatalf("P0.11: want lane_restricted, got %s", outS.Reason)
 	}
 
 	// Case 2 (fresh store so the stale seed isn't in scope): CURRENT-revision

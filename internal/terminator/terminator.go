@@ -325,8 +325,19 @@ func (t *Terminator) Admit(headers map[string][]string, feat lane.Features) *Out
 	syncEv := t.synchronousEvidence(laneNew, laneID)
 	var persistOnly []evidence.Evidence
 	if t.dep.Spray != nil {
-		if sp := t.dep.Spray.Observe(t.dep.SourceID, cred.CredentialID, feat.NetworkASN, now); len(sp) > 0 {
-			persistOnly = sp
+		if sigs := t.dep.Spray.Observe(t.dep.SourceID, cred.CredentialID, feat.NetworkASN, now); len(sigs) > 0 {
+			// P0.12: the detector returns signals; THIS compiled policy is the
+			// one policy authority. Each signal resolves against the current
+			// compiled rule table — score/family/scope/TTL and the minting
+			// revision all come from here, never from the detector. A signal
+			// with no rule in this revision resolves to nothing (fail-closed).
+			for _, sig := range sigs {
+				ev, err := evidence.Mint(t.pol.EvidenceRules, sig.Code, sig.SubjectID, now, t.pol.Revision)
+				if err != nil {
+					continue // unknown code in this revision: no invented parameters
+				}
+				persistOnly = append(persistOnly, ev)
+			}
 		}
 	}
 	if (len(syncEv) > 0 || len(persistOnly) > 0) && t.dep.Evidence != nil {

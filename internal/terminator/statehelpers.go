@@ -55,27 +55,29 @@ func dedupAppend(existing, incoming []evidence.Evidence) []evidence.Evidence {
 	return out
 }
 
-// policyRevisionFilter returns only evidence minted under the CURRENT policy
-// revision (mod == 0), keeping the rest out of both deduction and dedup. A
-// policy change landed after older evidence was minted means that evidence's
-// scores/severities came from a DIFFERENT rule table — feeding it into the
-// authoritative state machine would evaluate old-era risk under new-era
-// thresholds (P0.45). Filtering FAIL-CLOSED: stale-revision evidence never
-// drives the state machine; only evidence minted against the current revision
-// (including current-request synchronous evidence, which is always current)
-// does. Evidence with a zero revision (hand-seeded, e.g. operator/operator IOC
-// that predates revision tagging) is preserved as-is rather than dropped.
+// policyRevisionFilter returns the evidence that may drive the authoritative
+// state machine. Semantics (P0.11, supersedes the old current-revision-only
+// filter): evidence keeps the CONCRETE score/family/scope assigned by the
+// policy revision that minted it and remains active until its TTL ends. A
+// routine policy deployment must never wipe accumulated risk — the old filter
+// dropped evidence minted under any other revision, so deploying revision N+1
+// silently pardoned every unexpired event minted under revision N. The minting
+// revision stays on the record for audit and for any future explicit migration
+// rule (a revision that reinterprets old evidence must do so explicitly, not
+// by side effect of a filter).
+//
+// What still fails closed: evidence with NO minting revision (a possible
+// hand-construction artifact) is preserved — zero-revision records are
+// documented operator/operator-IOC evidence that predates revision tagging.
+// Dedup and TTL handling are unchanged; only revision-based erasure is gone.
 func policyRevisionFilter(items []evidence.Evidence, rev int) []evidence.Evidence {
-	if rev == 0 || len(items) == 0 {
+	if len(items) == 0 {
 		return items
 	}
-	out := items[:0:0]
-	for _, e := range items {
-		if e.PolicyRevision == 0 || e.PolicyRevision == rev {
-			out = append(out, e)
-		}
-	}
-	return out
+	// All unexpired evidence drives the machine regardless of minting revision.
+	// rev is still consulted for callers that log the evaluated-revision pair;
+	// it no longer gates inclusion.
+	return items
 }
 
 // credentialHysteresis derives the state-transition config from the compiled

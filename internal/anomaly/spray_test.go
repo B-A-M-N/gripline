@@ -1,69 +1,65 @@
 package anomaly
 
 import (
-	"strings"
 	"testing"
 	"time"
-
-	"github.com/B-A-M-N/gripline/internal/evidence"
 )
 
-// TestSprayMoreThan3ASNsMintsCredentialEvidence proves the P0.67 credential-
+// TestSprayMoreThan3ASNsSignalsCredentialSpray proves the P0.67 credential-
 // side ASN-spray signature: >3 distinct ASNs for one credential inside the
-// window mints MORE_THAN_3_UNRELATED_ASNS_IN_10_MIN (scope credential), with
-// score from the rule table.
-func TestSprayMoreThan3ASNsMintsCredentialEvidence(t *testing.T) {
+// window raises the MORE_THAN_3_UNRELATED_ASNS_IN_10_MIN signal for the
+// credential subject. P0.12: the detector emits SIGNALS; scoring/scope/minting
+// belong to the compiled policy at the admission site.
+func TestSprayMoreThan3ASNsSignalsCredentialSpray(t *testing.T) {
 	base := time.Now()
 	now := base
-	d := NewDetector(func() time.Time { return now }, nil, DefaultThresholds())
+	d := NewDetector(func() time.Time { return now }, DefaultThresholds())
 
-	var minted []evidence.Evidence
+	var sigs []Signal
 	// 4 distinct ASNs for the same credential within the window.
 	for _, asn := range []string{"AS1", "AS2", "AS3", "AS4"} {
 		now = base
-		minted = append(minted, d.Observe("src", "cred_c", asn, now)...)
+		sigs = append(sigs, d.Observe("src", "cred_c", asn, now)...)
 	}
 	// The 4th ASN crosses the threshold (MaxASNs = 3).
 	var credentialSpray bool
-	for _, e := range minted {
-		if e.Code == "MORE_THAN_3_UNRELATED_ASNS_IN_10_MIN" {
+	for _, s := range sigs {
+		if s.Code == "MORE_THAN_3_UNRELATED_ASNS_IN_10_MIN" {
 			credentialSpray = true
-			if e.Scope != evidence.ScopeCredential {
-				t.Fatalf("ASN-spray must scope to CREDENTIAL, got %v", e.Scope)
-			}
-			if e.SubjectID != "cred_c" {
-				t.Fatalf("ASN-spray subject = %q, want cred_c", e.SubjectID)
+			if s.SubjectID != "cred_c" {
+				t.Fatalf("ASN-spray subject = %q, want cred_c", s.SubjectID)
 			}
 		}
 	}
 	if !credentialSpray {
-		t.Fatal("P0.67: >3 unrelated ASNs in-window must mint the credential ASN-spray evidence")
+		t.Fatal("P0.67: >3 unrelated ASNs in-window must signal the credential ASN-spray")
 	}
 }
 
-// TestSpraySourceManyCredentialsMintsSourceEvidence proves the SOURCE-side
+// TestSpraySourceManyCredentialsSignalsSourceSpray proves the SOURCE-side
 // credential-spray signature (P0.67): one source presenting many distinct
-// credentials mints SOURCE_ATTEMPTING_MANY_UNRELATED_CREDENTIALS (scope source).
-func TestSpraySourceManyCredentialsMintsSourceEvidence(t *testing.T) {
+// credentials raises SOURCE_ATTEMPTING_MANY_UNRELATED_CREDENTIALS for the
+// source subject.
+func TestSpraySourceManyCredentialsSignalsSourceSpray(t *testing.T) {
 	base := time.Now()
 	now := base
-	d := NewDetector(func() time.Time { return now }, nil, DefaultThresholds())
+	d := NewDetector(func() time.Time { return now }, DefaultThresholds())
 
-	var minted []evidence.Evidence
+	var sigs []Signal
 	for i := 0; i < 6; i++ {
-		minted = append(minted, d.Observe("src-1", "cred_"+string(rune('a'+i)), "AS0", base)...)
+		sigs = append(sigs, d.Observe("src-1", "cred_"+string(rune('a'+i)), "AS0", base)...)
 	}
 	var sourceSpray bool
-	for _, e := range minted {
-		if e.Code == "SOURCE_ATTEMPTING_MANY_UNRELATED_CREDENTIALS" {
+	for _, s := range sigs {
+		if s.Code == "SOURCE_ATTEMPTING_MANY_UNRELATED_CREDENTIALS" {
 			sourceSpray = true
-			if e.Scope != evidence.ScopeSource {
-				t.Fatalf("credential-spray must scope to SOURCE, got %v", e.Scope)
+			if s.SubjectID != "src-1" {
+				t.Fatalf("credential-spray subject = %q, want src-1", s.SubjectID)
 			}
 		}
 	}
 	if !sourceSpray {
-		t.Fatal("P0.67: one source with many distinct credentials must mint the source-spray evidence")
+		t.Fatal("P0.67: one source with many distinct credentials must signal the source-spray")
 	}
 }
 
@@ -74,16 +70,15 @@ func TestSpraySourceManyCredentialsMintsSourceEvidence(t *testing.T) {
 func TestSprayWindowDecays(t *testing.T) {
 	base := time.Now()
 	now := base
-	d := NewDetector(func() time.Time { return now }, nil, DefaultThresholds())
+	d := NewDetector(func() time.Time { return now }, DefaultThresholds())
 
 	for _, asn := range []string{"AS1", "AS2", "AS3"} {
 		d.Observe("src", "cred_d", asn, base) // 3 distinct, at threshold (not over)
 	}
 	// Advance past the window; all 3 decay.
 	now = base.Add(11 * time.Minute)
-	m := d.Observe("src", "cred_d", "AS4", now)
-	for _, e := range m {
-		if e.Code == "MORE_THAN_3_UNRELATED_ASNS_IN_10_MIN" {
+	for _, s := range d.Observe("src", "cred_d", "AS4", now) {
+		if s.Code == "MORE_THAN_3_UNRELATED_ASNS_IN_10_MIN" {
 			t.Fatal("P0.67: window must decay — an old 3-ASN burst must not count toward a fresh 4th")
 		}
 	}
@@ -91,57 +86,27 @@ func TestSprayWindowDecays(t *testing.T) {
 	now = base.Add(12 * time.Minute)
 	sprayed := false
 	for _, asn := range []string{"AS5", "AS6", "AS7", "AS8"} {
-		for _, e := range d.Observe("src", "cred_d", asn, now) {
-			if e.Code == "MORE_THAN_3_UNRELATED_ASNS_IN_10_MIN" {
+		for _, s := range d.Observe("src", "cred_d", asn, now) {
+			if s.Code == "MORE_THAN_3_UNRELATED_ASNS_IN_10_MIN" {
 				sprayed = true
 			}
 		}
 	}
 	if !sprayed {
-		t.Fatal("P0.67: a fresh 4-ASN burst within one window must mint the evidence")
+		t.Fatal("P0.67: a fresh 4-ASN burst within one window must signal the spray")
 	}
 }
 
-// TestSprayNoCallerInventedFields proves P0.11: the detector never sets score/
-// confidence/severity itself — it goes through evidence.Mint, so a code is
-// only produced from the table.
-func TestSprayNoCallerInventedFields(t *testing.T) {
-	d := NewDetector(nil, nil, DefaultThresholds())
-	m := d.Observe("s", "c", "AS1", time.Now())
-	_ = m
-	// The only enforcement here is that Mint validated the rule exists; our
-	// detector has no path to build an Evidence literal directly.
-}
-// P0.15: the spray detector is a responsible minter — its evidence ids must be
-// CSPRNG-derived (unpredictable), NOT the timestamp-derived ev_<UnixNano> which
-// this detector previously inherited from Mint. An attacker observing request
-// timing must not be able to predict or collide a spray-evidence id.
-func TestSprayMintsUnpredictableEvidenceID(t *testing.T) {
-	d := NewDetector(nil, nil, DefaultThresholds())
-	now := time.Now()
-	got := d.Observe("s", "c", "AS1", now)
-	got = append(got, d.Observe("s", "c", "AS2", now)...)
-	got = append(got, d.Observe("s", "c", "AS3", now)...)
-	got = append(got, d.Observe("s", "c", "AS4", now)...) // crosses >3 → mints
-	if len(got) == 0 {
-		t.Fatal("expected sprayed evidence")
-	}
-	for _, ev := range got {
-		// Not a bare ev_<all-decimal-digits> timestamp-derived id.
-		if rest := strings.TrimPrefix(ev.EvidenceID, "ev_"); rest != ev.EvidenceID && isAllDigits(rest) {
-			t.Fatalf("P0.15: spray evidence id is timestamp-derived: %q", ev.EvidenceID)
-		}
-		if len(ev.EvidenceID) < 12 {
-			t.Fatalf("P0.15: spray evidence id too short: %q", ev.EvidenceID)
+// TestSpraySignalsCarryNoPrivilegedFields proves P0.12: the detector has no
+// path to invent evidence parameters — a Signal carries only a code and a
+// subject. Scoring, family, scope, TTL, and minting revision are resolved by
+// the admission engine against the current compiled policy.
+func TestSpraySignalsCarryNoPrivilegedFields(t *testing.T) {
+	d := NewDetector(nil, DefaultThresholds())
+	sigs := d.Observe("s", "c", "AS1", time.Now())
+	for _, s := range sigs {
+		if s.Code == "" || s.SubjectID == "" {
+			t.Fatalf("signal must carry code and subject: %+v", s)
 		}
 	}
-}
-
-func isAllDigits(s string) bool {
-	for _, r := range s {
-		if r < '0' || r > '9' {
-			return false
-		}
-	}
-	return len(s) > 0
 }
