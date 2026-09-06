@@ -23,6 +23,7 @@ func TestReduceLaneSecurityNormalToSuspicious(t *testing.T) {
 
 func TestReduceLaneSecuritySingleHighBlocks(t *testing.T) {
 	hy := DefaultSecurityHysteresis() // BlockThresh 70
+	hy.EnableAutomaticBlock = true    // P0.13: automatic block is policy-gated
 	now := time.Now()
 	after := ReduceLaneSecurity(hy, SecurityState{}, 90, now)
 	if after.Status != LaneBlocked {
@@ -112,7 +113,12 @@ func TestCleanSinceResetOnElevation(t *testing.T) {
 		t.Fatal("P0.42: CleanSince must be seeded at lane creation")
 	}
 
-	// A high lane-risk observation elevates to BLOCKED → CleanSince resets.
+	// A high lane-risk observation elevates → CleanSince resets. P0.13: with
+	// automatic block disabled (default), elevation lands SUSPICIOUS; enable
+	// the gate here to exercise the BLOCKED transition specifically.
+	hy := DefaultSecurityHysteresis()
+	hy.EnableAutomaticBlock = true
+	store.SetSecurityHysteresis(hy)
 	if _, err := store.ObserveRisk("cred_c", laneID, 95, now.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
@@ -122,5 +128,73 @@ func TestCleanSinceResetOnElevation(t *testing.T) {
 	}
 	if rec.Security.Status != LaneBlocked {
 		t.Fatalf("P0.7: lane must be BLOCKED after high risk, got %v", rec.Security.Status)
+	}
+}
+// P0.13: automatic lane BLOCK is policy-gated. With the gate disabled (the
+// default, shadow-first posture), a block-warranting score may elevate a lane
+// to SUSPICIOUS (restricted, non-promoting) but NEVER to BLOCKED — the old
+// code committed automatic, operator-unvalidated, durable denials while the
+// credential side claimed no-auto-quarantine. An operator block (via Unblock's
+// complement) remains available; enabling the gate in a validated revision
+// turns the automatic transition on.
+func TestAutomaticBlockIsPolicyGated(t *testing.T) {
+	now := time.Now()
+
+	// Gate OFF (default): block-warranting score lands SUSPICIOUS immediately,
+	// never BLOCKED.
+	hyOff := DefaultSecurityHysteresis()
+	after := ReduceLaneSecurity(hyOff, SecurityState{}, 95, now)
+	if after.Status != LaneSuspicious {
+		t.Fatalf("P0.13: gate off + score 95 → %v, want SUSPICIOUS (restricted, not blocked)", after.Status)
+	}
+	// And a SUSPICIOUS lane with a hot score stays SUSPICIOUS, not BLOCKED.
+	after2 := ReduceLaneSecurity(hyOff, SecurityState{Status: LaneSuspicious}, 95, now)
+	if after2.Status != LaneSuspicious {
+		t.Fatalf("P0.13: gate off + SUSPICIOUS + hot score → %v, want SUSPICIOUS", after2.Status)
+	}
+
+	// Gate ON (operator-validated posture): same score blocks.
+	hyOn := DefaultSecurityHysteresis()
+	hyOn.EnableAutomaticBlock = true
+	blocked := ReduceLaneSecurity(hyOn, SecurityState{}, 95, now)
+	if blocked.Status != LaneBlocked {
+		t.Fatalf("P0.13: gate on + score 95 → %v, want BLOCKED", blocked.Status)
+	}
+	blocked2 := ReduceLaneSecurity(hyOn, SecurityState{Status: LaneSuspicious}, 95, now)
+	if blocked2.Status != LaneBlocked {
+		t.Fatalf("P0.13: gate on + SUSPICIOUS + hot score → %v, want BLOCKED", blocked2.Status)
+	}
+
+	// An already-BLOCKED lane stays BLOCKED regardless of the gate — the gate
+	// guards automatic ESCALATION; it must never silently lift an operator
+	// state.
+	after3 := ReduceLaneSecurity(hyOff, SecurityState{Status: LaneBlocked}, 5, now)
+	if after3.Status != LaneBlocked {
+		t.Fatalf("P0.13: gate off must not auto-recover an operator block: %v", after3.Status)
+	}
+}
+
+// P0.13 end-to-end through the store: a terminator built with the default
+// policy (gate off) must not persist a BLOCKED lane even under extreme
+// evidence; it persists SUSPICIOUS instead.
+func TestStoreObserveRiskRespectsAutomaticBlockGate(t *testing.T) {
+	now := time.Now()
+	store := NewStore(nil, func() time.Time { return now })
+	// Defaults: automatic block OFF.
+	if _, _, err := store.BorrowOrCreate("cred_g", "lane_g", Features{NetworkASN: "AS1"}, DefaultThresholds()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ObserveRisk("cred_g", "lane_g", 100, now); err != nil {
+		t.Fatal(err)
+	}
+	rec, _ := store.Get("cred_g", "lane_g")
+	if rec.Security.Status != LaneSuspicious {
+		t.Fatalf("P0.13: default store posture + score 100 → %v, want SUSPICIOUS", rec.Security.Status)
+	}
+	if rec.Security.Status.Denied() {
+		t.Fatal("P0.13: SUSPICIOUS must not deny outright")
+	}
+	if !rec.Security.Status.Elevated() {
+		t.Fatal("P0.13: SUSPICIOUS must restrict")
 	}
 }

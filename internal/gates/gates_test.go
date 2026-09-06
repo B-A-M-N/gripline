@@ -251,10 +251,14 @@ func TestGateI_LaneScopedCompromiseDoesNotDisableEstablished(t *testing.T) {
 	reg := gateRegistry(t, "cred_i", raw)
 	signer, _ := terminator.GenerateSigner()
 	store := evidence.NewMemoryStore()
+	// P0.13: the Gate I contract is about BLOCKED lanes — enable the
+	// operator-validated automatic-block posture in this gate's policy.
+	gatePol := policy.Default()
+	gatePol.LaneSecurity.EnableAutomaticBlock = true
 	term, err := terminator.New(terminator.Dependencies{
 		Registry: reg, Peppers: credential.MustPepperRing(pep),
 		Lanes:    lane.NewStore(nil, time.Now),
-		Policy:   policy.Default(),
+		Policy:   gatePol,
 		Signer:   signer,
 		Audience: gateAudience,
 		Evidence: store,
@@ -355,10 +359,14 @@ func TestGateI_LaneScopedRestrictionThroughProxy(t *testing.T) {
 	pep := &credential.PepperKey{Version: 1, Key: []byte("gate-pepper-cred_i")}
 	reg := gateRegistry(t, "cred_i", raw)
 	store := evidence.NewMemoryStore()
+	// P0.13: the Gate I contract is about BLOCKED lanes — enable the
+	// operator-validated automatic-block posture in this gate's policy.
+	gatePol := policy.Default()
+	gatePol.LaneSecurity.EnableAutomaticBlock = true
 	term, err := terminator.New(terminator.Dependencies{
 		Registry: reg, Peppers: credential.MustPepperRing(pep),
 		Lanes:    lane.NewStore(nil, time.Now),
-		Policy:   policy.Default(),
+		Policy:   gatePol,
 		Signer:   signer,
 		Audience: gateAudience,
 		Evidence: store,

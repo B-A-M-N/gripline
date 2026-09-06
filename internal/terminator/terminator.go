@@ -224,6 +224,12 @@ func New(dep Dependencies) (*Terminator, error) {
 	if err != nil {
 		return nil, fmt.Errorf("terminator: compile policy: %w", err)
 	}
+	// P0.13: the compiled policy's lane security hysteresis — including the
+	// EnableAutomaticBlock gate — overrides whatever the lane store was built
+	// with, so policy revision is the one authority for lane security behavior.
+	if dep.Lanes != nil {
+		dep.Lanes.SetSecurityHysteresis(compiled.LaneSecurity)
+	}
 	return &Terminator{
 		dep:  dep,
 		rand: newRequestID,

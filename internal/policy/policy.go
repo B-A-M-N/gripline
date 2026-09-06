@@ -90,6 +90,15 @@ type Policy struct {
 	Privacy  Privacy
 	Identity Identity
 
+	// LaneSecurity is the lane risk→security-status hysteresis, policy-
+	// controlled (P0.13): the thresholds AND the EnableAutomaticBlock gate live
+	// in the versioned policy, not in store defaults — policy_rev=42 must fully
+	// describe the transition rules that revision enforces. The terminator
+	// applies this to its lane store at construction so the compiled revision is
+	// the one authority for lane security behavior. A zero value falls back to
+	// lane.DefaultSecurityHysteresis() at use time.
+	LaneSecurity lane.SecurityHysteresis
+
 	// EvidenceRules is the VERSIONED evidence rule table (P0.11): every
 	// security-relevant field of minted evidence — family, scope, score,
 	// severity, confidence, correlation group, TTL — is derived from this table,
@@ -138,6 +147,11 @@ func Default() *Policy {
 		},
 		Privacy:  Privacy{PromptRetention: false, CompletionRetention: false},
 		Identity: Identity{MaxTTLSeconds: 30},
+		// P0.13: lane security hysteresis is policy-owned. Automatic lane BLOCK
+		// ships DISABLED (shadow-first default, matching
+		// Risk.EnableAutomaticQuarantine); an operator must enable it explicitly
+		// in a validated revision.
+		LaneSecurity: lane.DefaultSecurityHysteresis(),
 		// EvidenceRules + Classification: the compiled-policy baseline is seeded
 		// from the spec's illustrative tables (§36, §26) so a default policy is
 		// identical to today's behavior; a policy author overrides these fields in

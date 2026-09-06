@@ -44,6 +44,10 @@ type Store struct {
 	mu     sync.Mutex
 	cfg    GetConfig
 	now    func() time.Time
+	// securityOverride, when non-zero, replaces the Limits.Security hysteresis
+	// (P0.13): the compiled policy's hysteresis is applied over whatever config
+	// the store was built with, so policy revision is the one authority.
+	securityOverride SecurityHysteresis
 	byCred map[string]map[string]*LaneRecord // credentialID -> laneID -> record
 }
 
@@ -62,6 +66,21 @@ func (s *Store) limits() Limits {
 		}
 	}
 	return DefaultLimits()
+}
+
+// SetSecurityHysteresis overrides the security hysteresis used for lane
+// risk→status transitions (P0.13). The terminator calls this at construction
+// with its COMPILED policy's LaneSecurity so the policy revision — not store
+// construction defaults — is the one authority for lane security behavior.
+// A zero hy falls back to defaults (conservative: automatic block off).
+func (s *Store) SetSecurityHysteresis(hy SecurityHysteresis) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if hy.SuspectThresh > 0 && hy.BlockThresh > 0 {
+		s.securityOverride = hy
+		return
+	}
+	s.securityOverride = DefaultSecurityHysteresis()
 }
 
 // ErrTooManyLanes is returned when a credential already holds the max lanes.
@@ -342,6 +361,10 @@ func (s *Store) ObserveRisk(credID, laneID string, riskScore int, now time.Time)
 // securityHys returns the configured lane security hysteresis, defaulting
 // conservatively when unset.
 func (s *Store) securityHys() SecurityHysteresis {
+	// P0.13: the compiled policy's override wins over construction config.
+	if s.securityOverride.SuspectThresh > 0 && s.securityOverride.BlockThresh > 0 {
+		return s.securityOverride
+	}
 	lm := s.limits()
 	if lm.Security.SuspectThresh > 0 && lm.Security.BlockThresh > 0 {
 		return lm.Security

@@ -878,10 +878,14 @@ func TestStalePolicyRevisionEvidenceFilteredFromStateMachine(t *testing.T) {
 	})
 	signer, _ := GenerateSigner()
 	store := evidence.NewMemoryStore()
+	// P0.13: block pathway under test → enable the operator-validated
+	// automatic-block posture in this test's policy.
+	pol := policy.Default()
+	pol.LaneSecurity.EnableAutomaticBlock = true
 	term, err := New(Dependencies{
 		Registry: reg, Peppers: credential.MustPepperRing(pep),
 		Lanes:    lane.NewStore(nil, time.Now),
-		Policy:   policy.Default(),
+		Policy:   pol,
 		Signer:   signer,
 		Audience: "fi-inference",
 		Evidence: store,
@@ -940,10 +944,12 @@ func TestStalePolicyRevisionEvidenceFilteredFromStateMachine(t *testing.T) {
 	// Case 2 (fresh store so the stale seed isn't in scope): CURRENT-revision
 	// evidence IS evaluated → the lane must be blocked (lane_restricted).
 	store = evidence.NewMemoryStore()
+	pol2 := policy.Default()
+	pol2.LaneSecurity.EnableAutomaticBlock = true // P0.13: block pathway under test
 	term2, err := New(Dependencies{
 		Registry: reg, Peppers: credential.MustPepperRing(pep),
 		Lanes:    lane.NewStore(nil, time.Now),
-		Policy:   policy.Default(),
+		Policy:   pol2,
 		Signer:   signer,
 		Audience: "fi-inference",
 		Evidence: store,

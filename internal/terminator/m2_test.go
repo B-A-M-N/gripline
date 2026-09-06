@@ -38,10 +38,14 @@ func TestM2LaneScopedContainment(t *testing.T) {
 	signer, _ := GenerateSigner()
 	store := evidence.NewMemoryStore()
 	ls := lane.NewStore(nil, time.Now)
+	// P0.13: this test exercises the BLOCKED pathway, which is policy-gated —
+	// opt into the operator-validated automatic-block posture.
+	pol := policy.Default()
+	pol.LaneSecurity.EnableAutomaticBlock = true
 	dep := Dependencies{
 		Registry: reg, Peppers: credential.MustPepperRing(pep),
 		Lanes:     ls,
-		Policy:    policy.Default(),
+		Policy:    pol,
 		Signer:    signer,
 		Audience:  "fi-inference",
 		Evidence:  store,

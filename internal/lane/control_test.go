@@ -19,7 +19,12 @@ func TestUnblockExitsBlockedAndReseedsClean(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Drive to BLOCKED via a single high-risk observation.
+	// Drive to BLOCKED via a single high-risk observation. P0.13: automatic
+	// block is now policy-gated, so the test enables it on this store (an
+	// operator-validated posture) before observing.
+	hy := DefaultSecurityHysteresis()
+	hy.EnableAutomaticBlock = true
+	store.SetSecurityHysteresis(hy)
 	if _, err := store.ObserveRisk("cred_c", laneID, 90, now); err != nil {
 		t.Fatal(err)
 	}

@@ -45,11 +45,24 @@ type SecurityHysteresis struct {
 	ClearThresh   int           // risk < this for ClearDwell → NORMAL
 	ClearDwell    time.Duration // dwell below ClearThresh to recover SUSPICIOUS→NORMAL
 	SuspectObs    int           // qualifying observations to enter SUSPICIOUS
+	// EnableAutomaticBlock gates the AUTOMATIC NORMAL/SUSPICIOUS→BLOCKED
+	// transition (P0.13). BLOCKED requires an operator unblock, so an
+	// automatic, operator-unvalidated, durable denial is exactly the class of
+	// action Gate H reserves for post-shadow-validation; while automatic
+	// credential quarantine is policy-disabled, lane block must be too — the
+	// old code blocked lanes unconditionally, so a "shadow-first" posture
+	// silently committed irreversible security actions. False (default):
+	// lane risk may elevate to SUSPICIOUS (restricted) but never to BLOCKED;
+	// manual operator block remains available. A block-warranting score still
+	// drives SUSPICIOUS (the strictest automatic posture).
+	EnableAutomaticBlock bool
 }
 
 // DefaultSecurityHysteresis returns conservative defaults. A single high-score
 // or repeated moderate-score lane observation elevates; recovery needs a
 // sustained clean window so a lane cannot flip-flop on a single low score.
+// Automatic BLOCK is DISABLED by default (P0.13): matching the credential
+// EnableAutomaticQuarantine default so shadow-first posture is consistent.
 func DefaultSecurityHysteresis() SecurityHysteresis {
 	return SecurityHysteresis{
 		SuspectThresh: 30,
@@ -74,6 +87,13 @@ type SecurityState struct {
 // ReduceLaneSecurity is the PURE, deterministic reducer for the lane security
 // dimension (P0.7). Given the current security state + one risk observation it
 // returns the next state. No clock reads, no shared state — replayable.
+//
+// P0.13: the automatic BLOCK transition fires only when hy.EnableAutomaticBlock
+// is set. With it disabled, a block-warranting score lands the lane in
+// SUSPICIOUS (restricted, and ineligible for promotion) instead — the strictest
+// automatic posture that commits no irreversible state. An already-BLOCKED lane
+// stays BLOCKED regardless: the gate guards AUTOMATIC escalation, and a manual
+// operator block must never be silently lifted by a policy change.
 func ReduceLaneSecurity(hy SecurityHysteresis, before SecurityState, score int, now time.Time) SecurityState {
 	score = clamp(score)
 	after := before
@@ -82,13 +102,16 @@ func ReduceLaneSecurity(hy SecurityHysteresis, before SecurityState, score int, 
 
 	switch before.Status {
 	case LaneNormal:
-		if score >= hy.BlockThresh {
-			// High-confidence abuse blocks immediately (analogous to §36).
+		if score >= hy.BlockThresh && hy.EnableAutomaticBlock {
+			// High-confidence abuse blocks immediately (analogous to §36) —
+			// only when automatic block is policy-enabled (P0.13).
 			after.Status = LaneBlocked
 			after.ClearSince = time.Time{}
 		} else if score >= hy.SuspectThresh {
 			after.SuspectStreak++
-			if after.SuspectStreak >= hy.SuspectObs {
+			// A block-warranting score under a disabled gate enters SUSPICIOUS
+			// immediately (no streak requirement): the lane is restricted now.
+			if after.SuspectStreak >= hy.SuspectObs || score >= hy.BlockThresh {
 				after.Status = LaneSuspicious
 				after.ClearSince = time.Time{}
 			}
@@ -98,7 +121,7 @@ func ReduceLaneSecurity(hy SecurityHysteresis, before SecurityState, score int, 
 		}
 
 	case LaneSuspicious:
-		if score >= hy.BlockThresh {
+		if score >= hy.BlockThresh && hy.EnableAutomaticBlock {
 			after.Status = LaneBlocked
 			after.ClearSince = time.Time{}
 		} else if score < hy.ClearThresh {
