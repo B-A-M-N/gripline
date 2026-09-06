@@ -260,8 +260,8 @@ func TestGateI_LaneScopedCompromiseDoesNotDisableEstablished(t *testing.T) {
 	}
 
 	// Two distinct lanes on the same credential.
-	laneA := lane.Features{NetworkASN: "AS-GATE-A", NetworkType: "residential"}
-	laneB := lane.Features{NetworkASN: "AS-GATE-B", NetworkType: "hosting"}
+	laneA := lane.Features{NetworkASN: "AS-GATE-A", NetworkType: "residential", RegionClass: "us", ClientFamily: "claude-code"}
+	laneB := lane.Features{NetworkASN: "AS-GATE-B", NetworkType: "hosting", RegionClass: "eu", ClientFamily: "sdk"}
 	outA := term.Admit(map[string][]string{"Authorization": {"Bearer " + raw}}, laneA)
 	outB := term.Admit(map[string][]string{"Authorization": {"Bearer " + raw}}, laneB)
 	if !outA.Authorized || !outB.Authorized {
@@ -366,7 +366,7 @@ func TestGateH_AutomaticQuarantineDisabledUntilValidation(t *testing.T) {
 			term, store, reg, raw := gateHIOTerminator(t, auto)
 
 			// Establish the lane normally (so classification/lane exist).
-			feat := lane.Features{NetworkASN: "AS-H", NetworkType: "residential"}
+			feat := lane.Features{NetworkASN: "AS-H", NetworkType: "residential", RegionClass: "us", ClientFamily: "claude-code"}
 			est := term.Admit(map[string][]string{"Authorization": {"Bearer " + raw}}, feat)
 			if !est.Authorized {
 				t.Fatalf("gate H %s: establish must authorize: %s", name, est.Reason)
@@ -571,16 +571,22 @@ func TestGateJ_ConcurrentAccountingNoOverAdmission(t *testing.T) {
 				return
 			}
 			// Carry the hold so overlapping workers contend for the same pool.
+			// `live` counts goroutines that are CURRENTLY holding a slot, so it
+			// must be decremented BEFORE Release returns the slot: leaving the
+			// live set after Release lets a legitimate successor re-provision the
+			// freed slot while this goroutine is still counted, driving peak above
+			// cap even though only `cap` slots are ever held at once (a pure
+			// measurement artifact, not over-admission).
 			mu.Lock()
 			live++
 			if live > peak {
 				peak = live
 			}
 			mu.Unlock()
-			res.Release()
 			mu.Lock()
 			live--
 			mu.Unlock()
+			res.Release()
 		}()
 	}
 	wg.Wait()

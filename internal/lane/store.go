@@ -133,7 +133,20 @@ func (s *Store) BorrowOrCreate(credID, newLaneID string, cand Features, th Class
 		}
 	}
 
-	if best != nil && th.classify(bestSim) == ClassMatch {
+	// Anti-laundering gate (P0.9): a MATCH requires BOTH enough renormalized
+	// similarity AND enough comparable feature mass. A sparse candidate that
+	// matches only on a couple of shared fields (renormalized to 1.0) must not
+	// collapse into an established lane. Fail-closed: a configured floor of 0
+	// (field forgotten) never permits a Match, so omitting the field cannot
+	// silently reopen the laundering strategy.
+	isMatch := best != nil && th.classify(bestSim) == ClassMatch
+	if isMatch && th.MinComparableWeight > 0 {
+		isMatch = ComparableWeight(cand, best.Features) >= th.MinComparableWeight
+	} else if best != nil {
+		// Nonzero comparable mass required; a zero floor is not blanket permission.
+		isMatch = false
+	}
+	if best != nil && isMatch {
 		best.LastSeenAt = s.now()
 		best.RequestCount++
 		best.Revision++

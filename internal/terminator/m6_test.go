@@ -53,9 +53,9 @@ func m6Terminator(t *testing.T, cp *control.ControlPlane) (*Terminator, string) 
 // requests on DIFFERENT features would be a NEW lane.
 func establishLane(t *testing.T, term *Terminator, raw string, existing bool) string {
 	t.Helper()
-	feat := lane.Features{NetworkASN: "AS-EST", NetworkType: "residential"}
+	feat := laneFeatures("AS-EST")
 	if !existing {
-		feat = lane.Features{NetworkASN: "AS-NEW", NetworkType: "hosting"}
+		feat = laneFeatures("AS-NEW")
 	}
 	out := term.Admit(bearerHeaders(raw), feat)
 	_ = out
@@ -76,7 +76,7 @@ func TestControlPlaneEmergencyLockdownDeniesNewLanes(t *testing.T) {
 		t.Fatal("establish failed")
 	}
 	// Confirm established traffic authorizes.
-	established := lane.Features{NetworkASN: "AS-EST", NetworkType: "residential"}
+	established := laneFeatures("AS-EST")
 	if o := term.Admit(bearerHeaders(raw), established); !o.Authorized {
 		t.Fatalf("established lane should authorize before lockdown: %s", o.Reason)
 	}
@@ -85,7 +85,7 @@ func TestControlPlaneEmergencyLockdownDeniesNewLanes(t *testing.T) {
 	cp.SetEmergency(true, "ops-oncall", "active credential exfiltration")
 
 	// A NEW lane request (different features, would create a new lane) is denied.
-	newLane := lane.Features{NetworkASN: "AS-NEW", NetworkType: "hosting"}
+	newLane := laneFeatures("AS-NEW")
 	out := term.Admit(bearerHeaders(raw), newLane)
 	if out.Authorized {
 		t.Fatal("P0.40: EMERGENCY_LOCKDOWN must deny a NEW lane's request")
@@ -108,7 +108,7 @@ func TestControlPlaneAuditTrailRecordsDecisions(t *testing.T) {
 	term, raw := m6Terminator(t, cp)
 
 	// One authorized admission.
-	feat := lane.Features{NetworkASN: "AS-AUDIT", NetworkType: "residential"}
+	feat := laneFeatures("AS-AUDIT")
 	term.Admit(bearerHeaders(raw), feat)
 
 	// One denied admission (invalid credential → extraction/auth fails before
@@ -116,7 +116,7 @@ func TestControlPlaneAuditTrailRecordsDecisions(t *testing.T) {
 	// defer is set AFTER auth, so an auth failure won't be audited here. Use a
 	// denied-but-authenticated path: quarantined credential after emergency.
 	cp.SetEmergency(true, "ops", "test")
-	term.Admit(bearerHeaders(raw), lane.Features{NetworkASN: "AS-NEW2", NetworkType: "hosting"})
+	term.Admit(bearerHeaders(raw), laneFeatures("AS-NEW2"))
 
 	events := cp.Audit()
 	var operatorSeen, admissionAuthorized, admissionDenied bool

@@ -123,14 +123,33 @@ func (f Features) has(field string) bool {
 // ClassificationThresholds carries the similarity cutoffs (policy-controlled):
 // similarity >= Match → candidate existing lane; >= Related → related context /
 // candidate new lane; below Related → novel lane.
+//
+// MinComparableWeight is the P0.9 anti-laundering floor: a candidate may only
+// MATCH an existing lane when BOTH its renormalized similarity is >= Match AND
+// ComparableWeight(candidate, stored) is >= MinComparableWeight. Otherwise a
+// sparse candidate that omits distinguishing features renormalizes its few
+// shared fields (e.g. ASN + region + client all match) to a perfect 1.0 and
+// collapses into an established lane. A zero value FAILS CLOSED to the floor
+// (no Match for any candidate whose comparable mass is below a believable
+// threshold), so omitting the field can never silently reopen the laundering
+// strategy.
 type ClassificationThresholds struct {
 	Match   float64 // >= this → candidate existing lane
 	Related float64 // floor; below this → novel lane
+	// MinComparableWeight is the minimum comparable feature mass a candidate
+	// must share with a stored lane to be a Match (P0.9). The default requires
+	// the trusted network-source identity (ASN+Region+NetworkType ≈ 0.70 of the
+	// feature space); a candidate refusing those trusted fields cannot Match.
+	MinComparableWeight float64
 }
 
-// DefaultThresholds are the spec §26 example defaults.
+// DefaultThresholds are the spec §26 example defaults, hardened per P0.9 with a
+// comparable-mass floor that requires the full trusted network-source identity
+// (NetworkASN 0.35 + RegionClass 0.20 + NetworkType 0.15 = 0.70) to be present
+// before a Match is permitted. A candidate omitting any trusted source field
+// drops below this floor and cannot collapse into an established lane.
 func DefaultThresholds() ClassificationThresholds {
-	return ClassificationThresholds{Match: 0.80, Related: 0.55}
+	return ClassificationThresholds{Match: 0.80, Related: 0.55, MinComparableWeight: 0.70}
 }
 
 // Weights multiply per-feature similarity; they are renormalized over present
@@ -148,11 +167,16 @@ var defaultWeights = map[string]float64{
 	"EndpointFamily":     0.05,
 }
 
-// Similarity computes a weighted, renormalized similarity in [0,1] between two
-// feature vectors, considering only features present in at least one vector's
-// comparable space (both must be present to score a match). Deterministic.
-func Similarity(a, b Features) float64 {
-	var totalW, matchedW float64
+// comparable returns the matched weight and the comparable total weight between
+// two feature vectors, considering only fields present in BOTH vectors (both
+// must be present to score a match). Deterministic (fixed field order).
+//
+// The comparable total is what Similarity renormalizes over. It is exposed so a
+// classification can ALSO bound how much feature mass the decision rests on
+// (P0.9): a sparse candidate that renormalizes to 1.0 over a tiny comparable
+// set must not be allowed to collapse into an established lane unless enough of
+// the trusted feature space is actually present.
+func comparable(a, b Features) (matchedW, totalW float64) {
 	// Iterate over a fixed field order so the result is deterministic.
 	fields := []string{
 		"NetworkASN", "NetworkType", "RegionClass", "ClientFamily",
@@ -169,10 +193,31 @@ func Similarity(a, b Features) float64 {
 			}
 		}
 	}
+	return matchedW, totalW
+}
+
+// Similarity computes a weighted, renormalized similarity in [0,1] between two
+// feature vectors, considering only features present in at least one vector's
+// comparable space (both must be present to score a match). Deterministic.
+func Similarity(a, b Features) float64 {
+	matchedW, totalW := comparable(a, b)
 	if totalW == 0 {
 		return 0
 	}
 	return matchedW / totalW
+}
+
+// ComparableWeight reports the fraction of the FEATURE SPACE (using fixed
+// default weights, out of 1.0) that both vectors populate — i.e. how much
+// comparable evidence a Similarity decision actually rests on. Used with
+// ClassificationThresholds.MinComparableWeight to stop a sparse candidate from
+// collapsing into an established lane on a sliver of shared fields (P0.9).
+func ComparableWeight(a, b Features) float64 {
+	_, totalW := comparable(a, b)
+	if totalW > 1 {
+		totalW = 1
+	}
+	return totalW
 }
 
 func fieldVal(f *Features, name string) string {

@@ -58,23 +58,23 @@ func TestStoreBorrowOrCreateAndExplosion(t *testing.T) {
 	}, time.Now)
 	th := DefaultThresholds()
 
-	// two distinct lanes
-	l1, created, err := store.BorrowOrCreate("cred_1", "lane_a", Features{NetworkASN: "AS1", RegionClass: "us"}, th)
+	// two distinct lanes (full trusted source identity so three can coexist)
+	l1, created, err := store.BorrowOrCreate("cred_1", "lane_a", Features{NetworkASN: "AS1", NetworkType: "residential", RegionClass: "us"}, th)
 	if err != nil || !created || l1.LaneID != "lane_a" {
 		t.Fatalf("create lane_a: created=%v err=%v", created, err)
 	}
-	l2, created, err := store.BorrowOrCreate("cred_1", "lane_b", Features{NetworkASN: "AS2", RegionClass: "eu"}, th)
+	l2, created, err := store.BorrowOrCreate("cred_1", "lane_b", Features{NetworkASN: "AS2", NetworkType: "hosting", RegionClass: "eu"}, th)
 	if err != nil || !created || l2.LaneID != "lane_b" {
 		t.Fatalf("create lane_b: created=%v err=%v", created, err)
 	}
 	// third distinct lane over limit → ErrTooManyLanes
-	_, created, err = store.BorrowOrCreate("cred_1", "lane_c", Features{NetworkASN: "AS3", RegionClass: "ap"}, th)
+	_, created, err = store.BorrowOrCreate("cred_1", "lane_c", Features{NetworkASN: "AS3", NetworkType: "hosting", RegionClass: "ap"}, th)
 	if err != ErrTooManyLanes {
 		t.Fatalf("explosion limit: got err=%v want ErrTooManyLanes", err)
 	}
 
-	// a matching re-request borrows lane_a (same ASN+region)
-	reuse, created, err := store.BorrowOrCreate("cred_1", "lane_x", Features{NetworkASN: "AS1", RegionClass: "us"}, th)
+	// a matching re-request borrows lane_a (same ASN+type+region)
+	reuse, created, err := store.BorrowOrCreate("cred_1", "lane_x", Features{NetworkASN: "AS1", NetworkType: "residential", RegionClass: "us"}, th)
 	if err != nil {
 		t.Fatalf("reuse err: %v", err)
 	}
@@ -214,44 +214,50 @@ func TestFullFeatureVectorDistinguishesLanes(t *testing.T) {
 // ties. The store previously iterated a Go map (randomized order) with strict
 // `>`, so which lane won a tie depended on hash order. Now: highest similarity,
 // then lexicographically smallest lane id — stable across store instances.
+//
+// Note: P0.9's comparable-weight floor means a SPARSE query no longer matches an
+// established lane (that was the laundering strategy). Determinism is therefore
+// exercised with a full, legitimate query that provably borrows an established
+// lane, and the sparse-query case is asserted to create a NEW lane instead.
 func TestLaneSelectionDeterministicUnderTies(t *testing.T) {
-	// Two candidate lanes that tie at the same similarity from the candidate's
-	// perspective: both seeds share {ASN, region, client} with the query and
-	// each carries one extra private feature the query lacks (present-only
-	// renormalization keeps the query's view identical for both). The seeds
-	// stay mutually distinct because their private features differ. Whichever
-	// lane wins must win IDENTICALLY on every run — Go map iteration order
-	// must not decide (P0.9).
 	th := DefaultThresholds()
-	cand := Features{NetworkASN: "AS1", RegionClass: "mid", ClientFamily: "cc"}
-	newStore := func() *Store {
+	// Full trusted source identity — a legitimate honest client.
+	full := Features{NetworkASN: "AS1", RegionClass: "mid", ClientFamily: "cc", NetworkType: "residential"}
+
+	// A sparse query (source identity WITHOUT a trusted field) must NOT borrow a
+	// full lane: it creates a new lane instead (P0.9 anti-laundering).
+	{
 		s := NewStore(func() Limits {
 			return Limits{MaxActiveLanesPerCredential: 8, MaxProvisionalLanes: 8, LaneIdleExpiration: time.Hour}
 		}, time.Now)
-		if _, created, err := s.BorrowOrCreate("cred_1", "lane_zulu", Features{NetworkASN: "AS1", RegionClass: "mid", ClientFamily: "cc", NetworkType: "residential", SDKFamily: "go", HTTPVersion: "1.1", Streaming: "streaming"}, th); err != nil || !created {
-			t.Fatalf("seed zulu: created=%v err=%v", created, err)
+		if _, created, err := s.BorrowOrCreate("cred_1", "lane_full", full, th); err != nil || !created {
+			t.Fatalf("seed full: created=%v err=%v", created, err)
 		}
-		// alpha differs from zulu in four candidate-absent features (total
-		// weight 0.35): mutual similarity = 0.65/1.00 = 0.65 (below Match →
-		// distinct rows), while each scores 1.0 against the candidate
-		// (candidate-absent features drop out of the denominator).
-		if _, created, err := s.BorrowOrCreate("cred_1", "lane_alpha", Features{NetworkASN: "AS1", RegionClass: "mid", ClientFamily: "cc", NetworkType: "hosting", SDKFamily: "py", HTTPVersion: "2", Streaming: "non-streaming"}, th); err != nil || !created {
-			t.Fatalf("seed alpha: created=%v err=%v", created, err)
+		sparse := Features{NetworkASN: "AS1", ClientFamily: "cc"} // omits NetworkType+Region
+		if _, created, err := s.BorrowOrCreate("cred_1", "lane_sparse", sparse, th); err != nil {
+			t.Fatal(err)
+		} else if !created {
+			t.Fatal("P0.9: sparse query must create a NEW lane, not borrow the established full lane")
 		}
-		if s.ActiveLaneCount("cred_1") != 2 {
-			t.Fatalf("seed lanes collapsed: %d", s.ActiveLaneCount("cred_1"))
-		}
-		return s
 	}
+
+	// Determinism: a full query that legitimately matches the established lane
+	// must borrow the SAME lane on every store instance (Go map order must not
+	// decide selection).
 	want := ""
 	for i := 0; i < 200; i++ {
-		s := newStore()
-		rec, created, err := s.BorrowOrCreate("cred_1", "lane_new_"+string(rune('a'+i%26)), cand, th)
+		s := NewStore(func() Limits {
+			return Limits{MaxActiveLanesPerCredential: 8, MaxProvisionalLanes: 8, LaneIdleExpiration: time.Hour}
+		}, time.Now)
+		if _, created, err := s.BorrowOrCreate("cred_1", "lane_alpha", full, th); err != nil || !created {
+			t.Fatalf("seed: created=%v err=%v", created, err)
+		}
+		rec, created, err := s.BorrowOrCreate("cred_1", "lane_query", full, th)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if created {
-			t.Fatalf("iteration %d: tie must borrow, not create", i)
+			t.Fatalf("iteration %d: full query must borrow, not create", i)
 		}
 		if want == "" {
 			want = rec.LaneID
@@ -259,7 +265,7 @@ func TestLaneSelectionDeterministicUnderTies(t *testing.T) {
 			t.Fatalf("iteration %d: nondeterministic selection %s, want %s", i, rec.LaneID, want)
 		}
 		if rec.LaneID != "lane_alpha" {
-			t.Fatalf("tie must deterministically pick the lexicographically smallest id, got %s", rec.LaneID)
+			t.Fatalf("borrow must deterministically return lane_alpha, got %s", rec.LaneID)
 		}
 	}
 }
@@ -322,8 +328,11 @@ func TestActiveDaysCountDistinctDays(t *testing.T) {
 		return Limits{MaxActiveLanesPerCredential: 4, MaxProvisionalLanes: 4, LaneIdleExpiration: 48 * time.Hour}
 	}, func() time.Time { return clock })
 	th := DefaultThresholds()
+	// A real client presents the full source identity, so a re-request matches
+	// the established lane (comparable weight well above the P0.9 floor).
+	feat := Features{NetworkASN: "AS1", NetworkType: "residential", RegionClass: "us", ClientFamily: "claude-code"}
 
-	rec, _, err := store.BorrowOrCreate("cred_1", "lane_d", Features{NetworkASN: "AS1"}, th)
+	rec, _, err := store.BorrowOrCreate("cred_1", "lane_d", feat, th)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,7 +342,7 @@ func TestActiveDaysCountDistinctDays(t *testing.T) {
 	// Same day: no change. The re-request must BORROW lane_d (identical
 	// features) and not advance ActiveDays.
 	clock = base.Add(2 * time.Hour)
-	rec, created, err := store.BorrowOrCreate("cred_1", "lane_d", Features{NetworkASN: "AS1"}, th)
+	rec, created, err := store.BorrowOrCreate("cred_1", "lane_d", feat, th)
 	if err != nil || created {
 		t.Fatalf("same-day borrow: created=%v err=%v", created, err)
 	}
@@ -345,7 +354,7 @@ func TestActiveDaysCountDistinctDays(t *testing.T) {
 	}
 	// Next day: +1 (borrow again, a day later).
 	clock = base.Add(26 * time.Hour)
-	rec, created, err = store.BorrowOrCreate("cred_1", "lane_d", Features{NetworkASN: "AS1"}, th)
+	rec, created, err = store.BorrowOrCreate("cred_1", "lane_d", feat, th)
 	if err != nil || created {
 		t.Fatalf("next-day borrow: created=%v err=%v", created, err)
 	}
@@ -354,5 +363,54 @@ func TestActiveDaysCountDistinctDays(t *testing.T) {
 	}
 	if rec.ActiveDays != 2 {
 		t.Fatalf("next-day ActiveDays = %d, want 2", rec.ActiveDays)
+	}
+}
+
+// TestSparseCandidateCannotLaunderIntoEstablishedLane proves P0.9: a candidate
+// that omits the trusted source dimensions must NOT renormalize its few shared
+// fields to a perfect 1.0 and collapse into an established lane. The
+// MinComparableWeight floor blocks the laundering strategy that a generic
+// "shared ASN + region + client all match → similarity 1.0" formula permits.
+func TestSparseCandidateCannotLaunderIntoEstablishedLane(t *testing.T) {
+	clock := time.Now()
+	store := NewStore(func() Limits {
+		return Limits{MaxActiveLanesPerCredential: 8, MaxProvisionalLanes: 8, LaneIdleExpiration: 48 * time.Hour}
+	}, func() time.Time { return clock })
+	th := DefaultThresholds()
+
+	// Establish a rich lane with the full trusted source identity.
+	rich := Features{NetworkASN: "AS77", NetworkType: "residential", RegionClass: "us",
+		ClientFamily: "claude-code", SDKFamily: "go", HTTPVersion: "1.1", Streaming: "non-streaming"}
+	rec, created, err := store.BorrowOrCreate("cred_1", "lane_rich", rich, th)
+	if err != nil || !created {
+		t.Fatalf("establish rich lane: created=%v err=%v", created, err)
+	}
+	// Rich identity matches itself (re-borrow): comparable weight is high.
+	if _, created, err := store.BorrowOrCreate("cred_1", "lane_rich", rich, th); err != nil || created {
+		t.Fatalf("re-borrow full identity: created=%v err=%v (want borrow, not new)", created, err)
+	}
+
+	// A SPARSE candidate omitting the trusted source dimensions (only ASN +
+	// client) renormalizes those shared fields to a perfect 1.0 similarity — but
+	// its comparable mass (ASN .35 + client .10 = .45) is below the floor, so it
+	// must NOT match the established lane (it must be treated as a new lane).
+	sparse := Features{NetworkASN: "AS77", ClientFamily: "claude-code"}
+	if w := ComparableWeight(sparse, rich); w >= th.MinComparableWeight {
+		t.Fatalf("sparse comparable weight %v >= floor %v — laundering not blocked", w, th.MinComparableWeight)
+	}
+	if s := Similarity(sparse, rich); s < th.Match {
+		t.Fatalf("sparse renormalized similarity %v < Match=%v — test is not exercising the collapse", s, th.Match)
+	}
+	rec2, created2, err := store.BorrowOrCreate("cred_1", "lane_sparse", sparse, th)
+	if err != nil {
+		t.Fatalf("sparse borrow err=%v", err)
+	}
+	if created2 {
+		if rec2.LaneID == rec.LaneID {
+			t.Fatal("P0.9: sparse candidate accidentally borrowed the established lane")
+		}
+		t.Logf("sparse candidate correctly treated as a NEW lane (ID %s), not the established %s", rec2.LaneID, rec.LaneID)
+	} else if rec2.LaneID == "lane_rich" {
+		t.Fatal("P0.9 FAIL: sparse candidate collapsed into the established lane via renormalization")
 	}
 }

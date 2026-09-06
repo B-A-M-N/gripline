@@ -51,7 +51,7 @@ func TestEvidenceAppendFailureDoesNotFailOpen(t *testing.T) {
 	}
 
 	// Admission with a new lane generates NEW_LANE evidence that persists.
-	out := term.Admit(bearerHeaders(raw), lane.Features{NetworkASN: "AS1"})
+	out := term.Admit(bearerHeaders(raw), laneFeatures("AS1"))
 	if !out.Authorized {
 		t.Fatalf("should authorize: %s", out.Reason)
 	}
@@ -131,7 +131,7 @@ func TestAdmitEvidenceExplainability(t *testing.T) {
 	}
 
 	// First admission with new lane → evidence codes should include NEW_LANE.
-	out := term.Admit(bearerHeaders(raw), lane.Features{NetworkASN: "AS1"})
+	out := term.Admit(bearerHeaders(raw), laneFeatures("AS1"))
 	if !out.Authorized {
 		t.Fatalf("should authorize: %s", out.Reason)
 	}
@@ -191,7 +191,7 @@ func TestAdmitEvidenceFromStore(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	out := term.Admit(bearerHeaders(raw), lane.Features{NetworkASN: "AS1"})
+	out := term.Admit(bearerHeaders(raw), laneFeatures("AS1"))
 	if !out.Authorized {
 		t.Fatalf("should authorize: %s", out.Reason)
 	}
@@ -319,7 +319,7 @@ func TestObservationNotTiedToAuthorization(t *testing.T) {
 	}
 
 	// First admission (authorized) → lane created, clean counter incremented.
-	out := term.Admit(bearerHeaders(raw), lane.Features{NetworkASN: "AS1"})
+	out := term.Admit(bearerHeaders(raw), laneFeatures("AS1"))
 	if !out.Authorized {
 		t.Fatalf("should authorize: %s", out.Reason)
 	}
@@ -381,7 +381,7 @@ func TestPromotionUsesCleanCounters(t *testing.T) {
 
 	// Simulate: 5 clean authorized requests → AuthorizedCleanRequests=5.
 	for i := 0; i < 5; i++ {
-		out := term.Admit(bearerHeaders(raw), lane.Features{NetworkASN: "AS1"})
+		out := term.Admit(bearerHeaders(raw), laneFeatures("AS1"))
 		if !out.Authorized {
 			t.Fatalf("request %d: should authorize: %s", i, out.Reason)
 		}
@@ -438,7 +438,7 @@ func TestLaneRevisionBumpedOnMutations(t *testing.T) {
 
 	// Create lane → revision=1.
 	laneID := "lane_test"
-	rec, created, err := store.BorrowOrCreate("cred_rev", laneID, lane.Features{NetworkASN: "AS1"}, lane.DefaultThresholds())
+	rec, created, err := store.BorrowOrCreate("cred_rev", laneID, laneFeatures("AS1"), lane.DefaultThresholds())
 	if err != nil || !created {
 		t.Fatalf("create: err=%v created=%v", err, created)
 	}
@@ -447,7 +447,7 @@ func TestLaneRevisionBumpedOnMutations(t *testing.T) {
 	}
 
 	// Borrow (re-request) → revision bumps.
-	rec, _, err = store.BorrowOrCreate("cred_rev", laneID, lane.Features{NetworkASN: "AS1"}, lane.DefaultThresholds())
+	rec, _, err = store.BorrowOrCreate("cred_rev", laneID, laneFeatures("AS1"), lane.DefaultThresholds())
 	if err != nil {
 		t.Fatalf("borrow: %v", err)
 	}
@@ -506,7 +506,7 @@ func TestAuthorizedContextLaneStateIsAuthoritative(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	out := term.Admit(bearerHeaders(raw), lane.Features{NetworkASN: "AS1"})
+	out := term.Admit(bearerHeaders(raw), laneFeatures("AS1"))
 	if !out.Authorized {
 		t.Fatalf("should authorize: %s", out.Reason)
 	}
@@ -639,7 +639,7 @@ func TestAuthorizedContextContents(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	out := term.Admit(bearerHeaders(raw), lane.Features{NetworkASN: "AS1"})
+	out := term.Admit(bearerHeaders(raw), laneFeatures("AS1"))
 	if !out.Authorized {
 		t.Fatalf("should authorize: %s", out.Reason)
 	}
@@ -700,7 +700,7 @@ func TestNilEvidenceStoreStillAuthorizes(t *testing.T) {
 	}
 
 	// Clean request should still authorize.
-	out := term.Admit(bearerHeaders(raw), lane.Features{NetworkASN: "AS1"})
+	out := term.Admit(bearerHeaders(raw), laneFeatures("AS1"))
 	if !out.Authorized {
 		t.Fatalf("clean request with nil evidence store should authorize: %s", out.Reason)
 	}

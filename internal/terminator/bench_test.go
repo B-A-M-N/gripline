@@ -46,7 +46,7 @@ func benchTerminator() (*Terminator, string) {
 // accidental O(n) scanning or unbounded allocation would show up here.
 func BenchmarkAdmit(b *testing.B) {
 	term, raw := benchTerminator()
-	feat := lane.Features{NetworkASN: "AS1", NetworkType: "residential"}
+	feat := laneFeatures("AS1")
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		out := term.Admit(bearerHeaders(raw), feat)
@@ -71,7 +71,7 @@ func TestAdmissionLatencyBudget(t *testing.T) {
 		t.Skip("latency budget gate skipped in -short")
 	}
 	term, raw := benchTerminator()
-	feat := lane.Features{NetworkASN: "AS1", NetworkType: "residential"}
+	feat := laneFeatures("AS1")
 	const samples = 2000
 	durs := make([]time.Duration, 0, samples)
 	for i := 0; i < samples; i++ {
