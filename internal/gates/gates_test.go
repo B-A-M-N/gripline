@@ -311,7 +311,172 @@ func TestGateI_LaneScopedCompromiseDoesNotDisableEstablished(t *testing.T) {
 	}
 }
 
-// --- Gate H: automatic quarantine disabled until shadow validation -----------
+// --- Gate I end-to-end: lane-scoped restriction through the real proxy -------
+//
+// This is the user's capstone target made executable: a LANE-RESTRICTED
+// decision that is authoritative and enforced through the actual terminate-and-
+// forward proxy, accepted/denied by a private backend WITHOUT the external
+// credential crossing the boundary. The terminator admits per-lane; the proxy
+// streams the signed internal assertion only for an AUTHORIZED lane; the
+// backend verifies it. A blocked lane's request must never reach the backend.
+//
+// sourceResolv attributes the trusted source identity (ASN/network/region +
+// client family) from headers — standing in for an M4 edge-provider seam, the
+// flagged default in proxy.HeaderFeatures. Without the trusted source dims the
+// P0.9 anti-laundering floor (0.70) makes every request a fresh NOVEL lane, so
+// no lane can ever establish or be restricted through the proxy. Supplying the
+// full source identity is what lets the lane MATCH across requests here.
+type sourceResolv struct{}
+
+func (sourceResolv) Resolve(r *http.Request, _ proxy.Peer) lane.Features {
+	return lane.Features{
+		NetworkASN:   r.Header.Get("X-Source-ASN"),
+		NetworkType:  "residential",
+		RegionClass:  "us",
+		ClientFamily: "claude-code",
+		HTTPVersion:  "1.1",
+	}
+}
+
+// TestGateI_LaneScopedRestrictionThroughProxy drives a lane block through the
+// DataPlane + a real httptest backend. It proves the boundary is sealed even
+// mid-firefight: the denied lane's request is terminated at the edge (403, no
+// assertion minted) and never arrives at the private backend, while an
+// established lane continues to be accepted with a backend-verified internal
+// assertion.
+func TestGateI_LaneScopedRestrictionThroughProxy(t *testing.T) {
+	signer, _ := terminator.GenerateSigner()
+	raw := gateSecret("i")
+	pep := &credential.PepperKey{Version: 1, Key: []byte("gate-pepper-cred_i")}
+	reg := gateRegistry(t, "cred_i", raw)
+	store := evidence.NewMemoryStore()
+	term, err := terminator.New(terminator.Dependencies{
+		Registry: reg, Peppers: credential.MustPepperRing(pep),
+		Lanes:    lane.NewStore(nil, time.Now),
+		Policy:   policy.Default(),
+		Signer:   signer,
+		Audience: gateAudience,
+		Evidence: store,
+		Resource: resource.NewGovernor(nil),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A private backend that verifies the internal assertion and rejects any
+	// residual secret carrier.
+	hit := make(map[string]int)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if len(r.Header.Values("Authorization")) > 0 || len(r.Header.Values("X-Api-Key")) > 0 {
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte("external-secret-leaked"))
+			return
+		}
+		ver := proxy.NewBackendVerifier(signer.Public(), gateAudience)
+		if _, verr := ver.Verify(r); verr != nil {
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(verr.Error()))
+			return
+		}
+		hit[r.Header.Get("X-Source-ASN")]++
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("accepted"))
+	}))
+	defer backend.Close()
+
+	dp, err := proxy.New(proxy.Config{
+		Terminator: term,
+		Backend:    http.DefaultTransport,
+		Audience:   gateAudience,
+		Features:   sourceResolv{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// admit runs one request through the real proxy with the given source ASN.
+	admit := func(asn string) (int, string) {
+		req := httptest.NewRequest("POST", backend.URL+"/v1/messages", strings.NewReader(`{"x":1}`))
+		req.Header.Set("Authorization", "Bearer "+raw)
+		req.Header.Set("X-Source-ASN", asn)
+		rec := httptest.NewRecorder()
+		dp.ServeHTTP(rec, req)
+		return rec.Code, rec.Header().Get("X-Gripline-Reason")
+	}
+
+	// (1) Two distinct asns establish two lanes; both authorize end-to-end, and
+	// the backend verifies the assertion for each.
+	if c, r := admit("AS-PROXY-A"); c != http.StatusOK {
+		t.Fatalf("lane A establish: proxy returned %d (reason %q)", c, r)
+	}
+	if c, r := admit("AS-PROXY-B"); c != http.StatusOK {
+		t.Fatalf("lane B establish: proxy returned %d (reason %q)", c, r)
+	}
+	if hit["AS-PROXY-A"] != 1 || hit["AS-PROXY-B"] != 1 {
+		t.Fatalf("backend must have accepted both lanes: %v", hit)
+	}
+
+	// (2) Block lane B via ITS OWN lane-scoped high-risk evidence (sum >= 70).
+	// The lane id is deterministic on the feature vector (classifyLane), so a
+	// direct Admit with the exact sourceResolv features yields the same lane id
+	// the proxy uses. Seed lane-scoped evidence under that id.
+	// Build the resolved feature the way the proxy does (Header.Set canonicalizes
+	// the key), so the probe targets the SAME lane the proxy established.
+	probeReq := httptest.NewRequest("POST", "/", nil)
+	probeReq.Header.Set("X-Source-ASN", "AS-PROXY-B")
+	laneBFeatures := sourceResolv{}.Resolve(probeReq, proxy.Peer{})
+	probe := term.Admit(map[string][]string{"Authorization": {"Bearer " + raw}}, laneBFeatures)
+	if !probe.Authorized {
+		t.Fatalf("pre-block lane B should authorize: %s", probe.Reason)
+	}
+	laneBID := probe.Context.LaneID
+	now := time.Now()
+	hi := []evidence.Evidence{
+		{
+			EvidenceID: "gate_epxy_b1", Code: "CONCURRENCY_OVER_10X_BASELINE",
+			Family: evidence.FamilyResourceVelocity, Scope: evidence.ScopeLane,
+			SubjectID: laneBID, Score: 40, Confidence: 85,
+			CreatedAt: now, ExpiresAt: now.Add(time.Hour),
+		},
+		{
+			EvidenceID: "gate_epxy_b2", Code: "NEW_HOSTING_ASN",
+			Family: evidence.FamilySourceDiscontinuity, Scope: evidence.ScopeLane,
+			SubjectID: laneBID, Score: 40, Confidence: 70,
+			CreatedAt: now, ExpiresAt: now.Add(time.Hour),
+		},
+	}
+	if err := store.Append(hi...); err != nil {
+		t.Fatal(err)
+	}
+
+	// (3) The blocked lane's request through the REAL proxy must be denied at the
+	// edge (403) and must NEVER reach the backend — no assertion is minted for a
+	// restricted lane, so the backend cannot accept it.
+	before := hit["AS-PROXY-B"]
+	if c, r := admit("AS-PROXY-B"); c != http.StatusForbidden {
+		t.Fatalf("blocked lane through proxy: got %d (reason %q), want 403 (lane_restricted)", c, r)
+	}
+	if hit["AS-PROXY-B"] != before {
+		t.Fatal("Gate I proxy: blocked lane's request must never reach the backend")
+	}
+
+	// (4) Lane A is untouched and still accepted end-to-end through the proxy.
+	before = hit["AS-PROXY-A"]
+	// Direct admit for AS-PROXY-A (canonical header, matching the proxy path).
+	diagReq := httptest.NewRequest("POST", "/", nil)
+	diagReq.Header.Set("X-Source-ASN", "AS-PROXY-A")
+	diagFeat := sourceResolv{}.Resolve(diagReq, proxy.Peer{})
+	if da := term.Admit(map[string][]string{"Authorization": {"Bearer " + raw}}, diagFeat); !da.Authorized {
+		t.Fatalf("pre-check direct lane A must authorize: %s", da.Reason)
+	}
+	if c, r := admit("AS-PROXY-A"); c != http.StatusOK {
+		t.Fatalf("lane A must continue through proxy: got %d (reason %q), want 200", c, r)
+	}
+	if hit["AS-PROXY-A"] != before+1 {
+		t.Fatal("Gate I proxy: established lane A must still be backend-accepted")
+	}
+}
+
 
 // gateHIOTerminator builds a terminator with the given auto-quarantine posture.
 // It returns the terminator, the evidence store (so the test can seed a high
