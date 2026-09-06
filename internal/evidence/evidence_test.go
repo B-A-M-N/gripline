@@ -1,6 +1,7 @@
 package evidence
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -176,5 +177,57 @@ func TestZeroTTLRuleMeansNeverExpires(t *testing.T) {
 	}
 	if positive.Valid(now.Add(7*24*time.Hour + time.Second)) {
 		t.Fatal("positive-TTL evidence must expire on schedule")
+	}
+}
+
+// P0.15: evidence ids minted by the default Mint MUST be unpredictable (CSPRNG),
+// not a timestamp-derived ev_<UnixNano> an attacker can guess, forge, or collide.
+func TestMintEvidenceIDIsCSPRNGNotPredictable(t *testing.T) {
+	tbl := DefaultTable()
+	now := time.Now()
+	a, err := Mint(tbl, "NEW_ASN", "cred_1", now, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := Mint(tbl, "NEW_ASN", "cred_1", now, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Two distinct mints must not collide, even with the same subject+time+revision
+	// (a timestamp id would be identical here — a collision).
+	if a.EvidenceID == b.EvidenceID {
+		t.Fatalf("P0.15: identical evidence ids on same input — predictable: %q", a.EvidenceID)
+	}
+	// Must not be a bare ev_<all-decimal-digits> (the pre-P0.15 forgeable id).
+	if rest := strings.TrimPrefix(a.EvidenceID, "ev_"); rest != a.EvidenceID && isAllDigits(rest) {
+		t.Fatalf("P0.15: evidence id is timestamp-derived and forgeable: %q", a.EvidenceID)
+	}
+	if len(a.EvidenceID) < 12 {
+		t.Fatalf("P0.15: evidence id too short to carry entropy: %q", a.EvidenceID)
+	}
+}
+
+func isAllDigits(s string) bool {
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return len(s) > 0
+}
+
+// P0.15: MintID with a caller-supplied generator produces EXACTLY that id, and a
+// nil generator fails closed (never silently reverts to an insecure timestamp id).
+func TestMintIDDeterministicAndNilFailsClosed(t *testing.T) {
+	tbl := DefaultTable()
+	ev, err := MintID(tbl, "NEW_ASN", "cred_1", time.Now(), 1, func() string { return "ev_fixed-123" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev.EvidenceID != "ev_fixed-123" {
+		t.Fatalf("MintID must use the supplied idgen verbatim, got %q", ev.EvidenceID)
+	}
+	if _, err := MintID(tbl, "NEW_ASN", "cred_1", time.Now(), 1, nil); err == nil {
+		t.Fatal("P0.15: MintID with nil idgen must fail closed (not fall back to insecure id)")
 	}
 }

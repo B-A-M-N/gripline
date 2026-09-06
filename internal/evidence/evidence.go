@@ -5,6 +5,8 @@
 package evidence
 
 import (
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"time"
@@ -159,6 +161,20 @@ func (e Evidence) NonEvictable() bool {
 	return false
 }
 
+// idRandom returns a CSPRNG-derived evidence id (P0.15): unconvergeable and
+// un-predictable, so evidence ids can never be guessed, forged, or collided by
+// an attacker who can observe timestamps or request ordering. A timestamp-derived
+// id (ev_<UnixNano>) is attacker-influenceable and must never be the default.
+func idRandom() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// Entropy failure is unrecoverable for a security-identity surface; the
+		// process must not mint forgeable evidence on a degraded RNG.
+		panic("evidence: entropy unavailable for evidence id: " + err.Error())
+	}
+	return "ev_" + base64.RawURLEncoding.EncodeToString(b[:])
+}
+
 // Mint is the ONLY sanctioned way to produce evidence for the risk engine
 // (P0.11): every security-relevant field — family, scope, score, severity,
 // confidence, correlation group, TTL — is populated from the versioned rule
@@ -167,6 +183,21 @@ func (e Evidence) NonEvictable() bool {
 // this same path; gating WHO may call it for those codes is a control-plane
 // authorization concern enforced at the API that exposes Mint.
 func Mint(table Table, code string, subjectID string, now time.Time, policyRevision int) (Evidence, error) {
+	return mintID(table, code, subjectID, now, policyRevision, idRandom)
+}
+
+// MintID is Mint with an explicit evidence-id generator, so callers can supply a
+// deterministic id (tests, replay, operator tools) while the security-critical
+// default Mint remains CSPRNG. The supplied idgen is used verbatim; a nil idgen
+// refuses to mint rather than silently reverting to an insecure id.
+func MintID(table Table, code string, subjectID string, now time.Time, policyRevision int, idgen func() string) (Evidence, error) {
+	if idgen == nil {
+		return Evidence{}, errors.New("evidence: nil id generator (must supply CSPRNG or explicit dd)")
+	}
+	return mintID(table, code, subjectID, now, policyRevision, idgen)
+}
+
+func mintID(table Table, code string, subjectID string, now time.Time, policyRevision int, idgen func() string) (Evidence, error) {
 	if table == nil {
 		return Evidence{}, errors.New("evidence: nil rule table")
 	}
@@ -178,7 +209,7 @@ func Mint(table Table, code string, subjectID string, now time.Time, policyRevis
 		return Evidence{}, errors.New("evidence: subject required")
 	}
 	ev := Evidence{
-		EvidenceID:       fmt.Sprintf("ev_%d", now.UnixNano()),
+		EvidenceID:       idgen(),
 		Code:             rule.Code,
 		Family:           rule.Family,
 		Scope:            rule.Scope,

@@ -1,6 +1,7 @@
 package anomaly
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -110,4 +111,37 @@ func TestSprayNoCallerInventedFields(t *testing.T) {
 	_ = m
 	// The only enforcement here is that Mint validated the rule exists; our
 	// detector has no path to build an Evidence literal directly.
+}
+// P0.15: the spray detector is a responsible minter — its evidence ids must be
+// CSPRNG-derived (unpredictable), NOT the timestamp-derived ev_<UnixNano> which
+// this detector previously inherited from Mint. An attacker observing request
+// timing must not be able to predict or collide a spray-evidence id.
+func TestSprayMintsUnpredictableEvidenceID(t *testing.T) {
+	d := NewDetector(nil, nil, DefaultThresholds())
+	now := time.Now()
+	got := d.Observe("s", "c", "AS1", now)
+	got = append(got, d.Observe("s", "c", "AS2", now)...)
+	got = append(got, d.Observe("s", "c", "AS3", now)...)
+	got = append(got, d.Observe("s", "c", "AS4", now)...) // crosses >3 → mints
+	if len(got) == 0 {
+		t.Fatal("expected sprayed evidence")
+	}
+	for _, ev := range got {
+		// Not a bare ev_<all-decimal-digits> timestamp-derived id.
+		if rest := strings.TrimPrefix(ev.EvidenceID, "ev_"); rest != ev.EvidenceID && isAllDigits(rest) {
+			t.Fatalf("P0.15: spray evidence id is timestamp-derived: %q", ev.EvidenceID)
+		}
+		if len(ev.EvidenceID) < 12 {
+			t.Fatalf("P0.15: spray evidence id too short: %q", ev.EvidenceID)
+		}
+	}
+}
+
+func isAllDigits(s string) bool {
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return len(s) > 0
 }

@@ -1039,10 +1039,9 @@ func (t *Terminator) synchronousEvidence(laneNew bool, laneID string) []evidence
 	if err != nil {
 		return nil
 	}
-	// Mint stamps a timestamp-derived id; the terminator overrides it with its
-	// unique per-request CSPRNG id so concurrent admissions never collide even
-	// on the same nanosecond and dedup across nodes is stable.
-	ev.EvidenceID = t.rand()
+	// Mint (P0.15) already stamps a CSPRNG-derived id (un-predictable, un-collidable),
+	// so no terminator override is needed — every evidence id across all producers
+	// is uniform (ev_...) and non-forgeable.
 	return []evidence.Evidence{ev}
 }
 
