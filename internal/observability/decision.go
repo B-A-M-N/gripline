@@ -23,24 +23,24 @@ type DecisionRecord struct {
 	// globally unique and encodes none of credential/account/IP/prompt (§71).
 	RequestID string `json:"request_id"`
 	// At is when the decision was made.
-	At       time.Time `json:"at"`
-	Action   string    `json:"action"`    // "AUTHORIZE" | "AUTHORIZE_DEGRADED" | "DENY"
-	Reason   string    `json:"reason"`    // safe, non-secret reason (e.g. "lane_restricted")
-	Authorized bool     `json:"authorized"`
+	At         time.Time `json:"at"`
+	Action     string    `json:"action"` // "AUTHORIZE" | "AUTHORIZE_DEGRADED" | "DENY"
+	Reason     string    `json:"reason"` // safe, non-secret reason (e.g. "lane_restricted")
+	Authorized bool      `json:"authorized"`
 	// Degraded records an AdaptiveDegraded posture: some authoritative history or
 	// state was unavailable, so the decision preserved persisted restrictions
 	// rather than transitioning (P0.1) — a reader must not treat RiskAfter as a
 	// freshly-observed score in that case.
 	Degraded bool `json:"degraded"`
 
-	Principal     drPrincipal `json:"principal"`
-	Scope         string    `json:"authorization_scope"` // LANE / CREDENTIAL / ...
-	LaneState     string    `json:"lane_state"`          // NEW / PROBATION / ESTABLISHED / ...
-	RiskBefore    int       `json:"risk_before"`
-	RiskAfter     int       `json:"risk_after"`
-	LaneNew       bool      `json:"lane_new"`
-	EvidenceCodes []string  `json:"evidence"` // evidence codes that contributed
-	PolicyRevision int      `json:"policy_revision"`
+	Principal      drPrincipal `json:"principal"`
+	Scope          string      `json:"authorization_scope"` // LANE / CREDENTIAL / ...
+	LaneState      string      `json:"lane_state"`          // NEW / PROBATION / ESTABLISHED / ...
+	RiskBefore     int         `json:"risk_before"`
+	RiskAfter      int         `json:"risk_after"`
+	LaneNew        bool        `json:"lane_new"`
+	EvidenceCodes  []string    `json:"evidence"` // evidence codes that contributed
+	PolicyRevision int         `json:"policy_revision"`
 }
 
 // drPrincipal is the minimal, credential-safe principal projection.
@@ -72,15 +72,15 @@ func New(out *terminator.Outcome) *DecisionRecord {
 		return newFromTrace(out)
 	}
 	dr := &DecisionRecord{
-		RequestID:    out.RequestID,
-		At:           time.Now().UTC(),
-		Reason:       out.Reason,
-		Authorized:   out.Authorized,
-		Degraded:     out.Degraded,
-		RiskAfter:    out.RiskAfter,
+		RequestID:     out.RequestID,
+		At:            time.Now().UTC(),
+		Reason:        out.Reason,
+		Authorized:    out.Authorized,
+		Degraded:      out.Degraded,
+		RiskAfter:     out.RiskAfter,
 		EvidenceCodes: out.Evidence,
-		LaneNew:      out.LaneNew,
-		Action:       "AUTHORIZE",
+		LaneNew:       out.LaneNew,
+		Action:        "AUTHORIZE",
 	}
 	if !out.Authorized {
 		dr.Action = "DENY"

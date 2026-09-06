@@ -130,6 +130,7 @@ func TestDecisionRecordEndToEndWired(t *testing.T) {
 		t.Fatalf("record missing scope/risk: %+v", dr)
 	}
 }
+
 // P0.50/P0.51: a DENIED decision must be as explainable as an authorized one.
 // The internal DecisionTrace supplies the principal, lane identity, and —
 // critically — the policy revision (stamped from the compiled policy, since

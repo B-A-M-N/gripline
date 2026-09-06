@@ -41,9 +41,9 @@ type GetConfig func() Limits
 // eviction (§28, §81 bounded memory). Overflow low-value variants are folded
 // into an overflow bucket instead of unbounded growth.
 type Store struct {
-	mu     sync.Mutex
-	cfg    GetConfig
-	now    func() time.Time
+	mu  sync.Mutex
+	cfg GetConfig
+	now func() time.Time
 	// securityOverride, when non-zero, replaces the Limits.Security hysteresis
 	// (P0.13): the compiled policy's hysteresis is applied over whatever config
 	// the store was built with, so policy revision is the one authority.
@@ -52,7 +52,7 @@ type Store struct {
 	// entry inside the same transaction as the state change (P0.49). Nil keeps
 	// the in-memory default (entry returned to the caller, nothing persisted).
 	auditSink AuditSink
-	byCred map[string]map[string]*LaneRecord // credentialID -> laneID -> record
+	byCred    map[string]map[string]*LaneRecord // credentialID -> laneID -> record
 }
 
 // NewStore builds a Store. cfg may be nil (defaults apply).

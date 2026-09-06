@@ -43,12 +43,12 @@ type AuditRepository interface {
 // review needs, nothing secret (INV-3).
 type OperatorRecord struct {
 	At        time.Time `json:"at"`
-	Actor     string    `json:"actor"`      // authenticated operator identity
-	Action    string    `json:"action"`     // e.g. "credential.revoke"
-	Target    string    `json:"target"`     // credential/lane/policy id
-	Reason    string    `json:"reason"`     // operator justification (required)
-	Posture   string    `json:"posture"`    // posture at action time
-	Committed bool      `json:"committed"`  // did the state change commit?
+	Actor     string    `json:"actor"`            // authenticated operator identity
+	Action    string    `json:"action"`           // e.g. "credential.revoke"
+	Target    string    `json:"target"`           // credential/lane/policy id
+	Reason    string    `json:"reason"`           // operator justification (required)
+	Posture   string    `json:"posture"`          // posture at action time
+	Committed bool      `json:"committed"`        // did the state change commit?
 	Detail    string    `json:"detail,omitempty"` // error/no-op detail
 }
 
@@ -111,7 +111,7 @@ func (r *FileAuditRepository) Close() error {
 
 // Identity is an authenticated operator principal.
 type Identity struct {
-	Name        string // stable operator/service identity, audited as Actor
+	Name         string // stable operator/service identity, audited as Actor
 	Capabilities []Capability
 }
 
@@ -217,9 +217,9 @@ type Service struct {
 	audit AuditRepository
 	now   func() time.Time
 
-	mu      sync.Mutex
-	lanes   LaneOperator   // optional lane lifecycle seam
-	creds   CredentialOperator // optional credential lifecycle seam
+	mu    sync.Mutex
+	lanes LaneOperator       // optional lane lifecycle seam
+	creds CredentialOperator // optional credential lifecycle seam
 }
 
 // Authenticator is the operator authentication seam.

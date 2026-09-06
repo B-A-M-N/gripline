@@ -81,6 +81,7 @@ func TestUnblockAbsentLaneFails(t *testing.T) {
 		t.Fatalf("absent lane unblock must return ErrLaneNotFound, got %v", err)
 	}
 }
+
 // P0.49: with a durable AuditSink wired, the operator transition and its audit
 // record commit atomically — a sink failure ROLLS BACK the state change, so
 // the audit trail and the authoritative state can never disagree, and the

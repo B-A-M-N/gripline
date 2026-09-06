@@ -16,8 +16,8 @@ import (
 	"time"
 
 	"github.com/B-A-M-N/gripline/internal/anomaly"
-	"github.com/B-A-M-N/gripline/internal/credential"
 	"github.com/B-A-M-N/gripline/internal/control"
+	"github.com/B-A-M-N/gripline/internal/credential"
 	"github.com/B-A-M-N/gripline/internal/evidence"
 	"github.com/B-A-M-N/gripline/internal/lane"
 	"github.com/B-A-M-N/gripline/internal/policy"
@@ -43,7 +43,7 @@ type Outcome struct {
 	// when the upstream request completes; until then the capacity is held for
 	// this request only.
 	ResourceRes *resource.MultiReservation
-	RiskAfter   int // effectiveRisk = max(credentialRisk, laneRisk)
+	RiskAfter   int      // effectiveRisk = max(credentialRisk, laneRisk)
 	Evidence    []string // evidence codes that contributed (explainability)
 	LaneNew     bool
 	// Degraded reports that the decision ran in AdaptiveDegraded posture: some
@@ -153,13 +153,13 @@ const (
 // lives behind these interfaces (spec §66-69) so the security core stays
 // agnostic.
 type Dependencies struct {
-	Registry  credential.Registry
-	Peppers   *credential.PepperRing
-	Lanes     *lane.Store
-	Policy    *policy.Policy
-	Signer    AssertionSigner
-	Audience  string
-	Evidence  evidence.Store // persistent evidence store; nil means no persistence
+	Registry credential.Registry
+	Peppers  *credential.PepperRing
+	Lanes    *lane.Store
+	Policy   *policy.Policy
+	Signer   AssertionSigner
+	Audience string
+	Evidence evidence.Store // persistent evidence store; nil means no persistence
 
 	// Mode selects the required-dependency contract. Zero value "" is treated
 	// as ModeTerminate (the minimum posture) with a validation of the same
@@ -310,16 +310,16 @@ func newRequestID() string {
 // Admit runs the admission-state pipeline (P0.10) for a request's secret
 // carriers and normalized feature set. The ordering is:
 //
-//   1. extract → strip → authenticate → policy binding → classify lane
-//   2. mint evidence → persist (fail silently if store unavailable)
-//   3. snapshot stored evidence (per-scope) → combine with per-request sync
-//      evidence (only if append failed / store nil) for evaluation
-//   4. compute credential risk + lane risk independently
-//   5. security observation: update credential state (observe + CAS + rollback)
-//   6. QUARANTINED → deny
-//   7. select resource limits based on resulting credential state
-//   8. security observation: update lane risk score (every admission)
-//   9. policy enforcement with updated state
+//  1. extract → strip → authenticate → policy binding → classify lane
+//  2. mint evidence → persist (fail silently if store unavailable)
+//  3. snapshot stored evidence (per-scope) → combine with per-request sync
+//     evidence (only if append failed / store nil) for evaluation
+//  4. compute credential risk + lane risk independently
+//  5. security observation: update credential state (observe + CAS + rollback)
+//  6. QUARANTINED → deny
+//  7. select resource limits based on resulting credential state
+//  8. security observation: update lane risk score (every admission)
+//  9. policy enforcement with updated state
 //  10. hard concurrency admission (cap-aware)
 //  11. issue internal identity (assertion)
 //  12. record clean authorized activity + lane promotion (authorized only)
@@ -780,9 +780,9 @@ func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features,
 	tr.CredentialRevAfter = cred.Revision
 
 	// 9. Security observation: update lane risk score + lane security status
-// (every admission, authorized or not) BEFORE limits selection so a lane that
-// has just crossed into SUSPICIOUS/BLOCKED is restricted from THIS request
-// (P0.7: lane risk must produce real lane enforcement, not just a stored score).
+	// (every admission, authorized or not) BEFORE limits selection so a lane that
+	// has just crossed into SUSPICIOUS/BLOCKED is restricted from THIS request
+	// (P0.7: lane risk must produce real lane enforcement, not just a stored score).
 	var laneSec lane.SecurityStatus
 	if t.dep.Lanes != nil {
 		rec, rerr := t.dep.Lanes.ObserveRisk(cred.CredentialID, laneID, laneRisk, now)
@@ -1150,12 +1150,12 @@ func (t *Terminator) pruneEvidence(now time.Time, credSubjects, laneSubjects []e
 func (t *Terminator) finalizeBaseline(b *BaselineToken) {
 	now := t.dep.RiskNow()
 	promCrit := lane.PromotionCriteria{
-		MinCleanAge:          t.pol.Learning.MinCleanAge,
-		MinCleanRequests:     t.pol.Learning.MinCleanRequests,
-		MinCleanActiveDays:   t.pol.Learning.MinCleanActiveDays,
-		MaxEstablishmentRisk: t.pol.Learning.MaxEstablishmentRisk,
-		AllowNewLanes:        t.pol.Learning.AllowNewLanes,
-		AllowSuspicious:      t.pol.Learning.AllowSuspiciousLanes,
+		MinCleanAge:              t.pol.Learning.MinCleanAge,
+		MinCleanRequests:         t.pol.Learning.MinCleanRequests,
+		MinCleanActiveDays:       t.pol.Learning.MinCleanActiveDays,
+		MaxEstablishmentRisk:     t.pol.Learning.MaxEstablishmentRisk,
+		AllowNewLanes:            t.pol.Learning.AllowNewLanes,
+		AllowSuspicious:          t.pol.Learning.AllowSuspiciousLanes,
 		HasDisqualifyingEvidence: t.hasActiveDisqualifyingEvidence(b.CredentialID, b.LaneID, now),
 	}
 	_, _, _ = t.dep.Lanes.RecordCleanAuthorizedAndPromote(
