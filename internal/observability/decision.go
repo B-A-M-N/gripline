@@ -54,14 +54,22 @@ type drPrincipal struct {
 // projection: it reads only exported, already-safe Outcome fields and never
 // touches the raw credential or assertion. It never fails on its own.
 //
-// RiskBefore isn't carried on Outcome for denied/unauthorized admissions (risk
-// is computed in the authorization path); callers that want a precise before
-// value must capture the credential's prior persisted risk separately. New
-// records the Outcome.RiskAfter as RiskAfter and leaves RiskBefore at the
-// caller-provided value (0 default) for the degraded/denied short path.
+// P0.50: when the Outcome carries an internal DecisionTrace (the normal path —
+// admission always attaches one), the record is built FROM THE TRACE. That is
+// what makes DENIED decisions complete: the trace holds the principal ids,
+// lane identity/state transitions, evidence ids, and selected limits that the
+// public Outcome deliberately omits on denial. P0.51: the policy revision comes
+// from the trace's compiled-policy stamp, so denied decisions no longer report
+// revision 0.
+//
+// Without a trace (legacy/nil outcomes) the old Outcome-only projection is
+// used, and RiskBefore is left 0 for denied admissions.
 func New(out *terminator.Outcome) *DecisionRecord {
 	if out == nil {
 		return &DecisionRecord{Action: "DENY", Reason: "nil_outcome"}
+	}
+	if out.Trace != nil {
+		return newFromTrace(out)
 	}
 	dr := &DecisionRecord{
 		RequestID:    out.RequestID,
@@ -87,6 +95,43 @@ func New(out *terminator.Outcome) *DecisionRecord {
 	dr.Scope = string(out.Context.AuthorizationScope)
 	dr.LaneState = out.Context.LaneState
 	dr.PolicyRevision = policyRevisionOf(out)
+	return dr
+}
+
+// newFromTrace projects the internal DecisionTrace (P0.50) into the public
+// record. Every field here is already credential-safe: the trace carries
+// internal ids, enum names, scores, and evidence identifiers only (INV-2/3).
+func newFromTrace(out *terminator.Outcome) *DecisionRecord {
+	tr := out.Trace
+	dr := &DecisionRecord{
+		RequestID:     tr.RequestID,
+		At:            time.Now().UTC(),
+		Authorized:    tr.Authorized,
+		Degraded:      out.Degraded,
+		RiskAfter:     out.RiskAfter,
+		EvidenceCodes: tr.EvidenceCodes,
+		LaneNew:       tr.LaneNew,
+		Action:        "AUTHORIZE",
+	}
+	if !tr.Authorized {
+		dr.Action = "DENY"
+	} else if out.Degraded {
+		dr.Action = "AUTHORIZE_DEGRADED"
+	}
+	dr.Reason = tr.Reason
+	dr.Principal = drPrincipal{
+		AccountID:    tr.AccountID,
+		CredentialID: tr.CredentialID,
+		PolicyID:     tr.PolicyID,
+	}
+	// P0.51: revision stamped from the compiled policy at decision time.
+	dr.PolicyRevision = tr.PolicyRevision
+	// Lane identity + post-decision trust state (trace-side, safe ids only).
+	dr.LaneState = tr.LaneTrustAfter
+	dr.Scope = "LANE"
+	if tr.LaneID == "" {
+		dr.Scope = "CREDENTIAL"
+	}
 	return dr
 }
 

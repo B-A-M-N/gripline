@@ -53,6 +53,35 @@ var (
 	ErrActionInvalid = errors.New("lane: operator action invalid for current security state")
 )
 
+// AuditSink is the durable destination for operator lifecycle audit entries
+// (P0.49). Implementations append the entry to DURABLE storage — a file, a
+// database, an append-only log. Returning nil means the entry is committed;
+// returning an error FAILS the whole operator transaction, so the audit record
+// can never be silently lost behind a state change that did land (and the
+// state change can never land without its audit record).
+type AuditSink interface {
+	AppendOperatorAudit(entry *AuditEntry) error
+}
+
+// AuditSinkFunc adapts a function to an AuditSink.
+type AuditSinkFunc func(entry *AuditEntry) error
+
+// AppendOperatorAudit implements AuditSink.
+func (f AuditSinkFunc) AppendOperatorAudit(entry *AuditEntry) error { return f(entry) }
+
+// WithAuditSink binds a durable audit sink to the store (P0.49). Once set,
+// EVERY operator transition commits its AuditEntry through the sink INSIDE the
+// same transaction that mutates state — the caller no longer has to remember
+// to persist the returned entry, and a sink failure rolls the transition back.
+// Without a sink the transition returns the entry as before (the in-memory
+// default remains usable by tests); production stores MUST wire a durable sink.
+func (s *Store) WithAuditSink(sink AuditSink) *Store {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.auditSink = sink
+	return s
+}
+
 // Unblock is the operator control-plane action that exits a BLOCKED lane. The
 // risk reducer never auto-recovers a block; only an explicit authorized operator
 // action may clear it (P0.7, §36 lifecycle). It resets the security dimension to
@@ -68,9 +97,13 @@ func (s *Store) Unblock(credID, laneID, actor, reason string, now time.Time) (*A
 }
 
 // operatorTransition applies a lifecycle status change under the store lock,
-// enforcing that the current status matches an expected precondition and writing
-// an audit entry. reseedClean controls whether CleanSince is reset to now (true
-// for an unblock: the clean window starts fresh after operator clearing).
+// enforcing that the current status matches an expected precondition and
+// committing the audit entry ATOMICALLY with the state change (P0.49): when a
+// durable AuditSink is wired, the entry is appended while the store lock is
+// held and BEFORE the mutation becomes visible; a sink failure aborts the
+// transition (state unchanged, no half-applied operator action, no lost audit
+// record). reseedClean controls whether CleanSince is reset to now (true for an
+// unblock: the clean window starts fresh after operator clearing).
 func (s *Store) operatorTransition(action OperatorAction, expectFrom, to SecurityStatus, credID, laneID, actor, reason string, now time.Time, reseedClean bool) (*AuditEntry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -85,6 +118,14 @@ func (s *Store) operatorTransition(action OperatorAction, expectFrom, to Securit
 		LaneID: laneID, CredentialID: credID, Actor: actor,
 		Action: action, Before: rec.Security.Status, After: to,
 		At: now, Reason: reason,
+	}
+	// P0.49: durable audit commit inside the transaction. Failure rolls back —
+	// the caller sees the sink's error and the lane is untouched, so the audit
+	// trail and the authoritative state can never disagree.
+	if s.auditSink != nil {
+		if aerr := s.auditSink.AppendOperatorAudit(entry); aerr != nil {
+			return nil, aerr
+		}
 	}
 	rec.Security.Status = to
 	if reseedClean {

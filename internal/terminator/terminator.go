@@ -61,6 +61,12 @@ type Outcome struct {
 	// (backend accepted / response complete). An admitted-but-never-completed
 	// request earns no baseline trust.
 	Baseline *BaselineToken
+	// Trace (P0.50) is the INTERNAL decision record: full state transitions,
+	// evidence ids, selected limits, and the policy revision (P0.51 — stamped
+	// for denied requests too, from the compiled policy rather than the
+	// assertion). It is internal: audit consumes it; the public response never
+	// serializes it.
+	Trace *DecisionTrace
 }
 
 // BaselineToken carries the deferred clean-activity credit from an authorized
@@ -374,6 +380,43 @@ func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features,
 	reqID := t.rand()
 	now := t.dep.RiskNow()
 	out := &Outcome{RequestID: reqID}
+	// P0.50: the internal decision trace lives for the whole pipeline and is
+	// populated at every gate, so DENIED decisions are as explainable as
+	// authorized ones. P0.51: policy identity is stamped from the COMPILED
+	// policy here — not from the assertion, which only exists on authorization.
+	tr := &DecisionTrace{
+		RequestID:              reqID,
+		At:                     now.UTC().Format(time.RFC3339Nano),
+		PolicyID:               t.pol.ID,
+		PolicyRevision:         t.pol.Revision,
+		CredentialSnapshotOK:   t.dep.Evidence == nil,
+		LaneSnapshotOK:         t.dep.Evidence == nil,
+		SourcePseudonym:        src.sourceID(),
+		SourceObserved:         src.sourceID() != "",
+		Estimate:               est,
+		ReservationResult:      "none",
+		Adaptive:               AdaptiveAvailable,
+		CredentialStatusBefore: "unknown",
+		CredentialStatusAfter:  "unknown",
+	}
+	out.Trace = tr
+	// P0.50: the trace is finalized at EXIT — every denial path (extraction,
+	// authentication, lane, policy, resource) gets its reason and posture
+	// stamped, not just the success path.
+	defer func() {
+		tr.Authorized = out.Authorized
+		tr.Reason = out.Reason
+		tr.Adaptive = out.Adaptive
+		if out.Degraded || tr.Adaptive == AdaptiveDegraded {
+			switch {
+			case !tr.CredentialSnapshotOK || !tr.LaneSnapshotOK:
+				tr.DegradedReason = "evidence_snapshot_unavailable"
+			default:
+				tr.DegradedReason = "security_observation_unavailable"
+			}
+		}
+		tr.TrimEvidence(defaultTraceEvidenceCap)
+	}()
 
 	// 1. Extract and strip.
 	presented, _, err := ExtractExternalCredential(headers)
@@ -392,6 +435,17 @@ func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features,
 		out.Authorized = false
 		out.Reason = safeReason(err)
 		out.DenialErr = err
+		// P0.50: a status-denied authentication (revoked/quarantined/expired)
+		// still identified the credential — attribute the denial in the trace.
+		if cred != nil {
+			tr.CredentialID = cred.CredentialID
+			tr.AccountID = cred.AccountID
+			tr.CredentialStatusBefore = cred.Status.String()
+			tr.CredentialStatusAfter = cred.Status.String()
+			tr.CredentialRevBefore = cred.Revision
+			tr.CredentialRevAfter = cred.Revision
+		}
+		tr.Reason = out.Reason
 		// P0.30: INVALID-credential spray tracking. Before the presented
 		// material is destroyed (defer above), derive a short-lived keyed
 		// pseudonym INSIDE the sealed boundary and count DISTINCT candidate
@@ -408,6 +462,8 @@ func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features,
 					for _, sig := range sigs {
 						if ev, merr := evidence.Mint(t.pol.EvidenceRules, sig.Code, sig.SubjectID, now, t.pol.Revision); merr == nil && t.dep.Evidence != nil {
 							_ = t.dep.Evidence.Append(ev)
+							tr.EvidenceIDs = append(tr.EvidenceIDs, ev.EvidenceID)
+							tr.EvidenceCodes = append(tr.EvidenceCodes, ev.Code)
 						}
 					}
 				}
@@ -415,6 +471,12 @@ func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features,
 		}
 		return out
 	}
+	tr.CredentialID = cred.CredentialID
+	tr.AccountID = cred.AccountID
+	tr.CredentialStatusBefore = cred.Status.String()
+	tr.CredentialStatusAfter = cred.Status.String()
+	tr.CredentialRevBefore = cred.Revision
+	tr.CredentialRevAfter = cred.Revision
 	// Record last-seen on successful authentication (P0.22). Analytics-grade and
 	// best-effort; must never influence the authorization outcome.
 	markLastSeen(t.dep.Registry, cred.CredentialID, now)
@@ -446,7 +508,18 @@ func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features,
 
 	// 4. Classify lane.
 	laneID, laneRec, laneNew, lerr := t.classifyLane(cred.CredentialID, feat)
+	tr.LaneID = laneID
+	tr.LaneNew = laneNew
+	if laneRec != nil {
+		tr.LaneTrustBefore = laneRec.State.String()
+		tr.LaneSecBefore = laneRec.Security.Status.String()
+		tr.LaneRevBefore = laneRec.Revision
+		tr.LaneTrustAfter = laneRec.State.String()
+		tr.LaneSecAfter = laneRec.Security.Status.String()
+		tr.LaneRevAfter = laneRec.Revision
+	}
 	if lerr != nil {
+		tr.Reason = "lane_error"
 		out.Authorized = false
 		if errors.Is(lerr, lane.ErrLaneConflict) {
 			out.Reason = "lane_conflict"
@@ -527,6 +600,15 @@ func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features,
 			laneSnapOK = true
 		}
 	}
+	// P0.50: per-subject evidence detail in the trace (IDs + codes), bounded.
+	for _, ev := range credentialEvidence {
+		tr.EvidenceIDs = append(tr.EvidenceIDs, ev.EvidenceID)
+		tr.EvidenceCodes = append(tr.EvidenceCodes, ev.Code)
+	}
+	for _, ev := range laneEvidence {
+		tr.EvidenceIDs = append(tr.EvidenceIDs, ev.EvidenceID)
+		tr.EvidenceCodes = append(tr.EvidenceCodes, ev.Code)
+	}
 	// P0.45: only evidence minted under the CURRENT policy revision may drive the
 	// authoritative state machine. Evidence from an older revision was scored
 	// under a different rule table; evaluating it after a policy change would
@@ -558,6 +640,12 @@ func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features,
 	if laneRisk > effectiveRisk {
 		effectiveRisk = laneRisk
 	}
+	tr.CredentialRisk = credentialRisk
+	tr.LaneRisk = laneRisk
+	tr.CredentialEvidenceCount = len(credentialEvidence)
+	tr.LaneEvidenceCount = len(laneEvidence)
+	tr.CredentialSnapshotOK = credSnapOK
+	tr.LaneSnapshotOK = laneSnapOK
 
 	// Collect all evidence codes for outcome explainability.
 	allEvidence := append(append([]evidence.Evidence{}, credentialEvidence...), laneEvidence...)
@@ -688,6 +776,8 @@ func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features,
 	if updatedCred != nil {
 		cred = updatedCred
 	}
+	tr.CredentialStatusAfter = cred.Status.String()
+	tr.CredentialRevAfter = cred.Revision
 
 	// 9. Security observation: update lane risk score + lane security status
 // (every admission, authorized or not) BEFORE limits selection so a lane that
@@ -698,6 +788,9 @@ func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features,
 		rec, rerr := t.dep.Lanes.ObserveRisk(cred.CredentialID, laneID, laneRisk, now)
 		if rerr == nil {
 			laneSec = rec.Security.Status
+			tr.LaneTrustAfter = rec.State.String()
+			tr.LaneSecAfter = rec.Security.Status.String()
+			tr.LaneRevAfter = rec.Revision
 		} else if laneRec != nil {
 			laneSec = laneRec.Security.Status
 		}
@@ -726,12 +819,20 @@ func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features,
 	// emergency set defaults tighter than constrained, so lockdown never grants
 	// more headroom than the posture it overrides.
 	limits := t.selectLimits(after)
+	limitsClass := "normal"
+	if after == credential.StatusConstrained {
+		limitsClass = "constrained"
+	}
 	if laneSec == lane.LaneSuspicious {
 		limits = t.pol.Limits.Constrained
+		limitsClass = "constrained"
 	}
 	if t.dep.Control != nil && t.dep.Control.InEmergency() {
 		limits = t.emergencyLimits()
+		limitsClass = "emergency"
 	}
+	tr.LimitsClass = limitsClass
+	tr.Limits = limits
 
 	// 11. Policy evaluation with updated state.
 	polCred := cred // use the (possibly updated) credential
@@ -804,7 +905,7 @@ func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features,
 	// slot against two different reservoirs. A caller wanting BOTH must compose
 	// two governors/inspect the outcome, which is not the default posture.
 	if t.dep.Resource != nil {
-		provErr := t.provisionMultiscope(cred, laneID, laneSec, limits, ctx, reqID, out, adaptiveForObservation, laneRisk, credentialRisk, effectiveRisk, evidenceCodes, src, est)
+		provErr := t.provisionMultiscope(cred, laneID, laneSec, limits, ctx, reqID, out, adaptiveForObservation, laneRisk, credentialRisk, effectiveRisk, evidenceCodes, src, est, tr)
 		if provErr != nil {
 			return provErr
 		}
@@ -913,7 +1014,7 @@ func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features,
 // tables land in the policy, only the spec construction here changes. Today a
 // single hostile actor cannot exceed the credential cap across its lanes/sources
 // without tripping the shared budget — a conservative first posture.
-func (t *Terminator) provisionMultiscope(cred *credential.Credential, laneID string, laneSec lane.SecurityStatus, limits policy.Limits, ctx principal.AuthorizedContext, reqID string, out *Outcome, adaptiveForObservation AdaptiveStateStatus, laneRisk, credentialRisk, effectiveRisk int, evidenceCodes []string, src TrustedSource, est resource.UsageEstimate) *Outcome {
+func (t *Terminator) provisionMultiscope(cred *credential.Credential, laneID string, laneSec lane.SecurityStatus, limits policy.Limits, ctx principal.AuthorizedContext, reqID string, out *Outcome, adaptiveForObservation AdaptiveStateStatus, laneRisk, credentialRisk, effectiveRisk int, evidenceCodes []string, src TrustedSource, est resource.UsageEstimate, tr *DecisionTrace) *Outcome {
 	cap := limits.ConcurrencyCap
 	// P0.35: the selected limits' per-dimension gauges (requests/tokens/cost)
 	// ride EVERY scope's spec — requests, tokens and spend are different
@@ -969,12 +1070,15 @@ func (t *Terminator) provisionMultiscope(cred *credential.Credential, laneID str
 	// are inert; dimensions the estimate leaves zero reserve nothing.
 	res, err := t.dep.Resource.ProvisionUsage(specs, est)
 	if err != nil {
+		tr.ReservationResult = "denied"
 		var sle *resource.ScopeLimitError
 		if errors.As(err, &sle) {
+			tr.ReservationScope = sle.Scope.String()
 			return deny(resourceScopeReason(sle.Scope), resourceScopeErr(sle.Scope))
 		}
 		return deny("resource_unavailable", err)
 	}
+	tr.ReservationResult = "granted"
 	// Every scope provisioned. Issue the assertion; if it fails, release the
 	// reservation so held capacity is refunded (never a leaked hold).
 	assertion, aerr := t.issueAssertion(ctx, reqID, cred)
@@ -1154,7 +1258,12 @@ func (t *Terminator) authenticate(presented *secret.SealedSecret) (*credential.C
 	verifier := t.dep.Peppers.DeriveVerifier(presented, latest)
 	if rec, err := t.lookupVerifier(verifier, latest); err == nil {
 		if aerr := rec.Authenticatable(t.dep.RiskNow()); aerr != nil {
-			return nil, aerr
+			// P0.50: the credential WAS identified even though its status
+			// denies authentication (revoked/quarantined/expired). Return the
+			// record alongside the error so the decision trace can attribute
+			// the denial to the principal — the most audit-critical denials
+			// were previously anonymous.
+			return credFrom(rec), aerr
 		}
 		return credFrom(rec), nil
 	} else if !errors.Is(err, credential.ErrNotFound) {
@@ -1168,7 +1277,7 @@ func (t *Terminator) authenticate(presented *secret.SealedSecret) (*credential.C
 		vv := t.dep.Peppers.DeriveVerifier(presented, v)
 		if rec, err := t.lookupVerifier(vv, v); err == nil {
 			if aerr := rec.Authenticatable(t.dep.RiskNow()); aerr != nil {
-				return nil, aerr
+				return credFrom(rec), aerr
 			}
 			return credFrom(rec), nil
 		} else if !errors.Is(err, credential.ErrNotFound) {

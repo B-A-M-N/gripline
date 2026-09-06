@@ -48,6 +48,10 @@ type Store struct {
 	// (P0.13): the compiled policy's hysteresis is applied over whatever config
 	// the store was built with, so policy revision is the one authority.
 	securityOverride SecurityHysteresis
+	// auditSink, when set, durably commits every operator-transition audit
+	// entry inside the same transaction as the state change (P0.49). Nil keeps
+	// the in-memory default (entry returned to the caller, nothing persisted).
+	auditSink AuditSink
 	byCred map[string]map[string]*LaneRecord // credentialID -> laneID -> record
 }
 

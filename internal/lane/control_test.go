@@ -81,3 +81,71 @@ func TestUnblockAbsentLaneFails(t *testing.T) {
 		t.Fatalf("absent lane unblock must return ErrLaneNotFound, got %v", err)
 	}
 }
+// P0.49: with a durable AuditSink wired, the operator transition and its audit
+// record commit atomically — a sink failure ROLLS BACK the state change, so
+// the audit trail and the authoritative state can never disagree, and the
+// caller never has to remember to persist the returned entry.
+func TestOperatorTransitionAtomicWithAuditSink(t *testing.T) {
+	now := time.Now()
+	store := NewStore(nil, func() time.Time { return now })
+	laneID := "lane_audit"
+	rec, _, err := store.BorrowOrCreate("cred_a", laneID, Features{NetworkASN: "AS1"}, DefaultThresholds())
+	if err != nil {
+		t.Fatal(err)
+	}
+	hy := DefaultSecurityHysteresis()
+	hy.EnableAutomaticBlock = true
+	hy.SuspectObs = 1
+	store.SetSecurityHysteresis(hy)
+	if _, err := store.ObserveRisk("cred_a", laneID, 90, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ObserveRisk("cred_a", laneID, 90, now); err != nil {
+		t.Fatal(err)
+	}
+	rec, _ = store.Get("cred_a", laneID)
+	if rec.Security.Status != LaneBlocked {
+		t.Fatalf("setup: lane must be blocked, got %v", rec.Security.Status)
+	}
+
+	var committed []*AuditEntry
+	failSink := AuditSinkFunc(func(e *AuditEntry) error { return errors.New("disk full") })
+	store.WithAuditSink(failSink)
+
+	// Sink failure: no state change, no revision bump, error surfaced.
+	before, _ := store.Get("cred_a", laneID)
+	if _, err := store.Unblock("cred_a", laneID, "op", "cleanup", now); err == nil {
+		t.Fatal("P0.49: audit-sink failure must fail the whole operator transaction")
+	}
+	after, _ := store.Get("cred_a", laneID)
+	if after.Revision != before.Revision {
+		t.Fatalf("P0.49: failed transaction must not bump revision (%d → %d)", before.Revision, after.Revision)
+	}
+	if after.Security.Status != LaneBlocked {
+		t.Fatal("P0.49: failed transaction must leave the lane blocked")
+	}
+
+	// Working sink: entry committed inside the transition, state changed.
+	okSink := AuditSinkFunc(func(e *AuditEntry) error {
+		committed = append(committed, e)
+		return nil
+	})
+	store.WithAuditSink(okSink)
+	entry, err := store.Unblock("cred_a", laneID, "op", "verified clean", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(committed) != 1 {
+		t.Fatalf("P0.49: exactly one audit entry must be durably committed, got %d", len(committed))
+	}
+	if committed[0] != entry {
+		t.Fatal("P0.49: the committed entry must be the same one returned")
+	}
+	got, _ := store.Get("cred_a", laneID)
+	if got.Security.Status != LaneNormal {
+		t.Fatal("P0.49: unblock must apply after the audit commits")
+	}
+	if entry.Revision != got.Revision {
+		t.Fatalf("audit entry revision %d must match post-transition %d", entry.Revision, got.Revision)
+	}
+}

@@ -130,3 +130,106 @@ func TestDecisionRecordEndToEndWired(t *testing.T) {
 		t.Fatalf("record missing scope/risk: %+v", dr)
 	}
 }
+// P0.50/P0.51: a DENIED decision must be as explainable as an authorized one.
+// The internal DecisionTrace supplies the principal, lane identity, and —
+// critically — the policy revision (stamped from the compiled policy, since
+// denied requests never receive an assertion). Revision 0 on a denied record
+// was the old bug: the most security-critical decisions reported no policy.
+func TestDeniedDecisionCarriesTraceAndPolicyRevision(t *testing.T) {
+	raw := "sk-denied-" + strings.Repeat("y", 24)
+	pep := &credential.PepperKey{Version: 1, Key: []byte("obs-pepper")}
+	reg := credential.NewMemoryRegistry()
+	if err := reg.Insert(&credential.CredentialRecord{
+		CredentialID: "cred_deny", AccountID: "acct_d", PolicyID: "fi-default-v1", PlanID: "plan-a",
+		Verifier: credential.Verifier(secret.NewFromBytes([]byte(raw)), pep), VerifierVersion: 1, PepperVersion: 1,
+		Status: credential.StatusRevoked, CreatedAt: time.Now().Add(-time.Hour), Revision: 7,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	signer, _ := terminator.GenerateSigner()
+	term, err := terminator.New(terminator.Dependencies{
+		Registry: reg, Peppers: credential.MustPepperRing(pep),
+		Lanes: lane.NewStore(nil, time.Now), Policy: policy.Default(),
+		Signer: signer, Audience: "fi-inference",
+		Evidence: evidence.NewMemoryStore(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := term.Admit(map[string][]string{"Authorization": {"Bearer " + raw}}, lane.Features{})
+	if out.Authorized {
+		t.Fatal("revoked credential must be denied")
+	}
+	if out.Trace == nil {
+		t.Fatal("P0.50: every outcome must carry a decision trace, denials included")
+	}
+	dr := New(out)
+	if dr.Action != "DENY" {
+		t.Fatalf("action = %q, want DENY", dr.Action)
+	}
+	if dr.PolicyRevision == 0 {
+		t.Fatal("P0.51: denied decision must carry the compiled policy revision, not 0")
+	}
+	if dr.Principal.CredentialID != "cred_deny" || dr.Principal.AccountID != "acct_d" {
+		t.Fatalf("P0.50: denied record lost principal: %+v", dr.Principal)
+	}
+	b, err := dr.JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), raw) {
+		t.Fatalf("denied record leaked raw credential: %s", b)
+	}
+	if !strings.Contains(string(b), `"policy_revision":`) {
+		t.Fatalf("denied record JSON missing policy_revision: %s", b)
+	}
+}
+
+// P0.50: the trace captures credential state transitions (before → after) and
+// the evidence that contributed, so audit/replay can reconstruct the decision.
+func TestTraceRecordsStateTransitionsAndEvidence(t *testing.T) {
+	raw := "sk-trace-" + strings.Repeat("z", 24)
+	pep := &credential.PepperKey{Version: 1, Key: []byte("obs-pepper")}
+	reg := credential.NewMemoryRegistry()
+	if err := reg.Insert(&credential.CredentialRecord{
+		CredentialID: "cred_tr", AccountID: "acct_t", PolicyID: "fi-default-v1", PlanID: "plan-a",
+		Verifier: credential.Verifier(secret.NewFromBytes([]byte(raw)), pep), VerifierVersion: 1, PepperVersion: 1,
+		Status: credential.StatusNormal, CreatedAt: time.Now().Add(-time.Hour), Revision: 3,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	signer, _ := terminator.GenerateSigner()
+	term, err := terminator.New(terminator.Dependencies{
+		Registry: reg, Peppers: credential.MustPepperRing(pep),
+		Lanes: lane.NewStore(nil, time.Now), Policy: policy.Default(),
+		Signer: signer, Audience: "fi-inference",
+		Evidence: evidence.NewMemoryStore(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	feat := lane.Features{NetworkASN: "AS-trace", NetworkType: "residential", RegionClass: "us", ClientFamily: "web", SDKFamily: "sdk", HTTPVersion: "h2", Streaming: "no", ModelFamily: "m", ConcurrencyPattern: "solo", EndpointFamily: "chat"}
+	out := term.Admit(map[string][]string{"Authorization": {"Bearer " + raw}}, feat)
+	if !out.Authorized {
+		t.Fatalf("admission should authorize: %s", out.Reason)
+	}
+	tr := out.Trace
+	if tr.CredentialStatusBefore != "NORMAL" || tr.CredentialStatusAfter != "NORMAL" {
+		t.Fatalf("credential status transition not traced: %q → %q", tr.CredentialStatusBefore, tr.CredentialStatusAfter)
+	}
+	if tr.CredentialRevBefore != 3 || tr.CredentialRevAfter != 3 {
+		t.Fatalf("credential revisions not traced: %d → %d", tr.CredentialRevBefore, tr.CredentialRevAfter)
+	}
+	if !tr.LaneNew {
+		t.Fatal("first request should create a new lane, traced")
+	}
+	if tr.LaneID == "" || tr.LaneTrustBefore == "" || tr.LaneSecAfter == "" {
+		t.Fatalf("lane state not traced: %+v", tr)
+	}
+	if tr.PolicyRevision != 1 || tr.PolicyID != "fi-default-v1" {
+		t.Fatalf("policy identity not traced: %q@%d", tr.PolicyID, tr.PolicyRevision)
+	}
+	if tr.LimitsClass != "normal" {
+		t.Fatalf("limits class not traced: %q", tr.LimitsClass)
+	}
+}
