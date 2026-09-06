@@ -28,9 +28,9 @@ from the Gripline specification (v0.1.0):
 
 ## Status
 
-**Phase:** early implementation — the deterministic security core of the MVP
-(§99) is implemented and tested. Provider adapters, the streaming proxy layer,
-and the control plane remain.
+**Phase:** implementation of the deterministic security core (§99) with a
+deployable single-node gateway (`cmd/gripline`). NOT production-stable: the
+known-gaps section below is the binding list.
 
 `✅` = implemented + tested · `◇` = partially / sketched · `⬜` = not yet
 
@@ -40,19 +40,36 @@ The smallest release worthy of the Gripline name:
 2. ✅ credential-safe handling — `SealedSecret` forbids formatting/serialization
 3. ✅ internal principal — `internal/principal`
 4. ✅ internal signed identity — Ed25519, ≤30s TTL, audience-bound (`internal/terminator`)
-5. ✅ private backend enforcement (terminate-and-forward proxy + backend verifier)
+5. ✅ private backend enforcement (terminate-and-forward proxy + backend verifier,
+   optional revision-freshness + transport-identity checks at sensitive backends)
 6. ✅ hard per-credential concurrency (atomic leases, INV-15; multi-scope governor)
-7. ✅ hard resource velocity — multi-scope governor + token buckets (`internal/resource`)
-8. ✅ source key-spray detection — pseudonym fingerprints + source-spray minter
-9. ✅ lane tracking — `internal/lane` (classification, states, explosion protection)
+7. ◇ hard resource velocity — typed multi-scope governor + token buckets with
+   reserve-estimate/settle-actuals (`internal/resource`); enforcement is REAL for
+   deployments that supply a provider `UsageEstimator`, but the shipped default
+   (`NoUsage`) accounts requests only — token/cost dimensions stay inert until a
+   provider adapter feeds estimates/actuals
+8. ✅ source key-spray detection — pseudonym fingerprints + invalid-credential
+   spray signals (`internal/anomaly`, `internal/secret.SprayPseudonym`)
+9. ✅ lane tracking — `internal/lane` (classification, trust/security axes,
+   explosion protection, retention classes)
 10. ✅ deterministic shadow evidence — `internal/evidence` + `internal/risk` (fuzzed 0..100)
-11. ✅ audit trail — operator control plane (`internal/control`) + decision records
-    (`internal/observability`)
+11. ✅ audit trail — authenticated control plane with durable append-only operator
+    audit (`internal/control`), atomic state+audit lane lifecycle (P0.49), and
+    internal decision traces for denials (`internal/observability`, P0.50/P0.51)
 12. ✅ adaptive-state failure semantics — DEGRADED never fails open (P0.1)
-13. ✅ source-spray anomaly detector (`internal/anomaly`)
-14. ✅ acceptance gates A–J (`internal/gates`, spec §111) — all green
-15. ✅ shadow-first auto-quarantine — `Risk.EnableAutomaticQuarantine=false` default
-    (Gate H); request-level denial still fires, persisted quarantine stays operator-set
+13. ✅ source-spray anomaly detector, bounded under one-shot-subject floods
+    (`internal/anomaly`, P0.30–P0.32)
+14. ◇ acceptance-gate COMPONENT tests (`internal/gates`, spec §111) — in-process
+    component approximations of gates A–J, honestly named (`...Component`).
+    These are NOT the gates: gate-level evidence (multi-node resource proofs,
+    network isolation, cross-process replay, external telemetry canary) requires
+    the external release harness, which does not exist yet. Passing this package
+    must never be reported as "gates A–J green".
+15. ✅ shadow-first auto-quarantine — `Risk.EnableAutomaticQuarantine=false` default;
+    request-level denial still fires, persisted quarantine stays operator-set
+16. ✅ deployable executable — `cmd/gripline` + `internal/config`: boot-validated
+    TLS posture, fixed backend, bounded timeouts/headers/bodies, graceful drain,
+    readiness/liveness, optional authenticated admin listener
 
 ### Implemented packages
 
@@ -84,13 +101,16 @@ internal/terminator    admission flow (§53): extract → strip secret+internal 
 internal/resource      multi-scope governor: SOURCE/LANE/CREDENTIAL/ACCOUNT/global all-or-nothing
                        provisioning; token buckets + atomic concurrency leases (INV-15)
 internal/lane/control  operator unblock lifecycle + audit entries (P0.35/P0.42)
-internal/control       operator control plane: emergency lockdown posture + bounded audit trail
-internal/anomaly       source-spray minter (credential ASN-spray + source credential-spray) via Mint
+internal/control       operator control plane: posture switch + authenticated RBAC service + durable
+                       append-only operator audit (P0.47); in-memory plane is the admission-side buffer
+internal/anomaly       source-spray signal detector (ASN/credential/invalid-key spray), bounded state
+                       + emit cooldown; signals resolve through Mint at the current policy revision
 internal/proxy         terminate-and-forward data plane: strip reserved headers (INV-12), re-inject
                        signed assertion on the trusted hop, stream unchanged (INV-1/10/11)
-internal/observability DecisionRecord per admission (§97): safe, machine-readable explanation
-internal/gates         executable acceptance gates A–J (spec §111) — each fails the build on
-                       release-contract regression
+internal/observability DecisionRecord per admission (§97) projected from the internal DecisionTrace
+                       (P0.50): denied decisions carry principal, lane, and policy revision (P0.51)
+internal/gates         component invariant tests for the §111 gate properties (honestly named
+                       `...Component`) — NOT the acceptance gates; external release harness pending
 ```
 
 Verified with `go vet ./...` clean and `go test -race ./...` (all packages)
@@ -110,25 +130,39 @@ no invariant is claimed beyond what the implementation establishes:
   NEW→PROBATION→ESTABLISHED. However, WATCH/CONSTRAINED limit selection
   uses the credential status (persisted), not the live state-machine
   observation — so an immediate downgrade from a single high-risk request
-  requires the CAS path to succeed first. Velocity/source-spray signals
-  are collected as evidence but not yet used as dynamic gates.
-- **Policy immutability:** the terminator enforces a deep-value SNAPSHOT of
-  the policy taken at construction (post-`New` mutation of the caller's
-  `*policy.Policy` cannot alter enforcement, tested), but a compiled/
-  immutable policy type with authenticated load, monotonic revision
-  enforcement, and explicit rollback authorization is not built yet.
+  requires the CAS path to succeed first. Velocity/source-spray signals are
+  collected as evidence and drive risk/scope enforcement through the evidence
+  pipeline; the gap is limit-selection timing only.
+- **Policy immutability:** the terminator enforces a compiled deep-copy
+  snapshot (`policy.Compile`, tested against post-construction mutation of
+  every reference-bearing field), but a POLICY MANAGER — authenticated/signed
+  artifact load, monotonic revision enforcement, last-known-good, explicit
+  authorized rollback — is not built yet.
+- **In-process state:** the credential registry, lane store, evidence store,
+  resource governor, and control plane are in-process. Durable backends
+  (PostgreSQL registry, shared resource leases, replicated lane/security
+  state) substitute behind the seams but are not implemented — a single
+  replica's BLOCKED lane is not yet blocked on every replica.
 - **Single-process resources:** the concurrency pool and token buckets prove
   the atomic accounting invariants in-process. Cross-node leases, reservation
   TTLs, and orphan recovery need a shared backend (see `07-deployment.md`).
 - **Streaming equivalence is gate-tested, not SDK-proven:** the proxy streams
-  generic HTTP + SSE pass-through unchanged (Gate C/D), but the real third-party
-  SDK matrix (OpenAI/Anthropic Python-TS, Claude Code, Codex) is not run in
-  this repo. Gate C enforces the generic-HTTP contract; connector-level
-  equivalence is verified in the hosting integration, not here.
-- **Provider adapters are stubbed:** real ASN/region attribution and
-  trusted-edge RealIP are `FeatureResolver` seams with deterministic defaults
-  (`HeaderFeatures`); a hosting provider must wire its adapter. Non-supplied
-  features are treated as unknown (never falsely matched).
+  generic HTTP + SSE pass-through with per-chunk flush and is gate-tested for
+  both byte fidelity AND incremental chunk arrival (a buffering proxy fails the
+  timing gate). The real third-party SDK matrix (OpenAI/Anthropic Python-TS,
+  Claude Code, Codex) is not run in this repo; connector-level equivalence is
+  verified in the hosting integration.
+- **Provider adapters are stubbed:** real ASN/region attribution, trusted-edge
+  RealIP (`SourceResolver`), and usage estimation (`UsageEstimator`) are
+  seams with deterministic defaults (`HeaderFeatures`, `NoSource`, `NoUsage`);
+  a hosting provider must wire its adapters. Non-supplied features are treated
+  as unknown (never falsely matched); without a UsageEstimator, token/cost
+  resource dimensions stay inert (item 7).
+- **Acceptance gates are components, not gates:** `internal/gates` proves
+  in-process approximations of the §111 properties under honest names. The
+  external release harness — telemetry canary sweeps, network-isolation
+  proofs, cross-process decision replay, multi-node resource accounting —
+  does not exist. Do not certify release from this repo's tests alone.
 
 ## Invariants
 

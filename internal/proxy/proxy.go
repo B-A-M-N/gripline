@@ -18,7 +18,6 @@ package proxy
 
 import (
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"path"
@@ -331,7 +330,27 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 6. Copy the backend response headers + status, stream the body back.
 	copyResponseHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+	// Stream the body, flushing eagerly so SSE/chunked semantics survive the
+	// hop (P0.40): a buffering proxy would still produce a correct final body,
+	// which is exactly the failure mode a final-concatenation check cannot
+	// distinguish from true streaming. Per-chunk Flush keeps chunk arrival
+	// times bounded by the backend's, not the response's end.
+	flusher, _ := w.(http.Flusher)
+	buf := make([]byte, 32<<10)
+	for {
+		n, rerr := resp.Body.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return // client went away; the deferred release runs
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if rerr != nil {
+			break // io.EOF or upstream error: nothing more to forward
+		}
+	}
 }
 
 // joinPath joins a configured backend base path with the request path without
