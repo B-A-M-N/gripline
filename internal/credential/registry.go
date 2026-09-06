@@ -63,6 +63,36 @@ var ErrStaleCAS = errors.New("credential: stale concurrent CAS")
 // ErrNotFound is returned by mutations for absent credentials.
 var ErrNotFound = errors.New("credential: not found")
 
+// Typed authentication-lookup errors (P0.28): authentication must distinguish
+// "unknown credential" from "registry unavailable/timeout/corrupt". Collapsing
+// them means an outage looks like an unknown credential (fail-open to the
+// unknown-credential path) or an unknown credential looks like an outage
+// (lock the edge on spray traffic).
+var (
+	// ErrLookupUnavailable is the registry backend being down/degraded. The
+	// documented response is the recently-authenticated cache + fail closed
+	// for credentials not in that cache.
+	ErrLookupUnavailable = errors.New("credential: registry unavailable")
+	// ErrLookupTimeout is a bounded-time lookup that exceeded its budget.
+	ErrLookupTimeout = errors.New("credential: registry lookup timed out")
+	// ErrLookupCorrupt is durable state that cannot be decoded/validated.
+	ErrLookupCorrupt = errors.New("credential: registry state corrupt")
+)
+
+// VerifierLookup is the production authentication-lookup seam (P0.28): a
+// Registry implementation MAY additionally implement it. Unlike
+// FindByVerifier (which folds outage into "not found" via a bool), it returns
+// typed errors so the terminator can treat UNKNOWN, UNAVAILABLE, TIMEOUT, and
+// CORRUPT as distinct failure classes — an outage must never masquerade as an
+// unknown credential.
+type VerifierLookup interface {
+	FindByVerifierContext(ctx context.Context, verifier []byte, pepperVersion int) (*CredentialRecord, error)
+}
+
+// IsUnknownCredential reports whether err is the typed "no such credential"
+// answer from a VerifierLookup (as opposed to an outage/timeouts/corruption).
+func IsUnknownCredential(err error) bool { return errors.Is(err, ErrNotFound) }
+
 // ErrVerifierOwned is returned when an insert would map a verifier to a
 // credential id that already owns a different verifier under the same pepper
 // version. Two live credentials must never share a verifier — it would let
@@ -248,6 +278,20 @@ func (m *MemoryRegistry) FindByVerifier(verifier []byte, pepperVersion int) (*Cr
 		return nil, false
 	}
 	return cloneRecord(rec), true
+}
+
+// FindByVerifierContext implements the typed-error lookup seam (P0.28). The
+// memory registry is always available, so it distinguishes only
+// ErrNotFound (unknown credential) from success; a durable implementation
+// maps its backend failures to ErrLookupUnavailable/Timeout/Corrupt.
+func (m *MemoryRegistry) FindByVerifierContext(ctx context.Context, verifier []byte, pepperVersion int) (*CredentialRecord, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, ErrLookupTimeout
+	}
+	if rec, ok := m.FindByVerifier(verifier, pepperVersion); ok {
+		return rec, nil
+	}
+	return nil, ErrNotFound
 }
 
 func cloneRecord(rec *CredentialRecord) *CredentialRecord {

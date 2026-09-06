@@ -176,14 +176,16 @@ func TestDataPlaneBackendFollowsSignerRotation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Private backend verifies via the keyring (rotation-aware, P0.59).
+	// Private backend verifies via a PUBLISHED verifier keyring (P0.59 +
+	// P0.17): the backend holds public keys only, connected by publication.
+	vk := keyring.PublishVerifier()
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if len(r.Header.Values("Authorization")) > 0 {
 			w.WriteHeader(http.StatusBadRequest)
 			w.Write([]byte("external-secret-leaked"))
 			return
 		}
-		ver := NewBackendVerifierKeyring(keyring, testAudience)
+		ver := NewBackendVerifierKeyring(vk, testAudience)
 		claims, verr := ver.Verify(r)
 		if verr != nil {
 			w.WriteHeader(http.StatusUnauthorized)

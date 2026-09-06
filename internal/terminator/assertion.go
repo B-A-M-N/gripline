@@ -135,32 +135,93 @@ var (
 
 // Issue builds and signs an internal assertion with the configured TTL and
 // audience. jti must be a unique request id. iat/exp are wall-clock bounded.
+//
+// P0.18: the signer enforces the same claim strictness the verifier applies —
+// a signer must never mint an assertion a conforming verifier would reject
+// (relying on every caller to populate claims correctly is how malformed-but-
+// signed authority gets into the wild).
 func (s *Signer) Issue(c Claims, ttl time.Duration) (*Assertion, error) {
 	// INV-10 / P0.28: internal assertions are hard-capped at 30s. The signer
 	// refuses a longer lifetime even if policy is somehow misconfigured upward.
 	if ttl <= 0 || ttl > maxAssertionTTLSeconds*time.Second {
 		return nil, fmt.Errorf("terminator: TTL out of bounds (INV-10): %v", ttl)
 	}
-	now := time.Now()
-	c.Issuer = "gripline"
-	c.IssuedAt = now.Unix()
-	c.ExpiresAt = now.Add(ttl).Unix()
-	// Stamp the signer's generation so the verifier selects the right key during
-	// rotation (P0.59). A zero/absent key id stays 0 for backward compat; the
-	// verifier keyring treats 0 as version 1.
-	c.KeyID = s.Kid()
 	if c.JTI == "" {
 		return nil, fmt.Errorf("terminator: jti (request id) required")
 	}
 	if c.Audience == "" {
 		return nil, fmt.Errorf("terminator: audience required (INV-11)")
 	}
+	if c.Subject == "" {
+		return nil, fmt.Errorf("terminator: subject required (P0.18)")
+	}
+	if c.CredID == "" {
+		return nil, fmt.Errorf("terminator: credential id required (P0.18)")
+	}
+	if len(c.Scope) == 0 || len(c.Scope) > maxAssertionScopes {
+		return nil, fmt.Errorf("terminator: scope required, bounded at %d (P0.18)", maxAssertionScopes)
+	}
+	for _, sc := range c.Scope {
+		if !validAssertionScope(sc) {
+			return nil, fmt.Errorf("terminator: scope %q not allowlisted (P0.18)", sc)
+		}
+	}
+	if c.PolicyRev < 1 {
+		return nil, fmt.Errorf("terminator: policy_rev must be > 0 (P0.18)")
+	}
+	if c.CredRev < 1 {
+		return nil, fmt.Errorf("terminator: cred_rev must be > 0 (P0.18)")
+	}
+	// LaneID is required when the scope set demands lane context (P0.18).
+	if requiresLaneScope(c.Scope) && c.LaneID == "" {
+		return nil, fmt.Errorf("terminator: lane scope requires LaneID (P0.18)")
+	}
+	now := time.Now()
+	c.Issuer = assertionIssuer
+	c.IssuedAt = now.Unix()
+	c.ExpiresAt = now.Add(ttl).Unix()
+	// Stamp the signer's generation so the verifier selects the right key during
+	// rotation (P0.59). A zero/absent key id stays 0 for backward compat; the
+	// verifier keyring treats 0 as version 1.
+	c.KeyID = s.Kid()
 	payload, err := json.Marshal(c)
 	if err != nil {
 		return nil, fmt.Errorf("terminator: marshal claims: %w", err)
 	}
+	if len(payload) > maxAssertionPayloadBytes {
+		return nil, fmt.Errorf("terminator: assertion payload %d exceeds bound %d (P0.18)", len(payload), maxAssertionPayloadBytes)
+	}
 	sig := ed25519.Sign(s.priv, payload)
 	return &Assertion{raw: payload, signature: sig, claims: c}, nil
+}
+
+// maxAssertionScopes bounds the scope claim's cardinality (P0.18).
+const maxAssertionScopes = 8
+
+// maxAssertionPayloadBytes bounds the encoded assertion size (P0.18): a signed
+// but bloated authority is still a DoS surface on every verifying hop.
+const maxAssertionPayloadBytes = 4096
+
+// validAssertionScope allowlists scope values (P0.18): an arbitrary scope
+// string must never acquire meaning by sneaking through. "inference" is the
+// data-plane workload scope the terminator mints; REQUEST/LANE/CREDENTIAL/
+// ACCOUNT are the principal scope names.
+func validAssertionScope(s string) bool {
+	switch s {
+	case "inference", "REQUEST", "LANE", "CREDENTIAL", "ACCOUNT":
+		return true
+	}
+	return false
+}
+
+// requiresLaneScope reports whether the scope set demands lane context.
+func requiresLaneScope(scopes []string) bool {
+	for _, s := range scopes {
+		if s == "LANE" {
+			return true
+		}
+	}
+	return false
 }
 
 // Claims decodes the payload JSON without exposing more than the claim set.
@@ -174,7 +235,21 @@ func (a *Assertion) Encode() string {
 // ParseAndVerify validates an encoded assertion against a public key, the
 // expected audience, and a sanity window. It rejects expired (INV-10) and
 // wrong-audience (INV-11) assertions.
+//
+// P0.18 strictness: a malformed-but-correctly-signed authority must fail.
+// Beyond signature/TTL/audience this requires a nonempty expected audience,
+// Subject, CredentialID, JTI, a valid kid, PolicyRev/CredRev > 0, a bounded
+// allowlisted scope set (LaneID required when lane scope is present), and a
+// bounded encoded size.
 func ParseAndVerify(encoded string, pub ed25519.PublicKey, expectedAudience string, now time.Time) (*Claims, error) {
+	if expectedAudience == "" {
+		// A verifier that forgot its audience binding accepts any audience —
+		// the INV-11 hole. Fail closed at the verifier, not the caller.
+		return nil, ErrWrongAudience
+	}
+	if len(encoded) > maxEncodedAssertionBytes {
+		return nil, ErrBadAssertion
+	}
 	dot := strings.IndexByte(encoded, '.')
 	if dot < 0 {
 		return nil, ErrBadAssertion
@@ -184,8 +259,14 @@ func ParseAndVerify(encoded string, pub ed25519.PublicKey, expectedAudience stri
 	if err != nil {
 		return nil, ErrBadAssertion
 	}
+	if len(payload) > maxAssertionPayloadBytes {
+		return nil, ErrBadAssertion
+	}
 	sig, err := base64.RawURLEncoding.DecodeString(sigB64)
 	if err != nil {
+		return nil, ErrBadAssertion
+	}
+	if len(sig) != ed25519.SignatureSize {
 		return nil, ErrBadAssertion
 	}
 	if !ed25519.Verify(pub, payload, sig) {
@@ -215,11 +296,31 @@ func ParseAndVerify(encoded string, pub ed25519.PublicKey, expectedAudience stri
 	if c.ExpiresAt-c.IssuedAt > maxAssertionTTLSeconds {
 		return nil, ErrTTLTooLong
 	}
-	if c.CredID == "" || c.JTI == "" {
+	if c.ExpiresAt <= c.IssuedAt {
+		return nil, ErrBadAssertion
+	}
+	if c.Subject == "" || c.CredID == "" || c.JTI == "" {
+		return nil, ErrBadAssertion
+	}
+	if c.PolicyRev < 1 || c.CredRev < 1 {
+		return nil, ErrBadAssertion
+	}
+	if len(c.Scope) == 0 || len(c.Scope) > maxAssertionScopes {
+		return nil, ErrBadAssertion
+	}
+	for _, sc := range c.Scope {
+		if !validAssertionScope(sc) {
+			return nil, ErrBadAssertion
+		}
+	}
+	if requiresLaneScope(c.Scope) && c.LaneID == "" {
 		return nil, ErrBadAssertion
 	}
 	return &c, nil
 }
+
+// maxEncodedAssertionBytes bounds the total encoded assertion (P0.18).
+const maxEncodedAssertionBytes = 8192
 
 // assertionIssuer is the only issuer internal verifiers accept.
 const assertionIssuer = "gripline"

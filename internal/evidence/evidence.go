@@ -289,6 +289,7 @@ func DefaultTable() Table {
 		"COST_VELOCITY_OVER_4X_BASELINE_AND_ABSOLUTE_FLOOR": mk("COST_VELOCITY_OVER_4X_BASELINE_AND_ABSOLUTE_FLOOR", FamilyResourceVelocity, ScopeCredential, 20, 4, 75, "resource", h),
 		"RAPID_ENDPOINT_OR_MODEL_ENUMERATION":               mk("RAPID_ENDPOINT_OR_MODEL_ENUMERATION", FamilyClientNovelty, ScopeLane, 15, 3, 60, "enumeration", h),
 		"SOURCE_ATTEMPTING_MANY_UNRELATED_CREDENTIALS":      mk("SOURCE_ATTEMPTING_MANY_UNRELATED_CREDENTIALS", FamilyAbuseCorrelation, ScopeSource, 35, 6, 90, "spray", m),
+		"SOURCE_ATTEMPTING_MANY_INVALID_CREDENTIALS":        mk("SOURCE_ATTEMPTING_MANY_INVALID_CREDENTIALS", FamilyAbuseCorrelation, ScopeSource, 30, 5, 85, "spray", m),
 		"NEW_CLIENT_FAMILY":                                 mk("NEW_CLIENT_FAMILY", FamilyClientNovelty, ScopeLane, 5, 1, 40, "novelty", d),
 		"NEW_LANE":                                          mk("NEW_LANE", FamilyClientNovelty, ScopeLane, 5, 1, 40, "novelty", d),
 		"MANUAL_CONFIRMED_COMPROMISE":                       mk("MANUAL_CONFIRMED_COMPROMISE", FamilyOperatorIOC, ScopeCredential, 100, 10, 100, "operator", none),

@@ -5,9 +5,17 @@ import (
 	"time"
 )
 
+// testClaims builds a P0.18-strict claim set for tests.
+func testClaims(subject, audience string) Claims {
+	return Claims{
+		Subject: subject, CredID: "c_" + subject, Audience: audience, JTI: "j_" + subject,
+		PolicyRev: 1, CredRev: 1, Scope: []string{"inference"},
+	}
+}
+
 func issue(t *testing.T, k *Keyring, subject string) *Assertion {
 	t.Helper()
-	a, err := k.Issue(Claims{Subject: subject, CredID: "c", Audience: "aud", JTI: "j"}, 30*time.Second)
+	a, err := k.Issue(testClaims(subject, "aud"), 30*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -34,6 +34,7 @@
 package secret
 
 import (
+	"encoding/base64"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -64,6 +65,11 @@ type secretState struct {
 // digestDomain separates this HMAC use from every other HMAC in the program
 // (the pepper-keyed verifier derives under this exact domain).
 var digestDomain = []byte("gripline:secret:digest:v1")
+
+// sprayDomain separates the P0.30 spray-pseudonym transform from verifier
+// derivation: a value that collides across the two would let spray tracking
+// impersonate authentication state.
+var sprayDomain = []byte("gripline:secret:spray-pseudonym:v1")
 
 // NewFromBytes builds a SealedSecret from a caller-owned byte slice, copying
 // the bytes into an internal buffer. The caller is responsible for zeroing its
@@ -121,6 +127,24 @@ func (s *SealedSecret) DigestHMAC(key []byte) []byte {
 	_, _ = m.Write(digestDomain)
 	_, _ = m.Write(s.state.buf)
 	return m.Sum(nil)
+}
+
+// SprayPseudonym is the second (and only other) deliberate transform (P0.30):
+// a SHORT-LIVED, domain-separated keyed pseudonym over the presented bytes,
+// used to track INVALID-credential spray. Before an unknown credential is
+// destroyed, source state can count DISTINCT presented keys per source —
+// without retaining any raw candidate key bytes and without adding a generic
+// Bytes() accessor (the transform stays inside the sealed boundary). The
+// output is a base64 tag suitable as a detector key; it is NOT a verifier and
+// MUST NOT be persisted as one.
+func (s *SealedSecret) SprayPseudonym(key []byte) string {
+	if s == nil || s.state == nil || s.state.zeroed || len(key) == 0 {
+		return ""
+	}
+	m := hmac.New(sha256.New, key)
+	_, _ = m.Write(sprayDomain) // domain separation: never DigestHMAC-compatible
+	_, _ = m.Write(s.state.buf)
+	return base64.RawURLEncoding.EncodeToString(m.Sum(nil)[:16])
 }
 
 // Random returns n random bytes sealed for test/key-generation use. The

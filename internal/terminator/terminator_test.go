@@ -48,7 +48,10 @@ func TestAssertionSignAndVerify(t *testing.T) {
 
 func TestExpiredAssertionFailsINV10(t *testing.T) {
 	signer, _ := GenerateSigner()
-	a, _ := signer.Issue(Claims{Subject: "s", Audience: "aud", JTI: "j"}, 30*time.Second)
+	a, err := signer.Issue(testClaims("s", "aud"), 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := ParseAndVerify(a.Encode(), signer.Public(), "aud", time.Now().Add(31*time.Second)); err != ErrExpired {
 		t.Fatalf("want ErrExpired, got %v", err)
 	}
@@ -56,7 +59,10 @@ func TestExpiredAssertionFailsINV10(t *testing.T) {
 
 func TestWrongAudienceFailsINV11(t *testing.T) {
 	signer, _ := GenerateSigner()
-	a, _ := signer.Issue(Claims{Subject: "s", Audience: "fi-inference", JTI: "j"}, 30*time.Second)
+	a, err := signer.Issue(testClaims("s", "fi-inference"), 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := ParseAndVerify(a.Encode(), signer.Public(), "some-other-aud", time.Now()); err != ErrWrongAudience {
 		t.Fatalf("want ErrWrongAudience, got %v", err)
 	}
@@ -64,7 +70,10 @@ func TestWrongAudienceFailsINV11(t *testing.T) {
 
 func TestTamperedAssertionFails(t *testing.T) {
 	signer, _ := GenerateSigner()
-	a, _ := signer.Issue(Claims{Subject: "s", Audience: "aud", JTI: "j"}, 30*time.Second)
+	a, err := signer.Issue(testClaims("s", "aud"), 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := ParseAndVerify(a.Encode()+"x", signer.Public(), "aud", time.Now()); err == nil {
 		t.Fatal("tampered assertion must fail verification")
 	}
@@ -74,13 +83,14 @@ func TestTamperedAssertionFails(t *testing.T) {
 // even when correctly signed with a trusted key (internal-identity spoofing).
 func TestWrongIssuerRejected(t *testing.T) {
 	signer, _ := GenerateSigner()
-	a, err := signer.Issue(Claims{Subject: "s", Audience: "aud", JTI: "j"}, 30*time.Second)
+	a, err := signer.Issue(testClaims("s", "aud"), 30*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// The issuer is forced to "gripline" on Issue; craft a foreign-issuer
 	// payload by re-signing claims with a different issuer value.
-	forged := Claims{Issuer: "other-service", Subject: "s", Audience: "aud", JTI: "j",
+	forged := Claims{Issuer: "other-service", Subject: "s", CredID: "cred_1", Audience: "aud", JTI: "j",
+		PolicyRev: 1, CredRev: 1, Scope: []string{"inference"},
 		IssuedAt: time.Now().Unix(), ExpiresAt: time.Now().Add(30 * time.Second).Unix()}
 	payload, _ := json.Marshal(forged)
 	sig := ed25519.Sign(signer.priv, payload)
@@ -99,6 +109,7 @@ func TestOverTTLAssertionRejected(t *testing.T) {
 	now := time.Now()
 	claims := Claims{
 		Issuer: "gripline", Subject: "s", CredID: "cred_1", Audience: "aud", JTI: "j",
+		PolicyRev: 1, CredRev: 1, Scope: []string{"inference"},
 		// Valid "now" window but a 2-hour lifetime — over the TTL bound.
 		IssuedAt:  now.Unix(),
 		ExpiresAt: now.Add(2 * time.Hour).Unix(),
@@ -115,7 +126,10 @@ func TestOverTTLAssertionRejected(t *testing.T) {
 // second (now == exp), not only after it.
 func TestAssertionExpiredAtExactExpiry(t *testing.T) {
 	signer, _ := GenerateSigner()
-	a, _ := signer.Issue(Claims{Subject: "s", CredID: "cred_x", Audience: "aud", JTI: "j"}, 30*time.Second)
+	a, err := signer.Issue(testClaims("s", "aud"), 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
 	enc := a.Encode()
 	atExp := time.Unix(a.Claims().ExpiresAt, 0)
 	if _, err := ParseAndVerify(enc, signer.Public(), "aud", atExp); err != ErrExpired {

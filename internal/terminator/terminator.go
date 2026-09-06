@@ -5,6 +5,7 @@
 package terminator
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -391,6 +392,27 @@ func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features,
 		out.Authorized = false
 		out.Reason = safeReason(err)
 		out.DenialErr = err
+		// P0.30: INVALID-credential spray tracking. Before the presented
+		// material is destroyed (defer above), derive a short-lived keyed
+		// pseudonym INSIDE the sealed boundary and count DISTINCT candidate
+		// keys per source. Raw candidate bytes are never retained; the signal
+		// resolves through the same one-policy-authority path as all spray
+		// signals. No trusted source identity → no attribution (fail-closed).
+		if t.dep.Spray != nil && src.sourceID() != "" && errors.Is(err, credential.UnknownError) {
+			// The spray key is the latest pepper key: SprayPseudonym is
+			// domain-separated from verifier derivation inside the sealed
+			// boundary, so the same key material never cross-purposes.
+			if key, ok := t.dep.Peppers.Get(t.dep.Peppers.Latest()); ok {
+				cand := presented.SprayPseudonym(key)
+				if sigs := t.dep.Spray.ObserveInvalidCredential(src.sourceID(), cand, now); len(sigs) > 0 {
+					for _, sig := range sigs {
+						if ev, merr := evidence.Mint(t.pol.EvidenceRules, sig.Code, sig.SubjectID, now, t.pol.Revision); merr == nil && t.dep.Evidence != nil {
+							_ = t.dep.Evidence.Append(ev)
+						}
+					}
+				}
+			}
+		}
 		return out
 	}
 	// Record last-seen on successful authentication (P0.22). Analytics-grade and
@@ -1113,38 +1135,60 @@ var (
 // resolves the credential. INV-13 (revoked never authenticates), §30
 // (quarantined denied at authentication), and §75 (expired denied) all gate
 // BEFORE any lane/resource/policy state.
+//
+// P0.29: verifiers are derived via PepperRing.DeriveVerifier — the ring folds
+// the presented secret internally; the terminator never extracts pepper key
+// bytes to call DigestHMAC itself.
+//
+// P0.28: when the registry implements the typed VerifierLookup seam, an
+// outage/timeout/corruption is DISTINCT from an unknown credential. An
+// unavailable registry is a degraded-admission signal: unknown credentials
+// fail closed as before (UnknownError), but the error is typed
+// LookupUnavailableError so callers/policy can distinguish spray traffic from
+// a backend outage instead of treating every miss as "no such credential".
 func (t *Terminator) authenticate(presented *secret.SealedSecret) (*credential.Credential, error) {
 	latest := t.dep.Peppers.Latest()
 	if latest < 0 {
 		return nil, errors.New("terminator: no active pepper keys")
 	}
-	key, ok := t.dep.Peppers.Get(latest)
-	if !ok {
-		return nil, errors.New("terminator: missing latest pepper")
-	}
-	verifier := presented.DigestHMAC(key)
-	if rec, found := t.dep.Registry.FindByVerifier(verifier, latest); found {
-		if err := rec.Authenticatable(t.dep.RiskNow()); err != nil {
-			return nil, err
+	verifier := t.dep.Peppers.DeriveVerifier(presented, latest)
+	if rec, err := t.lookupVerifier(verifier, latest); err == nil {
+		if aerr := rec.Authenticatable(t.dep.RiskNow()); aerr != nil {
+			return nil, aerr
 		}
 		return credFrom(rec), nil
+	} else if !errors.Is(err, credential.ErrNotFound) {
+		// Unavailable/timeout/corrupt: NOT an unknown credential. Fail closed
+		// with the typed error — degraded posture, never "no such credential".
+		return nil, err
 	}
 	versions := t.dep.Peppers.Versions()
 	for i := len(versions) - 2; i >= 0; i-- {
 		v := versions[i]
-		k, ok := t.dep.Peppers.Get(v)
-		if !ok {
-			continue
-		}
-		vv := presented.DigestHMAC(k)
-		if rec, found := t.dep.Registry.FindByVerifier(vv, v); found {
-			if err := rec.Authenticatable(t.dep.RiskNow()); err != nil {
-				return nil, err
+		vv := t.dep.Peppers.DeriveVerifier(presented, v)
+		if rec, err := t.lookupVerifier(vv, v); err == nil {
+			if aerr := rec.Authenticatable(t.dep.RiskNow()); aerr != nil {
+				return nil, aerr
 			}
 			return credFrom(rec), nil
+		} else if !errors.Is(err, credential.ErrNotFound) {
+			return nil, err
 		}
 	}
 	return nil, credential.UnknownError
+}
+
+// lookupVerifier resolves a derived verifier through the typed seam (P0.28)
+// when the registry implements it, else through the legacy bool API (all
+// misses become ErrNotFound — the legacy semantics).
+func (t *Terminator) lookupVerifier(verifier []byte, pepperVersion int) (*credential.CredentialRecord, error) {
+	if lu, ok := t.dep.Registry.(credential.VerifierLookup); ok {
+		return lu.FindByVerifierContext(context.Background(), verifier, pepperVersion)
+	}
+	if rec, found := t.dep.Registry.FindByVerifier(verifier, pepperVersion); found {
+		return rec, nil
+	}
+	return nil, credential.ErrNotFound
 }
 
 func credFrom(rec *credential.CredentialRecord) *credential.Credential {

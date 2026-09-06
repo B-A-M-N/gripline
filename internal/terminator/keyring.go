@@ -133,10 +133,31 @@ func (k *Keyring) Public(kid int) ([]byte, bool) {
 	return append([]byte(nil), b...), true
 }
 
+// PublishVerifier builds the VERIFIER-side keyring (P0.17): a
+// VerifierKeyring holding PUBLIC keys only, connected to this signer by key
+// publication. This is the boundary the deployment hands to private backends —
+// never the SignerKeyring itself, whose possession implies signing authority.
+func (k *Keyring) PublishVerifier() *VerifierKeyring {
+	k.st.mu.Lock()
+	defer k.st.mu.Unlock()
+	vk := newVerifierKeyring()
+	for kid, pub := range k.st.verifiers {
+		vk.st.verifiers[kid] = append([]byte(nil), pub...)
+	}
+	if k.st.now != nil {
+		vk.st.now = k.st.now
+	}
+	return vk
+}
+
 // Verify validates an encoded assertion by selecting the generation's public
 // key from the token's kid then running the standard signature/audience/TTL
 // checks. It FAILS CLOSED if the kid is unknown — a token signed by a generation
 // the verifier has not yet accepted is rejected, never accepted by guessing.
+//
+// Prefer publishing a VerifierKeyring (PublishVerifier) for verifiers (P0.17);
+// this method remains for single-process deployments where the signer and
+// verifier are the same trust domain.
 func (k *Keyring) Verify(encoded, audience string, now time.Time) (*Claims, error) {
 	if now.IsZero() {
 		k.st.mu.Lock()
@@ -155,6 +176,98 @@ func (k *Keyring) Verify(encoded, audience string, now time.Time) (*Claims, erro
 		return nil, fmt.Errorf("terminator: no public key for assertion kid %d (rotation not yet propagated)", kid)
 	}
 	return ParseAndVerify(encoded, ed25519.PublicKey(pub), audience, now)
+}
+
+// VerifierKeyring is the verification-only half of the rotation keyring
+// (P0.17): it holds PUBLIC keys for every retained generation and can never
+// sign. This is what a private backend receives — the old shape handed the
+// backend the full *Keyring (active private signer + Issue + Rotate), giving
+// the verifying side the authority to mint its own assertions and defeating
+// the issuer/verifier isolation the boundary exists for.
+//
+// Publication model: the signer side publishes generations into the verifier
+// (Publish, below); the two objects are independently constructed and share no
+// private material. Tests wire them together exactly that way.
+type VerifierKeyring struct {
+	st *verifierKeyringState
+}
+
+type verifierKeyringState struct {
+	mu        sync.Mutex
+	verifiers map[int][]byte // kid -> public key
+	now       func() time.Time
+}
+
+// Format/String/GoString: value receivers, always redact (P0.16 parity — the
+// contents are public material, but a consistent redaction surface means
+// nothing downstream can distinguish secret-bearing types by their formatting).
+func (k VerifierKeyring) Format(f fmt.State, verb rune) { fmt.Fprint(f, "<redacted>") }
+func (k VerifierKeyring) String() string                { return "<redacted>" }
+func (k VerifierKeyring) GoString() string              { return "<redacted>" }
+
+func newVerifierKeyring() *VerifierKeyring {
+	return &VerifierKeyring{st: &verifierKeyringState{
+		verifiers: make(map[int][]byte),
+		now:       time.Now,
+	}}
+}
+
+// NewVerifierKeyring builds an EMPTY verifier keyring (publication model:
+// generations arrive via Publish). For a fixed single-key verifier without
+// rotation, use NewBackendVerifier(pub, audience) instead.
+func NewVerifierKeyring() *VerifierKeyring { return newVerifierKeyring() }
+
+// WithClock injects a clock for tests.
+func (k *VerifierKeyring) WithClock(now func() time.Time) *VerifierKeyring {
+	k.st.mu.Lock()
+	defer k.st.mu.Unlock()
+	if now != nil {
+		k.st.now = now
+	}
+	return k
+}
+
+// Publish installs (or replaces) the public key for one generation. This is
+// the rotation-propagation seam: the operator/publisher pushes each new
+// signer generation's public key to verifiers, and unknown generations fail
+// closed until publication lands.
+func (k *VerifierKeyring) Publish(kid int, pub ed25519.PublicKey) {
+	k.st.mu.Lock()
+	defer k.st.mu.Unlock()
+	k.st.verifiers[kid] = append([]byte(nil), pub...)
+}
+
+// Retire drops a generation's public key (rotation cleanup: once every
+// outstanding ≤30s assertion of a generation is expired, its public key can
+// be removed).
+func (k *VerifierKeyring) Retire(kid int) {
+	k.st.mu.Lock()
+	defer k.st.mu.Unlock()
+	delete(k.st.verifiers, kid)
+}
+
+// Verify validates an encoded assertion against the published generation keys.
+// Fails closed on an unknown kid — publication lag denies, never downgrades.
+func (k *VerifierKeyring) Verify(encoded, audience string, now time.Time) (*Claims, error) {
+	if now.IsZero() {
+		k.st.mu.Lock()
+		now = k.st.now()
+		k.st.mu.Unlock()
+	}
+	kid, err := extractKid(encoded)
+	if err != nil {
+		return nil, err
+	}
+	if kid == 0 {
+		kid = 1
+	}
+	k.st.mu.Lock()
+	pub, ok := k.st.verifiers[kid]
+	k.st.mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("terminator: no public key for assertion kid %d (rotation not yet published)", kid)
+	}
+	return ParseAndVerify(encoded, ed25519.PublicKey(append([]byte(nil), pub...)), audience, now)
 }
 
 // extractKid decodes just the payload's kid claim to route verification to the

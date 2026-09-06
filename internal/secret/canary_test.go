@@ -63,7 +63,8 @@ func TestSecretBearingTypesRedactOnValueCopy(t *testing.T) {
 	checkRedacted(t, "Signer(value copy)", signerCopy)
 
 	a, err := signer.Issue(terminator.Claims{
-		Issuer: "gripline", Subject: "s", Audience: "aud", JTI: "j",
+		Issuer: "gripline", Subject: "s", CredID: "cred_1", Audience: "aud", JTI: "j",
+		PolicyRev: 1, CredRev: 1, Scope: []string{"inference"},
 		IssuedAt: time.Now().Unix(), ExpiresAt: time.Now().Add(time.Second).Unix(),
 	}, time.Second)
 	if err != nil {

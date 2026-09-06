@@ -410,7 +410,7 @@ func TestM1AssertionTTLCappedAt30s(t *testing.T) {
 		t.Fatalf("P0.28: effective TTL = %v, want 30s (hard cap)", ttl)
 	}
 	// The signer itself must also refuse >30s.
-	_, err := signer.Issue(Claims{Subject: "s", CredID: "c", Audience: "a", JTI: "j"}, 40*time.Second)
+	_, err := signer.Issue(testClaims("s", "a"), 40*time.Second)
 	if err == nil {
 		t.Fatal("P0.28: signer must refuse a 40s assertion")
 	}
