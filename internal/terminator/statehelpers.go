@@ -55,6 +55,29 @@ func dedupAppend(existing, incoming []evidence.Evidence) []evidence.Evidence {
 	return out
 }
 
+// policyRevisionFilter returns only evidence minted under the CURRENT policy
+// revision (mod == 0), keeping the rest out of both deduction and dedup. A
+// policy change landed after older evidence was minted means that evidence's
+// scores/severities came from a DIFFERENT rule table — feeding it into the
+// authoritative state machine would evaluate old-era risk under new-era
+// thresholds (P0.45). Filtering FAIL-CLOSED: stale-revision evidence never
+// drives the state machine; only evidence minted against the current revision
+// (including current-request synchronous evidence, which is always current)
+// does. Evidence with a zero revision (hand-seeded, e.g. operator/operator IOC
+// that predates revision tagging) is preserved as-is rather than dropped.
+func policyRevisionFilter(items []evidence.Evidence, rev int) []evidence.Evidence {
+	if rev == 0 || len(items) == 0 {
+		return items
+	}
+	out := items[:0:0]
+	for _, e := range items {
+		if e.PolicyRevision == 0 || e.PolicyRevision == rev {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
 // credentialHysteresis derives the state-transition config from the compiled
 // policy snapshot (P0.11: hysteresis is policy-controlled, not hardcoded).
 func (t *Terminator) credentialHysteresis() credential.Hysteresis {

@@ -1,6 +1,7 @@
 package terminator
 
 import (
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -849,5 +850,121 @@ func TestNewRejectsPolicyWithoutEvidenceTable(t *testing.T) {
 	}
 	if _, err := New(dep); err == nil {
 		t.Fatal("P0.11: New must reject a policy with no evidence table (fail-closed)")
+	}
+}
+
+// P0.45: stale-revision evidence must NOT drive the authoritative state machine.
+// Evidence minted under a PREVIOUS policy revision carried scores from an older
+// rule table; after a policy change it must be dropped (fail-closed) rather than
+// evaluated under new thresholds. Only evidence at the CURRENT revision (and
+// untagged/operator evidence) drives enforcement.
+func TestStalePolicyRevisionEvidenceFilteredFromStateMachine(t *testing.T) {
+	pep := &credential.PepperKey{Version: 1, Key: []byte("p45-pepper")}
+	rawBytes := make([]byte, 24)
+	for i := range rawBytes {
+		rawBytes[i] = byte('p' + i%26)
+	}
+	raw := "sk-p45-" + string(rawBytes)
+	sealed := secret.NewFromBytes([]byte(raw))
+	reg := credential.NewMemoryRegistry()
+	reg.Insert(&credential.CredentialRecord{
+		CredentialID: "cred_p45", AccountID: "acct",
+		Verifier: credential.Verifier(sealed, pep), VerifierVersion: 1, PepperVersion: 1,
+		Status: credential.StatusNormal, PolicyID: "fi-default-v1", PlanID: "plan-a",
+		CreatedAt: time.Now().Add(-time.Hour), Revision: 1,
+	})
+	signer, _ := GenerateSigner()
+	store := evidence.NewMemoryStore()
+	term, err := New(Dependencies{
+		Registry: reg, Peppers: credential.MustPepperRing(pep),
+		Lanes:    lane.NewStore(nil, time.Now),
+		Policy:   policy.Default(),
+		Signer:   signer,
+		Audience: "fi-inference",
+		Evidence: store,
+		Resource: resource.NewGovernor(nil),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rev := term.pol.Revision // current compiled revision (1)
+
+	feat := laneFeatures("AS45")
+	// Establish the lane.
+	out := term.Admit(bearerHeaders(raw), feat)
+	if !out.Authorized {
+		t.Fatalf("establish: %s", out.Reason)
+	}
+	laneID := out.Context.LaneID
+
+	now := time.Now()
+	// Two separate families so the total clears the block threshold (70) after
+	// family caps: FamilySourceDiscontinuity caps at 35, FamilyAbuseCorrelation at
+	// 40 → 35+40 = 75. Otherwise a single-family high score is clamped below 70.
+	const sc1, sc2 = 40, 40
+	seed := func(stale bool) {
+		revTag := rev
+		if stale {
+			revTag = rev - 100 // a much older revision
+		}
+		store.Append([]evidence.Evidence{
+			{EvidenceID: "p45_s_" + fmt.Sprint(revTag), Code: "NEW_HOSTING_ASN",
+				Family: evidence.FamilySourceDiscontinuity, Scope: evidence.ScopeLane,
+				SubjectID: laneID, Score: sc1, Confidence: 90, PolicyRevision: revTag,
+				CreatedAt: now, ExpiresAt: now.Add(time.Hour)},
+			{EvidenceID: "p45_a_" + fmt.Sprint(revTag), Code: "SOURCE_ATTEMPTING_MANY_UNRELATED_CREDENTIALS",
+				Family: evidence.FamilyAbuseCorrelation, Scope: evidence.ScopeLane,
+				SubjectID: laneID, Score: sc2, Confidence: 90, PolicyRevision: revTag,
+				CreatedAt: now, ExpiresAt: now.Add(time.Hour)},
+		}...)
+	}
+	// We clear between cases so the previous seed doesn't bleed over (the store
+	// is per-test). Each seed drives high lane risk that would BLOCK the lane
+	// IF it were evaluated.
+
+	// Case 1: STALE-revision evidence is filtered out → the lane must NOT be
+	// blocked by it (a policy landed after it was minted; it is not trusted).
+	seed(true)
+	outS := term.Admit(bearerHeaders(raw), feat)
+	if !outS.Authorized {
+		t.Fatalf("P0.45: stale-revision evidence must be filtered; admission denied: %s", outS.Reason)
+	}
+
+	// Case 2 (fresh store so the stale seed isn't in scope): CURRENT-revision
+	// evidence IS evaluated → the lane must be blocked (lane_restricted).
+	store = evidence.NewMemoryStore()
+	term2, err := New(Dependencies{
+		Registry: reg, Peppers: credential.MustPepperRing(pep),
+		Lanes:    lane.NewStore(nil, time.Now),
+		Policy:   policy.Default(),
+		Signer:   signer,
+		Audience: "fi-inference",
+		Evidence: store,
+		Resource: resource.NewGovernor(nil),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out2 := term2.Admit(bearerHeaders(raw), feat)
+	if !out2.Authorized {
+		t.Fatalf("establish (case 2): %s", out2.Reason)
+	}
+	laneID2 := out2.Context.LaneID
+	store.Append([]evidence.Evidence{
+		{EvidenceID: "p45_s_cur", Code: "NEW_HOSTING_ASN",
+			Family: evidence.FamilySourceDiscontinuity, Scope: evidence.ScopeLane,
+			SubjectID: laneID2, Score: sc1, Confidence: 90, PolicyRevision: rev,
+			CreatedAt: now, ExpiresAt: now.Add(time.Hour)},
+		{EvidenceID: "p45_a_cur", Code: "SOURCE_ATTEMPTING_MANY_UNRELATED_CREDENTIALS",
+			Family: evidence.FamilyAbuseCorrelation, Scope: evidence.ScopeLane,
+			SubjectID: laneID2, Score: sc2, Confidence: 90, PolicyRevision: rev,
+			CreatedAt: now, ExpiresAt: now.Add(time.Hour)},
+	}...)
+	outCur := term2.Admit(bearerHeaders(raw), feat)
+	if outCur.Authorized {
+		t.Fatal("P0.45: current-revision high-risk evidence must drive the block (lane_restricted)")
+	}
+	if outCur.Reason != "lane_restricted" {
+		t.Fatalf("P0.45: want lane_restricted, got %s", outCur.Reason)
 	}
 }

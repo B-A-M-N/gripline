@@ -363,6 +363,13 @@ func (t *Terminator) Admit(headers map[string][]string, feat lane.Features) *Out
 			laneSnapOK = true
 		}
 	}
+	// P0.45: only evidence minted under the CURRENT policy revision may drive the
+	// authoritative state machine. Evidence from an older revision was scored
+	// under a different rule table; evaluating it after a policy change would
+	// apply old-era risk to new-era thresholds. Filter fail-closed (stale-revision
+	// evidence is dropped); current-request sync evidence is always current-rev.
+	credentialEvidence = policyRevisionFilter(credentialEvidence, t.pol.Revision)
+	laneEvidence = policyRevisionFilter(laneEvidence, t.pol.Revision)
 	// Current-request sync evidence (scope: lane) is included in evaluation
 	// EVERY time it was minted, independent of append/snapshot success, so a
 	// store outage or read-after-write lag can never drop the current signal
