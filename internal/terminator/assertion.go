@@ -71,19 +71,22 @@ func (s *Signer) Public() ed25519.PublicKey {
 }
 
 // Format implements fmt.Formatter and always redacts (P0.15/P0.31): formatting a
-// Signer must never reach the private key bytes.
-func (s *Signer) Format(f fmt.State, verb rune) { fmt.Fprint(f, "<redacted>") }
+// Signer must never reach the private key bytes. VALUE receivers (P0.15): a
+// copy of a Signer (copy := *signer) must redact identically — pointer
+// receivers only cover the original, and a copy falls back to struct
+// formatting, exposing priv.
+func (s Signer) Format(f fmt.State, verb rune) { fmt.Fprint(f, "<redacted>") }
 
-// String implements fmt.Stringer.
-func (s *Signer) String() string { return "<redacted>" }
+// String implements fmt.Stringer (value receiver, P0.15).
+func (s Signer) String() string { return "<redacted>" }
 
-// GoString implements fmt.GoStringer (%#v).
-func (s *Signer) GoString() string { return "<redacted>" }
+// GoString implements fmt.GoStringer (%#v; value receiver, P0.15).
+func (s Signer) GoString() string { return "<redacted>" }
 
 var (
-	_ fmt.Formatter  = (*Signer)(nil)
-	_ fmt.Stringer   = (*Signer)(nil)
-	_ fmt.GoStringer = (*Signer)(nil)
+	_ fmt.Formatter  = Signer{}
+	_ fmt.Stringer   = Signer{}
+	_ fmt.GoStringer = Signer{}
 )
 
 // Claims is the internal-identity payload (§20).
@@ -113,20 +116,21 @@ type Assertion struct {
 	claims    Claims
 }
 
-// Format implements fmt.Formatter and always redacts (P0.31): generic logging
-// of an Assertion must not leak the wire token or its signature.
-func (a *Assertion) Format(f fmt.State, verb rune) { fmt.Fprint(f, "<redacted>") }
+// Format implements fmt.Formatter and always redacts (P0.31/P0.15): generic
+// logging of an Assertion must not leak the wire token or its signature. VALUE
+// receivers so a struct copy redacts identically to the original.
+func (a Assertion) Format(f fmt.State, verb rune) { fmt.Fprint(f, "<redacted>") }
 
-// String implements fmt.Stringer.
-func (a *Assertion) String() string { return "<redacted>" }
+// String implements fmt.Stringer (value receiver, P0.15).
+func (a Assertion) String() string { return "<redacted>" }
 
-// GoString implements fmt.GoStringer (%#v).
-func (a *Assertion) GoString() string { return "<redacted>" }
+// GoString implements fmt.GoStringer (%#v; value receiver, P0.15).
+func (a Assertion) GoString() string { return "<redacted>" }
 
 var (
-	_ fmt.Formatter  = (*Assertion)(nil)
-	_ fmt.Stringer   = (*Assertion)(nil)
-	_ fmt.GoStringer = (*Assertion)(nil)
+	_ fmt.Formatter  = Assertion{}
+	_ fmt.Stringer   = Assertion{}
+	_ fmt.GoStringer = Assertion{}
 )
 
 // Issue builds and signs an internal assertion with the configured TTL and

@@ -202,6 +202,24 @@ type PepperRing struct {
 	now    func() time.Time
 }
 
+// Format implements fmt.Formatter and always redacts (P0.16). VALUE receiver:
+// a struct copy of a PepperRing must redact identically — the ring holds live
+// pepper key material (map[int][]byte), and a copy of a pointer-receiver
+// formatter type falls back to struct formatting, exposing the map.
+func (r PepperRing) Format(f fmt.State, verb rune) { fmt.Fprint(f, "<redacted>") }
+
+// String implements fmt.Stringer (value receiver, P0.16).
+func (r PepperRing) String() string { return "<redacted>" }
+
+// GoString implements fmt.GoStringer (%#v; value receiver, P0.16).
+func (r PepperRing) GoString() string { return "<redacted>" }
+
+var (
+	_ fmt.Formatter  = PepperRing{}
+	_ fmt.Stringer   = PepperRing{}
+	_ fmt.GoStringer = PepperRing{}
+)
+
 // NewPepperRing builds a ring from one or more versions. A later version is
 // "active" for new verifiers; all versions remain valid for comparison.
 // Versions with empty key material or negative version numbers are refused:

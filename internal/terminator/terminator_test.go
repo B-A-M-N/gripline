@@ -492,6 +492,19 @@ func TestPolicyMutationAfterNewCannotAlterEnforcement(t *testing.T) {
 	pol.Identity.MaxTTLSeconds = 60
 	pol.Revision = 999
 
+	// P0.10: mutate the REFERENCE-BEARING field too. The old shallow struct
+	// copy shared EvidenceRules with the compiled snapshot — this write would
+	// rewrite live enforcement (e.g. inflate NEW_LANE score) after New().
+	pol.EvidenceRules["NEW_LANE"] = evidence.Rule{
+		Family: evidence.FamilyAbuseCorrelation, Score: 100, Severity: 5,
+		Confidence: 100, TTL: 24 * time.Hour,
+	}
+	pol.EvidenceRules["NONEXISTENT_INJECTED_RULE"] = evidence.Rule{
+		Family: evidence.FamilyAbuseCorrelation, Score: 100, Severity: 5,
+		Confidence: 100, TTL: 24 * time.Hour,
+	}
+	pol.Classification.Match = 0.01 // would collapse every candidate into any lane
+
 	out := term.Admit(bearerHeaders(tc.raw), lane.Features{})
 	if !out.Authorized {
 		t.Fatalf("snapshot policy must still authorize a clean request: %s %v", out.Reason, out.DenialErr)
@@ -505,6 +518,43 @@ func TestPolicyMutationAfterNewCannotAlterEnforcement(t *testing.T) {
 	if out.Assertion.Claims().CredID == "" {
 		t.Fatal("assertion must carry the credential id")
 	}
+
+	// P0.10 continued: the compiled evidence table must be the ORIGINAL
+	// DefaultTable parameters, not the mutated ones — the injected rule must
+	// not mint, and NEW_LANE must keep its default parameters. Construct an
+	// ENFORCE terminator with a valid policy, inject into the caller's table
+	// AFTER construction, and verify the injection never reaches enforcement.
+	enfPol := policy.Default()
+	enfTerm, err := New(Dependencies{
+		Registry: tc.reg, Peppers: credential.MustPepperRing(pep),
+		Lanes:    lane.NewStore(nil, time.Now),
+		Policy:   enfPol, Signer: signer, Audience: "fi-inference",
+		Evidence:    evidence.NewMemoryStore(),
+		Concurrency: &fakePool{resource.NewConcurrencyPool(16)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	enfPol.EvidenceRules["NONEXISTENT_INJECTED_RULE"] = evidence.Rule{
+		Family: evidence.FamilyAbuseCorrelation, Scope: evidence.ScopeCredential,
+		Score: 100, Severity: 5, Confidence: 100, TTL: 24 * time.Hour,
+	}
+	enfPol.EvidenceRules["NEW_LANE"] = evidence.Rule{
+		Family: evidence.FamilyAbuseCorrelation, Scope: evidence.ScopeLane,
+		Score: 100, Severity: 5, Confidence: 100, TTL: 24 * time.Hour,
+	}
+	out2 := enfTerm.Admit(bearerHeaders(tc.raw), laneFeatures("AS1"))
+	if !out2.Authorized {
+		t.Fatalf("clean request must authorize: %s", out2.Reason)
+	}
+	for _, code := range out2.Evidence {
+		if code == "NONEXISTENT_INJECTED_RULE" {
+			t.Fatal("post-New injected evidence rule must not mint (P0.10)")
+		}
+	}
+	// The authorized outcome itself proves NEW_LANE kept its compiled score:
+	// the injected 100-score NEW_LANE rule would have pushed risk to QUARANTINE
+	// and denied this clean request.
 }
 
 // Regression (P0.5): a credential whose PolicyID differs from the loaded

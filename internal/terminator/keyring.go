@@ -33,6 +33,25 @@ type Keyring struct {
 	now       func() time.Time // clock (tests)
 }
 
+// Format implements fmt.Formatter and always redacts (P0.16 defense in
+// depth). VALUE receiver: the Keyring owns the active private signer; a
+// struct copy must redact identically rather than fall back to struct
+// formatting. (The verifier map is public material, but the active signer is
+// not.)
+func (k Keyring) Format(f fmt.State, verb rune) { fmt.Fprint(f, "<redacted>") }
+
+// String implements fmt.Stringer (value receiver, P0.16).
+func (k Keyring) String() string { return "<redacted>" }
+
+// GoString implements fmt.GoStringer (%#v; value receiver, P0.16).
+func (k Keyring) GoString() string { return "<redacted>" }
+
+var (
+	_ fmt.Formatter  = Keyring{}
+	_ fmt.Stringer   = Keyring{}
+	_ fmt.GoStringer = Keyring{}
+)
+
 // NewKeyring seeds a keyring with an initial generation (kid 1), freshly
 // generated. The verifier map starts with generation 1's public key.
 func NewKeyring() (*Keyring, error) {

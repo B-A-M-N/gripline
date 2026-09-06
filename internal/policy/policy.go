@@ -148,6 +148,38 @@ func Default() *Policy {
 	}
 }
 
+// CompiledPolicy is a validated, deep-copied policy snapshot (P0.10). The data
+// plane stores ONLY a CompiledPolicy: a shallow struct copy of Policy shares
+// the EvidenceRules map with the caller, so a post-construction mutation of the
+// caller's table would rewrite live enforcement. Compile copies every
+// reference-bearing field; the result is the caller's to mutate freely with no
+// effect on enforcement.
+type CompiledPolicy struct {
+	Policy
+}
+
+// Compile validates and deep-copies a policy revision. It returns an error on
+// an invalid policy rather than compiling one that fails closed later.
+func Compile(p *Policy) (*CompiledPolicy, error) {
+	if !p.IsValid() {
+		return nil, errors.New("policy: invalid policy revision")
+	}
+	c := &CompiledPolicy{Policy: *p}
+	// Deep-copy every reference-bearing field (P0.10). EvidenceRules is the
+	// map that matters today; Classification and the threshold structs are
+	// value types copied by the struct copy above. Any field added to Policy
+	// holding a slice or map MUST be added here — the terminator immutability
+	// test (TestCompiledPolicyIsImmutableAgainstCallerMutation) fails on a
+	// shared map otherwise.
+	if p.EvidenceRules != nil {
+		c.EvidenceRules = make(evidence.Table, len(p.EvidenceRules))
+		for code, rule := range p.EvidenceRules {
+			c.EvidenceRules[code] = rule
+		}
+	}
+	return c, nil
+}
+
 // IsValid reports whether a policy revision is structurally valid to load
 // (§57: the data plane loads only validated policy). Beyond identity fields it
 // checks the risk-threshold ordering, down-thresholds, dwell times, observation

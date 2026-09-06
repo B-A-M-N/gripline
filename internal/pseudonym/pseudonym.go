@@ -59,6 +59,23 @@ type Ring struct {
 	active map[int][]byte
 }
 
+// Format implements fmt.Formatter and always redacts (P0.16). VALUE receiver:
+// the Ring holds live pseudonym key material (map[int][]byte); a struct copy
+// must redact identically, not fall back to struct formatting.
+func (r Ring) Format(f fmt.State, verb rune) { fmt.Fprint(f, "<redacted>") }
+
+// String implements fmt.Stringer (value receiver, P0.16).
+func (r Ring) String() string { return "<redacted>" }
+
+// GoString implements fmt.GoStringer (%#v; value receiver, P0.16).
+func (r Ring) GoString() string { return "<redacted>" }
+
+var (
+	_ fmt.Formatter  = Ring{}
+	_ fmt.Stringer   = Ring{}
+	_ fmt.GoStringer = Ring{}
+)
+
 // NewRing builds a Ring from one or more keys (latest wins for new psys).
 // Keys with empty secret material or negative versions are refused: an HMAC
 // under an empty key is publicly computable, which would silently turn the

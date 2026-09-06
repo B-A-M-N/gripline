@@ -136,12 +136,14 @@ type resourceController interface {
 type Terminator struct {
 	dep  Dependencies
 	rand func() string // injectable request-id generator for deterministic tests
-	// pol is a deep-value SNAPSHOT of the policy taken at New (P0.5). The
-	// terminator enforces this snapshot; later mutation of the caller's
-	// *policy.Policy cannot alter live enforcement without an explicit
-	// re-configuration (New). It bounds the blast radius of the mutable public
-	// config object until a compiled/immutable policy type lands.
-	pol policy.Policy
+	// pol is the COMPILED policy snapshot taken at New (P0.10). Compile
+	// deep-copies every reference-bearing field (the EvidenceRules map), so
+	// later mutation of the caller's *policy.Policy — including its rule
+	// table — cannot alter live enforcement without an explicit
+	// re-configuration (New). The old shallow struct copy shared the evidence
+	// map: a caller writing dep.Policy.EvidenceRules["NEW_LANE"] after
+	// construction rewrote live enforcement.
+	pol *policy.CompiledPolicy
 	// pruneCounter triggers pruning every N admissions (optimization only).
 	pruneCounter atomic.Int64
 }
@@ -195,10 +197,14 @@ func New(dep Dependencies) (*Terminator, error) {
 	if dep.LaneNow == nil {
 		dep.LaneNow = time.Now
 	}
+	compiled, err := policy.Compile(dep.Policy)
+	if err != nil {
+		return nil, fmt.Errorf("terminator: compile policy: %w", err)
+	}
 	return &Terminator{
 		dep:  dep,
 		rand: newRequestID,
-		pol:  *dep.Policy,
+		pol:  compiled,
 	}, nil
 }
 

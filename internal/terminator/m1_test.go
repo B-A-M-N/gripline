@@ -404,7 +404,7 @@ func TestM1AssertionTTLCappedAt30s(t *testing.T) {
 	signer, _ := GenerateSigner()
 	pol := policy.Default()
 	pol.Identity.MaxTTLSeconds = 60 // operator tries to raise to 60
-	term := &Terminator{pol: *pol}
+	term := &Terminator{pol: &policy.CompiledPolicy{Policy: *pol}}
 	ttl := time.Duration(term.pol.MaxIdentityTTLSeconds()) * time.Second
 	if ttl != 30*time.Second {
 		t.Fatalf("P0.28: effective TTL = %v, want 30s (hard cap)", ttl)

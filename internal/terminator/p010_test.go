@@ -411,7 +411,7 @@ func TestPromotionUsesCleanCounters(t *testing.T) {
 
 func TestSelectLimitsBasedOnStatus(t *testing.T) {
 	term := &Terminator{}
-	term.pol = *policy.Default()
+	term.pol = &policy.CompiledPolicy{Policy: *policy.Default()}
 
 	// Normal → normal limits.
 	normal := term.selectLimits(credential.StatusNormal)
