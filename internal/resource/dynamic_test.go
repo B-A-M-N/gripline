@@ -136,34 +136,34 @@ func TestGovernorDynamicScopeCap(t *testing.T) {
 	}
 
 	// NORMAL cap 3: two concurrent admissions hold 2 slots.
-	r1, err := g.Provision(spec(3), nil, ProvisionAmt{Concurrency: 1})
+	r1, err := g.ProvisionUsage(spec(3), UsageEstimate{Requests: 1})
 	if err != nil {
 		t.Fatalf("provision 1: %v", err)
 	}
-	r2, err := g.Provision(spec(3), nil, ProvisionAmt{Concurrency: 1})
+	r2, err := g.ProvisionUsage(spec(3), UsageEstimate{Requests: 1})
 	if err != nil {
 		t.Fatalf("provision 2: %v", err)
 	}
 
 	// CONSTRAINED cap 2: 2 in-use → denied. The old code built the pool at
 	// capacity 3 and ignored this cap forever.
-	if _, err := g.Provision(spec(2), nil, ProvisionAmt{Concurrency: 1}); err == nil {
+	if _, err := g.ProvisionUsage(spec(2), UsageEstimate{Requests: 1}); err == nil {
 		t.Fatal("constrained cap 2 with 2 in-flight must deny (P0.2)")
 	}
 
 	// Release one → exactly one new admission fits under the constrained cap.
 	r1.Release()
-	r3, err := g.Provision(spec(2), nil, ProvisionAmt{Concurrency: 1})
+	r3, err := g.ProvisionUsage(spec(2), UsageEstimate{Requests: 1})
 	if err != nil {
 		t.Fatalf("one slot freed should admit under cap 2: %v", err)
 	}
-	if _, err := g.Provision(spec(2), nil, ProvisionAmt{Concurrency: 1}); err == nil {
+	if _, err := g.ProvisionUsage(spec(2), UsageEstimate{Requests: 1}); err == nil {
 		t.Fatal("constrained cap 2 must still deny at 2 in-flight")
 	}
 
 	// Back to NORMAL: capacity expands without recreating/resetting accounting.
 	r2.Release()
-	r4, err := g.Provision(spec(3), nil, ProvisionAmt{Concurrency: 1})
+	r4, err := g.ProvisionUsage(spec(3), UsageEstimate{Requests: 1})
 	if err != nil {
 		t.Fatalf("restored cap should admit: %v", err)
 	}

@@ -27,7 +27,7 @@ func TestGovernorAllOrNothingAcrossScopes(t *testing.T) {
 
 	// Fill CREDENTIAL (cap 2) to saturation first, through two full admissions.
 	for i := 0; i < 2; i++ {
-		res, err := g.Provision(scopes, nil, ProvisionAmt{Concurrency: 1})
+		res, err := g.ProvisionUsage(scopes, UsageEstimate{Requests: 1})
 		if err != nil {
 			t.Fatalf("provision %d: %v", i, err)
 		}
@@ -36,7 +36,7 @@ func TestGovernorAllOrNothingAcrossScopes(t *testing.T) {
 
 	// Next admission: SOURCE/LANE have room, CREDENTIAL is full → deny, and the
 	// SOURCE/LANE partial holds MUST be returned (rollback).
-	_, err := g.Provision(scopes, nil, ProvisionAmt{Concurrency: 1})
+	_, err := g.ProvisionUsage(scopes, UsageEstimate{Requests: 1})
 	if err == nil {
 		t.Fatal("P0.23: admission must fail when CREDENTIAL is at cap")
 	}
@@ -70,19 +70,19 @@ func TestGovernorHighestPriorityOpensAfterRelease(t *testing.T) {
 
 	var res []*MultiReservation
 	for i := 0; i < 2; i++ {
-		r, err := g.Provision(scopes, nil, ProvisionAmt{Concurrency: 1})
+		r, err := g.ProvisionUsage(scopes, UsageEstimate{Requests: 1})
 		if err != nil {
 			t.Fatal(err)
 		}
 		res = append(res, r)
 	}
 	// Full credential → third denied.
-	if _, err := g.Provision(scopes, nil, ProvisionAmt{Concurrency: 1}); err == nil {
+	if _, err := g.ProvisionUsage(scopes, UsageEstimate{Requests: 1}); err == nil {
 		t.Fatal("expected deny at capacity")
 	}
 	// Release one admission → credential capacity freed → next succeeds.
 	res[0].Release()
-	if _, err := g.Provision(scopes, nil, ProvisionAmt{Concurrency: 1}); err != nil {
+	if _, err := g.ProvisionUsage(scopes, UsageEstimate{Requests: 1}); err != nil {
 		t.Fatalf("P0.25: after release the credential scope must authorize, got %v", err)
 	}
 }
@@ -96,7 +96,7 @@ func TestGovernorDenyAllScope(t *testing.T) {
 		{Scope: ScopeSource, ID: "s", Buckets: BucketSpec{ConcurrencyCap: 4}},
 		{Scope: ScopeLane, ID: "l", Buckets: BucketSpec{ConcurrencyCap: 0}}, // deny-all lane
 	}
-	_, err := g.Provision(scopes, nil, ProvisionAmt{Concurrency: 1})
+	_, err := g.ProvisionUsage(scopes, UsageEstimate{Requests: 1})
 	if err == nil {
 		t.Fatal("cap-0 scope must deny")
 	}
@@ -121,42 +121,53 @@ func TestGovernorTokenSettleConsumesCancelRefunds(t *testing.T) {
 	g := NewGovernor(func() time.Time { return base })
 	scopes := []ScopeSpec{
 		{Scope: ScopeCredential, ID: "c", Buckets: BucketSpec{
-			ConcurrencyCap: 4, BurstCapacity: 100, RefillPer: 10, RefillIn: time.Second,
+			ConcurrencyCap: 4, TokensBurst: BucketConfig{Capacity: 100, RefillPer: 10, RefillIn: time.Second},
 		}},
 	}
-	tokens := []Dimension{DimCombinedTokens}
-
-	// First admission reserves 30 tokens; settle → they are consumed.
-	r1, err := g.Provision(scopes, tokens, ProvisionAmt{Tokens: 30})
+	// First admission reserves 30 tokens; settle with ACTUAL 10 → only the
+	// unused 20 is refunded, 10 is consumed (P0.36 ownership-complete settle).
+	r1, err := g.ProvisionUsage(scopes, UsageEstimate{CombinedTokens: 30})
 	if err != nil {
 		t.Fatal(err)
 	}
-	r1.Settle()
+	r1.Settle(UsageEstimate{CombinedTokens: 10})
 	r1.Release() // concurrency returns, tokens stay settled
 
 	g.mu.Lock()
-	b := g.bucket(DimCombinedTokens, scopeKey(ScopeCredential, "c"), scopes[0].Buckets)
+	b := g.bucket(DimCombinedTokens, scopeKey(ScopeCredential, "c"), scopes[0].Buckets.TokensBurst)
 	g.mu.Unlock()
 	afterSettle := b.Available()
-	if afterSettle >= 100 {
-		t.Fatalf("settle must consume tokens; available = %v, want < 100", afterSettle)
+	if afterSettle != 90 {
+		t.Fatalf("settle(actual 10) must consume 10 and refund 20; available = %v, want 90", afterSettle)
 	}
 
 	// Second admission reserves 40 but the request aborts → Release (not Settle)
 	// refunds the reservation.
-	r2, err := g.Provision(scopes, tokens, ProvisionAmt{Tokens: 40})
+	r2, err := g.ProvisionUsage(scopes, UsageEstimate{CombinedTokens: 40})
 	if err != nil {
 		t.Fatal(err)
 	}
 	// While held, availability drops by 40.
-	if held := b.Available(); held >= afterSettle {
-		t.Fatalf("reservation must temporarily hold tokens; available = %v, want < %v", held, afterSettle)
+	if held := b.Available(); held != 50 {
+		t.Fatalf("reservation must temporarily hold tokens; available = %v, want 50", held)
 	}
 	// Abandon → release → the full 40 is refunded back to the pre-hold level.
 	r2.Release()
 	if avail := b.Available(); avail != afterSettle {
 		t.Fatalf("P0.27: abandoned reservation must refund its 40 tokens; available = %v, want %v", avail, afterSettle)
 	}
+
+	// P0.36: an actual ABOVE the estimate consumes the whole hold — never a
+	// negative refund, never minted allowance.
+	r3, err := g.ProvisionUsage(scopes, UsageEstimate{CombinedTokens: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r3.Settle(UsageEstimate{CombinedTokens: 999})
+	if avail := b.Available(); avail != 80 {
+		t.Fatalf("over-estimate actual must consume the full hold; available = %v, want 80", avail)
+	}
+	r3.Release()
 }
 
 // TestGovernorBalanceNeverNegative is a concurrent stress: many goroutines
@@ -172,12 +183,12 @@ func TestGovernorBalanceNeverNegative(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 20; j++ {
-				r, err := g.Provision(scopes, nil, ProvisionAmt{Concurrency: 1})
+				r, err := g.ProvisionUsage(scopes, UsageEstimate{Requests: 1})
 				if err != nil {
 					// A denial is legal under concurrency; just don't double-release.
 					continue
 				}
-				r.Settle()
+				r.Settle(UsageEstimate{Requests: 1})
 				r.Release()
 			}
 		}()

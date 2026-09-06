@@ -58,7 +58,11 @@ func establishLane(t *testing.T, term *Terminator, raw string, existing bool) st
 		feat = laneFeatures("AS-NEW")
 	}
 	out := term.Admit(bearerHeaders(raw), feat)
-	_ = out
+	if out.Authorized {
+		// Release the held reservation so subsequent admissions see free
+		// capacity (emergency posture caps concurrency at 1, P0.48).
+		out.Reservation().Release()
+	}
 	return feat.NetworkASN
 }
 
@@ -79,6 +83,10 @@ func TestControlPlaneEmergencyLockdownDeniesNewLanes(t *testing.T) {
 	established := laneFeatures("AS-EST")
 	if o := term.Admit(bearerHeaders(raw), established); !o.Authorized {
 		t.Fatalf("established lane should authorize before lockdown: %s", o.Reason)
+	} else {
+		// P0.48: emergency limits cap concurrency at 1 — release the slot so
+		// the post-lockdown established admission can take it.
+		o.Reservation().Release()
 	}
 
 	// Flip to emergency lockdown as the operator.
@@ -94,9 +102,12 @@ func TestControlPlaneEmergencyLockdownDeniesNewLanes(t *testing.T) {
 		t.Fatalf("P0.40: denial reason = %q, want emergency_lockdown", out.Reason)
 	}
 
-	// The established lane still authorizes during lockdown.
+	// The established lane still authorizes during lockdown — but under the
+	// EMERGENCY limit set (P0.48): one in-flight request, not the normal cap.
 	if o := term.Admit(bearerHeaders(raw), established); !o.Authorized {
 		t.Fatalf("P0.41: established lane must continue through lockdown: %s", o.Reason)
+	} else {
+		o.Reservation().Release()
 	}
 }
 

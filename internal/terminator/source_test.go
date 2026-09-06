@@ -135,23 +135,23 @@ func TestAdmitSourceResourceScopePerRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// With a source: the hold must include SOURCE (4 scopes).
+	// With a source: the hold must include SOURCE (5 scopes: P0.34 adds GLOBAL).
 	out := term.AdmitSource(bearerHeaders(raw), lane.Features{NetworkASN: "AS1"}, TrustedSource{Pseudonym: "srcR1"})
 	if !out.Authorized {
 		t.Fatalf("admit: %s", out.Reason)
 	}
-	if n := len(out.ResourceRes.Leases()); n != 4 {
-		t.Fatalf("with source: want 4 scope leases (SOURCE+LANE+CRED+ACCT), got %d", n)
+	if n := len(out.ResourceRes.Leases()); n != 5 {
+		t.Fatalf("with source: want 5 scope leases (SOURCE+ACCT+CRED+LANE+GLOBAL), got %d", n)
 	}
 	out.ResourceRes.Release()
 
-	// Without a source: SOURCE is skipped (3 scopes), not bucketed under "".
+	// Without a source: SOURCE is skipped (4 scopes), not bucketed under "".
 	out2 := term.Admit(bearerHeaders(raw), lane.Features{NetworkASN: "AS1"})
 	if !out2.Authorized {
 		t.Fatalf("admit no-source: %s", out2.Reason)
 	}
-	if n := len(out2.ResourceRes.Leases()); n != 3 {
-		t.Fatalf("no source: want 3 scope leases (SOURCE skipped), got %d", n)
+	if n := len(out2.ResourceRes.Leases()); n != 4 {
+		t.Fatalf("no source: want 4 scope leases (SOURCE skipped; ACCT+CRED+LANE+GLOBAL), got %d", n)
 	}
 	out2.ResourceRes.Release()
 }

@@ -7,16 +7,20 @@ import (
 )
 
 // Scope identifies the resource-authorization scope dimension (§04-4). The
-// ordering matters: a denial at a higher-priority scope dominates, per the
-// policy precedence (§58 of the design docs). Lower index = higher priority.
+// ordering IS the policy precedence (§58, P0.33): after revoked/emergency,
+// hard-limit denials resolve SOURCE → ACCOUNT → CREDENTIAL → LANE. Lower
+// index = higher priority. This enum is the ONE statement of that order; the
+// governor iterates specs in slice order but denial naming, terminator reason
+// mapping, and any future scope tables must derive from this constant block —
+// never from a second hand-restated list in another package.
 type Scope int
 
 const (
 	ScopeSource     Scope = iota // source / network origin
-	ScopeLane                    // classified lane
-	ScopeCredential              // credential
 	ScopeAccount                 // account (tenant)
-	ScopeGlobal                  // global fleet
+	ScopeCredential              // credential
+	ScopeLane                    // classified lane
+	ScopeGlobal                  // global fleet (P0.34: whole-plane gauge)
 )
 
 func (s Scope) String() string {
@@ -86,11 +90,44 @@ func (d Dimension) String() string {
 
 // BucketSpec describes how to build a scope's gauges. A zero RefillIn means
 // burst-only (no continuous refill) for that dimension.
+//
+// P0.35: the three token gauges are DIFFERENT resources and get different
+// buckets. RequestsBurst bounds request velocity; TokensBurst bounds token
+// velocity (input+output+combined share the token policy multiplier today but
+// are distinct gauges); CostBurst bounds spend. A zero BurstCapacity on a
+// dimension means that dimension is NOT enforced at this scope (no bucket);
+// concurrency is governed separately by ConcurrencyCap.
 type BucketSpec struct {
-	ConcurrencyCap int     // max concurrent slots; 0 = deny-all concurrency
-	BurstCapacity  float64 // token-bucket capacity for gauge dimensions
-	RefillPer      float64
-	RefillIn       time.Duration
+	ConcurrencyCap int // max concurrent slots; 0 = deny-all concurrency
+	// RequestsBurst bounds REQUESTS per window (P0.35).
+	RequestsBurst BucketConfig
+	// TokensBurst bounds INPUT/OUTPUT/COMBINED token gauges (P0.35).
+	TokensBurst BucketConfig
+	// CostBurst bounds spend in microunits per window (P0.35).
+	CostBurst BucketConfig
+}
+
+// BucketConfig is one gauge's burst/rate policy (P0.35). A zero Capacity
+// disables the gauge at this scope.
+type BucketConfig struct {
+	Capacity float64
+	RefillPer float64
+	RefillIn  time.Duration
+}
+
+// specFor selects the per-dimension gauge config (P0.35): requests, tokens,
+// and cost each get their OWN bucket parameters instead of one shared spec.
+func (bs BucketSpec) specFor(dim Dimension) BucketConfig {
+	switch dim {
+	case DimRequests:
+		return bs.RequestsBurst
+	case DimInputTokens, DimOutputTokens, DimCombinedTokens:
+		return bs.TokensBurst
+	case DimCost:
+		return bs.CostBurst
+	default:
+		return BucketConfig{}
+	}
 }
 
 // Governor is a bounded, per-scope resource governor enforcing the policy
@@ -147,17 +184,17 @@ func (g *Governor) pool(key string, cap int) *ConcurrencyPool {
 }
 
 // bucket retrieves-or-creates a token bucket for a dimension+scope. On every
-// call the bucket is reconfigured to the CURRENT spec (P0.2): the parameters in
-// effect at first creation are not frozen — a constrained scope's tightened
+// call the bucket is reconfigured to the CURRENT config (P0.2): the parameters
+// in effect at first creation are not frozen — a constrained scope's tightened
 // burst/rate applies to the next reservation, and a restored scope's allowance
 // returns without resetting accounting. Caller holds g.mu.
-func (g *Governor) bucket(dim Dimension, key string, spec BucketSpec) *TokenBucket {
+func (g *Governor) bucket(dim Dimension, key string, cfg BucketConfig) *TokenBucket {
 	m := g.buckets[dim]
 	if b, ok := m[key]; ok {
-		b.Reconfigure(spec.BurstCapacity, spec.RefillPer, spec.RefillIn)
+		b.Reconfigure(cfg.Capacity, cfg.RefillPer, cfg.RefillIn)
 		return b
 	}
-	b := NewTokenBucket(spec.BurstCapacity, spec.RefillPer, spec.RefillIn, g.now)
+	b := NewTokenBucket(cfg.Capacity, cfg.RefillPer, cfg.RefillIn, g.now)
 	m[key] = b
 	return b
 }
@@ -184,7 +221,49 @@ type ProvisionAmt struct {
 	Tokens      float64 // charged to each token dimension in dims
 }
 
-func (g *Governor) Provision(scopes []ScopeSpec, dims []Dimension, amt ProvisionAmt) (*MultiReservation, error) {
+// UsageEstimate is the typed, per-dimension usage of one request (P0.3).
+// Integers everywhere: tokens are integers by nature and float accounting on
+// cost invites drift. Cost is integer MICROUNITS (1e-6 of a currency unit) so
+// tiny per-request costs still accumulate exactly.
+//
+// The provider adapter supplies what is knowable before execution (request
+// body size → input-token estimate; requested max_tokens → output estimate);
+// admission reserves the ESTIMATE across every scope, and the reservation is
+// SETTLED with the actual usage after execution — refunding only reserved-
+// but-unused amounts (P0.36: ownership-complete settlement).
+type UsageEstimate struct {
+	Requests       int64
+	InputTokens    int64
+	OutputTokens   int64
+	CombinedTokens int64
+	CostMicrounits int64
+}
+
+// amountFor returns the reserved amount for one gauge dimension.
+func (u UsageEstimate) amountFor(dim Dimension) int64 {
+	switch dim {
+	case DimRequests:
+		return u.Requests
+	case DimInputTokens:
+		return u.InputTokens
+	case DimOutputTokens:
+		return u.OutputTokens
+	case DimCombinedTokens:
+		return u.CombinedTokens
+	case DimCost:
+		return u.CostMicrounits
+	default:
+		return 0
+	}
+}
+
+// ProvisionUsage is the P0.3 admission path: an atomic estimate-based reserve
+// across every scope for EVERY dimension the estimate carries, with a
+// settlement handle that accepts the ACTUAL usage. Concurrency is always
+// charged (1 slot) when amt > 0. Token dimensions with a zero estimate are
+// not reserved (nothing to refund later); the policy may still bound them at
+// settle-time through the same buckets.
+func (g *Governor) ProvisionUsage(scopes []ScopeSpec, est UsageEstimate) (*MultiReservation, error) {
 	if len(scopes) == 0 {
 		return nil, errors.New("resource: no scopes to provision")
 	}
@@ -192,7 +271,6 @@ func (g *Governor) Provision(scopes []ScopeSpec, dims []Dimension, amt Provision
 	defer g.mu.Unlock()
 
 	var acquired []*singleAcquired
-	// Rollback on any failure: releases every lease + reservation taken so far.
 	defer func() {
 		if acquired != nil {
 			for i := len(acquired) - 1; i >= 0; i-- {
@@ -201,39 +279,47 @@ func (g *Governor) Provision(scopes []ScopeSpec, dims []Dimension, amt Provision
 		}
 	}()
 
-	// Round 1 — concurrency: every scope in precedence order. A failure here
-	// names the denying scope directly. Each acquisition supplies the scope's
-	// CURRENT policy cap (P0.2): admission is capped at
-	// min(pool construction capacity, current cap), so a NORMAL→CONSTRAINED
-	// transition throttles the very next request, and a return to NORMAL
-	// expands capacity without recreating the pool or resetting accounting.
+	// Round 1 — concurrency, in precedence order, each scope at its CURRENT
+	// policy cap (P0.2).
 	for _, sp := range scopes {
-		key := scopeKey(sp.Scope, sp.ID)
-		p := g.pool(key, sp.Buckets.ConcurrencyCap)
-		lease := p.AcquireNCap(amt.Concurrency, sp.Buckets.ConcurrencyCap)
+		p := g.pool(scopeKey(sp.Scope, sp.ID), sp.Buckets.ConcurrencyCap)
+		lease := p.AcquireNCap(1, sp.Buckets.ConcurrencyCap)
 		if lease == nil {
 			return nil, &ScopeLimitError{Scope: sp.Scope}
 		}
 		acquired = append(acquired, &singleAcquired{kind: acquPool, pool: p, lease: lease})
 	}
 
-	// Round 2 — token buckets for declared dimensions, per scope precedence.
-	for _, dim := range dims {
+	// Round 2 — one bucket reservation per dimension the estimate carries,
+	// per scope, in precedence order. A dimension whose scope config has zero
+	// capacity is NOT enforced at that scope (P0.35) and is skipped — reserving
+	// against a capacity-0 bucket would deny every request. The reservation
+	// remembers ITS amount so Settle(actual) can refund reserved−actual
+	// against the same bucket (P0.36 ownership: only the reservation refunds
+	// its own unused amount).
+	for _, dim := range []Dimension{DimRequests, DimInputTokens, DimOutputTokens, DimCombinedTokens, DimCost} {
+		amount := est.amountFor(dim)
+		if amount <= 0 {
+			continue
+		}
 		for _, sp := range scopes {
+			cfg := sp.Buckets.specFor(dim)
+			if cfg.Capacity <= 0 {
+				continue // gauge not enforced at this scope
+			}
 			key := scopeKey(sp.Scope, sp.ID)
-			b := g.bucket(dim, key, sp.Buckets)
-			res := b.Reserve(amt.Tokens)
+			b := g.bucket(dim, key, cfg)
+			res := b.Reserve(float64(amount))
 			if res == nil {
 				return nil, &ScopeLimitError{Scope: sp.Scope}
 			}
-			acquired = append(acquired, &singleAcquired{kind: acquBucket, bucket: b, res: res})
+			acquired = append(acquired, &singleAcquired{kind: acquBucket, bucket: b, res: res, dim: dim})
 		}
 	}
 
-	// Success: detach the rollback list (owned by the caller's reservation).
 	hold := &MultiReservation{now: g.now}
 	hold.acquired = acquired
-	acquired = nil // deferred rollback becomes a no-op
+	acquired = nil
 	return hold, nil
 }
 
@@ -246,13 +332,15 @@ const (
 
 // singleAcquired is one scope's held capacity: either a concurrency lease or a
 // token reservation. It owns exactly its own hold and releases at most once
-// (INV-15).
+// (INV-15). dim records which gauge the reservation is against so settlement
+// can attribute actual usage per dimension (P0.36).
 type singleAcquired struct {
 	kind   acquKind
 	pool   *ConcurrencyPool
 	lease  *LeaseHandle
 	bucket *TokenBucket
 	res    *Reservation
+	dim    Dimension
 }
 
 func (a *singleAcquired) release() {
@@ -274,25 +362,40 @@ type MultiReservation struct {
 	settled  bool
 }
 
-// Settle commits all token reservations. Concurrency leases are NOT released
-// here — they stay held for the request's lifetime and are returned by Release.
-func (r *MultiReservation) Settle() {
+// Settle commits every dimension reservation against the ACTUAL usage (P0.3/
+// P0.36): each hold refunds only its own reserved−actual remainder, to its own
+// bucket. An actual above the estimate consumes the full hold (overage is
+// charged against future capacity through the buckets' refill, never negative
+// refunded). Concurrency leases are NOT released here — they stay held for the
+// request's lifetime and are returned by Release. Idempotent.
+func (r *MultiReservation) Settle(actual UsageEstimate) {
 	if r == nil {
 		return
 	}
 	for _, a := range r.acquired {
 		switch a.kind {
 		case acquBucket:
-			a.res.Settle()
+			a.res.Settle(float64(actual.amountFor(a.dim)))
 		}
 	}
 	r.settled = true
 }
 
-// Release returns all held concurrency to their pools (idempotent). It also
-// cancels any not-yet-settled token reservations so an abandoned admission
-// refunds its token holds (never mints allowance — each cancel is its own
-// amount and can only release what was reserved).
+// Settled reports whether Settle has run (diagnostics; the proxy uses it to
+// guarantee settle-then-release ordering).
+func (r *MultiReservation) Settled() bool {
+	if r == nil {
+		return false
+	}
+	return r.settled
+}
+
+// Release returns all held concurrency to their pools (idempotent). Any
+// not-yet-settled token reservation is CANCELLED so an abandoned admission
+// refunds its full token hold (never mints allowance — each cancel is its own
+// amount and can only release what was reserved). Settle-then-Release is the
+// normal completion order: settled dimensions are already done, so Release
+// only returns concurrency.
 func (r *MultiReservation) Release() {
 	if r == nil {
 		return
@@ -326,4 +429,21 @@ func (g *Governor) InUseAll() int {
 		total += p.InUse()
 	}
 	return total
+}
+
+// AvailableFor reports a gauge's current availability for one scope+dimension
+// (diagnostics/observability). Returns (0, false) when no bucket exists —
+// i.e. the gauge was never enforced for this scope.
+func (g *Governor) AvailableFor(dim Dimension, scope Scope, id string) (float64, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	m := g.buckets[dim]
+	if m == nil {
+		return 0, false
+	}
+	b, ok := m[scopeKey(scope, id)]
+	if !ok {
+		return 0, false
+	}
+	return b.Available(), true
 }

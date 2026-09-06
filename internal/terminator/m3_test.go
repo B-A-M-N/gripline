@@ -55,8 +55,8 @@ func TestM3MultiscopeHoldCoversPriorityScopes(t *testing.T) {
 	if out.ResourceRes == nil {
 		t.Fatal("P0.23: authorized request must carry a multi-scope resource hold")
 	}
-	if n := len(out.ResourceRes.Leases()); n != 4 {
-		t.Fatalf("P0.23: hold must carry SOURCE+LANE+CREDENTIAL+ACCOUNT leases, got %d", n)
+	if n := len(out.ResourceRes.Leases()); n != 5 {
+		t.Fatalf("P0.23/P0.34: hold must carry SOURCE+ACCOUNT+CREDENTIAL+LANE+GLOBAL leases, got %d", n)
 	}
 	// Release so the test doesn't leak capacity for the rest of the suite.
 	out.ResourceRes.Release()
@@ -76,7 +76,7 @@ func TestM3MultiscopeDeniesWhenScopeSaturated(t *testing.T) {
 	fillSpecs := []resource.ScopeSpec{
 		{Scope: resource.ScopeCredential, ID: "cred_m3", Buckets: resource.BucketSpec{ConcurrencyCap: 1}},
 	}
-	fill, err := gov.Provision(fillSpecs, nil, resource.ProvisionAmt{Concurrency: 1})
+	fill, err := gov.ProvisionUsage(fillSpecs, resource.UsageEstimate{Requests: 1})
 	if err != nil {
 		t.Fatal(err)
 	}

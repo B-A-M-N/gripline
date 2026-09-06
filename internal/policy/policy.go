@@ -43,11 +43,31 @@ type Limits struct {
 	TokenVelocityMult float64
 	CostVelocityMult  float64
 	RequestRate       int // requests / minute
+
+	// RequestsPerWindow is the hard REQUEST gauge (P0.35): burst capacity and
+	// refill for the per-scope request bucket. Zero disables the gauge (not
+	// enforced) — velocity enforcement remains with ConcurrencyCap until a
+	// deployment populates it.
+	RequestsPerWindow BucketConfig
+	// TokensPerWindow is the hard TOKEN gauge across input/output/combined
+	// dimensions (P0.35). Zero disables.
+	TokensPerWindow BucketConfig
+	// CostPerWindow is the hard SPEND gauge in microunits (P0.35). Zero
+	// disables.
+	CostPerWindow BucketConfig
+}
+
+// BucketConfig is one gauge's burst/rate policy (P0.35). Capacity is the
+// burst allowance; RefillPer tokens are credited every RefillIn. A zero
+// Capacity disables the gauge.
+type BucketConfig struct {
+	Capacity  int64
+	RefillPer int64
+	RefillIn  time.Duration
 }
 
 // Learning controls baseline seeding (§29, §42) and lane promotion criteria.
-type Learning struct {
-	MaximumRisk          int
+type Learning struct {	MaximumRisk          int
 	AllowNewLanes        bool
 	// AllowSuspiciousLanes is DEPRECATED and has no effect. SUSPICIOUS/BLOCKED
 	// lanes NEVER promote (INV-8). This field is retained for wire compatibility
@@ -83,9 +103,16 @@ type Identity struct {
 }
 
 // ScopedLimits are per-scope policy overrides (plan / credential / lane).
+// Emergency (P0.48) is the incident-mode limit set: when the operator control
+// plane is in EMERGENCY_LOCKDOWN, EVERY admission (established lanes included)
+// is provisioned against these limits — that is what "throttles all traffic"
+// means concretely. Zero-value Emergency falls back to Constrained (fail-closed
+// for traffic volume: an unset emergency profile never grants MORE than the
+// constrained posture).
 type ScopedLimits struct {
 	Normal      Limits
 	Constrained Limits
+	Emergency   Limits
 }
 
 // Policy is one versioned, immutable policy revision.
@@ -144,6 +171,9 @@ func Default() *Policy {
 		Limits: ScopedLimits{
 			Normal:      Limits{ConcurrencyCap: 32, RequestBurstCap: 64, TokenVelocityMult: 1.0, CostVelocityMult: 1.0, RequestRate: 300},
 			Constrained: Limits{ConcurrencyCap: 2, RequestBurstCap: 8, TokenVelocityMult: 1.25, CostVelocityMult: 1.25, RequestRate: 20},
+			// P0.48: incident posture — deliberately tighter than constrained.
+			// A credential holds at most ONE in-flight request under lockdown.
+			Emergency: Limits{ConcurrencyCap: 1, RequestBurstCap: 1, TokenVelocityMult: 2.0, CostVelocityMult: 2.0, RequestRate: 5},
 		},
 		Learning: Learning{
 			MaximumRisk:          20,
@@ -283,7 +313,8 @@ func (p *Policy) IsValid() bool {
 		}
 	}
 	// Hard caps must not go negative.
-	if p.Limits.Normal.ConcurrencyCap < 0 || p.Limits.Constrained.ConcurrencyCap < 0 {
+	if p.Limits.Normal.ConcurrencyCap < 0 || p.Limits.Constrained.ConcurrencyCap < 0 ||
+		p.Limits.Emergency.ConcurrencyCap < 0 {
 		return false
 	}
 	// P0.11: the compiled policy must carry a usable evidence rule table and
@@ -327,6 +358,7 @@ var (
 	ErrAccountLimit    = errors.New("policy: account hard limit")
 	ErrCredentialLimit = errors.New("policy: credential hard limit")
 	ErrLaneLimit       = errors.New("policy: lane hard limit")
+	ErrGlobalLimit     = errors.New("policy: global fleet hard limit")
 	ErrRiskDenial      = errors.New("policy: risk-state restriction")
 )
 

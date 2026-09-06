@@ -753,7 +753,7 @@ func TestGateJ_ConcurrentAccountingNoOverAdmission(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			res, err := g.Provision(scopes, nil, resource.ProvisionAmt{Concurrency: 1})
+			res, err := g.ProvisionUsage(scopes, resource.UsageEstimate{Requests: 1})
 			if err != nil {
 				return
 			}

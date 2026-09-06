@@ -333,7 +333,7 @@ func newRequestID() string {
 // them; a Terminator serves many clients and must never carry one process-wide
 // source identity.
 func (t *Terminator) Admit(headers map[string][]string, feat lane.Features) *Outcome {
-	return t.AdmitSource(headers, feat, TrustedSource{})
+	return t.AdmitUsage(headers, feat, TrustedSource{}, resource.UsageEstimate{Requests: 1})
 }
 
 // TrustedSource is the per-request source identity, derived at TRUSTED ingress
@@ -362,6 +362,14 @@ func (s TrustedSource) sourceID() string { return s.Pseudonym }
 // long-lived engine shared by every client, and a process-global SourceID made
 // every client one source (or disabled source security entirely when empty).
 func (t *Terminator) AdmitSource(headers map[string][]string, feat lane.Features, src TrustedSource) *Outcome {
+	return t.AdmitUsage(headers, feat, src, resource.UsageEstimate{Requests: 1})
+}
+
+// AdmitUsage is the full entry point including the typed usage estimate (P0.3):
+// the estimate is reserved atomically across every scope at the hard gate, and
+// the returned Outcome's reservation is SETTLED with actuals after execution
+// (proxy lifecycle). Admit/AdmitSource delegate here with {Requests: 1}.
+func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features, src TrustedSource, est resource.UsageEstimate) *Outcome {
 	reqID := t.rand()
 	now := t.dep.RiskNow()
 	out := &Outcome{RequestID: reqID}
@@ -690,9 +698,17 @@ func (t *Terminator) AdmitSource(headers map[string][]string, feat lane.Features
 	// 10. Select limits based on the resulting credential state AND the lane
 	// security status. A SUSPICIOUS lane is restricted to the constrained lane
 	// limits regardless of credential status — lane-scoped containment (P0.7).
+	// EMERGENCY_LOCKDOWN (P0.48) overrides BOTH: every admission — established
+	// lanes included — is provisioned against the policy's Emergency limit set,
+	// which is what "emergency throttles all traffic" concretely means. The
+	// emergency set defaults tighter than constrained, so lockdown never grants
+	// more headroom than the posture it overrides.
 	limits := t.selectLimits(after)
 	if laneSec == lane.LaneSuspicious {
 		limits = t.pol.Limits.Constrained
+	}
+	if t.dep.Control != nil && t.dep.Control.InEmergency() {
+		limits = t.emergencyLimits()
 	}
 
 	// 11. Policy evaluation with updated state.
@@ -766,7 +782,7 @@ func (t *Terminator) AdmitSource(headers map[string][]string, feat lane.Features
 	// slot against two different reservoirs. A caller wanting BOTH must compose
 	// two governors/inspect the outcome, which is not the default posture.
 	if t.dep.Resource != nil {
-		provErr := t.provisionMultiscope(cred, laneID, laneSec, limits, ctx, reqID, out, adaptiveForObservation, laneRisk, credentialRisk, effectiveRisk, evidenceCodes, src)
+		provErr := t.provisionMultiscope(cred, laneID, laneSec, limits, ctx, reqID, out, adaptiveForObservation, laneRisk, credentialRisk, effectiveRisk, evidenceCodes, src, est)
 		if provErr != nil {
 			return provErr
 		}
@@ -875,24 +891,42 @@ func (t *Terminator) AdmitSource(headers map[string][]string, feat lane.Features
 // tables land in the policy, only the spec construction here changes. Today a
 // single hostile actor cannot exceed the credential cap across its lanes/sources
 // without tripping the shared budget — a conservative first posture.
-func (t *Terminator) provisionMultiscope(cred *credential.Credential, laneID string, laneSec lane.SecurityStatus, limits policy.Limits, ctx principal.AuthorizedContext, reqID string, out *Outcome, adaptiveForObservation AdaptiveStateStatus, laneRisk, credentialRisk, effectiveRisk int, evidenceCodes []string, src TrustedSource) *Outcome {
+func (t *Terminator) provisionMultiscope(cred *credential.Credential, laneID string, laneSec lane.SecurityStatus, limits policy.Limits, ctx principal.AuthorizedContext, reqID string, out *Outcome, adaptiveForObservation AdaptiveStateStatus, laneRisk, credentialRisk, effectiveRisk int, evidenceCodes []string, src TrustedSource, est resource.UsageEstimate) *Outcome {
 	cap := limits.ConcurrencyCap
-	// Precedence order is preserved by the Governor; we build the list so the
-	// highest-priority scope is first (SOURCE > LANE > CREDENTIAL > ACCOUNT).
-	// The SOURCE scope keys on this REQUEST's source pseudonym (P0.4) — empty
+	// P0.35: the selected limits' per-dimension gauges (requests/tokens/cost)
+	// ride EVERY scope's spec — requests, tokens and spend are different
+	// resources with different buckets, and each scope enforces the same
+	// policy-authored gauge parameters. Zero-capacity gauges are inert at every
+	// scope (the governor skips them), so a policy that only authors
+	// ConcurrencyCap behaves exactly as before.
+	gauges := resource.BucketSpec{
+		ConcurrencyCap: cap,
+		RequestsBurst:  resource.BucketConfig{Capacity: float64(limits.RequestsPerWindow.Capacity), RefillPer: float64(limits.RequestsPerWindow.RefillPer), RefillIn: limits.RequestsPerWindow.RefillIn},
+		TokensBurst:    resource.BucketConfig{Capacity: float64(limits.TokensPerWindow.Capacity), RefillPer: float64(limits.TokensPerWindow.RefillPer), RefillIn: limits.TokensPerWindow.RefillIn},
+		CostBurst:      resource.BucketConfig{Capacity: float64(limits.CostPerWindow.Capacity), RefillPer: float64(limits.CostPerWindow.RefillPer), RefillIn: limits.CostPerWindow.RefillIn},
+	}
+	// Precedence order is the policy enum (P0.33): SOURCE → ACCOUNT →
+	// CREDENTIAL → LANE, GLOBAL last as the whole-plane gauge (P0.34). The
+	// SOURCE scope keys on this REQUEST's source pseudonym (P0.4) — empty
 	// means no trusted source identity for the request, so SOURCE is skipped
 	// rather than bucketed under a shared process-global id.
 	specs := []resource.ScopeSpec{}
 	if src.sourceID() != "" {
-		specs = append(specs, resource.ScopeSpec{Scope: resource.ScopeSource, ID: src.sourceID(), Buckets: resource.BucketSpec{ConcurrencyCap: cap}})
-	}
-	if laneID != "" {
-		specs = append(specs, resource.ScopeSpec{Scope: resource.ScopeLane, ID: laneID, Buckets: resource.BucketSpec{ConcurrencyCap: cap}})
+		specs = append(specs, resource.ScopeSpec{Scope: resource.ScopeSource, ID: src.sourceID(), Buckets: gauges})
 	}
 	specs = append(specs,
-		resource.ScopeSpec{Scope: resource.ScopeCredential, ID: cred.CredentialID, Buckets: resource.BucketSpec{ConcurrencyCap: cap}},
-		resource.ScopeSpec{Scope: resource.ScopeAccount, ID: cred.AccountID, Buckets: resource.BucketSpec{ConcurrencyCap: cap}},
+		resource.ScopeSpec{Scope: resource.ScopeAccount, ID: cred.AccountID, Buckets: gauges},
+		resource.ScopeSpec{Scope: resource.ScopeCredential, ID: cred.CredentialID, Buckets: gauges},
 	)
+	if laneID != "" {
+		specs = append(specs, resource.ScopeSpec{Scope: resource.ScopeLane, ID: laneID, Buckets: gauges})
+	}
+	// GLOBAL scope (P0.34): the whole-plane gauge, keyed "fleet". Without it
+	// the governor's ScopeGlobal was implemented but never provisioned, so no
+	// fleet-wide bound existed. A fleet cap of 0 (unset) skips the gauge.
+	if fleetCap := t.pol.Limits.Normal.ConcurrencyCap * 1024; fleetCap > 0 {
+		specs = append(specs, resource.ScopeSpec{Scope: resource.ScopeGlobal, ID: "fleet", Buckets: resource.BucketSpec{ConcurrencyCap: fleetCap}})
+	}
 
 	deny := func(reason string, err error) *Outcome {
 		out.Authorized = false
@@ -907,7 +941,11 @@ func (t *Terminator) provisionMultiscope(cred *credential.Credential, laneID str
 		return out
 	}
 
-	res, err := t.dep.Resource.Provision(specs, nil, resource.ProvisionAmt{Concurrency: 1})
+	// Typed per-dimension usage (P0.3): the estimate is reserved atomically
+	// across every scope; the proxy settles the reservation with ACTUALS after
+	// the backend responds. Dimensions the policy doesn't gauge (zero capacity)
+	// are inert; dimensions the estimate leaves zero reserve nothing.
+	res, err := t.dep.Resource.ProvisionUsage(specs, est)
 	if err != nil {
 		var sle *resource.ScopeLimitError
 		if errors.As(err, &sle) {
@@ -940,6 +978,8 @@ func resourceScopeReason(s resource.Scope) string {
 		return "credential_restricted"
 	case resource.ScopeAccount:
 		return "rate_limit"
+	case resource.ScopeGlobal:
+		return "resource_limit"
 	default:
 		return "resource_limit"
 	}
@@ -957,6 +997,8 @@ func resourceScopeErr(s resource.Scope) error {
 		return policy.ErrCredentialLimit
 	case resource.ScopeAccount:
 		return policy.ErrAccountLimit
+	case resource.ScopeGlobal:
+		return policy.ErrGlobalLimit
 	default:
 		return policy.ErrRiskDenial
 	}
@@ -1042,6 +1084,17 @@ func (t *Terminator) selectLimits(status credential.Status) policy.Limits {
 	default:
 		return t.pol.Limits.Normal
 	}
+}
+
+// emergencyLimits returns the policy's Emergency limit set (P0.48), falling
+// back to Constrained when the policy leaves it zero (a deployment that did
+// not author an emergency profile must never see lockdown grant MORE headroom
+// than the constrained posture).
+func (t *Terminator) emergencyLimits() policy.Limits {
+	if t.pol.Limits.Emergency.ConcurrencyCap > 0 {
+		return t.pol.Limits.Emergency
+	}
+	return t.pol.Limits.Constrained
 }
 
 // SDK-facing errors.

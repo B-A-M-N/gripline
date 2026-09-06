@@ -241,8 +241,8 @@ func TestReservationSettleCancelIdempotent(t *testing.T) {
 		t.Fatal("reserve failed")
 	}
 	cp := *r // struct copy shares settlement state
-	r.Settle()
-	cp.Settle() // idempotent
+	r.Settle(4) // full actual: whole hold consumed
+	cp.Settle(4) // idempotent
 	r.Cancel()  // must be a no-op after settle
 	cp.Cancel() // through the copy too
 	if bal := b.Balance(); bal != 4 {

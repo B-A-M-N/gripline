@@ -212,10 +212,14 @@ func (r *Reservation) Amount() float64 {
 	return r.st.amount
 }
 
-// Settle commits the reservation: the held amount is consumed (the refund of
-// the unspent remainder is a policy decision made by the caller via a second
-// Return on actual usage — settlement itself finalizes the hold). Idempotent.
-func (r *Reservation) Settle() {
+// Settle commits the reservation against the ACTUAL usage (P0.36): the
+// reserved-but-unused remainder (reserved − actual, never below 0) is
+// refunded to THIS reservation's bucket and nothing else. Ownership-complete:
+// no generic Return sits on the settlement path, so one request cannot
+// release capacity another consumed, and a settlement can never refund more
+// than its own hold. Idempotent; a second Settle (or Settle after Cancel) is
+// a no-op.
+func (r *Reservation) Settle(actual float64) {
 	if r == nil || r.st == nil {
 		return
 	}
@@ -224,7 +228,23 @@ func (r *Reservation) Settle() {
 	if r.st.done {
 		return
 	}
-	r.st.done = true // amount stays spent: reservation consumed
+	r.st.done = true
+	if actual < 0 {
+		actual = 0
+	}
+	if actual > r.st.amount {
+		actual = r.st.amount // actual usage above estimate consumes the whole hold
+	}
+	refund := r.st.amount - actual
+	if refund <= 0 {
+		return
+	}
+	b := r.st.b
+	b.balance -= refund
+	if b.balance < 0 {
+		b.balance = 0
+	}
+	b.revision++
 }
 
 // Cancel releases the full held amount back to the bucket. Idempotent, and a

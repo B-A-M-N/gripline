@@ -25,6 +25,7 @@ import (
 	"strings"
 
 	"github.com/B-A-M-N/gripline/internal/lane"
+	"github.com/B-A-M-N/gripline/internal/resource"
 	"github.com/B-A-M-N/gripline/internal/terminator"
 )
 
@@ -148,6 +149,32 @@ type Config struct {
 	// Audience must match the terminator's audience, so its assertions verify
 	// at the backend (INV-11 binding).
 	Audience string
+	// Usage (P0.3) supplies the typed per-dimension usage knowledge: the
+	// ESTIMATE admission reserves before execution, and the ACTUAL usage the
+	// reservation settles against after the backend responds. Nil uses the
+	// minimal {Requests: 1} both ways — correct for pure-request accounting;
+	// token/cost dimension enforcement requires a real provider adapter.
+	Usage UsageEstimator
+}
+
+// UsageEstimator is the provider-adapter seam for resource accounting (P0.3).
+// Estimate is what admission reserves (what is knowable before execution);
+// Actual is what settlement charges (collected from the backend's response —
+// usage headers or a metering API). Actual receives the response so a
+// provider adapter can read provider-specific usage headers.
+type UsageEstimator interface {
+	Estimate(obs Observation) resource.UsageEstimate
+	Actual(obs Observation, resp *http.Response) resource.UsageEstimate
+}
+
+// NoUsage is the default UsageEstimator: one request per admission, settled
+// at one request. Token/cost gauges stay inert (a zero estimate reserves
+// nothing, and the governor skips unenforced dimensions).
+type NoUsage struct{}
+
+func (NoUsage) Estimate(Observation) resource.UsageEstimate { return resource.UsageEstimate{Requests: 1} }
+func (NoUsage) Actual(Observation, *http.Response) resource.UsageEstimate {
+	return resource.UsageEstimate{Requests: 1}
 }
 
 // DataPlane is a single terminate-and-forward proxy hop. It is CONCURRENT-SAFE
@@ -184,6 +211,9 @@ func New(cfg Config) (*DataPlane, error) {
 	}
 	if cfg.Sources == nil {
 		cfg.Sources = NoSource{}
+	}
+	if cfg.Usage == nil {
+		cfg.Usage = NoUsage{}
 	}
 	bu := *cfg.BackendURL
 	bu.User = nil
@@ -228,8 +258,9 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	feat := d.feat.Resolve(obs)
 	src := d.srcs.ResolveSource(obs)
+	est := d.cfg.Usage.Estimate(obs)
 
-	out := d.cfg.Terminator.AdmitSource(headers, feat, src)
+	out := d.cfg.Terminator.AdmitUsage(headers, feat, src, est)
 
 	if !out.Authorized {
 		d.writeDenial(w, out)
@@ -238,7 +269,9 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// 3. Panic-safe reservation lifecycle (P0.8/P0.9): one abstraction for every
 	// reservation shape, released exactly once via defer before ANY subsequent
-	// code can leak it. Release is idempotent.
+	// code can leak it. Release is idempotent; for the multi-scope governor
+	// reservation it cancels any NOT-yet-settled token hold, so the settle below
+	// must run first (P0.3 settle-with-actuals, then release).
 	reservation := out.Reservation()
 	defer reservation.Release()
 
@@ -273,7 +306,8 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// Upstream never accepted the request: no baseline credit (P0.27 — an
 		// admitted request that fails before any useful workload is not clean
-		// trust-building activity).
+		// trust-building activity). The deferred Release cancels the unsettled
+		// reservation, refunding the full estimate hold (P0.36).
 		http.Error(w, "backend_error", http.StatusBadGateway)
 		return
 	}
@@ -284,6 +318,15 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// deferred baseline credit exactly once — a request that was admitted but
 	// never reached the backend earns no trust.
 	out.FinalizeBaseline()
+
+	// Settle the resource reservation against ACTUAL usage (P0.3/P0.36): only
+	// the reserved-but-unused remainder is refunded, and only to this
+	// reservation's own buckets. Runs BEFORE the deferred Release so unsettled
+	// holds are never cancelled-and-refunded in full. Concurrency is released
+	// by the deferred Release.
+	if mr, ok := reservation.(*resource.MultiReservation); ok && !mr.Settled() {
+		mr.Settle(d.cfg.Usage.Actual(obs, resp))
+	}
 
 	// 6. Copy the backend response headers + status, stream the body back.
 	copyResponseHeaders(w.Header(), resp.Header)
