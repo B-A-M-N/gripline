@@ -57,6 +57,14 @@ func (h *LeaseHandle) Released() bool {
 // ConcurrencyPool is an atomic, capacity-bounded lease pool for one resource
 // scope (e.g. a credential or lane). Safe for concurrent use.
 //
+// The pool's built-in capacity is a high-water construction value; the
+// EFFECTIVE cap on admission is whatever the caller passes to AcquireCap (P0.2).
+// This is what makes dynamic policy caps work: a credential that drops from
+// NORMAL (cap 32) to CONSTRAINED (cap 2) passes 2 on its next AcquireCap, and
+// admission is denied while in-use >= 2 — without recreating the pool or
+// resetting its accounting. When the constraint lifts, the next AcquireCap
+// passes 32 and the full capacity is usable again.
+//
 // In production the pool is backed by a shared store where leases carry a TTL
 // ≥ expected request duration or are renewed while an active request lives
 // (§48-49); orphaned leases expire and the store replenishes. This in-memory
@@ -152,6 +160,38 @@ func (p *ConcurrencyPool) AcquireN(n int) *LeaseHandle {
 		return &LeaseHandle{st: &leaseState{mu: &p.mu, balance: &p.balance, released: true, slots: 0}}
 	}
 	if p.balance < n {
+		return nil
+	}
+	p.balance -= n
+	return &LeaseHandle{st: &leaseState{mu: &p.mu, balance: &p.balance, released: false, slots: n}}
+}
+
+// AcquireNCap reserves n slots atomically under a DYNAMIC effective cap
+// (P0.2). The effective cap is min(pool construction capacity, cap), and
+// admission is denied while slots already in use have reached it — so a scope
+// whose policy cap drops (NORMAL→CONSTRAINED) is throttled on the very next
+// acquisition, and a scope whose cap rises expands without recreating the pool
+// or disturbing its accounting. Leases taken under a higher cap keep their
+// slots until released (no preemption; new admissions carry the constraint).
+// A cap of 0 denies all acquisition for the scope.
+func (p *ConcurrencyPool) AcquireNCap(n, cap int) *LeaseHandle {
+	if n < 0 {
+		n = 0
+	}
+	if cap < 0 {
+		cap = 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	effectiveCap := p.capacity
+	if cap < effectiveCap {
+		effectiveCap = cap
+	}
+	if n == 0 {
+		return &LeaseHandle{st: &leaseState{mu: &p.mu, balance: &p.balance, released: true, slots: 0}}
+	}
+	inUse := p.capacity - p.balance
+	if n > effectiveCap || inUse > effectiveCap-n {
 		return nil
 	}
 	p.balance -= n

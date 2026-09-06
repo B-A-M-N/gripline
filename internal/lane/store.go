@@ -29,7 +29,9 @@ func DefaultLimits() Limits {
 }
 
 // featSchemaVersion is the current classification-vector schema. Bump when the
-// Features struct changes shape so old rows are visibly incompatible.
+// Features struct changes shape so old rows are visibly incompatible. Exposed
+// read-only as FeatSchemaVersion (P0.22); rows under an older schema are never
+// compared against candidates (skip for borrow, reject for same-ID reuse).
 const featSchemaVersion = 2
 
 // GetConfig is a minimal hook returning the enforced limits; nil means defaults.
@@ -118,10 +120,44 @@ func (s *Store) BorrowOrCreate(credID, newLaneID string, cand Features, th Class
 		s.byCred[credID] = m
 	}
 
+	// Exact-manifestation reuse (P0.1): if the deterministic lane ID derived
+	// from this candidate already exists with an IDENTICAL feature vector under
+	// the CURRENT schema, the request is re-presenting the same provisional
+	// manifestation. It reuses its OWN lane — the same record, whatever its
+	// state — without that reuse granting any established-lane trust. This is
+	// distinct from borrowing: the 0.70 comparable/trusted-feature floor below
+	// governs a candidate matching a DIFFERENT (established) lane, not a client
+	// repeating the exact vector its lane ID was derived from. Without this,
+	// the default sparse resolver (no trusted network dims) would derive the
+	// same ID, fail the borrow floor, and hit ErrLaneConflict on every second
+	// request — the proxy would be functionally unusable.
+	//
+	// A same-ID record with a DIFFERENT vector or an old schema is still the
+	// §24 state-reset collision and fails closed (ErrLaneConflict), and a
+	// schema-stale record is never silently compared (P0.22).
+	if rec, exists := m[newLaneID]; exists {
+		if rec.FeatSchema == featSchemaVersion && sameFeatures(rec.Features, cand) {
+			rec.LastSeenAt = s.now()
+			rec.RequestCount++
+			rec.Revision++
+			rec.trackActiveDayLocked(s.now())
+			c := *rec
+			return &c, false, nil
+		}
+		return nil, false, ErrLaneConflict
+	}
+
 	bestSim := -1.0
 	var bestID string
 	var best *LaneRecord
 	for id, rec := range m {
+		// Never classify across feature-schema revisions (P0.22): a record
+		// stored under an older schema has dimensions this schema may score
+		// differently. Skip it for borrowing; the exact-reuse path above
+		// already rejected same-ID schema-stale records.
+		if rec.FeatSchema != featSchemaVersion {
+			continue
+		}
 		if sim := Similarity(cand, rec.Features); sim > bestSim {
 			bestSim = sim
 			bestID = id
@@ -133,12 +169,14 @@ func (s *Store) BorrowOrCreate(credID, newLaneID string, cand Features, th Class
 		}
 	}
 
-	// Anti-laundering gate (P0.9): a MATCH requires BOTH enough renormalized
-	// similarity AND enough comparable feature mass. A sparse candidate that
-	// matches only on a couple of shared fields (renormalized to 1.0) must not
-	// collapse into an established lane. Fail-closed: a configured floor of 0
-	// (field forgotten) never permits a Match, so omitting the field cannot
-	// silently reopen the laundering strategy.
+	// Anti-laundering gate (P0.9): a MATCH (borrowing another lane) requires
+	// BOTH enough renormalized similarity AND enough comparable feature mass.
+	// A sparse candidate that matches only on a couple of shared fields
+	// (renormalized to 1.0) must not collapse into an established lane.
+	// Fail-closed: a configured floor of 0 (field forgotten) never permits a
+	// Match, so omitting the field cannot silently reopen the laundering
+	// strategy. Exact self-reuse was already handled above and does not pass
+	// through this gate.
 	isMatch := best != nil && th.classify(bestSim) == ClassMatch
 	if isMatch && th.MinComparableWeight > 0 {
 		isMatch = ComparableWeight(cand, best.Features) >= th.MinComparableWeight
@@ -172,9 +210,10 @@ func (s *Store) BorrowOrCreate(credID, newLaneID string, cand Features, th Class
 			return nil, false, ErrTooManyLanes
 		}
 	}
-	// Never overwrite an existing row: if the id is taken but features were not
-	// a Match (checked above), the id derivation has collided. Insert-only
-	// keeps lane history append-only (§24); the caller fails closed.
+	// Never overwrite an existing row: same-ID/different-features and
+	// schema-stale collisions were rejected above (P0.1/P0.22); this is the
+	// unreachable-if-consistent backstop. Insert-only keeps lane history
+	// append-only (§24); the caller fails closed.
 	if _, exists := m[newLaneID]; exists {
 		return nil, false, ErrLaneConflict
 	}

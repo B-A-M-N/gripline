@@ -132,8 +132,11 @@ func scopeKey(s Scope, id string) string {
 	return s.String() + ":" + id
 }
 
-// pool retrieves-or-creates the concurrency pool for a scope key with the given
-// capacity. Caller holds g.mu.
+// pool retrieves-or-creates the concurrency pool for a scope key. The
+// construction capacity is only the pool's high-water bound — the CURRENT
+// policy cap is supplied per acquisition via AcquireNCap (P0.2), so later
+// NORMAL→CONSTRAINED (or reverse) transitions take effect immediately without
+// recreating the pool or resetting its accounting. Caller holds g.mu.
 func (g *Governor) pool(key string, cap int) *ConcurrencyPool {
 	if p, ok := g.pools[key]; ok {
 		return p
@@ -143,11 +146,15 @@ func (g *Governor) pool(key string, cap int) *ConcurrencyPool {
 	return p
 }
 
-// bucket retrieves-or-creates a token bucket for a dimension+scope. Caller holds
-// g.mu.
+// bucket retrieves-or-creates a token bucket for a dimension+scope. On every
+// call the bucket is reconfigured to the CURRENT spec (P0.2): the parameters in
+// effect at first creation are not frozen — a constrained scope's tightened
+// burst/rate applies to the next reservation, and a restored scope's allowance
+// returns without resetting accounting. Caller holds g.mu.
 func (g *Governor) bucket(dim Dimension, key string, spec BucketSpec) *TokenBucket {
 	m := g.buckets[dim]
 	if b, ok := m[key]; ok {
+		b.Reconfigure(spec.BurstCapacity, spec.RefillPer, spec.RefillIn)
 		return b
 	}
 	b := NewTokenBucket(spec.BurstCapacity, spec.RefillPer, spec.RefillIn, g.now)
@@ -195,13 +202,15 @@ func (g *Governor) Provision(scopes []ScopeSpec, dims []Dimension, amt Provision
 	}()
 
 	// Round 1 — concurrency: every scope in precedence order. A failure here
-	// names the denying scope directly.
+	// names the denying scope directly. Each acquisition supplies the scope's
+	// CURRENT policy cap (P0.2): admission is capped at
+	// min(pool construction capacity, current cap), so a NORMAL→CONSTRAINED
+	// transition throttles the very next request, and a return to NORMAL
+	// expands capacity without recreating the pool or resetting accounting.
 	for _, sp := range scopes {
 		key := scopeKey(sp.Scope, sp.ID)
 		p := g.pool(key, sp.Buckets.ConcurrencyCap)
-		// Each pool's capacity IS its scope cap (built with ConcurrencyCap), so
-		// AcquireN enforces the cap directly. A denied scope names itself.
-		lease := p.AcquireN(amt.Concurrency)
+		lease := p.AcquireNCap(amt.Concurrency, sp.Buckets.ConcurrencyCap)
 		if lease == nil {
 			return nil, &ScopeLimitError{Scope: sp.Scope}
 		}

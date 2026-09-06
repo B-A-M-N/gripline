@@ -782,7 +782,7 @@ func (w *syncTestWaitGroup) Wait()     { w.wg.Wait() }
 // does not require the trusted source mass) must allow the collapse. This is
 // the lever a policy author needs to tune per revision.
 func TestCompiledPolicyClassificationDrivesLaneMatch(t *testing.T) {
-	sparse := lane.Features{NetworkASN: "AS77", ClientFamily: "claude-code"} // comparable 0.45
+	sparse := lane.Features{NetworkASN: "AS77", ClientFamily: "claude-code"} // comparable 0.45 raw mass = 0.375 fraction (P0.21)
 
 	// (a) Default floor (0.70): sparse must NOT match the rich established lane.
 	{
@@ -803,8 +803,9 @@ func TestCompiledPolicyClassificationDrivesLaneMatch(t *testing.T) {
 	}
 
 	// (b) Loosened floor (policy revision that demands less source mass): the
-	// SAME sparse candidate's comparable mass (0.45) now clears a 0.40 floor, so
-	// it must borrow. The COMPILED cutoff — not any store global — decides.
+	// SAME sparse candidate's comparable FRACTION (P0.21: 0.45 raw mass over the
+	// 1.20 total = 0.375) now clears a 0.35 floor, so it must borrow. The
+	// COMPILED cutoff — not any store global — decides.
 	// (Floor 0 is intentionally FAIL-CLOSED and forbids all matches — P0.9 — so a
 	// positive loosened floor is the correct way to express permissiveness and
 	// still proves the knob is live.)
@@ -813,7 +814,7 @@ func TestCompiledPolicyClassificationDrivesLaneMatch(t *testing.T) {
 			return lane.Limits{MaxActiveLanesPerCredential: 8, MaxProvisionalLanes: 8, LaneIdleExpiration: 48 * time.Hour}
 		}, time.Now)
 		th := policy.Default().Classification
-		th.MinComparableWeight = 0.40 // still demands meaningful source mass, but below this candidate's 0.45
+		th.MinComparableWeight = 0.35 // still demands meaningful source mass, but below this candidate's 0.375
 		if _, created, err := store.BorrowOrCreate("cred_1", "lane_rich",
 			lane.Features{NetworkASN: "AS77", NetworkType: "residential", RegionClass: "us",
 				ClientFamily: "claude-code", SDKFamily: "go"}, th); err != nil || !created {
@@ -824,7 +825,7 @@ func TestCompiledPolicyClassificationDrivesLaneMatch(t *testing.T) {
 			t.Fatal(err)
 		}
 		if created {
-			t.Fatal("P0.11: floor 0.40 must allow the match (sparse comparable 0.45 >= 0.40)")
+			t.Fatal("P0.11: floor 0.35 must allow the match (sparse comparable fraction 0.375 >= 0.35)")
 		}
 		if rec.LaneID != "lane_rich" {
 			t.Fatalf("loosened policy must borrow lane_rich, got %s", rec.LaneID)

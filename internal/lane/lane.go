@@ -136,24 +136,41 @@ func (f Features) has(field string) bool {
 type ClassificationThresholds struct {
 	Match   float64 // >= this → candidate existing lane
 	Related float64 // floor; below this → novel lane
-	// MinComparableWeight is the minimum comparable feature mass a candidate
-	// must share with a stored lane to be a Match (P0.9). The default requires
-	// the trusted network-source identity (ASN+Region+NetworkType ≈ 0.70 of the
-	// feature space); a candidate refusing those trusted fields cannot Match.
+	// MinComparableWeight is the minimum comparable feature mass FRACTION a
+	// candidate must share with a stored lane to be a Match (P0.9/P0.21). The
+	// default equals the trusted network trio's share of the feature space
+	// ((0.35+0.15+0.20)/1.20), computed from the same table ComparableWeight
+	// normalizes over — so a candidate refusing those trusted fields cannot
+	// Match, and floor and table can never drift apart.
 	MinComparableWeight float64
 }
 
 // DefaultThresholds are the spec §26 example defaults, hardened per P0.9 with a
 // comparable-mass floor that requires the full trusted network-source identity
-// (NetworkASN 0.35 + RegionClass 0.20 + NetworkType 0.15 = 0.70) to be present
-// before a Match is permitted. A candidate omitting any trusted source field
-// drops below this floor and cannot collapse into an established lane.
+// (the NetworkASN/RegionClass/NetworkType trio) to be present before a Match is
+// permitted. The floor is derived from the weight table itself (P0.21), so
+// editing the weights re-derives the floor. A candidate omitting any trusted
+// source field drops below this floor and cannot collapse into an established
+// lane.
 func DefaultThresholds() ClassificationThresholds {
-	return ClassificationThresholds{Match: 0.80, Related: 0.55, MinComparableWeight: 0.70}
+	trustedTrio := defaultWeights["NetworkASN"] + defaultWeights["NetworkType"] + defaultWeights["RegionClass"]
+	total := totalFeatureWeight()
+	return ClassificationThresholds{
+		Match:               0.80,
+		Related:             0.55,
+		MinComparableWeight: trustedTrio / total,
+	}
 }
 
 // Weights multiply per-feature similarity; they are renormalized over present
-// features (§27).
+// features (§27). The raw table sums to 1.20, NOT 1.0 (P0.21): similarity is a
+// ratio of weights so classification is unaffected, but ComparableWeight must
+// divide by the true table total (see totalFeatureWeight) rather than clamping
+// at 1.0 — the old clamp silently flattened every mass above 1.0 and made the
+// documented "fraction out of 1.0" a lie. The trusted network trio's FRACTION
+// of the space is (0.35+0.15+0.20)/1.20 ≈ 0.583; DefaultThresholds derives its
+// MinComparableWeight from that same computation so floor and table can never
+// drift apart.
 var defaultWeights = map[string]float64{
 	"NetworkASN":         0.35,
 	"NetworkType":        0.15,
@@ -167,6 +184,25 @@ var defaultWeights = map[string]float64{
 	"EndpointFamily":     0.05,
 }
 
+// featureFields is the fixed iteration order used by comparable (deterministic
+// classification, §26).
+var featureFields = []string{
+	"NetworkASN", "NetworkType", "RegionClass", "ClientFamily",
+	"SDKFamily", "HTTPVersion", "Streaming", "ModelFamily",
+	"ConcurrencyPattern", "EndpointFamily",
+}
+
+// totalFeatureWeight is the exact sum of the weight table. ComparableWeight
+// divides the comparable mass by this so the reported fraction is genuinely in
+// [0,1] regardless of how the table is edited (P0.21).
+func totalFeatureWeight() float64 {
+	t := 0.0
+	for _, f := range featureFields {
+		t += defaultWeights[f]
+	}
+	return t
+}
+
 // comparable returns the matched weight and the comparable total weight between
 // two feature vectors, considering only fields present in BOTH vectors (both
 // must be present to score a match). Deterministic (fixed field order).
@@ -178,12 +214,7 @@ var defaultWeights = map[string]float64{
 // the trusted feature space is actually present.
 func comparable(a, b Features) (matchedW, totalW float64) {
 	// Iterate over a fixed field order so the result is deterministic.
-	fields := []string{
-		"NetworkASN", "NetworkType", "RegionClass", "ClientFamily",
-		"SDKFamily", "HTTPVersion", "Streaming", "ModelFamily",
-		"ConcurrencyPattern", "EndpointFamily",
-	}
-	for _, f := range fields {
+	for _, f := range featureFields {
 		w := defaultWeights[f]
 		av, bv := fieldVal(&a, f), fieldVal(&b, f)
 		if av != "" && bv != "" {
@@ -207,17 +238,21 @@ func Similarity(a, b Features) float64 {
 	return matchedW / totalW
 }
 
-// ComparableWeight reports the fraction of the FEATURE SPACE (using fixed
-// default weights, out of 1.0) that both vectors populate — i.e. how much
-// comparable evidence a Similarity decision actually rests on. Used with
+// ComparableWeight reports the fraction of the FEATURE SPACE (out of 1.0) that
+// both vectors populate — i.e. how much comparable evidence a Similarity
+// decision actually rests on. The mass is divided by the total weight of the
+// table (P0.21): with defaultWeights summing to 1.0 the division is a no-op,
+// but an edited table can no longer push the fraction above 1.0 or silently
+// shift the MinComparableWeight floor. Used with
 // ClassificationThresholds.MinComparableWeight to stop a sparse candidate from
 // collapsing into an established lane on a sliver of shared fields (P0.9).
 func ComparableWeight(a, b Features) float64 {
 	_, totalW := comparable(a, b)
-	if totalW > 1 {
-		totalW = 1
+	tw := totalFeatureWeight()
+	if tw == 0 {
+		return 0
 	}
-	return totalW
+	return totalW / tw
 }
 
 func fieldVal(f *Features, name string) string {
@@ -246,6 +281,25 @@ func fieldVal(f *Features, name string) string {
 		return ""
 	}
 }
+
+// sameFeatures reports exact equality of two feature vectors (every field).
+// Used by the store's exact-manifestation reuse path: a candidate re-presenting
+// the identical vector its lane was created under reuses that lane. Any
+// difference — even one field — means a different manifestation and must go
+// through classification, never overwrite.
+func sameFeatures(a, b Features) bool {
+	for _, f := range featureFields {
+		if fieldVal(&a, f) != fieldVal(&b, f) {
+			return false
+		}
+	}
+	return true
+}
+
+// FeatSchemaVersion is the current classification-vector schema revision.
+// Store rows classified under an older schema are never silently compared
+// (P0.22); bump when the Features struct changes shape.
+const FeatSchemaVersion = featSchemaVersion
 
 // classify maps a similarity score to the classification label.
 func (c ClassificationThresholds) classify(sim float64) Classification {

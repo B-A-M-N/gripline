@@ -113,6 +113,37 @@ func (b *TokenBucket) Balance() float64 {
 	return b.balance
 }
 
+// Reconfigure swaps a bucket's policy parameters (capacity, refill rate) in
+// place (P0.2). A scope's bucket is created on first use; without this, the
+// burst/rate in effect at creation time would be frozen forever — a constrained
+// credential would keep its original allowance and a restored one would never
+// regain it. Refill is applied first so elapsed time is credited under the OLD
+// rate (the time already passed), then the new parameters apply to future
+// elapsed time. The spent balance is preserved and clamped into the new
+// capacity: tightening never mints allowance, loosening never resets accounting.
+func (b *TokenBucket) Reconfigure(capacity float64, refillPer float64, refillIn time.Duration) {
+	if capacity < 0 || math.IsNaN(capacity) || math.IsInf(capacity, 0) {
+		capacity = 0
+	}
+	if refillPer < 0 || math.IsNaN(refillPer) || math.IsInf(refillPer, 0) {
+		refillPer = 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.refillLocked()
+	// refillLocked skips lastRefill advancement entirely when refillIn <= 0;
+	// advance it unconditionally here so elapsed time under a zero OLD rate is
+	// not re-credited at the NEW rate (a tightening must not mint allowance).
+	b.lastRefill = b.now()
+	b.capacity = capacity
+	b.refillPer = refillPer
+	b.refillIn = refillIn
+	if b.balance > capacity {
+		b.balance = capacity
+	}
+	b.revision++
+}
+
 // refillLocked adds elapsed refill units, capped at capacity. It is the only
 // place time advances the bucket.
 func (b *TokenBucket) refillLocked() {
