@@ -90,7 +90,7 @@ across all 15 packages.
 | P0.42 | RESOLVED | `CleanSince` seeded at creation, zeroed on security elevation, re-seeded on operator unblock, used (not FirstSeenAt) in `PromoteIfEligible`. `TestCleanSinceResetOnElevation`. |
 | P0.43 | RESOLVED | `PromoteIfEligible` returns early when `Security.Status != Normal`; `AllowSuspicious` deprecated/no-effect; SUSPICIOUS forced to constrained limits. lane/security_test. |
 | P0.44 | RESOLVED | `ObserveAndCommit` bumps `Revision++` exactly once on status change, not on NoChange; `UpdateStatusCAS` likewise. m1_test. |
-| P0.45 | PARTIAL | Evidence is minted with a `PolicyRevision` and assertions embed `PolicyRev`, but enforcement never compares evidence's revision against the compiled policy, and the lane id ignores the revision — stale-revision evidence is silently evaluated under the new policy. Mixing `t.pol.Revision` into `shortTag` (or filtering evidence by revision) would close it. |
+| P0.45 | PARTIAL | Evidence-revision filtering CLOSED (`policyRevisionFilter` drops stale-revision evidence from the authoritative feed; **commit 1685b35**). Lane-id part remains open: `shortTag` still hashes features only, so a policy change does not re-key lane identity (a fresh lane per §26 re-classification); documented follow-up. |
 | P0.46/P0.47 | NOT GROUNDED | No code references P0.46/P0.47. |
 | P0.48 | PARTIAL | Clean counters advance only on authorized requests (INV-8, `RecordCleanAuthorizedAndPromote` only in the authorized path; promotion gated behind `AdaptiveAvailable`). Caveat: in DEGRADED posture the counters still advance (promotion itself is the gated action) — a conditional INV-8 reading. |
 
@@ -168,8 +168,9 @@ TLS.
 ## Open / partial work queue (ordered by what blocks the e2e goal)
 
 1. ~~P0.15~~ CLOSED — CSPRNG evidence ids (commit 5b644ee).
-2. P0.48/P0.10 — gate clean-counter increments on adaptive status; implement the
+2. ~~P0.45 evidence-revision filter~~ CLOSED — stale-revision evidence dropped
+   from the authoritative state machine (commit 1685b35); lane-id re-keying
+   per §26 remains a separate follow-up.
+3. P0.48/P0.10 — gate clean-counter increments on adaptive status; implement the
    single-request conflict re-observe.
-3. P0.45 — mix `t.pol.Revision` into `shortTag` (or filter evidence by revision)
-   so a policy change forces re-classification per §26.
 4. Durable stores + gateway process (P0.58/63/64/61/62) — before production.
