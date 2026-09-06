@@ -54,6 +54,57 @@ type Outcome struct {
 	// CredentialRisk and LaneRisk expose the independently computed scores.
 	CredentialRisk int
 	LaneRisk       int
+	// Baseline (P0.27) is non-nil on an authorized outcome when a lane store is
+	// configured. It is the deferred clean-activity credit: the proxy calls
+	// FinalizeBaseline ONCE after the upstream request has actually succeeded
+	// (backend accepted / response complete). An admitted-but-never-completed
+	// request earns no baseline trust.
+	Baseline *BaselineToken
+}
+
+// BaselineToken carries the deferred clean-activity credit from an authorized
+// admission to the proxy-side completion event (P0.27). It is a value token:
+// the proxy cannot forge extra counts, only present or not-present the one it
+// was given. Finalize is idempotent.
+type BaselineToken struct {
+	CredentialID string
+	LaneID       string
+	LaneRisk     int
+	// Eligible reports whether the admission ran in AdaptiveAvailable posture
+	// — a degraded admission never builds baseline trust (P0.1).
+	Eligible bool
+
+	// done guards idempotent finalization: a request completed and then
+	// double-released (error path + defer) must count once.
+	done bool
+
+	// term is the issuing terminator (back-pointer, set at issuance) — the
+	// completion event lands on the same authority that admitted the request.
+	term *Terminator
+}
+
+// Finalize records ONE clean successful observation against the lane baseline
+// (counters + promotion evaluation) at the moment the proxy has proof the
+// upstream request succeeded. It is a no-op when the token was already spent,
+// when the admission ran degraded, or when no lane store is configured.
+// Returns whether a baseline credit was applied.
+func (b *BaselineToken) Finalize() bool {
+	if b == nil || !b.Eligible || b.done || b.term == nil || b.term.dep.Lanes == nil {
+		return false
+	}
+	b.done = true
+	b.term.finalizeBaseline(b)
+	return true
+}
+
+// FinalizeBaseline spends this outcome's BaselineToken (P0.27 convenience for
+// the proxy lifecycle). Safe to call on a denied outcome (no token) and
+// idempotent.
+func (o *Outcome) FinalizeBaseline() bool {
+	if o == nil {
+		return false
+	}
+	return o.Baseline.Finalize()
 }
 
 // Reservation returns the ONE lifecycle handle for whatever this admission is
@@ -763,25 +814,26 @@ func (t *Terminator) AdmitSource(headers map[string][]string, feat lane.Features
 		out.Assertion = assertion
 	}
 
-	// 13. Record clean authorized activity + lane promotion (authorized only).
-	// This is separated from risk observation (step 10) — promotion should only
-	// happen on fully authorized requests, not on denied ones. In AdaptiveDegraded
-	// posture, no promotion and no clean-baseline advance runs (P0.1): unreliable
-	// history must not build trust upward.
-	if t.dep.Lanes != nil && adaptiveForObservation == AdaptiveAvailable {
-		promCrit := lane.PromotionCriteria{
-			MinCleanAge:          t.pol.Learning.MinCleanAge,
-			MinCleanRequests:     t.pol.Learning.MinCleanRequests,
-			MinCleanActiveDays:   t.pol.Learning.MinCleanActiveDays,
-			MaxEstablishmentRisk: t.pol.Learning.MaxEstablishmentRisk,
-			AllowNewLanes:        t.pol.Learning.AllowNewLanes,
-			AllowSuspicious:      t.pol.Learning.AllowSuspiciousLanes,
-		}
-		_, _, perr := t.dep.Lanes.RecordCleanAuthorizedAndPromote(
-			cred.CredentialID, laneID, laneRisk, promCrit, now,
-		)
-		if perr != nil {
-			_ = perr // unexpected but not fatal for authorized request
+	// 13. BASELINE FINALIZATION MOVED TO THE PROXY LIFECYCLE (P0.27). Admit no
+	// longer counts a request as "clean authorized activity" at admission time:
+	// at this point the backend may be unreachable, reject the request, or the
+	// client may cancel before any useful workload — none of which is trust-
+	// building activity. The Outcome instead carries a BaselineToken holding
+	// everything needed to finalize the lane baseline AFTER the upstream proves
+	// the request actually worked. The proxy calls Outcome.FinalizeBaseline
+	// (via CompleteAuthorized) when the backend has accepted the response.
+	// Nothing here mutates lane clean counters.
+	if t.dep.Lanes != nil {
+		out.Baseline = &BaselineToken{
+			CredentialID: cred.CredentialID,
+			LaneID:       laneID,
+			LaneRisk:     laneRisk,
+			// Baseline finalization requires AVAILABLE adaptive posture (P0.1):
+			// unreliable history must not build trust upward, so a degraded
+			// admission's token is issued but the proxy-side finalize is a
+			// no-op for it (flagged in the token).
+			Eligible: adaptiveForObservation == AdaptiveAvailable,
+			term:     t,
 		}
 	}
 
@@ -921,6 +973,62 @@ func (t *Terminator) pruneEvidence(now time.Time, credSubjects, laneSubjects []e
 	allSubjects = append(allSubjects, credSubjects...)
 	allSubjects = append(allSubjects, laneSubjects...)
 	t.dep.Evidence.Prune(allSubjects, now)
+}
+
+// finalizeBaseline applies one deferred clean-activity credit (P0.27): counters
+// advance and promotion is evaluated — including the P0.26 disqualifying-
+// evidence veto, computed NOW (at completion) against live evidence, not at
+// admission. Called only from BaselineToken.Finalize, which owns idempotency.
+func (t *Terminator) finalizeBaseline(b *BaselineToken) {
+	now := t.dep.RiskNow()
+	promCrit := lane.PromotionCriteria{
+		MinCleanAge:          t.pol.Learning.MinCleanAge,
+		MinCleanRequests:     t.pol.Learning.MinCleanRequests,
+		MinCleanActiveDays:   t.pol.Learning.MinCleanActiveDays,
+		MaxEstablishmentRisk: t.pol.Learning.MaxEstablishmentRisk,
+		AllowNewLanes:        t.pol.Learning.AllowNewLanes,
+		AllowSuspicious:      t.pol.Learning.AllowSuspiciousLanes,
+		HasDisqualifyingEvidence: t.hasActiveDisqualifyingEvidence(b.CredentialID, b.LaneID, now),
+	}
+	_, _, _ = t.dep.Lanes.RecordCleanAuthorizedAndPromote(
+		b.CredentialID, b.LaneID, b.LaneRisk, promCrit, now,
+	)
+}
+
+// hasActiveDisqualifyingEvidence reports whether any currently-active evidence
+// against the lane or its credential carries a code on the policy's
+// disqualifying list (P0.26). A store outage here must NOT fail open into
+// "no disqualifying evidence" — it conservatively vetoes (fail-closed): an
+// unavailable history is unknown, and unknown blocks trust-building.
+func (t *Terminator) hasActiveDisqualifyingEvidence(credID, laneID string, now time.Time) bool {
+	if len(t.pol.Learning.DisqualifyingEvidenceCodes) == 0 {
+		return false
+	}
+	if t.dep.Evidence == nil {
+		// No evidence store configured: no ACTIVE evidence exists anywhere, so
+		// there is nothing to disqualify — this is a real answer, not an outage.
+		return false
+	}
+	subjects := []evidence.SubjectKey{
+		{Scope: evidence.ScopeLane, ID: laneID},
+		{Scope: evidence.ScopeCredential, ID: credID},
+	}
+	snap, err := t.dep.Evidence.Snapshot(subjects, now)
+	if err != nil {
+		// History unavailable → unknown → veto. Trust-building stops during an
+		// evidence outage; it resumes when the store is readable again.
+		return true
+	}
+	dq := make(map[string]struct{}, len(t.pol.Learning.DisqualifyingEvidenceCodes))
+	for _, c := range t.pol.Learning.DisqualifyingEvidenceCodes {
+		dq[c] = struct{}{}
+	}
+	for _, ev := range snap {
+		if _, hit := dq[ev.Code]; hit {
+			return true
+		}
+	}
+	return false
 }
 
 // selectLimits chooses resource limits based on the resulting credential state.

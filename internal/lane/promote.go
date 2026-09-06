@@ -11,6 +11,16 @@ type PromotionCriteria struct {
 	MaxEstablishmentRisk int
 	AllowNewLanes        bool // if false, new lanes stay NEW and never promote
 	AllowSuspicious      bool // if false, SUSPICIOUS lanes cannot promote
+
+	// HasDisqualifyingEvidence (P0.26): when true, ACTIVE high-confidence
+	// abuse evidence exists against the lane's subject set RIGHT NOW, and
+	// baseline learning is independently prevented — regardless of what the
+	// scalar risk score says. A score can average away semantics ("only 25
+	// total"), but active abuse evidence is a qualitative no. The caller
+	// (terminator) computes this from the evidence store against the
+	// policy-declared disqualifying code list; the lane layer only enforces
+	// the boolean.
+	HasDisqualifyingEvidence bool
 }
 
 // DefaultPromotionCriteria returns conservative defaults. Options mirror the
@@ -44,6 +54,12 @@ func DefaultPromotionCriteria() PromotionCriteria {
 // The EstablishmentScore is set to 100 only when the PROBATION→ESTABLISHED
 // criteria are met.
 //
+// Revision ownership (P0.25): this function mutates State/EstablishmentScore
+// but NEVER bumps Revision. The Store's mutation transaction (e.g.
+// RecordCleanAuthorizedAndPromote) is the single owner of the revision bump —
+// exactly one per authoritative mutation, promotion or not. Callers that
+// mutate a record outside the store must bump Revision themselves.
+//
 // Note: promotion should only be called after a request has been fully
 // authorized (clean). Denied requests must not advance a lane toward promotion.
 func PromoteIfEligible(rec *LaneRecord, crit PromotionCriteria, now time.Time) (State, bool) {
@@ -55,6 +71,14 @@ func PromoteIfEligible(rec *LaneRecord, crit PromotionCriteria, now time.Time) (
 	if rec.Security.Status != LaneNormal {
 		return rec.State, false
 	}
+	// Disqualifying-evidence gate (P0.26): active high-confidence abuse
+	// evidence independently prevents baseline learning. This is checked in
+	// addition to the scalar risk bound below — a score is an aggregate and can
+	// under-represent a single severe signal; the policy's declared
+	// disqualifying evidence is a direct semantic veto.
+	if crit.HasDisqualifyingEvidence {
+		return rec.State, false
+	}
 	switch rec.State {
 	case StateNew:
 		if !crit.AllowNewLanes {
@@ -63,7 +87,6 @@ func PromoteIfEligible(rec *LaneRecord, crit PromotionCriteria, now time.Time) (
 		// NEW→PROBATION: only needs policy permission. No age/request
 		// threshold — this is purely a seeding control.
 		rec.State = StateProbation
-		rec.Revision++
 		return rec.State, false
 	case StateProbation:
 		// PROBATION→ESTABLISHED: full trust criteria.
@@ -94,18 +117,10 @@ func PromoteIfEligible(rec *LaneRecord, crit PromotionCriteria, now time.Time) (
 		// EstablishmentScore: exactly 100 when all criteria satisfied.
 		rec.EstablishmentScore = 100
 		rec.State = StateEstablished
-		rec.Revision++
 		return rec.State, true
 	case StateEstablished:
 		return StateEstablished, false
 	default: // trust SUSPICIOUS/BLOCKED ladder states (legacy) — never promote
 		return rec.State, false
 	}
-}
-
-func boolToInt(b bool) int {
-	if b {
-		return 1
-	}
-	return 0
 }

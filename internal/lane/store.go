@@ -266,17 +266,43 @@ func (r *LaneRecord) trackActiveDayLocked(now time.Time) {
 	r.ActiveDays++
 }
 
-// evictIdleLocked removes lanes idle beyond the configured expiration for one
-// credential (bounded work per admission, not a global scan).
+// evictIdleLocked removes lanes idle beyond their RETENTION CLASS's expiration
+// for one credential (bounded work per admission, not a global scan).
+//
+// Retention classes (P0.23): generic idle eviction must never erase security
+// history. Ordinary NEW/PROBATION lanes are cache (expire at the configured
+// idle bound); ESTABLISHED lanes carry continuity value and live 4x longer;
+// SUSPICIOUS lanes are security history (16x); BLOCKED lanes are tombstones
+// that NEVER expire through this path — an operator-controlled state must not
+// silently re-arm itself as a fresh lane after enough idle time. A BLOCKED
+// lane's reappearance after eviction would launder its entire abuse history
+// through generic cache pressure; the retention classing is what keeps the
+// security axis durable.
 func (s *Store) evictIdleLocked(credID string) {
 	lm := s.limits()
 	if lm.LaneIdleExpiration <= 0 {
 		return
 	}
-	cutoff := s.now().Add(-lm.LaneIdleExpiration)
+	now := s.now()
+	cutoff := now.Add(-lm.LaneIdleExpiration)
 	m := s.byCred[credID]
 	for id, r := range m {
-		if r.LastSeenAt.Before(cutoff) {
+		if r.LastSeenAt.After(cutoff) {
+			continue
+		}
+		if r.Security.Status == LaneBlocked {
+			// Tombstone: never expires through generic eviction (P0.23).
+			// Only an explicit operator lifecycle action may remove it.
+			continue
+		}
+		retained := lm.LaneIdleExpiration
+		switch {
+		case r.Security.Status == LaneSuspicious:
+			retained *= 16 // security history outlives the cache bound
+		case r.State == StateEstablished:
+			retained *= 4 // continuity for established lanes
+		}
+		if r.LastSeenAt.Before(now.Add(-retained)) {
 			delete(m, id)
 		}
 	}
@@ -353,6 +379,21 @@ func (s *Store) ObserveRisk(credID, laneID string, riskScore int, now time.Time)
 	if rec.Security.Status != LaneNormal && before == LaneNormal {
 		rec.CleanSince = time.Time{}
 	}
+	// P0.24: the mirror image of P0.42 — when an elevated lane RECOVERS to
+	// NORMAL, the clean window restarts at the moment of recovery. Without
+	// this, CleanSince stays zero after recovery and PromoteIfEligible's
+	// MinCleanAge fallback (FirstSeenAt) silently includes the entire
+	// suspicious period, so a lane could promote on the strength of the very
+	// quiet time that preceded its abuse.
+	if rec.Security.Status == LaneNormal && before != LaneNormal {
+		rec.CleanSince = now
+		// The disqualifying window also invalidates baseline progress: clean
+		// counters epoch so promotion criteria must be re-earned in the new
+		// window, not inherited from before the elevation.
+		rec.AuthorizedCleanRequests = 0
+		rec.CleanActiveDays = 0
+		rec.LastCleanActiveDay = ""
+	}
 	rec.Revision++
 	c := *rec
 	return &c, nil
@@ -376,6 +417,12 @@ func (s *Store) securityHys() SecurityHysteresis {
 // criteria under the store lock. This is called AFTER a request has been fully
 // authorized (passed all gates). Denied requests must NOT call this — they
 // contribute evidence but not baseline progress.
+//
+// Revision ownership (P0.25): this call is ONE authoritative mutation
+// transaction — counters, and promotion if it fires — and bumps Revision
+// exactly once, whether or not a promotion occurred. Callers use Revision for
+// optimistic concurrency and evidence-revision checks; a counter update that
+// ships without a revision bump is a lost-update window.
 //
 // Returns whether a promotion occurred. The returned LaneRecord (if any) has
 // the updated state and Revision.
@@ -407,20 +454,19 @@ func (s *Store) RecordCleanAuthorizedAndPromote(credID, laneID string, riskScore
 	case StateNew, StateProbation:
 		if newState, promoted = PromoteIfEligible(rec, crit, now); promoted {
 			rec.State = newState
-			c := *rec
-			return &c, true, nil
 		}
 	}
 
-	// No promotion; return updated record with risk + clean counters.
+	rec.Revision++
 	c := *rec
-	return &c, false, nil
+	return &c, promoted, nil
 }
 
 // RecordCleanAuthorized increments the authorized clean request counter and
 // tracks the active day for promotion purposes. This is called AFTER a
 // request has been fully authorized (passed all gates). Denied requests must
 // NOT call this — they contribute evidence but not baseline progress.
+// One authoritative mutation: bumps Revision exactly once (P0.25).
 func (s *Store) RecordCleanAuthorized(credID, laneID string, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -434,4 +480,6 @@ func (s *Store) RecordCleanAuthorized(credID, laneID string, now time.Time) {
 		rec.LastCleanActiveDay = day
 		rec.CleanActiveDays++
 	}
+	rec.trackActiveDayLocked(now)
+	rec.Revision++
 }

@@ -319,13 +319,17 @@ func TestObservationNotTiedToAuthorization(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// First admission (authorized) → lane created, clean counter incremented.
+	// First admission (authorized) → lane created. P0.27: the clean counter
+	// advances only when the proxy lifecycle finalizes the baseline token.
 	out := term.Admit(bearerHeaders(raw), laneFeatures("AS1"))
 	if !out.Authorized {
 		t.Fatalf("should authorize: %s", out.Reason)
 	}
+	if !out.FinalizeBaseline() {
+		t.Fatal("finalize should apply on an authorized, available admission")
+	}
 
-	// Verify clean counter was incremented.
+	// Verify clean counter was incremented by the finalize.
 	ids := term.dep.Lanes.ListLaneIDs("cred_split")
 	if len(ids) != 1 {
 		t.Fatalf("expected 1 lane, got %d", len(ids))
@@ -380,11 +384,15 @@ func TestPromotionUsesCleanCounters(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Simulate: 5 clean authorized requests → AuthorizedCleanRequests=5.
+	// Simulate: 5 clean authorized requests (admit + upstream success finalize)
+	// → AuthorizedCleanRequests=5.
 	for i := 0; i < 5; i++ {
 		out := term.Admit(bearerHeaders(raw), laneFeatures("AS1"))
 		if !out.Authorized {
 			t.Fatalf("request %d: should authorize: %s", i, out.Reason)
+		}
+		if !out.FinalizeBaseline() {
+			t.Fatalf("request %d: finalize should apply", i)
 		}
 	}
 

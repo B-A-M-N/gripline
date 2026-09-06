@@ -271,10 +271,19 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := d.cfg.Transport.RoundTrip(upr)
 	if err != nil {
+		// Upstream never accepted the request: no baseline credit (P0.27 — an
+		// admitted request that fails before any useful workload is not clean
+		// trust-building activity).
 		http.Error(w, "backend_error", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
+
+	// The backend ACCEPTED the request (transport + response head received):
+	// this is the "upstream accepted" lifecycle event (P0.27). Finalize the
+	// deferred baseline credit exactly once — a request that was admitted but
+	// never reached the backend earns no trust.
+	out.FinalizeBaseline()
 
 	// 6. Copy the backend response headers + status, stream the body back.
 	copyResponseHeaders(w.Header(), resp.Header)

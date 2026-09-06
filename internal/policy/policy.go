@@ -60,6 +60,15 @@ type Learning struct {
 	MinCleanRequests     int64         // minimum authorized clean requests
 	MinCleanActiveDays   int           // minimum distinct active days with clean history
 	MaxEstablishmentRisk int           // risk below this threshold for promotion
+
+	// DisqualifyingEvidenceCodes (P0.26): evidence codes that independently
+	// prevent lane promotion while ACTIVE against the lane's subject — a
+	// semantic veto, not a score contribution. A scalar risk bound can
+	// under-represent a single severe signal (averaging hides it); this list
+	// names the codes whose live presence means the lane must not become
+	// trusted baseline material, whatever the aggregate says. Empty list = no
+	// code-level veto (the score bound and security-status gate still apply).
+	DisqualifyingEvidenceCodes []string
 }
 
 // Privacy flags retention policy (§72).
@@ -144,6 +153,19 @@ func Default() *Policy {
 			MinCleanRequests:     200,
 			MinCleanActiveDays:   3,
 			MaxEstablishmentRisk: 15,
+			// P0.26 baseline: the high-severity abuse families veto promotion
+			// while active. Source-discontinuity novelty (NEW_ASN etc.) is
+			// deliberately NOT disqualifying on its own — it is normal churn;
+			// abuse correlation and resource-velocity abuse are.
+			DisqualifyingEvidenceCodes: []string{
+				"MORE_THAN_3_UNRELATED_ASNS_IN_10_MIN",
+				"SIMULTANEOUS_ESTABLISHED_LANE_FROM_UNRELATED_ASN",
+				"SOURCE_ATTEMPTING_MANY_UNRELATED_CREDENTIALS",
+				"CONCURRENCY_OVER_10X_BASELINE",
+				"TOKEN_VELOCITY_OVER_10X_BASELINE",
+				"COST_VELOCITY_OVER_4X_BASELINE_AND_ABSOLUTE_FLOOR",
+				"MANUAL_CONFIRMED_COMPROMISE",
+			},
 		},
 		Privacy:  Privacy{PromptRetention: false, CompletionRetention: false},
 		Identity: Identity{MaxTTLSeconds: 30},
@@ -190,6 +212,14 @@ func Compile(p *Policy) (*CompiledPolicy, error) {
 		for code, rule := range p.EvidenceRules {
 			c.EvidenceRules[code] = rule
 		}
+	}
+	// P0.10/P0.26: DisqualifyingEvidenceCodes is a slice — also a
+	// reference-bearing field. Deep-copy it so the caller cannot mutate live
+	// enforcement's veto list after Compile.
+	if len(p.Learning.DisqualifyingEvidenceCodes) > 0 {
+		codes := make([]string, len(p.Learning.DisqualifyingEvidenceCodes))
+		copy(codes, p.Learning.DisqualifyingEvidenceCodes)
+		c.Learning.DisqualifyingEvidenceCodes = codes
 	}
 	return c, nil
 }
@@ -243,6 +273,14 @@ func (p *Policy) IsValid() bool {
 	}
 	if p.Learning.MinCleanAge < 0 || p.Learning.MinCleanRequests < 0 || p.Learning.MinCleanActiveDays < 0 {
 		return false
+	}
+	// P0.26: every disqualifying code must exist in the compiled evidence rule
+	// table — a veto naming a code the policy cannot mint is dead configuration
+	// (and a typo would silently never fire).
+	for _, code := range p.Learning.DisqualifyingEvidenceCodes {
+		if _, ok := p.EvidenceRules[code]; !ok {
+			return false
+		}
 	}
 	// Hard caps must not go negative.
 	if p.Limits.Normal.ConcurrencyCap < 0 || p.Limits.Constrained.ConcurrencyCap < 0 {

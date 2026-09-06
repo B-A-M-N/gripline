@@ -312,8 +312,8 @@ func TestCleanAuthorizedRecordedOnSuccess(t *testing.T) {
 		t.Fatalf("should authorize: %s", out.Reason)
 	}
 
-	// The lane should have 1 authorized clean request.
-	// List all lanes for this credential (there should be exactly 1).
+	// P0.27: admission alone must NOT count as clean activity — the baseline
+	// credit is deferred to the upstream-success lifecycle event.
 	ids := store.ListLaneIDs("cred_e")
 	if len(ids) != 1 {
 		t.Fatalf("expected 1 lane, got %d (ids: %v)", len(ids), ids)
@@ -322,8 +322,26 @@ func TestCleanAuthorizedRecordedOnSuccess(t *testing.T) {
 	if !ok {
 		t.Fatal("lane record should exist")
 	}
+	if laneRec.AuthorizedCleanRequests != 0 {
+		t.Fatalf("admission alone must not count as clean activity, got %d", laneRec.AuthorizedCleanRequests)
+	}
+
+	// The proxy lifecycle: upstream accepted → finalize. Counters advance once.
+	if !out.FinalizeBaseline() {
+		t.Fatal("finalize after successful admission should apply")
+	}
+	laneRec, _ = store.Get("cred_e", ids[0])
 	if laneRec.AuthorizedCleanRequests != 1 {
-		t.Fatalf("expected 1 clean request, got %d", laneRec.AuthorizedCleanRequests)
+		t.Fatalf("expected 1 clean request after finalize, got %d", laneRec.AuthorizedCleanRequests)
+	}
+
+	// Idempotent: a second finalize (error path + defer) must not double count.
+	if out.FinalizeBaseline() {
+		t.Fatal("finalize must be idempotent")
+	}
+	laneRec, _ = store.Get("cred_e", ids[0])
+	if laneRec.AuthorizedCleanRequests != 1 {
+		t.Fatalf("double finalize must not double count, got %d", laneRec.AuthorizedCleanRequests)
 	}
 }
 
