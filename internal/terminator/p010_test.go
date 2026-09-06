@@ -772,3 +772,82 @@ type syncTestWaitGroup struct {
 func (w *syncTestWaitGroup) Add(n int) { w.wg.Add(n) }
 func (w *syncTestWaitGroup) Done()     { w.wg.Done() }
 func (w *syncTestWaitGroup) Wait()     { w.wg.Wait() }
+
+// P0.11: the lane-MATCH decision must be driven by the COMPILED policy's
+// classification cutoffs, not the package-global lane.DefaultThresholds(). Same
+// store, same sparse candidate: a policy with the default anti-laundering floor
+// (0.70, full source identity) must REJECT the match (creates a new lane),
+// while the same policy's floor being lowered to 0 (equivalent to a policy that
+// does not require the trusted source mass) must allow the collapse. This is
+// the lever a policy author needs to tune per revision.
+func TestCompiledPolicyClassificationDrivesLaneMatch(t *testing.T) {
+	sparse := lane.Features{NetworkASN: "AS77", ClientFamily: "claude-code"} // comparable 0.45
+
+	// (a) Default floor (0.70): sparse must NOT match the rich established lane.
+	{
+		store := lane.NewStore(func() lane.Limits {
+			return lane.Limits{MaxActiveLanesPerCredential: 8, MaxProvisionalLanes: 8, LaneIdleExpiration: 48 * time.Hour}
+		}, time.Now)
+		th := policy.Default().Classification // the compiled policy's cutoffs
+		if _, created, err := store.BorrowOrCreate("cred_1", "lane_rich",
+			lane.Features{NetworkASN: "AS77", NetworkType: "residential", RegionClass: "us",
+				ClientFamily: "claude-code", SDKFamily: "go"}, th); err != nil || !created {
+			t.Fatalf("seed rich: created=%v err=%v", created, err)
+		}
+		if _, created, err := store.BorrowOrCreate("cred_1", "lane_sparse", sparse, th); err != nil {
+			t.Fatal(err)
+		} else if !created {
+			t.Fatal("P0.11: compiled policy floor 0.70 MUST reject sparse match (created=false means it borrowed)")
+		}
+	}
+
+	// (b) Loosened floor (policy revision that demands less source mass): the
+	// SAME sparse candidate's comparable mass (0.45) now clears a 0.40 floor, so
+	// it must borrow. The COMPILED cutoff — not any store global — decides.
+	// (Floor 0 is intentionally FAIL-CLOSED and forbids all matches — P0.9 — so a
+	// positive loosened floor is the correct way to express permissiveness and
+	// still proves the knob is live.)
+	{
+		store := lane.NewStore(func() lane.Limits {
+			return lane.Limits{MaxActiveLanesPerCredential: 8, MaxProvisionalLanes: 8, LaneIdleExpiration: 48 * time.Hour}
+		}, time.Now)
+		th := policy.Default().Classification
+		th.MinComparableWeight = 0.40 // still demands meaningful source mass, but below this candidate's 0.45
+		if _, created, err := store.BorrowOrCreate("cred_1", "lane_rich",
+			lane.Features{NetworkASN: "AS77", NetworkType: "residential", RegionClass: "us",
+				ClientFamily: "claude-code", SDKFamily: "go"}, th); err != nil || !created {
+			t.Fatalf("seed rich: created=%v err=%v", created, err)
+		}
+		rec, created, err := store.BorrowOrCreate("cred_1", "lane_sparse", sparse, th)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if created {
+			t.Fatal("P0.11: floor 0.40 must allow the match (sparse comparable 0.45 >= 0.40)")
+		}
+		if rec.LaneID != "lane_rich" {
+			t.Fatalf("loosened policy must borrow lane_rich, got %s", rec.LaneID)
+		}
+	}
+}
+
+// P0.11 fail-closed wiring: an empty evidence table on the COMPILED policy must
+// reject terminator construction — the data plane can never mint evidence
+// against a policy that defines none, and must not silently fall back to the
+// package-global table.
+func TestNewRejectsPolicyWithoutEvidenceTable(t *testing.T) {
+	p := policy.Default()
+	p.EvidenceRules = nil
+	signer, _ := GenerateSigner()
+	dep := Dependencies{
+		Registry: credential.NewMemoryRegistry(),
+		Peppers:  credential.MustPepperRing(&credential.PepperKey{Version: 1, Key: []byte("p")}),
+		Lanes:    lane.NewStore(nil, time.Now),
+		Policy:   p,
+		Signer:   signer,
+		Audience: "fi-inference",
+	}
+	if _, err := New(dep); err == nil {
+		t.Fatal("P0.11: New must reject a policy with no evidence table (fail-closed)")
+	}
+}

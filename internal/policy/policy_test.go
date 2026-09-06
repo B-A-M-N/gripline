@@ -4,6 +4,9 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/B-A-M-N/gripline/internal/evidence"
+	"github.com/B-A-M-N/gripline/internal/lane"
 )
 
 func TestDefaultPolicyValid(t *testing.T) {
@@ -130,5 +133,53 @@ func TestInvertedRiskThresholdsInvalid(t *testing.T) {
 	p11.Learning.MaxEstablishmentRisk = -1
 	if p11.IsValid() {
 		t.Fatal("negative MaxEstablishmentRisk must be invalid")
+	}
+}
+
+// P0.11: the compiled policy revision must carry BOTH the evidence rule table
+// and the lane-classification cutoffs, so the data plane classifies lanes and
+// mints evidence against the versioned artifact — not package globals. A policy
+// missing these (empty evidence table / degenerate classification) must FAIL
+// CLOSED at validation.
+func TestPolicyCarriesEvidenceRulesAndClassification(t *testing.T) {
+	p := Default()
+	if len(p.EvidenceRules) == 0 {
+		t.Fatal("compiled policy must carry an evidence rule table (P0.11)")
+	}
+	if p.Classification.Match <= p.Classification.Related {
+		t.Fatal("compiled policy classification must have Match > Related (P0.11)")
+	}
+	if p.Classification.MinComparableWeight <= 0 {
+		t.Fatal("compiled policy anti-laundering floor must be non-zero (P0.9/P0.11)")
+	}
+	// The compiled default must agree with the spec baseline so behavior is
+	// unchanged for a default policy.
+	if p.Classification.MinComparableWeight != lane.DefaultThresholds().MinComparableWeight {
+		t.Fatal("compiled default floor diverges from lane.DefaultThresholds baseline")
+	}
+	// NEW_LANE + the core risk codes must be mintable from the compiled table.
+	if _, err := evidence.Mint(p.EvidenceRules, "NEW_LANE", "subject", time.Now(), p.Revision); err != nil {
+		t.Fatalf("compiled evidence table must mint NEW_LANE: %v", err)
+	}
+}
+
+// P0.11 fail-closed: a policy carrying NO evidence rules (or degenerate lane
+// classification) is rejected by IsValid — the data plane must not silently
+// fall back to global defaults.
+func TestPolicyFailsClosedWithoutEvidenceRules(t *testing.T) {
+	noRules := Default()
+	noRules.EvidenceRules = nil
+	if noRules.IsValid() {
+		t.Fatal("policy with nil evidence table must be invalid (P0.11 fail-closed)")
+	}
+	emptyRules := Default()
+	emptyRules.EvidenceRules = map[string]evidence.Rule{}
+	if emptyRules.IsValid() {
+		t.Fatal("policy with empty evidence table must be invalid (P0.11 fail-closed)")
+	}
+	degenerate := Default()
+	degenerate.Classification.Match = degenerate.Classification.Related
+	if degenerate.IsValid() {
+		t.Fatal("policy with Match <= Related classification must be invalid (P0.11)")
 	}
 }

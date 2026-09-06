@@ -8,6 +8,9 @@ package policy
 import (
 	"errors"
 	"time"
+
+	"github.com/B-A-M-N/gripline/internal/evidence"
+	"github.com/B-A-M-N/gripline/internal/lane"
 )
 
 // RiskThresholds are the credential/lane risk-state boundaries (§31).
@@ -87,6 +90,20 @@ type Policy struct {
 	Privacy  Privacy
 	Identity Identity
 
+	// EvidenceRules is the VERSIONED evidence rule table (P0.11): every
+	// security-relevant field of minted evidence — family, scope, score,
+	// severity, confidence, correlation group, TTL — is derived from this table,
+	// never from a package-global default. A nil/empty table fails closed at the
+	// mint site (Mint rejects a missing rule instead of inventing parameters).
+	EvidenceRules evidence.Table
+
+	// Classification carries the lane-similarity cutoffs (Match / Related /
+	// MinComparableWeight) as policy (P0.11). The data plane must classify lanes
+	// against the COMPILED revision's cutoffs — not lane.DefaultThresholds() —
+	// so a policy author can tune anti-laundering sensitivity in the versioned
+	// artifact without a code edit.
+	Classification lane.ClassificationThresholds
+
 	// CreatedAt and signature hooks reserved for authenticated+validated load.
 	CreatedAt time.Time
 }
@@ -121,6 +138,13 @@ func Default() *Policy {
 		},
 		Privacy:  Privacy{PromptRetention: false, CompletionRetention: false},
 		Identity: Identity{MaxTTLSeconds: 30},
+		// EvidenceRules + Classification: the compiled-policy baseline is seeded
+		// from the spec's illustrative tables (§36, §26) so a default policy is
+		// identical to today's behavior; a policy author overrides these fields in
+		// the versioned artifact (P0.11). The data plane reads them from the
+		// compiled revision, never the package globals.
+		EvidenceRules:  evidence.DefaultTable(),
+		Classification: lane.DefaultThresholds(),
 	}
 }
 
@@ -176,6 +200,21 @@ func (p *Policy) IsValid() bool {
 	}
 	// Hard caps must not go negative.
 	if p.Limits.Normal.ConcurrencyCap < 0 || p.Limits.Constrained.ConcurrencyCap < 0 {
+		return false
+	}
+	// P0.11: the compiled policy must carry a usable evidence rule table and
+	// lane-classification cutoffs. A nil/empty evidence table fails closed (the
+	// data plane cannot mint evidence under a policy that defines none), and a
+	// degenerate classification (Match below Related, or a negative floor) is
+	// rejected rather than silently mis-enforced.
+	if len(p.EvidenceRules) == 0 {
+		return false
+	}
+	if p.Classification.Match <= p.Classification.Related {
+		return false
+	}
+	if p.Classification.Related < 0 || p.Classification.Match > 1 ||
+		p.Classification.MinComparableWeight < 0 {
 		return false
 	}
 	return true

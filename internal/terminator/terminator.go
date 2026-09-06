@@ -912,7 +912,10 @@ func (t *Terminator) classifyLane(credID string, feat lane.Features) (string, *l
 		return "lane_" + credID, nil, false, nil
 	}
 	laneID := "lane_" + credID + "_" + shortTag(feat)
-	rec, created, err := t.dep.Lanes.BorrowOrCreate(credID, laneID, feat, lane.DefaultThresholds())
+	// P0.11: classify against the COMPILED policy revision's cutoffs, not the
+	// package-global lane.DefaultThresholds(), so anti-laundering sensitivity
+	// (MinComparableWeight etc.) is policy-tunable and versioned.
+	rec, created, err := t.dep.Lanes.BorrowOrCreate(credID, laneID, feat, t.pol.Classification)
 	if err != nil {
 		return laneID, nil, false, err
 	}
@@ -1021,10 +1024,18 @@ func (t *Terminator) synchronousEvidence(laneNew bool, laneID string) []evidence
 	now := t.dep.RiskNow()
 	// Mint (P0.4) is the ONLY sanctioned producer: every security-relevant field
 	// — family, scope, score, severity, confidence, correlation group, TTL — is
-	// populated from the versioned rule table, never hand-built here. (The table
-	// is still evidence.DefaultTable until the compiled-policy migration lands
-	// in M2/P0.11; the Mint path is what guarantees non-drift.)
-	ev, err := evidence.Mint(evidence.DefaultTable(), "NEW_LANE", laneID, now, t.pol.Revision)
+	// populated from the versioned rule table, never hand-built here.
+	//
+	// P0.11: the rule table comes from the COMPILED policy revision
+	// (t.pol.EvidenceRules), not the package-global evidence.DefaultTable, so a
+	// policy author's evidence tuning is enforced. Fail-closed: if the compiled
+	// policy somehow carries no table, refuse to mint (a missing rule must never
+	// be invented) rather than silently fall back to defaults.
+	table := t.pol.EvidenceRules
+	if len(table) == 0 {
+		return nil
+	}
+	ev, err := evidence.Mint(table, "NEW_LANE", laneID, now, t.pol.Revision)
 	if err != nil {
 		return nil
 	}
