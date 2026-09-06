@@ -30,7 +30,6 @@ func m3Terminator(t *testing.T, reg *credential.MemoryRegistry, id string) (*Ter
 		Audience: "fi-inference",
 		Evidence: evidence.NewMemoryStore(),
 		Resource: gov,
-		SourceID: "src-3",
 	}
 	term, err := New(dep)
 	if err != nil {
@@ -48,7 +47,8 @@ func TestM3MultiscopeHoldCoversPriorityScopes(t *testing.T) {
 	term, _, raw := m3Terminator(t, reg, "cred_m3")
 
 	feat := lane.Features{NetworkASN: "AS1", RegionClass: "us"}
-	out := term.Admit(bearerHeaders(raw), feat)
+	// P0.4: the source identity rides the request, not the Terminator.
+	out := term.AdmitSource(bearerHeaders(raw), feat, TrustedSource{Pseudonym: "src-3"})
 	if !out.Authorized {
 		t.Fatalf("request should authorize: %s", out.Reason)
 	}

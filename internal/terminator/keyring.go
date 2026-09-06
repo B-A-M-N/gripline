@@ -26,18 +26,26 @@ import (
 // after a Rotate uses the CURRENT active key at that instant, so a single token
 // never mixes generations.
 type Keyring struct {
+	st *keyringState // shared state: copies of the handle stay the SAME keyring
+}
+
+// keyringState holds the keyring's actual contents behind one lock. It exists
+// so the exported Keyring can carry value-receiver redaction methods (P0.16)
+// without copying a sync.Mutex (go vet lock-by-value): the exported struct is
+// a thin handle, and copy := *kr yields another handle over the same state —
+// same behavior as before for use, redacting correctly for formatting.
+type keyringState struct {
 	mu        sync.Mutex
-	active    *Signer         // current signing generation (highest kid)
-	verifiers map[int][]byte  // kid -> public key (all retained generations)
-	next      int             // next kid to assign
+	active    *Signer          // current signing generation (highest kid)
+	verifiers map[int][]byte   // kid -> public key (all retained generations)
+	next      int              // next kid to assign
 	now       func() time.Time // clock (tests)
 }
 
 // Format implements fmt.Formatter and always redacts (P0.16 defense in
-// depth). VALUE receiver: the Keyring owns the active private signer; a
-// struct copy must redact identically rather than fall back to struct
-// formatting. (The verifier map is public material, but the active signer is
-// not.)
+// depth). VALUE receiver so a struct copy (copy := *kr) redacts identically
+// rather than fall back to struct formatting that would expose the active
+// private signer. (The verifier map is public material, but the signer is not.)
 func (k Keyring) Format(f fmt.State, verb rune) { fmt.Fprint(f, "<redacted>") }
 
 // String implements fmt.Stringer (value receiver, P0.16).
@@ -46,12 +54,6 @@ func (k Keyring) String() string { return "<redacted>" }
 // GoString implements fmt.GoStringer (%#v; value receiver, P0.16).
 func (k Keyring) GoString() string { return "<redacted>" }
 
-var (
-	_ fmt.Formatter  = Keyring{}
-	_ fmt.Stringer   = Keyring{}
-	_ fmt.GoStringer = Keyring{}
-)
-
 // NewKeyring seeds a keyring with an initial generation (kid 1), freshly
 // generated. The verifier map starts with generation 1's public key.
 func NewKeyring() (*Keyring, error) {
@@ -59,22 +61,22 @@ func NewKeyring() (*Keyring, error) {
 	if err != nil {
 		return nil, err
 	}
-	k := &Keyring{
+	k := &Keyring{st: &keyringState{
 		verifiers: make(map[int][]byte),
 		next:      2,
 		now:       time.Now,
-	}
-	k.active = s
-	k.verifiers[s.Kid()] = []byte(s.Public())
+	}}
+	k.st.active = s
+	k.st.verifiers[s.Kid()] = []byte(s.Public())
 	return k, nil
 }
 
 // WithClock injects a clock for tests.
 func (k *Keyring) WithClock(now func() time.Time) *Keyring {
-	k.mu.Lock()
-	defer k.mu.Unlock()
+	k.st.mu.Lock()
+	defer k.st.mu.Unlock()
 	if now != nil {
-		k.now = now
+		k.st.now = now
 	}
 	return k
 }
@@ -82,36 +84,36 @@ func (k *Keyring) WithClock(now func() time.Time) *Keyring {
 // Issue is the AssertionSigner interface: it signs with the current active
 // generation. The verifier selects the matching public key by the token's kid.
 func (k *Keyring) Issue(c Claims, ttl time.Duration) (*Assertion, error) {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	if k.active == nil {
+	k.st.mu.Lock()
+	defer k.st.mu.Unlock()
+	if k.st.active == nil {
 		return nil, errors.New("terminator: keyring has no active signer")
 	}
-	return k.active.Issue(c, ttl)
+	return k.st.active.Issue(c, ttl)
 }
 
 // ActiveKid reports the current signing generation.
 func (k *Keyring) ActiveKid() int {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	return k.active.Kid()
+	k.st.mu.Lock()
+	defer k.st.mu.Unlock()
+	return k.st.active.Kid()
 }
 
 // Rotate advances the keyring to a NEW random generation with kid = previous+1,
 // retaining every prior public key so outstanding short-lived assertions remain
 // verifiable (P0.59). Returns the new kid.
 func (k *Keyring) Rotate() (int, error) {
-	k.mu.Lock()
-	defer k.mu.Unlock()
+	k.st.mu.Lock()
+	defer k.st.mu.Unlock()
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return 0, fmt.Errorf("terminator: rotate keyring: %w", err)
 	}
-	kid := k.next
-	k.next++
+	kid := k.st.next
+	k.st.next++
 	s := &Signer{priv: priv, Version: kid}
-	k.verifiers[kid] = []byte(s.Public())
-	k.active = s
+	k.st.verifiers[kid] = []byte(s.Public())
+	k.st.active = s
 	return kid, nil
 }
 
@@ -119,12 +121,12 @@ func (k *Keyring) Rotate() (int, error) {
 // resolves to generation 1 for backward-compatible tokens issued without a kid.
 // Returns a copy so the caller cannot mutate the keyring.
 func (k *Keyring) Public(kid int) ([]byte, bool) {
-	k.mu.Lock()
-	defer k.mu.Unlock()
+	k.st.mu.Lock()
+	defer k.st.mu.Unlock()
 	if kid == 0 {
 		kid = 1
 	}
-	b, ok := k.verifiers[kid]
+	b, ok := k.st.verifiers[kid]
 	if !ok {
 		return nil, false
 	}
@@ -137,9 +139,9 @@ func (k *Keyring) Public(kid int) ([]byte, bool) {
 // the verifier has not yet accepted is rejected, never accepted by guessing.
 func (k *Keyring) Verify(encoded, audience string, now time.Time) (*Claims, error) {
 	if now.IsZero() {
-		k.mu.Lock()
-		now = k.now()
-		k.mu.Unlock()
+		k.st.mu.Lock()
+		now = k.st.now()
+		k.st.mu.Unlock()
 	}
 	kid, err := extractKid(encoded)
 	if err != nil {

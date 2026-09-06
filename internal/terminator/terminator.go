@@ -117,6 +117,11 @@ type Dependencies struct {
 	// (P0.35). Nil disables both. Keep it nil unless a control plane is wired.
 	Control *control.ControlPlane
 
+	// SourceID was REMOVED (P0.4): a Terminator serves many clients, and a
+	// process-global source id either disabled source security (empty) or
+	// collapsed every client into one bucket. Source identity now rides the
+	// REQUEST — see AdmitSource/TrustedSource.
+
 	// Spray is an OPTIONAL source-spray / velocity detector (P0.67). When set,
 	// each admission observes (SourceID, credential, feature ASN) and any spray
 	// signature that crosses its window threshold is minted into the evidence
@@ -244,7 +249,44 @@ func newRequestID() string {
 //
 // On exit the presented secret is always zeroed (deferred), regardless of
 // outcome (INV-3).
+//
+// Admit is the no-source entry point: it admits with an UNKNOWN source
+// (P0.4). Source-scoped features — spray detection, SOURCE resource scope,
+// source-scoped risk — are inactive for that request, because there is no
+// identity to attribute them to. Use AdmitSource with a TrustedSource derived
+// at trusted ingress (peer address → pseudonym, ASN, network type) to enable
+// them; a Terminator serves many clients and must never carry one process-wide
+// source identity.
 func (t *Terminator) Admit(headers map[string][]string, feat lane.Features) *Outcome {
+	return t.AdmitSource(headers, feat, TrustedSource{})
+}
+
+// TrustedSource is the per-request source identity, derived at TRUSTED ingress
+// (P0.4) — transport peer metadata (RealIP → pseudonym, ASN lookup, network
+// classification), never client-asserted headers. It keys the SOURCE resource
+// scope, source-spray detection, and source-scoped risk for this request only.
+// The zero value means "source unknown for this request": source-scoped
+// features are inactive rather than attributed to a shared bucket.
+type TrustedSource struct {
+	// Pseudonym is the privacy-preserving source key (pseudonym.Ring output over
+	// the peer address). Empty disables source attribution for the request.
+	Pseudonym string
+	// ASN, NetworkType, RegionClass are the trusted source dimensions, when the
+	// deployment has a trusted source resolver. Empty = unknown.
+	ASN         string
+	NetworkType string
+	Region      string
+}
+
+// sourceID returns the key this request attributes to for SOURCE-scope
+// decisions, or "" when the request carries no trusted source identity.
+func (s TrustedSource) sourceID() string { return s.Pseudonym }
+
+// AdmitSource is the full entry point (P0.4): admission with the per-request
+// trusted source identity. The source lives on the REQUEST — a Terminator is a
+// long-lived engine shared by every client, and a process-global SourceID made
+// every client one source (or disabled source security entirely when empty).
+func (t *Terminator) AdmitSource(headers map[string][]string, feat lane.Features, src TrustedSource) *Outcome {
 	reqID := t.rand()
 	now := t.dep.RiskNow()
 	out := &Outcome{RequestID: reqID}
@@ -324,8 +366,8 @@ func (t *Terminator) Admit(headers map[string][]string, feat lane.Features) *Out
 	// lane).
 	syncEv := t.synchronousEvidence(laneNew, laneID)
 	var persistOnly []evidence.Evidence
-	if t.dep.Spray != nil {
-		if sigs := t.dep.Spray.Observe(t.dep.SourceID, cred.CredentialID, feat.NetworkASN, now); len(sigs) > 0 {
+	if t.dep.Spray != nil && src.sourceID() != "" {
+		if sigs := t.dep.Spray.Observe(src.sourceID(), cred.CredentialID, feat.NetworkASN, now); len(sigs) > 0 {
 			// P0.12: the detector returns signals; THIS compiled policy is the
 			// one policy authority. Each signal resolves against the current
 			// compiled rule table — score/family/scope/TTL and the minting
@@ -649,7 +691,7 @@ func (t *Terminator) Admit(headers map[string][]string, feat lane.Features) *Out
 	// slot against two different reservoirs. A caller wanting BOTH must compose
 	// two governors/inspect the outcome, which is not the default posture.
 	if t.dep.Resource != nil {
-		provErr := t.provisionMultiscope(cred, laneID, laneSec, limits, ctx, reqID, out, adaptiveForObservation, laneRisk, credentialRisk, effectiveRisk, evidenceCodes)
+		provErr := t.provisionMultiscope(cred, laneID, laneSec, limits, ctx, reqID, out, adaptiveForObservation, laneRisk, credentialRisk, effectiveRisk, evidenceCodes, src)
 		if provErr != nil {
 			return provErr
 		}
@@ -757,13 +799,16 @@ func (t *Terminator) Admit(headers map[string][]string, feat lane.Features) *Out
 // tables land in the policy, only the spec construction here changes. Today a
 // single hostile actor cannot exceed the credential cap across its lanes/sources
 // without tripping the shared budget — a conservative first posture.
-func (t *Terminator) provisionMultiscope(cred *credential.Credential, laneID string, laneSec lane.SecurityStatus, limits policy.Limits, ctx principal.AuthorizedContext, reqID string, out *Outcome, adaptiveForObservation AdaptiveStateStatus, laneRisk, credentialRisk, effectiveRisk int, evidenceCodes []string) *Outcome {
+func (t *Terminator) provisionMultiscope(cred *credential.Credential, laneID string, laneSec lane.SecurityStatus, limits policy.Limits, ctx principal.AuthorizedContext, reqID string, out *Outcome, adaptiveForObservation AdaptiveStateStatus, laneRisk, credentialRisk, effectiveRisk int, evidenceCodes []string, src TrustedSource) *Outcome {
 	cap := limits.ConcurrencyCap
 	// Precedence order is preserved by the Governor; we build the list so the
 	// highest-priority scope is first (SOURCE > LANE > CREDENTIAL > ACCOUNT).
+	// The SOURCE scope keys on this REQUEST's source pseudonym (P0.4) — empty
+	// means no trusted source identity for the request, so SOURCE is skipped
+	// rather than bucketed under a shared process-global id.
 	specs := []resource.ScopeSpec{}
-	if t.dep.SourceID != "" {
-		specs = append(specs, resource.ScopeSpec{Scope: resource.ScopeSource, ID: t.dep.SourceID, Buckets: resource.BucketSpec{ConcurrencyCap: cap}})
+	if src.sourceID() != "" {
+		specs = append(specs, resource.ScopeSpec{Scope: resource.ScopeSource, ID: src.sourceID(), Buckets: resource.BucketSpec{ConcurrencyCap: cap}})
 	}
 	if laneID != "" {
 		specs = append(specs, resource.ScopeSpec{Scope: resource.ScopeLane, ID: laneID, Buckets: resource.BucketSpec{ConcurrencyCap: cap}})

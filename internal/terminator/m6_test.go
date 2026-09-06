@@ -177,7 +177,6 @@ func TestM6SprayDetectorPersistsEvidence(t *testing.T) {
 		Audience: "fi-inference",
 		Evidence: store,
 		Resource: resource.NewGovernor(nil),
-		SourceID: "src-m6",
 		Spray:    spray,
 	})
 	if err != nil {
@@ -185,10 +184,11 @@ func TestM6SprayDetectorPersistsEvidence(t *testing.T) {
 	}
 
 	// Establish 5 distinct ASNs for the same credential; the 4th+ crosses the
-	// spray threshold and must persist the evidence.
+	// spray threshold and must persist the evidence. P0.4: each request carries
+	// its own trusted source identity (previously a process-global SourceID).
 	for _, asn := range []string{"AS1", "AS2", "AS3", "AS4", "AS5"} {
 		feat := lane.Features{NetworkASN: asn, NetworkType: "residential", RegionClass: "us"}
-		out := term.Admit(bearerHeaders(raw), feat)
+		out := term.AdmitSource(bearerHeaders(raw), feat, TrustedSource{Pseudonym: "src-m6"})
 		if !out.Authorized {
 			t.Fatalf("spray-establish request on %s should authorize: %s", asn, out.Reason)
 		}
