@@ -8,12 +8,20 @@
 // the reserved Gripline-* namespace from anything arriving from the public side,
 // and it only ever re-injects an authoritatively-signed assertion after a
 // successful admission, on the trusted internal hop to the backend.
+//
+// Termination ordering (P0.6): the credential is extracted and stripped BEFORE
+// any pluggable adapter (FeatureResolver / SourceResolver) runs, and those
+// adapters receive a bounded Observation — never the original *http.Request,
+// whose Header still carries Authorization / x-api-key. An adapter cannot log,
+// copy, or forward what it is never handed.
 package proxy
 
 import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"path"
 	"strings"
 
 	"github.com/B-A-M-N/gripline/internal/lane"
@@ -26,23 +34,53 @@ import (
 // present it post-admission.
 const assertionHeader = "X-Gripline-Assertion"
 
-// FeatureResolver derives the normalized lane feature vector from a request
-// (peer origin, client family, transport). Real ASN/region attribution is a
-// provider adapter; the default resolver covers what is unambiguous from the
-// HTTP surface and treats the rest as unknown (zeros are not scored by
-// lane.Similarity, so unknown features never cause a false match).
-type FeatureResolver interface {
-	Resolve(r *http.Request, peer Peer) lane.Features
+// Observation is the bounded, credential-free view of a request that feature
+// and source resolvers may inspect (P0.6). It carries only non-secret
+// metadata: transport identity and headers the secret carriers have already
+// been stripped from. There is no path from an Observation to the presented
+// credential.
+type Observation struct {
+	// Header is a COPY of the request headers with every secret carrier and
+	// reserved Gripline-* header already stripped. Resolvers may read it freely;
+	// mutating it affects nothing outside this request's classification.
+	Header http.Header
+	// RemoteAddr is the transport peer (host:port), after any trusted-proxy
+	// resolution the deployment configures.
+	RemoteAddr string
+	// ProtoMajor is the HTTP major version of the inbound request.
+	ProtoMajor int
+	// URLPath is the request path (no query), for endpoint-family features.
+	URLPath string
 }
 
-// Peer is the resolved transport-origin view of the request sender.
+// FeatureResolver derives the normalized lane feature vector from a sanitized
+// Observation (P0.6 — previously the raw *http.Request, exposing the
+// credential to every adapter). Real ASN/region attribution is a provider
+// adapter; the default resolver covers what is unambiguous from the HTTP
+// surface and treats the rest as unknown (zeros are not scored by
+// lane.Similarity, so unknown features never cause a false match).
+type FeatureResolver interface {
+	Resolve(obs Observation) lane.Features
+}
+
+// SourceResolver derives the per-request trusted source identity (P0.4) from
+// a sanitized Observation. It is the trusted-ingress seam: a production
+// deployment supplies one backed by its RealIP configuration and an ASN
+// database; the default trusts nothing and returns the zero TrustedSource
+// (source-scoped features inert for that request).
+type SourceResolver interface {
+	ResolveSource(obs Observation) terminator.TrustedSource
+}
+
+// Peer is retained for adapter compatibility; resolvers should prefer the
+// Observation.RemoteAddr field.
 type Peer struct {
 	// IP is the remote address (after any trusted proxy). Empty resolves no
 	// SOURCE scope features (unknown).
 	IP string
 }
 
-// HeaderFeatures implements FeatureResolver from request headers + transport.
+// HeaderFeatures implements FeatureResolver from sanitized request metadata.
 // It is the default: deterministic, no external provider.
 type HeaderFeatures struct{}
 
@@ -51,16 +89,17 @@ type HeaderFeatures struct{}
 // X-Stream) — the classification-critical ones the caller can't spoof easily
 // are the source-identity dims, which default to unknown here (flagged default:
 // real ASN/region attribution is an M4 provider-adapter seam).
-func (HeaderFeatures) Resolve(r *http.Request, _ Peer) lane.Features {
+func (HeaderFeatures) Resolve(obs Observation) lane.Features {
 	f := lane.Features{
 		HTTPVersion: "1.1",
 	}
-	if r.ProtoMajor == 2 {
+	switch obs.ProtoMajor {
+	case 2:
 		f.HTTPVersion = "2"
-	} else if r.ProtoMajor == 3 {
+	case 3:
 		f.HTTPVersion = "3"
 	}
-	ua := strings.ToLower(r.UserAgent())
+	ua := strings.ToLower(obs.Header.Get("User-Agent"))
 	switch {
 	case strings.Contains(ua, "claude-code"):
 		f.ClientFamily = "claude-code"
@@ -72,9 +111,9 @@ func (HeaderFeatures) Resolve(r *http.Request, _ Peer) lane.Features {
 		f.ClientFamily = ""
 	}
 	// Streaming preference from Accept or the SDK advertisement header.
-	if v := r.Header.Get("Accept"); strings.Contains(strings.ToLower(v), "text/event-stream") {
+	if v := obs.Header.Get("Accept"); strings.Contains(strings.ToLower(v), "text/event-stream") {
 		f.Streaming = "streaming"
-	} else if v := r.Header.Get("X-Stream"); v == "true" || v == "1" {
+	} else if v := obs.Header.Get("X-Stream"); v == "true" || v == "1" {
 		f.Streaming = "streaming"
 	} else {
 		f.Streaming = "non-streaming"
@@ -82,11 +121,30 @@ func (HeaderFeatures) Resolve(r *http.Request, _ Peer) lane.Features {
 	return f
 }
 
-// Config wires the data plane. Backend is REQUIRED; Terminator is REQUIRED.
+// NoSource is the default SourceResolver: it derives no trusted source
+// identity, so source-scoped features stay inert per request (P0.4 fail-closed
+// default — an unknown source is not attributed to any bucket).
+type NoSource struct{}
+
+// ResolveSource returns the zero TrustedSource.
+func (NoSource) ResolveSource(Observation) terminator.TrustedSource { return terminator.TrustedSource{} }
+
+// Config wires the data plane. Terminator, BackendURL, and Audience are
+// REQUIRED (P0.7); Transport is the upstream round tripper (defaults to
+// http.DefaultTransport).
 type Config struct {
 	Terminator *terminator.Terminator
-	Backend    http.RoundTripper // upstream transport (e.g. a *http.Transport to the private backend)
-	Features   FeatureResolver   // defaults to HeaderFeatures
+	// BackendURL is the FIXED upstream origin (scheme + host). The client
+	// cannot select the upstream host: the forwarded request's scheme/host are
+	// always the configured backend's, with only the path safely joined and
+	// the query preserved (P0.7).
+	BackendURL *url.URL
+	// Transport forwards to the backend. Nil defaults to http.DefaultTransport.
+	Transport http.RoundTripper
+	Features  FeatureResolver // defaults to HeaderFeatures
+	// Sources derives per-request trusted source identity (P0.4/P0.6). Nil
+	// defaults to NoSource (source-scoped features inert).
+	Sources SourceResolver
 	// Audience must match the terminator's audience, so its assertions verify
 	// at the backend (INV-11 binding).
 	Audience string
@@ -96,91 +154,142 @@ type Config struct {
 // (stateless besides the terminator), so a single instance can serve the whole
 // edge.
 type DataPlane struct {
-	cfg Config
-	feat FeatureResolver
+	cfg    Config
+	feat   FeatureResolver
+	srcs   SourceResolver
+	backend *url.URL
 }
 
 // New validates the required seams and returns a DataPlane. Fail-closed: a
-// missing backend, terminator, or audience is a construction error, not a
+// missing backend URL, terminator, or audience is a construction error, not a
 // degraded runtime (matching the terminator's own P0.6 seam contract).
 func New(cfg Config) (*DataPlane, error) {
 	if cfg.Terminator == nil {
 		return nil, fmt.Errorf("proxy: terminator required")
 	}
-	if cfg.Backend == nil {
-		return nil, fmt.Errorf("proxy: backend round tripper required")
+	if cfg.BackendURL == nil || cfg.BackendURL.Host == "" {
+		return nil, fmt.Errorf("proxy: fixed backend URL required (P0.7)")
+	}
+	if cfg.BackendURL.Scheme != "http" && cfg.BackendURL.Scheme != "https" {
+		return nil, fmt.Errorf("proxy: backend URL scheme must be http/https, got %q", cfg.BackendURL.Scheme)
 	}
 	if cfg.Audience == "" {
 		return nil, fmt.Errorf("proxy: audience required (INV-11)")
 	}
+	if cfg.Transport == nil {
+		cfg.Transport = http.DefaultTransport
+	}
 	if cfg.Features == nil {
 		cfg.Features = HeaderFeatures{}
 	}
-	return &DataPlane{cfg: cfg, feat: cfg.Features}, nil
+	if cfg.Sources == nil {
+		cfg.Sources = NoSource{}
+	}
+	bu := *cfg.BackendURL
+	bu.User = nil
+	bu.RawQuery = ""
+	bu.Fragment = ""
+	bu.Path = strings.TrimSuffix(bu.Path, "/") // joined per-request below
+	return &DataPlane{cfg: cfg, feat: cfg.Features, srcs: cfg.Sources, backend: &bu}, nil
 }
 
 // ServeHTTP implements the data-plane admission. It is safe to use as an
 // http.Handler.
 //
-// Flow: extract credential → strip secret + reserved headers → terminate
-// (admit) → on denial respond with a safe status → on success re-inject the
-// signed assertion on the trusted hop → forward → stream back. The resource
-// hold is released when the upstream response body finishes.
+// Flow: extract credential → strip secret + reserved headers → build the
+// sanitized Observation → resolve features/source from sanitized metadata only
+// (P0.6) → terminate (admit) → on denial respond with a safe status → on
+// success defer the reservation release (P0.8/P0.9: panic-safe, idempotent) →
+// re-inject the signed assertion on the trusted hop → forward to the FIXED
+// backend (P0.7) → stream back.
 func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 1. Copy headers so stripping never mutates the caller's request, and so we
 	// keep a normalized map for extraction + a pristine one for the backend.
 	headers := copyHeaders(r.Header)
-	peer := Peer{IP: remoteIP(r)}
 
-	// 2. Terminate. Admit derives the feature vector, but the terminator needs
-	// the normalized headers map (it strips internally). We strip here AND let
-	// the terminator's own Admit do the authoritative terminal strip.
-	feat := d.feat.Resolve(r, peer)
-	out := d.cfg.Terminator.Admit(headers, feat)
+	// 2. Terminate the credential BEFORE any adapter sees the request (P0.6):
+	// the extraction strips the secret carriers from our copy, and only that
+	// sanitized copy is handed to resolvers.
+	presented, _, err := terminator.ExtractExternalCredential(headers)
+	if err != nil {
+		// Even on extraction failure the terminator's safe-reason mapping is
+		// reused so no header detail leaks into the response.
+		out := &terminator.Outcome{Authorized: false, Reason: "invalid_credential", DenialErr: err}
+		d.writeDenial(w, out)
+		return
+	}
+	presented.Zero() // the proxy never needs the raw secret again
+
+	obs := Observation{
+		Header:     headers,
+		RemoteAddr: remoteIP(r),
+		ProtoMajor: r.ProtoMajor,
+		URLPath:    r.URL.Path,
+	}
+	feat := d.feat.Resolve(obs)
+	src := d.srcs.ResolveSource(obs)
+
+	out := d.cfg.Terminator.AdmitSource(headers, feat, src)
 
 	if !out.Authorized {
 		d.writeDenial(w, out)
 		return
 	}
 
-	// 3. Resolve the (now stripped + re-injected) upstream headers: every secret
+	// 3. Panic-safe reservation lifecycle (P0.8/P0.9): one abstraction for every
+	// reservation shape, released exactly once via defer before ANY subsequent
+	// code can leak it. Release is idempotent.
+	reservation := out.Reservation()
+	defer reservation.Release()
+
+	// 4. Resolve the (now stripped + re-injected) upstream headers: every secret
 	// carrier and any forged Gripline-* header is gone; the signed assertion is
 	// freshly minted.
 	upstreamHeaders := copyHeaders(r.Header)
 	terminator.StripSecretHeaders(upstreamHeaders)
-	upstreamHeaders["X-Gripline-Assertion"] = []string{out.Assertion.Encode()}
+	upstreamHeaders[assertionHeader] = []string{out.Assertion.Encode()}
 
-	// 4. Build and forward the upstream request, streaming the body.
+	// 5. Build and forward the upstream request, streaming the body. The
+	// upstream origin is the CONFIGURED backend (P0.7): scheme and host come
+	// from BackendURL, the path is safely joined, and the client's query is
+	// preserved. The client cannot redirect the proxy at another host.
 	upr := r.Clone(r.Context())
 	upr.Header = upstreamHeaders
+	upr.URL = &url.URL{
+		Scheme:   d.backend.Scheme,
+		Host:     d.backend.Host,
+		Path:     joinPath(d.backend.Path, r.URL.Path),
+		RawQuery: r.URL.RawQuery,
+	}
+	// The Host HEADER must also be the backend's (not the client's chosen
+	// origin) — Transport routes by URL.Host but writes req.Host as the Host
+	// header, so leaving the client's value here would leak a wrong (or
+	// attacker-chosen) Host to the backend. The backend URL's own Host header
+	// override (its URL.Host) is what a plain reverse proxy would send.
+	upr.Host = d.backend.Host
 	upr.RequestURI = "" // illegal for client requests after Server round-trip
 
-	resp, err := d.cfg.Backend.RoundTrip(upr)
+	resp, err := d.cfg.Transport.RoundTrip(upr)
 	if err != nil {
-		// Release the multi-scope hold on transport failure — capacity must not
-		// leak for a request that never reached the backend.
-		if out.ResourceRes != nil {
-			out.ResourceRes.Release()
-		}
 		http.Error(w, "backend_error", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
-	// 5. Copy the backend response headers + status, stream the body back.
+	// 6. Copy the backend response headers + status, stream the body back.
 	copyResponseHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
 
-	// 6. Release the multi-scope hold at end-of-stream once the response has been
-	// fully streamed back. Release is idempotent, so the transport-error well is
-	// double-released safely. A hosting server that wants the concurrency to span
-	// its own response handling must call out.ResourceRes.Release() itself; for
-	// the minimal in-process path the default keeps the hold for exactly the
-	// request lifecycle.
-	if out.ResourceRes != nil {
-		out.ResourceRes.Release()
+// joinPath joins a configured backend base path with the request path without
+// allowing traversal out of the base (P0.7). The result is always rooted and
+// cleaned.
+func joinPath(base, req string) string {
+	if base == "" {
+		return path.Clean("/" + req)
 	}
+	return path.Clean(base + "/" + req)
 }
 
 // writeDenial maps an admission denial to an HTTP status + safe reason. Internal

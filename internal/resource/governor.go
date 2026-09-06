@@ -316,3 +316,14 @@ func (r *MultiReservation) Leases() []*LeaseHandle {
 	}
 	return out
 }
+// InUseAll reports the total concurrency currently held across every scope
+// pool (diagnostics/leak-detection in tests).
+func (g *Governor) InUseAll() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	total := 0
+	for _, p := range g.pools {
+		total += p.InUse()
+	}
+	return total
+}

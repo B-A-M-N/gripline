@@ -3,6 +3,7 @@ package proxy
 import (
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -65,6 +66,37 @@ func buildTerminator(t *testing.T, signer *terminator.Signer) *terminator.Termin
 	return buildTerminatorWithSigner(t, signer)
 }
 
+// buildTerminatorWithGovernor wires a terminator around a shared governor so
+// leak tests can inspect held capacity.
+func buildTerminatorWithGovernor(t *testing.T, signer terminator.AssertionSigner, gov *resource.Governor) *terminator.Terminator {
+	t.Helper()
+	pep := &credential.PepperKey{Version: 1, Key: []byte("dp-pepper")}
+	raw := dpRaw()
+	reg := credential.NewMemoryRegistry()
+	if err := reg.Insert(&credential.CredentialRecord{
+		CredentialID: "cred_dp", AccountID: "acct_dp",
+		Verifier: credential.Verifier(secret.NewFromBytes([]byte(raw)), pep), VerifierVersion: 1, PepperVersion: 1,
+		Status:    credential.StatusNormal,
+		PolicyID:  "fi-default-v1", PlanID: "plan-a",
+		CreatedAt: time.Now().Add(-time.Hour), Revision: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	term, err := terminator.New(terminator.Dependencies{
+		Registry: reg, Peppers: credential.MustPepperRing(pep),
+		Lanes:    lane.NewStore(nil, time.Now),
+		Policy:   policy.Default(),
+		Signer:   signer,
+		Audience: testAudience,
+		Evidence: evidence.NewMemoryStore(),
+		Resource: gov,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return term
+}
+
 // TestDataPlaneExternalSecretNeverCrosses is the capstone containment proof:
 // the external credential at ingress is terminated, the signed internal
 // assertion replaces it on the trusted hop, the private backend verifies the
@@ -93,9 +125,13 @@ func TestDataPlaneExternalSecretNeverCrosses(t *testing.T) {
 	}))
 	defer backend.Close()
 
+	bu, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
 	dp, err := New(Config{
 		Terminator: buildTerminator(t, signer),
-		Backend:    http.DefaultTransport,
+		BackendURL: bu,
 		Audience:   testAudience,
 	})
 	if err != nil {
@@ -106,8 +142,10 @@ func TestDataPlaneExternalSecretNeverCrosses(t *testing.T) {
 	raw := dpRaw()
 
 	// Client request carries the EXTERNAL credential AND a forged reserved
-	// internal header (INV-12 impersonation attempt).
-	req := httptest.NewRequest("POST", backend.URL+"/v1/messages", strings.NewReader(`{"text":"hi"}`))
+	// internal header (INV-12 impersonation attempt). P0.7: the client targets
+	// the PROXY with a relative-style origin (the proxy's own address is
+	// irrelevant to routing); the upstream is chosen by config, not the client.
+	req := httptest.NewRequest("POST", "http://gripline.local/v1/messages", strings.NewReader(`{"text":"hi"}`))
 	req.Header.Set("Authorization", "Bearer "+raw)
 	req.Header.Set("X-Gripline-Principal", "forged-account-id")
 
@@ -157,9 +195,13 @@ func TestDataPlaneBackendFollowsSignerRotation(t *testing.T) {
 	}))
 	defer backend.Close()
 
+	bu, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
 	dp, err := New(Config{
 		Terminator: buildTerminatorWithSigner(t, keyring),
-		Backend:    http.DefaultTransport,
+		BackendURL: bu,
 		Audience:   testAudience,
 	})
 	if err != nil {
@@ -168,7 +210,7 @@ func TestDataPlaneBackendFollowsSignerRotation(t *testing.T) {
 
 	raw := dpRaw()
 
-	req := httptest.NewRequest("POST", backend.URL+"/v1/messages", strings.NewReader(`{"x":1}`))
+	req := httptest.NewRequest("POST", "http://gripline.local/v1/messages", strings.NewReader(`{"x":1}`))
 	req.Header.Set("Authorization", "Bearer "+raw)
 	rec := httptest.NewRecorder()
 	dp.ServeHTTP(rec, req)
@@ -187,7 +229,7 @@ func TestDataPlaneDenialMapsStatus(t *testing.T) {
 	signer, _ := terminator.GenerateSigner()
 	dp, err := New(Config{
 		Terminator: buildTerminator(t, signer),
-		Backend:    &http.Transport{},
+		BackendURL: &url.URL{Scheme: "http", Host: "backend.internal"},
 		Audience:   testAudience,
 	})
 	if err != nil {
@@ -202,5 +244,114 @@ func TestDataPlaneDenialMapsStatus(t *testing.T) {
 	}
 	if rec.Header().Get("X-Gripline-Reason") == "" {
 		t.Fatal("denial must carry a safe reason header")
+	}
+}
+// P0.7 regression: the client cannot select the upstream host. A request
+// addressed at ANY origin is forwarded to the CONFIGURED backend only — the
+// client-supplied scheme/host are discarded and the path is safely joined.
+func TestDataPlaneClientCannotSelectUpstreamHost(t *testing.T) {
+	signer, _ := terminator.GenerateSigner()
+
+	var gotPath, gotHost string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHost, gotPath = r.Host, r.URL.Path
+		ver := NewBackendVerifier(signer.Public(), testAudience)
+		if _, verr := ver.Verify(r); verr != nil {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	bu, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dp, err := New(Config{
+		Terminator: buildTerminator(t, signer),
+		BackendURL: bu,
+		Audience:   testAudience,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	raw := dpRaw()
+	// The attacker addresses the proxy at an "upstream-looking" origin and a
+	// traversal-flavored path; neither may influence where the request lands.
+	req := httptest.NewRequest("POST", "http://evil.example/../../v1/messages", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer "+raw)
+	rec := httptest.NewRecorder()
+	dp.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("request should succeed: %d %s", rec.Code, rec.Body.String())
+	}
+	if gotHost != bu.Host {
+		t.Fatalf("upstream host = %q, want configured backend %q (client host must be discarded)", gotHost, bu.Host)
+	}
+	if gotPath != "/v1/messages" {
+		t.Fatalf("upstream path = %q, want cleaned /v1/messages (no traversal)", gotPath)
+	}
+}
+
+// P0.8/P0.9 regression: the reservation is released exactly once through the
+// unified lifecycle, on a successful stream AND on a backend transport error.
+func TestDataPlaneReservationReleasedOnSuccessAndTransportError(t *testing.T) {
+	signer, _ := terminator.GenerateSigner()
+
+	// Successful backend: request completes, release must happen (governor
+	// balance returns to full).
+	gov := resource.NewGovernor(nil)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	bu, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	term := buildTerminatorWithGovernor(t, signer, gov)
+	dp, err := New(Config{Terminator: term, BackendURL: bu, Audience: testAudience})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := dpRaw()
+
+	run := func() int {
+		req := httptest.NewRequest("POST", "http://gripline.local/v1/messages", strings.NewReader(`{}`))
+		req.Header.Set("Authorization", "Bearer "+raw)
+		rec := httptest.NewRecorder()
+		dp.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	if c := run(); c != http.StatusOK {
+		t.Fatalf("success run: %d", c)
+	}
+	if inUse := gov.InUseAll(); inUse != 0 {
+		t.Fatalf("P0.9: reservation leaked after successful stream: %d slots in use", inUse)
+	}
+
+	// Transport error path: unreachable backend port; the reservation must
+	// still release (P0.8: one lifecycle, no leak on error branches).
+	bad, err := url.Parse("http://127.0.0.1:1") // nothing listens here
+	if err != nil {
+		t.Fatal(err)
+	}
+	dpBad, err := New(Config{Terminator: buildTerminatorWithGovernor(t, signer, gov), BackendURL: bad, Audience: testAudience})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("POST", "http://gripline.local/v1/messages", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer "+raw)
+	rec := httptest.NewRecorder()
+	dpBad.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("transport error should map to 502, got %d", rec.Code)
+	}
+	if inUse := gov.InUseAll(); inUse != 0 {
+		t.Fatalf("P0.8: reservation leaked on transport error: %d slots in use", inUse)
 	}
 }

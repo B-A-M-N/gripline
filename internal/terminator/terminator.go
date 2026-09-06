@@ -56,6 +56,24 @@ type Outcome struct {
 	LaneRisk       int
 }
 
+// Reservation returns the ONE lifecycle handle for whatever this admission is
+// holding (P0.8): the multi-scope governor reservation when one was taken,
+// otherwise the legacy single-scope concurrency lease, otherwise a no-op. The
+// proxy (or any caller) defers Release on this — it never needs to know which
+// reservation shape was used, and no error/panic path can leak the hold.
+func (o *Outcome) Reservation() resource.AdmissionReservation {
+	if o == nil {
+		return resource.NoopReservation{}
+	}
+	if o.ResourceRes != nil {
+		return o.ResourceRes
+	}
+	if o.Lease != nil {
+		return o.Lease
+	}
+	return resource.NoopReservation{}
+}
+
 // Mode is the explicit deployment posture (P0.6). Each mode declares which
 // dependencies are security-critical; New fails construction when any is
 // missing, so an ENFORCE instance can never silently start without its

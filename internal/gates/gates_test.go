@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -199,12 +200,16 @@ func TestGateG_NoExternalCredentialDownstream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dp, err := proxy.New(proxy.Config{Terminator: term, Backend: http.DefaultTransport, Audience: gateAudience})
+	bu, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dp, err := proxy.New(proxy.Config{Terminator: term, BackendURL: bu, Audience: gateAudience})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	req := httptest.NewRequest("POST", backend.URL+"/v1/messages", strings.NewReader(`{"x":1}`))
+	req := httptest.NewRequest("POST", "http://gripline.local/v1/messages", strings.NewReader(`{"x":1}`))
 	req.Header.Set("Authorization", "Bearer "+raw)
 	req.Header.Set("X-Gripline-Principal", "forged")
 	rec := httptest.NewRecorder()
@@ -328,9 +333,9 @@ func TestGateI_LaneScopedCompromiseDoesNotDisableEstablished(t *testing.T) {
 // full source identity is what lets the lane MATCH across requests here.
 type sourceResolv struct{}
 
-func (sourceResolv) Resolve(r *http.Request, _ proxy.Peer) lane.Features {
+func (sourceResolv) Resolve(obs proxy.Observation) lane.Features {
 	return lane.Features{
-		NetworkASN:   r.Header.Get("X-Source-ASN"),
+		NetworkASN:   obs.Header.Get("X-Source-ASN"),
 		NetworkType:  "residential",
 		RegionClass:  "us",
 		ClientFamily: "claude-code",
@@ -384,9 +389,13 @@ func TestGateI_LaneScopedRestrictionThroughProxy(t *testing.T) {
 	}))
 	defer backend.Close()
 
+	bu, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
 	dp, err := proxy.New(proxy.Config{
 		Terminator: term,
-		Backend:    http.DefaultTransport,
+		BackendURL: bu,
 		Audience:   gateAudience,
 		Features:   sourceResolv{},
 	})
@@ -396,7 +405,7 @@ func TestGateI_LaneScopedRestrictionThroughProxy(t *testing.T) {
 
 	// admit runs one request through the real proxy with the given source ASN.
 	admit := func(asn string) (int, string) {
-		req := httptest.NewRequest("POST", backend.URL+"/v1/messages", strings.NewReader(`{"x":1}`))
+		req := httptest.NewRequest("POST", "http://gripline.local/v1/messages", strings.NewReader(`{"x":1}`))
 		req.Header.Set("Authorization", "Bearer "+raw)
 		req.Header.Set("X-Source-ASN", asn)
 		rec := httptest.NewRecorder()
@@ -422,9 +431,9 @@ func TestGateI_LaneScopedRestrictionThroughProxy(t *testing.T) {
 	// the proxy uses. Seed lane-scoped evidence under that id.
 	// Build the resolved feature the way the proxy does (Header.Set canonicalizes
 	// the key), so the probe targets the SAME lane the proxy established.
-	probeReq := httptest.NewRequest("POST", "/", nil)
-	probeReq.Header.Set("X-Source-ASN", "AS-PROXY-B")
-	laneBFeatures := sourceResolv{}.Resolve(probeReq, proxy.Peer{})
+	laneBFeatures := sourceResolv{}.Resolve(proxy.Observation{
+		Header: http.Header{"X-Source-Asn": {"AS-PROXY-B"}}, // canonical key, as Header.Set stores it
+	})
 	probe := term.Admit(map[string][]string{"Authorization": {"Bearer " + raw}}, laneBFeatures)
 	if !probe.Authorized {
 		t.Fatalf("pre-block lane B should authorize: %s", probe.Reason)
@@ -463,9 +472,9 @@ func TestGateI_LaneScopedRestrictionThroughProxy(t *testing.T) {
 	// (4) Lane A is untouched and still accepted end-to-end through the proxy.
 	before = hit["AS-PROXY-A"]
 	// Direct admit for AS-PROXY-A (canonical header, matching the proxy path).
-	diagReq := httptest.NewRequest("POST", "/", nil)
-	diagReq.Header.Set("X-Source-ASN", "AS-PROXY-A")
-	diagFeat := sourceResolv{}.Resolve(diagReq, proxy.Peer{})
+	diagFeat := sourceResolv{}.Resolve(proxy.Observation{
+		Header: http.Header{"X-Source-Asn": {"AS-PROXY-A"}}, // canonical key, as Header.Set stores it
+	})
 	if da := term.Admit(map[string][]string{"Authorization": {"Bearer " + raw}}, diagFeat); !da.Authorized {
 		t.Fatalf("pre-check direct lane A must authorize: %s", da.Reason)
 	}
@@ -614,7 +623,12 @@ func gateProxyUpstream(t *testing.T, credID, raw string, backend http.Handler) h
 	if err != nil {
 		t.Fatal(err)
 	}
-	dp, err := proxy.New(proxy.Config{Terminator: term, Backend: roundTripper(backend), Audience: gateAudience})
+	dp, err := proxy.New(proxy.Config{
+		Terminator: term,
+		BackendURL: &url.URL{Scheme: "http", Host: "gate-backend.internal"},
+		Transport:  roundTripper(backend),
+		Audience:   gateAudience,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
