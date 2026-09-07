@@ -83,6 +83,51 @@ func TestEvidenceStoreRoundTripAndExpiry(t *testing.T) {
 	}
 }
 
+// TestEvidencePruneDeletesExpiredRowsAmongActiveRows proves pruning removes
+// the physical expired Bolt row even when the subject still has live evidence.
+// A logical Snapshot-only check would miss this restart resurrection bug.
+func TestEvidencePruneDeletesExpiredRowsAmongActiveRows(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/state.db"
+	now := time.Now()
+	s, err := Open(path, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	subj := []evidence.SubjectKey{{Scope: evidence.ScopeCredential, ID: "cred_mixed"}}
+	active := testEvidence("ev_active", evidence.ScopeCredential, "cred_mixed", now.Add(time.Hour))
+	active.CreatedAt = now.Add(-time.Minute)
+	expired := testEvidence("ev_expired", evidence.ScopeCredential, "cred_mixed", now.Add(-time.Minute))
+	expired.CreatedAt = now.Add(-time.Hour)
+	if err := s.Append(active, expired); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := s.CountEvidence(); err != nil || n != 2 {
+		t.Fatalf("before prune count=%d err=%v, want 2", n, err)
+	}
+	if n, err := s.Prune(subj, now); err != nil || n != 1 {
+		t.Fatalf("prune=%d err=%v, want one expired row", n, err)
+	}
+	if n, err := s.CountEvidence(); err != nil || n != 1 {
+		t.Fatalf("after prune count=%d err=%v, want 1", n, err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = Open(path, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if n, err := s.CountEvidence(); err != nil || n != 1 {
+		t.Fatalf("reopen count=%d err=%v, want 1", n, err)
+	}
+	got, err := s.Snapshot(subj, now)
+	if err != nil || len(got) != 1 || got[0].EvidenceID != "ev_active" {
+		t.Fatalf("reopened snapshot=%v err=%v, want active evidence only", got, err)
+	}
+}
+
 // TestEvidenceStoreSharedSemantics proves the Bolt backend behaves like the
 // memory store: atomic batch validation, per-subject compaction that never
 // evicts NonEvictable items, and error-on-invalid.

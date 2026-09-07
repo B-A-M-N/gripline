@@ -8,16 +8,14 @@ import (
 	"github.com/B-A-M-N/gripline/internal/evidence"
 )
 
-// ctxFor returns a bounded context for an authoritative-state operation so an
-// abandoned or slow admission cannot leave the state write running indefinitely
-// (request-cancellation requirement). The state write is short but must not
-// block forever on a stalled backend. The cancel fires automatically at the
-// deadline (no returned cancel to leak); the only read is the deadline itself.
-func ctxFor(now time.Time) context.Context {
+func ctxForRequest(now time.Time, requestID string) context.Context {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	// Self-releasing: the cancel is invoked once the deadline passes so the
 	// goroutine/context is reclaimed even though callers never hold a ref to it.
 	time.AfterFunc(5*time.Second, cancel)
+	if requestID != "" {
+		ctx = credential.WithRequestID(ctx, requestID)
+	}
 	return ctx
 }
 
@@ -55,7 +53,7 @@ func dedupAppend(existing, incoming []evidence.Evidence) []evidence.Evidence {
 	return out
 }
 
-// policyRevisionFilter returns the evidence that may drive the authoritative
+// activeEvidenceAcrossPolicyRevisions returns the evidence that may drive the authoritative
 // state machine. Semantics (P0.11, supersedes the old current-revision-only
 // filter): evidence keeps the CONCRETE score/family/scope assigned by the
 // policy revision that minted it and remains active until its TTL ends. A
@@ -70,7 +68,7 @@ func dedupAppend(existing, incoming []evidence.Evidence) []evidence.Evidence {
 // hand-construction artifact) is preserved — zero-revision records are
 // documented operator/operator-IOC evidence that predates revision tagging.
 // Dedup and TTL handling are unchanged; only revision-based erasure is gone.
-func policyRevisionFilter(items []evidence.Evidence, rev int) []evidence.Evidence {
+func activeEvidenceAcrossPolicyRevisions(items []evidence.Evidence, rev int) []evidence.Evidence {
 	if len(items) == 0 {
 		return items
 	}

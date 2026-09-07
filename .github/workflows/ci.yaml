@@ -28,11 +28,26 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      - name: go mod tidy check
+        run: go mod tidy -diff
+
+      - name: diff check
+        run: git diff --check
+
       - name: staticcheck
         run: staticcheck ./...
 
       - name: go build
         run: go build ./...
+
+      - name: definitive causal demo
+        run: go run ./cmd/gripline-demo --headless
+
+      - name: container build
+        run: docker build -t gripline-ci -f deploy/Dockerfile .
+
+      - name: container runtime smoke
+        run: bash deploy/container-smoke.sh gripline-ci
 
       - name: go test -race (full)
         run: go test -race ./...

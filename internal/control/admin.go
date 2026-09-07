@@ -27,6 +27,8 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"github.com/B-A-M-N/gripline/internal/credential"
 )
 
 // AuditRepository is the durable, append-only audit destination (P0.47).
@@ -137,6 +139,10 @@ const (
 	CapEvidence Capability = "evidence.operator"
 	// CapPolicyInstall: policy install / rollback.
 	CapPolicyInstall Capability = "policy.install"
+	// CapAuditRead: read operator and automatic security audit history.
+	CapAuditRead Capability = "audit.read"
+	// CapIdentityKeysRotate: rotate the live assertion signing generation.
+	CapIdentityKeysRotate Capability = "identity.keys.rotate"
 )
 
 // ErrUnauthenticated is returned when credentials are absent or invalid.
@@ -178,7 +184,7 @@ func NewTokenAuthenticator(tokens map[string]*Identity) (*TokenAuthenticator, er
 		if id == nil || id.Name == "" {
 			return nil, errors.New("control: operator identity requires a name")
 		}
-		a.digest[tokenDigest(tok)] = id
+		a.digest[tokenDigest(tok)] = cloneIdentity(id)
 	}
 	return a, nil
 }
@@ -189,7 +195,7 @@ func NewTokenAuthenticator(tokens map[string]*Identity) (*TokenAuthenticator, er
 func ParseCapability(s string) (Capability, error) {
 	capability := Capability(s)
 	switch capability {
-	case CapCredentialLifecycle, CapLaneLifecycle, CapPosture, CapEvidence, CapPolicyInstall:
+	case CapCredentialLifecycle, CapLaneLifecycle, CapPosture, CapEvidence, CapPolicyInstall, CapAuditRead, CapIdentityKeysRotate:
 		return capability, nil
 	default:
 		return "", fmt.Errorf("control: unknown capability %q", s)
@@ -215,7 +221,14 @@ func (a *TokenAuthenticator) Authenticate(_ context.Context, token string) (*Ide
 	if !ok {
 		return nil, ErrUnauthenticated
 	}
-	return id, nil
+	return cloneIdentity(id), nil
+}
+
+func cloneIdentity(id *Identity) *Identity {
+	if id == nil {
+		return nil
+	}
+	return &Identity{Name: id.Name, Capabilities: append([]Capability(nil), id.Capabilities...)}
 }
 
 // Authorize checks the identity holds the capability. Deny-by-default.
@@ -307,6 +320,9 @@ func WithPosturePersister(fn func(ctx context.Context, target Posture, actor, re
 // operator seams (CredentialOperator/LaneOperator + separate audit append)
 // remain only for non-durable test/dev wiring.
 type MutationStore interface {
+	// ProvisionCredentialWithAudit inserts a new credential and its audit row
+	// atomically. Existing ids are rejected; provisioning is never replacement.
+	ProvisionCredentialWithAudit(ctx context.Context, rec credential.CredentialRecord, audit OperatorRecord) error
 	// RevokeCredentialWithAudit revokes a credential and commits its audit row
 	// atomically.
 	RevokeCredentialWithAudit(ctx context.Context, credID string, audit OperatorRecord) error
@@ -318,6 +334,28 @@ type MutationStore interface {
 	// SetPostureWithAudit persists a new operator posture and commits its audit
 	// row atomically.
 	SetPostureWithAudit(ctx context.Context, posture Posture, audit OperatorRecord) error
+}
+
+// ProvisionCredential adds a verifier-only credential through the authenticated
+// lifecycle surface. Raw secrets are intentionally absent from this API.
+func (s *Service) ProvisionCredential(ctx context.Context, token string, rec credential.CredentialRecord, reason string) error {
+	id, err := s.authorize(ctx, token, CapCredentialLifecycle, reason)
+	if err != nil {
+		s.record("", "credential.add", rec.CredentialID, reason, false, err.Error())
+		return err
+	}
+	if s.mutations == nil {
+		s.record(id.Name, "credential.add", rec.CredentialID, reason, false, "no transactional credential provisioner wired")
+		return errors.New("control: credential provisioning requires a transactional state store")
+	}
+	if err := s.mutations.ProvisionCredentialWithAudit(ctx, rec, OperatorRecord{
+		At: s.now().UTC(), Actor: id.Name, Action: "credential.add", Target: rec.CredentialID,
+		Reason: reason, Posture: s.plane.Posture().String(), Committed: true,
+	}); err != nil {
+		s.record(id.Name, "credential.add", rec.CredentialID, reason, false, err.Error())
+		return err
+	}
+	return nil
 }
 
 // WithMutationStore wires the transactional mutation seam (P0.18). When set,
@@ -430,6 +468,7 @@ func (s *Service) SetEmergency(ctx context.Context, token string, on bool, reaso
 			At: s.now().UTC(), Actor: id.Name, Action: "posture.set_emergency",
 			Target: "global", Reason: reason, Posture: target.String(), Committed: true,
 		}); err != nil {
+			s.record(id.Name, "posture.set_emergency", "global", reason, false, err.Error())
 			return s.plane.Posture(), fmt.Errorf("control: posture persist + audit failed, action aborted: %w", err)
 		}
 		posture := s.plane.SetEmergency(on, id.Name, reason)
@@ -437,6 +476,7 @@ func (s *Service) SetEmergency(ctx context.Context, token string, on bool, reaso
 	}
 	if s.posturePersist != nil {
 		if err := s.posturePersist(ctx, target, id.Name, reason); err != nil {
+			s.record(id.Name, "posture.set_emergency", "global", reason, false, err.Error())
 			return s.plane.Posture(), fmt.Errorf("control: posture persist + audit failed, action aborted: %w", err)
 		}
 		posture := s.plane.SetEmergency(on, id.Name, reason)
@@ -448,10 +488,36 @@ func (s *Service) SetEmergency(ctx context.Context, token string, on bool, reaso
 		At: s.now().UTC(), Actor: id.Name, Action: "posture.set_emergency",
 		Target: "global", Reason: reason, Posture: target.String(), Committed: true,
 	}); err != nil {
+		s.record(id.Name, "posture.set_emergency", "global", reason, false, err.Error())
 		return s.plane.Posture(), fmt.Errorf("control: audit commit failed, action aborted: %w", err)
 	}
 	posture := s.plane.SetEmergency(on, id.Name, reason)
 	return posture, nil
+}
+
+// RotateIdentityKeys rotates a live signer through the supplied atomic
+// persist-and-publish callback. The callback must persist the candidate key
+// generation before making it active; a failed persistence therefore cannot
+// silently publish an identity that restart would forget.
+func (s *Service) RotateIdentityKeys(ctx context.Context, token, reason string, rotate func() (int, error)) (int, error) {
+	id, err := s.authorize(ctx, token, CapIdentityKeysRotate, reason)
+	if err != nil {
+		s.record("", "identity.keys.rotate", "signer", reason, false, err.Error())
+		return 0, err
+	}
+	if rotate == nil {
+		s.record(id.Name, "identity.keys.rotate", "signer", reason, false, "no signer rotation implementation")
+		return 0, errors.New("control: signer rotation unavailable")
+	}
+	kid, err := rotate()
+	if err != nil {
+		s.record(id.Name, "identity.keys.rotate", "signer", reason, false, err.Error())
+		return 0, err
+	}
+	if err := s.commitAudit(ctx, id.Name, "identity.keys.rotate", "signer", reason); err != nil {
+		return 0, fmt.Errorf("control: signer rotated but audit commit failed: %w", err)
+	}
+	return kid, nil
 }
 
 // RevokeCredential revokes a credential under full control-plane discipline.

@@ -10,6 +10,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -25,25 +26,34 @@ import (
 	"github.com/B-A-M-N/gripline/internal/control"
 	"github.com/B-A-M-N/gripline/internal/credential"
 	"github.com/B-A-M-N/gripline/internal/policy"
+	"github.com/B-A-M-N/gripline/internal/secret"
 )
 
 // runCredentialCLI dispatches `gripline credential <list|revoke>`.
 func runCredentialCLI(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("credential: expected 'list' or 'revoke' (use --token; add --offline only for stopped maintenance)")
+		return fmt.Errorf("credential: expected 'list', 'add', or 'revoke' (use --token-file; add --offline only for stopped maintenance)")
 	}
 	fs := flag.NewFlagSet("credential", flag.ExitOnError)
 	cfgPath := fs.String("config", "/etc/gripline/config.json", "path to the deployment configuration")
 	credID := fs.String("id", "", "credential id (revoke)")
 	reason := fs.String("reason", "", "audit reason (revoke, required)")
+	account := fs.String("account", "", "account id (add, required)")
+	policyID := fs.String("policy", "fi-default-v1", "policy id (add)")
+	planID := fs.String("plan", "plan-default", "plan id (add)")
+	secretStdin := fs.Bool("secret-stdin", false, "read the raw credential from stdin (add, required)")
 	token := fs.String("token", "", "operator token (env GRIPLINE_OPERATOR_TOKEN)")
+	tokenFile := fs.String("token-file", "", "read the operator token from this file")
 	offline := fs.Bool("offline", false, "operate directly on a stopped state database")
 	switch args[0] {
 	case "list":
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
-		tok := operatorToken(*token)
+		tok, err := operatorTokenFromFile(*token, *tokenFile)
+		if err != nil {
+			return err
+		}
 		if *offline {
 			return runCredentialList(*cfgPath)
 		}
@@ -52,23 +62,35 @@ func runCredentialCLI(args []string) error {
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
-		tok := *token
-		if tok == "" {
-			tok = os.Getenv("GRIPLINE_OPERATOR_TOKEN")
+		tok, err := operatorTokenFromFile(*token, *tokenFile)
+		if err != nil {
+			return err
 		}
 		if *offline {
 			return runCredentialRevoke(*cfgPath, *credID, *reason, tok)
 		}
 		return runCredentialRevokeLive(*cfgPath, *credID, *reason, tok)
+	case "add":
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if !*secretStdin {
+			return fmt.Errorf("credential add: --secret-stdin is required; raw secrets are never accepted as flags")
+		}
+		tok, err := operatorTokenFromFile(*token, *tokenFile)
+		if err != nil {
+			return err
+		}
+		return runCredentialAddLive(*cfgPath, *credID, *account, *policyID, *planID, *reason, tok)
 	default:
-		return fmt.Errorf("credential: unknown action %q (expected list|revoke)", args[0])
+		return fmt.Errorf("credential: unknown action %q (expected list|add|revoke)", args[0])
 	}
 }
 
 // runLaneCLI dispatches `gripline lane <list|unblock>`.
 func runLaneCLI(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("lane: expected 'list' or 'unblock' (use --token; add --offline only for stopped maintenance)")
+		return fmt.Errorf("lane: expected 'list' or 'unblock' (use --token-file; add --offline only for stopped maintenance)")
 	}
 	fs := flag.NewFlagSet("lane", flag.ExitOnError)
 	cfgPath := fs.String("config", "/etc/gripline/config.json", "path to the deployment configuration")
@@ -76,6 +98,7 @@ func runLaneCLI(args []string) error {
 	laneID := fs.String("id", "", "lane id (unblock)")
 	reason := fs.String("reason", "", "audit reason (unblock, required)")
 	token := fs.String("token", "", "operator token (env GRIPLINE_OPERATOR_TOKEN)")
+	tokenFile := fs.String("token-file", "", "read the operator token from this file")
 	offline := fs.Bool("offline", false, "operate directly on a stopped state database")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
@@ -85,15 +108,18 @@ func runLaneCLI(args []string) error {
 		if *credID == "" {
 			return fmt.Errorf("lane list: --credential is required")
 		}
-		tok := operatorToken(*token)
+		tok, err := operatorTokenFromFile(*token, *tokenFile)
+		if err != nil {
+			return err
+		}
 		if *offline {
 			return runLaneList(*cfgPath, *credID)
 		}
 		return runLaneListLive(*cfgPath, *credID, tok)
 	case "unblock":
-		tok := *token
-		if tok == "" {
-			tok = os.Getenv("GRIPLINE_OPERATOR_TOKEN")
+		tok, err := operatorTokenFromFile(*token, *tokenFile)
+		if err != nil {
+			return err
 		}
 		if *offline {
 			return runLaneUnblock(*cfgPath, *credID, *laneID, *reason, tok)
@@ -104,11 +130,18 @@ func runLaneCLI(args []string) error {
 	}
 }
 
-func operatorToken(flagValue string) string {
+func operatorTokenFromFile(flagValue, path string) (string, error) {
 	if flagValue != "" {
-		return flagValue
+		return flagValue, nil
 	}
-	return os.Getenv("GRIPLINE_OPERATOR_TOKEN")
+	if path != "" {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return "", fmt.Errorf("read operator token file: %w", err)
+		}
+		return strings.TrimSpace(string(b)), nil
+	}
+	return os.Getenv("GRIPLINE_OPERATOR_TOKEN"), nil
 }
 
 type adminClient struct {
@@ -206,6 +239,74 @@ func runCredentialRevokeLive(cfgPath, credID, reason, token string) error {
 	return nil
 }
 
+func runCredentialAddLive(cfgPath, credID, accountID, policyID, planID, reason, token string) error {
+	if credID == "" || accountID == "" || policyID == "" || planID == "" || reason == "" || token == "" {
+		return fmt.Errorf("credential add: --id, --account, --reason, and --token (or --token-file/GRIPLINE_OPERATOR_TOKEN) are required")
+	}
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(cfg.Paths.State); err != nil {
+		return fmt.Errorf("credential add: persistent paths.state is required: %w", err)
+	}
+	pepperRaw := os.Getenv("GRIPLINE_PEPPER_V1")
+	if pepperRaw == "" {
+		return fmt.Errorf("credential add: GRIPLINE_PEPPER_V1 is required to derive the verifier locally")
+	}
+	pepper, err := decodeSecretKey("GRIPLINE_PEPPER_V1", pepperRaw, 32)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		for i := range pepper {
+			pepper[i] = 0
+		}
+	}()
+	raw, err := io.ReadAll(io.LimitReader(os.Stdin, 4097))
+	if err != nil {
+		return fmt.Errorf("credential add: read --secret-stdin: %w", err)
+	}
+	defer func() {
+		for i := range raw {
+			raw[i] = 0
+		}
+	}()
+	if len(raw) == 4097 {
+		return fmt.Errorf("credential add: secret exceeds 4096 bytes")
+	}
+	if len(raw) > 0 && raw[len(raw)-1] == '\n' {
+		raw = raw[:len(raw)-1]
+		if len(raw) > 0 && raw[len(raw)-1] == '\r' {
+			raw = raw[:len(raw)-1]
+		}
+	}
+	if len(raw) == 0 {
+		return fmt.Errorf("credential add: stdin secret is empty")
+	}
+	sealed := secret.NewFromBytes(raw)
+	verifier := credential.Verifier(sealed, &credential.PepperKey{Version: 1, Key: pepper})
+	defer func() {
+		for i := range verifier {
+			verifier[i] = 0
+		}
+	}()
+	sealed.Zero()
+	client, err := newAdminClient(cfgPath)
+	if err != nil {
+		return err
+	}
+	if err := client.request(http.MethodPost, "/admin/credentials/add", token, map[string]any{
+		"credential_id": credID, "account_id": accountID, "policy_id": policyID, "plan_id": planID,
+		"verifier_b64": base64.StdEncoding.EncodeToString(verifier), "verifier_version": 1,
+		"pepper_version": 1, "reason": reason,
+	}, nil); err != nil {
+		return fmt.Errorf("credential add: %w", err)
+	}
+	fmt.Printf("added %s (verifier derived locally; raw secret not sent)\n", credID)
+	return nil
+}
+
 type adminLaneSummary struct {
 	LaneID       string    `json:"lane_id"`
 	CredentialID string    `json:"credential_id"`
@@ -265,10 +366,14 @@ func runAuditCLI(args []string) error {
 	fs := flag.NewFlagSet("audit", flag.ExitOnError)
 	cfgPath := fs.String("config", "/etc/gripline/config.json", "path to deployment configuration")
 	token := fs.String("token", "", "operator token (env GRIPLINE_OPERATOR_TOKEN)")
+	tokenFile := fs.String("token-file", "", "read the operator token from this file")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
-	tok := operatorToken(*token)
+	tok, err := operatorTokenFromFile(*token, *tokenFile)
+	if err != nil {
+		return err
+	}
 	if tok == "" {
 		return fmt.Errorf("audit: --token (or GRIPLINE_OPERATOR_TOKEN) is required")
 	}

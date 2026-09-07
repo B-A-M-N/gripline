@@ -124,24 +124,22 @@ func (s *Store) BorrowOrCreate(credID, newLaneID string, cand lane.Features, ctx
 	}
 	var out *lane.LaneRecord
 	var created bool
+	var domainErr error
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		records, err := loadLanesTx(tx, credID)
 		if err != nil {
 			return err
 		}
-		res, err := lane.ApplyBorrowOrCreate(records, credID, newLaneID, cand, ctx, s.laneLimits(), s.now())
-		if err != nil {
-			// Retention deletions are legitimate even on failure: an expired
-			// lane's capacity is freed regardless of the borrow outcome. The
-			// mutation error itself must still propagate (conflict, explosion
-			// limit) — never the deletes' success.
-			if derr := applyLaneDeletesTx(tx, credID, res.Deletes); derr != nil {
-				return derr
-			}
-			return err
-		}
+		res, reduceErr := lane.ApplyBorrowOrCreate(records, credID, newLaneID, cand, ctx, s.laneLimits(), s.now())
+		// Retention deletions are committed even when the requested borrow is
+		// rejected. Keep the domain error outside the transaction so Bolt does
+		// not roll the cleanup back with it.
 		if err := applyLaneDeletesTx(tx, credID, res.Deletes); err != nil {
 			return err
+		}
+		if reduceErr != nil {
+			domainErr = reduceErr
+			return nil
 		}
 		if res.Upsert == nil {
 			// Unreachable: every success path sets Upsert.
@@ -156,6 +154,9 @@ func (s *Store) BorrowOrCreate(credID, newLaneID string, cand lane.Features, ctx
 	})
 	if err != nil {
 		return nil, false, err
+	}
+	if domainErr != nil {
+		return nil, false, domainErr
 	}
 	return out, created, nil
 }
@@ -186,18 +187,89 @@ func (s *Store) Get(credID, laneID string) (*lane.LaneRecord, bool) {
 // ObserveRisk implements lane.Repository: risk observation + security-status
 // reduction in one write transaction (P0.7).
 func (s *Store) ObserveRisk(credID, laneID string, riskScore int, now time.Time) (*lane.LaneRecord, error) {
-	return s.mutateLane(credID, laneID, func(rec *lane.LaneRecord) error {
-		lane.ApplyRiskObservation(rec, riskScore, s.securityHys(), now)
+	return s.ObserveRiskWithRequestID(credID, laneID, riskScore, now, "")
+}
+
+// ObserveRiskWithRequestID is the request-correlated durable variant used by
+// the terminator when the ingress boundary supplied an id.
+func (s *Store) ObserveRiskWithRequestID(credID, laneID string, riskScore int, now time.Time, requestID string) (*lane.LaneRecord, error) {
+	key, err := laneKey(credID, laneID)
+	if err != nil {
+		return nil, err
+	}
+	var out *lane.LaneRecord
+	err = s.db.Update(func(tx *bolt.Tx) error {
+		v := tx.Bucket(bucketLanes).Get(key)
+		if v == nil {
+			return lane.ErrLaneNotFound
+		}
+		var p persistedLane
+		if err := json.Unmarshal(v, &p); err != nil || p.SchemaVersion != laneSchemaVersion {
+			return errCorruptLane
+		}
+		rec := p.Record
+		before := rec.Security.Status
+		lane.ApplyRiskObservation(&rec, riskScore, s.securityHys(), now)
+		if err := putLaneTx(tx, &rec); err != nil {
+			return err
+		}
+		if before != rec.Security.Status {
+			if err := appendSecurityTransitionTx(tx, control.SecurityTransitionRecord{
+				At: now.UTC(), Kind: "lane_security", RequestID: requestID,
+				CredentialID: credID, LaneID: laneID, Before: before.String(), After: rec.Security.Status.String(),
+				RiskScore: riskScore, Revision: rec.Revision,
+			}); err != nil {
+				return err
+			}
+		}
+		out = &rec
 		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // RecordCleanAuthorizedAndPromote implements lane.Repository (P0.25): counters
 // + promotion + revision bump in one authoritative transaction.
 func (s *Store) RecordCleanAuthorizedAndPromote(credID, laneID string, riskScore int, crit lane.PromotionCriteria, now time.Time) (*lane.LaneRecord, bool, error) {
+	return s.RecordCleanAuthorizedAndPromoteWithRequestID(credID, laneID, riskScore, crit, now, "")
+}
+
+// RecordCleanAuthorizedAndPromoteWithRequestID persists automatic trust
+// promotions and correlates a resulting trust transition with its request.
+func (s *Store) RecordCleanAuthorizedAndPromoteWithRequestID(credID, laneID string, riskScore int, crit lane.PromotionCriteria, now time.Time, requestID string) (*lane.LaneRecord, bool, error) {
 	var promoted bool
-	rec, err := s.mutateLane(credID, laneID, func(r *lane.LaneRecord) error {
-		promoted = lane.ApplyCleanAuthorizedAndPromote(r, riskScore, crit, now)
+	key, err := laneKey(credID, laneID)
+	if err != nil {
+		return nil, false, err
+	}
+	var rec *lane.LaneRecord
+	err = s.db.Update(func(tx *bolt.Tx) error {
+		v := tx.Bucket(bucketLanes).Get(key)
+		if v == nil {
+			return lane.ErrLaneNotFound
+		}
+		var p persistedLane
+		if err := json.Unmarshal(v, &p); err != nil || p.SchemaVersion != laneSchemaVersion {
+			return errCorruptLane
+		}
+		r := p.Record
+		before := r.State
+		promoted = lane.ApplyCleanAuthorizedAndPromote(&r, riskScore, crit, now)
+		if err := putLaneTx(tx, &r); err != nil {
+			return err
+		}
+		if before != r.State {
+			if err := appendSecurityTransitionTx(tx, control.SecurityTransitionRecord{
+				At: now.UTC(), Kind: "lane_trust", RequestID: requestID,
+				CredentialID: credID, LaneID: laneID, Before: before.String(), After: r.State.String(), Revision: r.Revision,
+			}); err != nil {
+				return err
+			}
+		}
+		rec = &r
 		return nil
 	})
 	if err != nil {
@@ -261,39 +333,6 @@ func (s *Store) LookupLane(credID, laneID string) (*lane.LaneRecord, bool, error
 		return nil
 	})
 	return rec, rec != nil, err
-}
-
-// mutateLane loads one lane, applies mut, and persists the row in one write
-// transaction. Unknown lanes fail with lane.ErrLaneNotFound.
-func (s *Store) mutateLane(credID, laneID string, mut func(*lane.LaneRecord) error) (*lane.LaneRecord, error) {
-	key, err := laneKey(credID, laneID)
-	if err != nil {
-		return nil, err
-	}
-	var out *lane.LaneRecord
-	err = s.db.Update(func(tx *bolt.Tx) error {
-		v := tx.Bucket(bucketLanes).Get(key)
-		if v == nil {
-			return lane.ErrLaneNotFound
-		}
-		var p persistedLane
-		if err := json.Unmarshal(v, &p); err != nil || p.SchemaVersion != laneSchemaVersion {
-			return errCorruptLane
-		}
-		rec := p.Record
-		if err := mut(&rec); err != nil {
-			return err
-		}
-		if err := putLaneTx(tx, &rec); err != nil {
-			return err
-		}
-		out = &rec
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
 }
 
 // putLaneTx writes one lane row inside an open transaction (P0.3-fix

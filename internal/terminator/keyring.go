@@ -35,14 +35,17 @@ func (k *Keyring) Save(path string) error {
 	}
 	k.st.mu.Lock()
 	defer k.st.mu.Unlock()
+	return saveKeyringLocked(path, k.st.active, k.st.next, k.st.verifiers)
+}
 
+func saveKeyringLocked(path string, active *Signer, next int, verifiers map[int][]byte) error {
 	persist := keyringPersist{
-		ActiveKid: k.st.active.Kid(),
-		Active:    base64.StdEncoding.EncodeToString([]byte(k.st.active.Private())),
-		Next:      k.st.next,
-		Verifiers: make(map[int]string, len(k.st.verifiers)),
+		ActiveKid: active.Kid(),
+		Active:    base64.StdEncoding.EncodeToString([]byte(active.Private())),
+		Next:      next,
+		Verifiers: make(map[int]string, len(verifiers)),
 	}
-	for kid, pub := range k.st.verifiers {
+	for kid, pub := range verifiers {
 		persist.Verifiers[kid] = base64.StdEncoding.EncodeToString(pub)
 	}
 
@@ -55,6 +58,33 @@ func (k *Keyring) Save(path string) error {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+// RotateAndSave atomically persists a candidate generation before publishing
+// it as active. A failed write leaves the current signer untouched, so a live
+// process can never publish a key that a restart would forget.
+func (k *Keyring) RotateAndSave(path string) (int, error) {
+	if path == "" {
+		return 0, errors.New("terminator: keyring path required for live rotation")
+	}
+	k.st.mu.Lock()
+	defer k.st.mu.Unlock()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return 0, fmt.Errorf("terminator: rotate keyring: %w", err)
+	}
+	kid := k.st.next
+	candidate := &Signer{priv: priv, Version: kid}
+	verifiers := make(map[int][]byte, len(k.st.verifiers)+1)
+	for oldKid, pub := range k.st.verifiers {
+		verifiers[oldKid] = append([]byte(nil), pub...)
+	}
+	verifiers[kid] = []byte(candidate.Public())
+	if err := saveKeyringLocked(path, candidate, kid+1, verifiers); err != nil {
+		return 0, fmt.Errorf("terminator: persist rotated keyring: %w", err)
+	}
+	k.st.verifiers, k.st.active, k.st.next = verifiers, candidate, kid+1
+	return kid, nil
 }
 
 // LoadKeyring reads a keyring from a file with load-or-create semantics: a

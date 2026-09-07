@@ -13,6 +13,7 @@ import (
 	"github.com/B-A-M-N/gripline/internal/credential"
 	"github.com/B-A-M-N/gripline/internal/evidence"
 	"github.com/B-A-M-N/gripline/internal/lane"
+	"github.com/B-A-M-N/gripline/internal/observability"
 	"github.com/B-A-M-N/gripline/internal/policy"
 	"github.com/B-A-M-N/gripline/internal/producers"
 	"github.com/B-A-M-N/gripline/internal/resource"
@@ -50,9 +51,10 @@ func (f *failingEvidenceStore) Prune(s []evidence.SubjectKey, n time.Time) (int,
 
 // recordingObserver captures CompletionEvents.
 type recordingObserver struct {
-	mu    sync.Mutex
-	event CompletionEvent
-	got   bool
+	mu         sync.Mutex
+	event      CompletionEvent
+	got        bool
+	admissions []*observability.DecisionRecord
 }
 
 func (r *recordingObserver) ObserveCompletion(ev CompletionEvent) {
@@ -65,6 +67,12 @@ func (r *recordingObserver) snapshot() (CompletionEvent, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.event, r.got
+}
+
+func (r *recordingObserver) ObserveAdmission(ev *observability.DecisionRecord) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.admissions = append(r.admissions, ev)
 }
 
 // P0.9: the proxy must not silently discard the Outcome.Complete result. When
@@ -115,7 +123,7 @@ func TestObserverSeesCompletionPersistenceFailure(t *testing.T) {
 
 	obs := &recordingObserver{}
 	dp, err := New(Config{
-		Terminator: term, BackendURL: bu, Audience: testAudience, Observer: obs,
+		Terminator: term, BackendURL: bu, Audience: testAudience, Observer: obs, Admission: obs,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -147,6 +155,12 @@ func TestObserverSeesCompletionPersistenceFailure(t *testing.T) {
 	if ev.StreamOK != true {
 		t.Fatal("StreamOK must be true for a clean stream")
 	}
+	obs.mu.Lock()
+	if len(obs.admissions) != 1 || !obs.admissions[0].Authorized || obs.admissions[0].RequestID == "" {
+		obs.mu.Unlock()
+		t.Fatalf("AdmissionObserver must see one immediate decision: %+v", obs.admissions)
+	}
+	obs.mu.Unlock()
 
 	// Healthy path: with a working store, the observer sees Persisted=true, nil Err.
 	term2, err := terminator.New(terminator.Dependencies{
@@ -162,7 +176,7 @@ func TestObserverSeesCompletionPersistenceFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	obs2 := &recordingObserver{}
-	dp2, err := New(Config{Terminator: term2, BackendURL: bu, Audience: testAudience, Observer: obs2})
+	dp2, err := New(Config{Terminator: term2, BackendURL: bu, Audience: testAudience, Observer: obs2, Admission: obs2})
 	if err != nil {
 		t.Fatal(err)
 	}

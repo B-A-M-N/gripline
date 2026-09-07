@@ -23,6 +23,24 @@ import (
 	"time"
 )
 
+type requestIDContextKey struct{}
+
+// WithRequestID associates the outer ingress request id with an authoritative
+// security-state mutation. Stores use it only for correlation; it never affects
+// the transition result.
+func WithRequestID(ctx context.Context, requestID string) context.Context {
+	return context.WithValue(ctx, requestIDContextKey{}, requestID)
+}
+
+// RequestIDFromContext returns the optional ingress correlation id.
+func RequestIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	id, _ := ctx.Value(requestIDContextKey{}).(string)
+	return id
+}
+
 // SecurityState is the persisted hysteresis metadata needed to reproduce a
 // credential's security-state transitions (P0.5). It does not carry Status —
 // Status is the top-level CredentialRecord.Status, which ObserveAndCommit keeps

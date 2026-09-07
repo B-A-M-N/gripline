@@ -131,6 +131,27 @@ func TestStateboltObserveAndCommitSingleTxn(t *testing.T) {
 	}
 }
 
+func TestAutomaticSecurityTransitionsAreDurablyAudited(t *testing.T) {
+	s := openTest(t)
+	rec := mustRecord("cred_audit", "sk-audit")
+	if err := s.Insert(rec); err != nil {
+		t.Fatal(err)
+	}
+	hy := credential.DefaultHysteresis()
+	hy.WatchObs = 1
+	ctx := credential.WithRequestID(context.Background(), "req_security_audit")
+	if _, err := s.ObserveAndCommit(ctx, rec.CredentialID, hy.WatchThresh, hy, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := s.ListSecurityTransitions(0, 100)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("security transitions=%v err=%v, want one credential transition", rows, err)
+	}
+	if rows[0].Kind != "credential_status" || rows[0].RequestID != "req_security_audit" || rows[0].Before != "NORMAL" {
+		t.Fatalf("unexpected credential transition: %+v", rows[0])
+	}
+}
+
 func TestStateboltUpdateStatusCAS(t *testing.T) {
 	s := openTest(t)
 	rec := mustRecord("cred_d", "sk-d")

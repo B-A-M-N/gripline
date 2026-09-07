@@ -22,7 +22,9 @@ COPY --from=build /out/gripline /usr/local/bin/gripline
 COPY --from=build --chown=65532:65532 /out/state/ /var/lib/gripline/
 USER 65532:65532
 
-# Config (read-only mount) and durable state (volume).
+# Config (read-only mount) and durable state (volume). If request bodies may be
+# chunked, mount the configured spool_dir as a bounded writable tmpfs, for
+# example: --tmpfs /tmp/gripline-spool:rw,noexec,nosuid,size=64m.
 #   docker run -v ./config.json:/etc/gripline/config.json:ro \
 #              -v gripline-state:/var/lib/gripline \
 #              -p 8443:8443 -p 127.0.0.1:9090:9090 gripline

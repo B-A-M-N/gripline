@@ -76,6 +76,14 @@ func TestAcceptanceAdminLifecycleRoutes(t *testing.T) {
 	if status != http.StatusOK || !bytes.Contains(body, []byte("credential.revoke")) || !bytes.Contains(body, []byte("lane.unblock")) {
 		t.Fatalf("audit status=%d body=%s", status, body)
 	}
+	status, body = adminHTTP(t, base, http.MethodGet, "/admin/security-events?limit=100", token, nil)
+	if status != http.StatusOK || !bytes.Contains(body, []byte("lane_security")) {
+		t.Fatalf("security audit status=%d body=%s", status, body)
+	}
+	status, body = adminHTTP(t, base, http.MethodPost, "/admin/identity/keys/rotate", token, []byte(`{"reason":"acceptance rotation"}`))
+	if status != http.StatusOK || !bytes.Contains(body, []byte(`"active_kid":2`)) || !bytes.Contains(body, []byte(`"public"`)) {
+		t.Fatalf("key rotation status=%d body=%s", status, body)
+	}
 	status, _ = adminHTTP(t, base, http.MethodGet, "/admin/credentials", "", nil)
 	if status != http.StatusUnauthorized {
 		t.Fatalf("missing admin token status=%d, want %d", status, http.StatusUnauthorized)

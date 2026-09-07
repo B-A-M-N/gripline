@@ -2,6 +2,10 @@
 
 ## 1. Versioned policy
 
+Resource windows are process-local and volatile in the beta. They reset when
+the process restarts; durable credential, lane, evidence, audit, and posture
+state do not. Multi-node shared leases and window persistence are out of scope.
+
 All policy is versioned (`id` + monotonically increasing `revision`). The data
 plane loads only authenticated + validated policy; the previous validated
 revision stays available for rollback (§57). Data-plane reload of policy on

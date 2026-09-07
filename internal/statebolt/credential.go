@@ -11,6 +11,7 @@ import (
 
 	bolt "go.etcd.io/bbolt"
 
+	"github.com/B-A-M-N/gripline/internal/control"
 	"github.com/B-A-M-N/gripline/internal/credential"
 )
 
@@ -370,6 +371,13 @@ func (s *Store) ObserveAndCommit(
 			return err
 		}
 		if err := creds.Put([]byte(credentialID), b); err != nil {
+			return err
+		}
+		if err := appendSecurityTransitionTx(tx, control.SecurityTransitionRecord{
+			At: now.UTC(), Kind: "credential_status", RequestID: credential.RequestIDFromContext(ctx),
+			CredentialID: credentialID, Before: before.Status.String(), After: rec.Status.String(),
+			RiskScore: score, Revision: rec.Revision,
+		}); err != nil {
 			return err
 		}
 		result = credential.TransitionResult{

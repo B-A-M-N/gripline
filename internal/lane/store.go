@@ -68,6 +68,14 @@ type Repository interface {
 	ListLaneIDs(credID string) []string
 }
 
+// RequestAwareRepository is an optional extension used by durable stores to
+// correlate automatic security transitions with the ingress request that
+// caused them. Repository remains the compatibility contract for embedders.
+type RequestAwareRepository interface {
+	ObserveRiskWithRequestID(credID, laneID string, riskScore int, now time.Time, requestID string) (*LaneRecord, error)
+	RecordCleanAuthorizedAndPromoteWithRequestID(credID, laneID string, riskScore int, criteria PromotionCriteria, now time.Time, requestID string) (*LaneRecord, bool, error)
+}
+
 // Store is a per-credential, bounded, concurrency-safe lane store with idle
 // eviction (§28, §81 bounded memory). It is the RESIDENT implementation of
 // Repository; its every mutation is a pure reducer from reduce.go executed
@@ -103,6 +111,13 @@ func (s *Store) limits() Limits {
 		}
 	}
 	return DefaultLimits()
+}
+
+// SetLaneLimits wires the compiled policy-owned lane capacity and retention
+// provider. It is optional on the compatibility store and safe to call during
+// construction before traffic starts.
+func (s *Store) SetLaneLimits(fn func() Limits) {
+	s.cfg = fn
 }
 
 // SetSecurityHysteresis overrides the security hysteresis used for lane

@@ -869,7 +869,7 @@ func TestNewRejectsPolicyWithoutEvidenceTable(t *testing.T) {
 // revision, so deploying revision N+1 silently pardoned every unexpired event
 // from revision N. If a future revision must invalidate/reinterpret old
 // evidence, that is an explicit migration rule — never a filter side effect.
-func TestStalePolicyRevisionEvidenceFilteredFromStateMachine(t *testing.T) {
+func TestStalePolicyRevisionEvidenceRemainsActiveAcrossPolicyRevisions(t *testing.T) {
 	pep := &credential.PepperKey{Version: 1, Key: []byte("p45-pepper")}
 	rawBytes := make([]byte, 24)
 	for i := range rawBytes {

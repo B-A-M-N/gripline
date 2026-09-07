@@ -47,9 +47,16 @@ func (s Scope) String() string {
 // "rate limited" bucket.
 var ErrScopeLimit = errors.New("resource: scope hard limit exceeded")
 
-// ScopeLimitError carries the scope that denied.
+// ScopeLimitError carries the scope and gauge dimension that denied. Both are
+// internal diagnostic data; callers should not expose the exact scope to an
+// untrusted client.
 type ScopeLimitError struct {
-	Scope Scope
+	Scope     Scope
+	Dimension Dimension
+	// RetryAfter is a best-effort lower bound for bucket-backed limits. A zero
+	// value means the denial was concurrency-only, burst-only, or otherwise has
+	// no meaningful automatic retry time.
+	RetryAfter time.Duration
 }
 
 func (e *ScopeLimitError) Error() string {
@@ -98,13 +105,17 @@ func (d Dimension) String() string {
 // dimension means that dimension is NOT enforced at this scope (no bucket);
 // concurrency is governed separately by ConcurrencyCap.
 type BucketSpec struct {
-	ConcurrencyCap int // max concurrent slots; 0 = deny-all concurrency
+	ConcurrencyCap int // max concurrent slots
 	// RequestsBurst bounds REQUESTS per window (P0.35).
 	RequestsBurst BucketConfig
 	// TokensBurst bounds INPUT/OUTPUT/COMBINED token gauges (P0.35).
 	TokensBurst BucketConfig
 	// CostBurst bounds spend in microunits per window (P0.35).
 	CostBurst BucketConfig
+}
+
+func (bs BucketSpec) hasNonConcurrencyGauge() bool {
+	return bs.RequestsBurst.Capacity > 0 || bs.TokensBurst.Capacity > 0 || bs.CostBurst.Capacity > 0
 }
 
 // BucketConfig is one gauge's burst/rate policy (P0.35). A zero Capacity
@@ -282,12 +293,17 @@ func (g *Governor) ProvisionUsage(scopes []ScopeSpec, est UsageEstimate) (*Multi
 	// Round 1 — concurrency, in precedence order, each scope at its CURRENT
 	// policy cap (P0.2).
 	for _, sp := range scopes {
-		p := g.pool(scopeKey(sp.Scope, sp.ID), sp.Buckets.ConcurrencyCap)
-		lease := p.AcquireNCap(1, sp.Buckets.ConcurrencyCap)
-		if lease == nil {
-			return nil, &ScopeLimitError{Scope: sp.Scope}
+		// A zero concurrency cap is disabled when another gauge is authored;
+		// otherwise a concurrency-only zero spec retains the historical
+		// deny-all behavior for direct resource callers.
+		if sp.Buckets.ConcurrencyCap > 0 || !sp.Buckets.hasNonConcurrencyGauge() {
+			p := g.pool(scopeKey(sp.Scope, sp.ID), sp.Buckets.ConcurrencyCap)
+			lease := p.AcquireNCap(1, sp.Buckets.ConcurrencyCap)
+			if lease == nil {
+				return nil, &ScopeLimitError{Scope: sp.Scope, Dimension: DimConcurrency}
+			}
+			acquired = append(acquired, &singleAcquired{kind: acquPool, pool: p, lease: lease})
 		}
-		acquired = append(acquired, &singleAcquired{kind: acquPool, pool: p, lease: lease})
 	}
 
 	// Round 2 — one bucket reservation per dimension the estimate carries,
@@ -313,7 +329,7 @@ func (g *Governor) ProvisionUsage(scopes []ScopeSpec, est UsageEstimate) (*Multi
 			b := g.bucket(dim, key, cfg)
 			res := b.Reserve(float64(amount))
 			if res == nil {
-				return nil, &ScopeLimitError{Scope: sp.Scope}
+				return nil, &ScopeLimitError{Scope: sp.Scope, Dimension: dim, RetryAfter: b.RetryAfter(float64(amount))}
 			}
 			acquired = append(acquired, &singleAcquired{kind: acquBucket, bucket: b, res: res, dim: dim})
 		}

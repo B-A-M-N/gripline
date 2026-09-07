@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Gripline causal demo</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <p class="eyebrow">GRIPLINE / PUBLIC BETA</p>
+        <h1>Same key. Different outcome.</h1>
+        <p class="lede">A conventional backend accepts reusable-key theft. Gripline observes the real request, contains the attacking lane, and forwards only a short-lived assertion.</p>
+      </div>
+      <div class="fingerprint"><span>test credential fingerprint</span><code id="fingerprint">loading</code></div>
+    </header>
+    <nav class="controls">
+      <button class="primary" data-action="run-full">RUN FULL DEMO</button>
+      <button data-action="reset">RESET</button>
+      <button data-action="run-normal">RUN NORMAL</button>
+      <button data-action="steal-key">STEAL KEY + ATTACK</button>
+      <button data-action="legit-after-containment">LEGIT REQUEST AFTER CONTAINMENT</button>
+      <button data-action="direct-raw">DIRECT RAW BACKEND ATTEMPT</button>
+    </nav>
+    <section class="systems">
+      <article class="system baseline">
+        <div class="system-head"><span class="dot"></span><h2>Baseline backend</h2><span class="tag">reusable key</span></div>
+        <p>Conventional forwarding: both the legitimate client and the stolen key reach the backend.</p>
+        <div class="metrics"><div><strong id="baseline-legit">0</strong><span>legitimate accepted</span></div><div><strong id="baseline-attacker">0</strong><span>attacker accepted</span></div></div>
+      </article>
+      <article class="system protected">
+        <div class="system-head"><span class="dot"></span><h2>Gripline protected backend</h2><span class="tag">assertion boundary</span></div>
+        <p>Source-aware admission, evidence, lane security, hard gates, and private assertion verification.</p>
+        <div class="metrics"><div><strong id="protected-legit">0</strong><span>legitimate reached</span></div><div><strong id="protected-attacker">0</strong><span>attacker reached</span></div><div><strong id="protected-blocked">0</strong><span>attacker blocked</span></div></div>
+      </article>
+    </section>
+    <section class="proof-grid">
+      <article><h2>Private backend boundary</h2><div class="metric-line"><span>valid assertions</span><strong id="valid-assertions">0</strong></div><div class="metric-line"><span>invalid / forged</span><strong id="invalid-assertions">0</strong></div><div class="metric-line"><span>raw Authorization seen</span><strong id="raw-auth">0</strong></div><div class="metric-line"><span>direct raw rejected</span><strong id="direct-rejected">0</strong></div></article>
+      <article><h2>Causal timeline</h2><div id="proof" class="proof">Waiting for the first run…</div></article>
+    </section>
+    <section><div class="timeline-head"><h2>Authoritative admission events</h2><span id="status">idle</span></div><div class="table-wrap"><table><thead><tr><th>time</th><th>request</th><th>actor</th><th>source</th><th>lane</th><th>evidence</th><th>risk</th><th>transition</th><th>limits</th><th>decision</th><th>backend</th></tr></thead><tbody id="timeline"></tbody></table></div></section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>

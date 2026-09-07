@@ -52,11 +52,11 @@ Thresholds are policy defaults, not constants.
 
 ## 4. Explosion protection
 
-An attacker must not exhaust state with lane variants (§28). Enforce max active
-lanes per credential, max provisional lanes, lane creation rate, idle
-expiration, and state compaction; group excess low-value variants into an
-overflow security context. (Lives in `internal/lane`; backed by a bounded map +
-LRU/idle eviction.)
+The beta enforces the policy-owned maximum active lanes per credential,
+maximum provisional lanes, idle expiration, and hard `ErrTooManyLanes`
+admission failure. It does not claim a creation-rate limiter or an overflow
+security context: those are future controls, not hidden behavior. The resident
+and Bolt repositories apply the same bounded reducer and retention rules.
 
 ## 5. Promotion & baselines
 

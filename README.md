@@ -85,12 +85,19 @@ Operator lifecycle:
 ```bash
 gripline status     --config /etc/gripline/config.json   # what is durable / on / off, honestly
 gripline credential list   --config c.json --token "$GRIPLINE_OPERATOR_TOKEN"
+gripline credential add    --config c.json --id <cred> --account <acct> --reason "provision" --secret-stdin --token-file /run/secrets/gripline-operator <<< "$KEY"
 gripline credential revoke --config c.json --id <cred> --reason "..." --token "$GRIPLINE_OPERATOR_TOKEN"
-gripline lane list         --config c.json --credential <cred> --token "$GRIPLINE_OPERATOR_TOKEN"
-gripline lane unblock      --config c.json --credential <cred> --id <lane> --reason "..." --token "$GRIPLINE_OPERATOR_TOKEN"
-gripline audit list        --config c.json --token "$GRIPLINE_OPERATOR_TOKEN"
-gripline audit export      --config c.json --token "$GRIPLINE_OPERATOR_TOKEN" > audit.jsonl
+gripline lane list         --config c.json --credential <cred> --token-file /run/secrets/gripline-operator
+gripline lane unblock      --config c.json --credential <cred> --id <lane> --reason "..." --token-file /run/secrets/gripline-operator
+gripline audit list        --config c.json --token-file /run/secrets/gripline-operator
+gripline audit export      --config c.json --token-file /run/secrets/gripline-operator > audit.jsonl
 gripline keys export       --config c.json   # public backend verification material only
+
+# Live signer rotation is authenticated, audited, persisted-before-publish,
+# and returns the complete public verification export for backend reload.
+curl -X POST -H "Authorization: Bearer $GRIPLINE_OPERATOR_TOKEN" \
+  -H 'Content-Type: application/json' -d '{"reason":"scheduled rotation"}' \
+  http://127.0.0.1:9090/admin/identity/keys/rotate
 ```
 
 Lifecycle and audit commands use the running private admin listener by default;
@@ -114,6 +121,16 @@ docker run --user 65532:65532 \
 The state database and signer keyring must be on a persistent volume; the
 gateway refuses to boot in ephemeral mode unless a deployment explicitly opts
 in (`deployment.allow_ephemeral_state`).
+
+The configured `server.spool_dir` must be writable. In a read-only-root
+container, use a bounded tmpfs mount such as
+`--tmpfs /tmp/gripline-spool:rw,noexec,nosuid,size=64m`; Gripline removes stale
+`gripline-body-*.tmp` files there at startup.
+
+The stock executable supports verifier pepper V1 at runtime. Pepper rotation
+is available as a library capability; a deployment changing pepper versions
+must provision a versioned runtime configuration and re-derive verifiers before
+switching traffic. It is not an automatic stock-binary operation.
 
 ## Guarantees (and how they are proven)
 
@@ -140,6 +157,29 @@ Verification: `go vet`, `staticcheck`, `gofmt`, and `go test -race ./...` green
 across all packages; executable acceptance suite (restart containment, real
 streaming, stalled-stream cut, transactional operator mutations, oversized
 bodies, admin lockdown) green; §112 admission-latency budget p95 ≈ 0.5ms.
+
+## Definitive causal demo
+
+Run the browser demo locally:
+
+```bash
+go run ./cmd/gripline-demo
+```
+
+Open the printed URL and run `RUN FULL DEMO`. The two panels use the same exact
+credential: the baseline accepts the stolen-key client, while Gripline's real
+HTTP path observes a residential-to-hosting source change, mints live evidence,
+blocks only the attacking lane, and continues serving the legitimate lane.
+The timeline is emitted by the admission observer and includes request IDs,
+source pseudonyms, evidence, risks, transitions, decisions, and assertion
+verification. CI/release checks can run the non-interactive proof with:
+
+```bash
+go run ./cmd/gripline-demo --headless
+```
+
+The demo is intentionally local and single-node; it is not a substitute for a
+provider SDK matrix, a distributed resource harness, or production telemetry.
 
 ## Design
 

@@ -2,7 +2,15 @@ package config
 
 import (
 	"bytes"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
+	"math/big"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -52,6 +60,84 @@ func TestLoadValid(t *testing.T) {
 	}
 	if err := c.ValidateCertificates(); err == nil {
 		t.Fatal("nonexistent cert files must fail certificate validation")
+	}
+}
+
+func writeCertificateMaterial(t *testing.T, dir, name string) (certPath, keyPath string) {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: name},
+		DNSNames: []string{name}, IPAddresses: []net.IP{net.ParseIP("127.0.0.1")},
+		NotBefore: time.Now().Add(-time.Minute), NotAfter: time.Now().Add(time.Hour),
+		KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		IsCA:     true, BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPath = filepath.Join(dir, name+".crt")
+	keyPath = filepath.Join(dir, name+".key")
+	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return certPath, keyPath
+}
+
+func TestValidateCertificatesMaterial(t *testing.T) {
+	dir := t.TempDir()
+	cert, key := writeCertificateMaterial(t, dir, "listener")
+	_, otherKey := writeCertificateMaterial(t, dir, "other")
+
+	valid := &Config{TLS: TLSSection{CertFile: cert, KeyFile: key}}
+	if err := valid.ValidateCertificates(); err != nil {
+		t.Fatalf("valid certificate/key pair rejected: %v", err)
+	}
+	for name, cfg := range map[string]*Config{
+		"malformed certificate": {TLS: TLSSection{CertFile: filepath.Join(dir, "bad.crt"), KeyFile: key}},
+		"mismatched key":        {TLS: TLSSection{CertFile: cert, KeyFile: otherKey}},
+	} {
+		if name == "malformed certificate" {
+			if err := os.WriteFile(cfg.TLS.CertFile, []byte("not a certificate"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := cfg.ValidateCertificates(); err == nil {
+			t.Errorf("%s must fail certificate validation", name)
+		}
+	}
+
+	if err := (&Config{TLS: TLSSection{CertFile: cert}}).ValidateCertificates(); err == nil {
+		t.Fatal("one-sided certificate configuration must fail")
+	}
+}
+
+func TestBackendTLSConfigMaterial(t *testing.T) {
+	dir := t.TempDir()
+	caCert, _ := writeCertificateMaterial(t, dir, "ca")
+	clientCert, clientKey := writeCertificateMaterial(t, dir, "client")
+	c := &Config{Backend: BackendSection{TLS: BackendTLSSection{
+		CAFile: caCert, ClientCertFile: clientCert, ClientKeyFile: clientKey,
+		ServerName: "backend.internal", MinVersion: "1.3",
+	}}}
+	tlsConfig, err := c.BackendTLSConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tlsConfig.MinVersion != tls.VersionTLS13 || tlsConfig.RootCAs == nil || len(tlsConfig.Certificates) != 1 {
+		t.Fatalf("backend TLS material not loaded: %+v", tlsConfig)
+	}
+	bad := *c
+	bad.Backend.TLS.ClientKeyFile = filepath.Join(dir, "missing.key")
+	if _, err := bad.BackendTLSConfig(); err == nil {
+		t.Fatal("missing client key must fail backend TLS validation")
 	}
 }
 

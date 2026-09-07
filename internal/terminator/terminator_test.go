@@ -299,9 +299,11 @@ func TestAdmitLaneExplosionDenied(t *testing.T) {
 	store := lane.NewStore(func() lane.Limits {
 		return lane.Limits{MaxActiveLanesPerCredential: 2, LaneIdleExpiration: time.Hour}
 	}, time.Now)
+	pol := policy.Default()
+	pol.LaneLimits = lane.Limits{MaxActiveLanesPerCredential: 2, MaxProvisionalLanes: 2, LaneIdleExpiration: time.Hour}
 	term, err := New(Dependencies{
 		Registry: tc.reg, Peppers: credential.MustPepperRing(pep),
-		Lanes: store, Policy: policy.Default(), Signer: signer, Audience: "fi-inference",
+		Lanes: store, Policy: pol, Signer: signer, Audience: "fi-inference",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -450,9 +452,11 @@ func TestAdmitLaneCollisionFailsClosed(t *testing.T) {
 	store := lane.NewStore(func() lane.Limits {
 		return lane.Limits{MaxActiveLanesPerCredential: 8, MaxProvisionalLanes: 8, LaneIdleExpiration: time.Hour}
 	}, time.Now)
+	pol := policy.Default()
+	pol.LaneLimits = lane.Limits{MaxActiveLanesPerCredential: 8, MaxProvisionalLanes: 8, LaneIdleExpiration: time.Hour}
 	term, err := New(Dependencies{
 		Registry: tc.reg, Peppers: credential.MustPepperRing(pep),
-		Lanes: store, Policy: policy.Default(), Signer: signer, Audience: "fi-inference",
+		Lanes: store, Policy: pol, Signer: signer, Audience: "fi-inference",
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -65,7 +65,8 @@ changed, why, under which policy (revision), at what scope, for how long
 ```
 
 External errors avoid disclosing detailed security reasoning: 401 invalid
-credential, 429 resource restriction with `Retry-After`, 403 quarantine — with
+credential, 429 resource restriction with `Retry-After` when a refill-backed
+bucket can calculate one, 403 quarantine — with
 a request id (`credential_temporarily_restricted`) and investigation via
 authenticated operator interfaces (§70).
 

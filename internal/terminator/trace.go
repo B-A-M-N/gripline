@@ -76,11 +76,12 @@ type DecisionTrace struct {
 	// limit set selected (normal/constrained/emergency); Reservation reports
 	// what the hard gate did with it. Limits echo the selected gauges so replay
 	// can recompute the resource decision.
-	LimitsClass       string                 `json:"limits_class"`
-	Limits            policy.Limits          `json:"limits"`
-	ReservationResult string                 `json:"reservation_result"` // granted | denied | none
-	ReservationScope  string                 `json:"reservation_scope,omitempty"`
-	Estimate          resource.UsageEstimate `json:"usage_estimate"`
+	LimitsClass          string                 `json:"limits_class"`
+	Limits               policy.Limits          `json:"limits"`
+	ReservationResult    string                 `json:"reservation_result"` // granted | denied | none
+	ReservationScope     string                 `json:"reservation_scope,omitempty"`
+	ReservationDimension string                 `json:"reservation_dimension,omitempty"`
+	Estimate             resource.UsageEstimate `json:"usage_estimate"`
 
 	// Adaptive posture + WHY it degraded (P0.1/P0.50): a degraded decision must
 	// be explainable as degraded, not silently read as clean.

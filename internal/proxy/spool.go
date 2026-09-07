@@ -5,6 +5,8 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -68,6 +70,10 @@ func (b *spooledBody) Close() error {
 // tooLarge=true when the body exceeds maxBytes. A tooLarge result never
 // carries a valid forwardable body — the caller must reject (413) and Close it.
 func spoolBody(rc io.ReadCloser, maxBytes int64, memThreshold int64) (*spooledBody, error) {
+	return spoolBodyInDir(rc, maxBytes, memThreshold, spoolTempDir)
+}
+
+func spoolBodyInDir(rc io.ReadCloser, maxBytes int64, memThreshold int64, tempDir string) (*spooledBody, error) {
 	if maxBytes < 0 {
 		maxBytes = 0
 	}
@@ -97,7 +103,7 @@ func spoolBody(rc io.ReadCloser, maxBytes int64, memThreshold int64) (*spooledBo
 			_ = rc.Close()
 			return &spooledBody{reader: buf, tooLarge: true, length: int64(buf.Len())}, nil
 		}
-		tmp, err := os.CreateTemp(spoolTempDir, "gripline-body-*.tmp")
+		tmp, err := os.CreateTemp(tempDir, "gripline-body-*.tmp")
 		if err != nil {
 			_ = rc.Close()
 			return nil, err
@@ -135,4 +141,29 @@ func spoolBody(rc io.ReadCloser, maxBytes int64, memThreshold int64) (*spooledBo
 		length:   int64(buf.Len()),
 		tooLarge: int64(buf.Len()) > maxBytes,
 	}, nil
+}
+
+// CleanupSpoolDir removes only stale Gripline spool files from an explicitly
+// configured directory. It is intended for startup recovery when a process
+// died before the request-body Close path ran.
+func CleanupSpoolDir(dir string) error {
+	if dir == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(filepath.Clean(dir))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasPrefix(entry.Name(), "gripline-body-") || !strings.HasSuffix(entry.Name(), ".tmp") {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, entry.Name())); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
 }

@@ -131,13 +131,16 @@ type Identity struct {
 // Emergency (P0.48) is the incident-mode limit set: when the operator control
 // plane is in EMERGENCY_LOCKDOWN, EVERY admission (established lanes included)
 // is provisioned against these limits — that is what "throttles all traffic"
-// means concretely. Zero-value Emergency falls back to Constrained (fail-closed
-// for traffic volume: an unset emergency profile never grants MORE than the
+// means concretely. A nil Emergency falls back to Constrained (fail-closed for
+// traffic volume: an unset emergency profile never grants MORE than the
 // constrained posture).
 type ScopedLimits struct {
 	Normal      Limits
 	Constrained Limits
-	Emergency   Limits
+	// Emergency is explicit optional configuration. A nil pointer means no
+	// emergency profile was authored and therefore falls back to Constrained;
+	// zero-valued limits are no longer ambiguous with "present but deny all".
+	Emergency *Limits
 }
 
 // Policy is one versioned, immutable policy revision.
@@ -147,6 +150,10 @@ type Policy struct {
 
 	Risk   RiskThresholds
 	Limits ScopedLimits
+	// LaneLimits owns lane capacity and retention policy alongside the lane
+	// security hysteresis below. The terminator wires this compiled value into
+	// both resident and durable lane repositories.
+	LaneLimits lane.Limits
 	// Global carries the whole-plane (fleet) limits (P0.19). Global replaces
 	// the old magic Normal.ConcurrencyCap*1024 derivation; a zero
 	// Global.ConcurrencyCap disables the fleet gauge. Leaving Tokens/Cost zero
@@ -235,7 +242,7 @@ func Default() *Policy {
 			},
 			// P0.48: incident posture — deliberately tighter than constrained.
 			// A credential holds at most ONE in-flight request under lockdown.
-			Emergency: Limits{
+			Emergency: &Limits{
 				ConcurrencyCap: 1,
 				Requests:       BucketConfig{Capacity: 1, RefillPer: 5, RefillIn: time.Minute},
 			},
@@ -283,6 +290,7 @@ func Default() *Policy {
 		// compiled revision, never the package globals.
 		EvidenceRules:  evidence.DefaultTable(),
 		Classification: lane.DefaultThresholds(),
+		LaneLimits:     lane.DefaultLimits(),
 	}
 }
 
@@ -303,6 +311,13 @@ func Compile(p *Policy) (*CompiledPolicy, error) {
 		return nil, errors.New("policy: invalid policy revision")
 	}
 	c := &CompiledPolicy{Policy: *p}
+	if c.LaneLimits.MaxActiveLanesPerCredential == 0 {
+		c.LaneLimits = lane.DefaultLimits()
+	}
+	if p.Limits.Emergency != nil {
+		emergency := *p.Limits.Emergency
+		c.Limits.Emergency = &emergency
+	}
 	// Deep-copy every reference-bearing field (P0.10). EvidenceRules is the
 	// map that matters today; Classification and the threshold structs are
 	// value types copied by the struct copy above. Any field added to Policy
@@ -396,8 +411,12 @@ func (p *Policy) IsValid() bool {
 		}
 	}
 	// Concurrency caps must not go negative (global included, P0.19).
+	emergency := Limits{}
+	if p.Limits.Emergency != nil {
+		emergency = *p.Limits.Emergency
+	}
 	if p.Limits.Normal.ConcurrencyCap < 0 || p.Limits.Constrained.ConcurrencyCap < 0 ||
-		p.Limits.Emergency.ConcurrencyCap < 0 || p.Global.ConcurrencyCap < 0 {
+		emergency.ConcurrencyCap < 0 || p.Global.ConcurrencyCap < 0 {
 		return false
 	}
 	// P0.19: validate every windowed gauge across scopes and the global plane.
@@ -405,7 +424,7 @@ func (p *Policy) IsValid() bool {
 	// a positive interval (zero interval would be a divide-by-zero / mint-every
 	// instant). Burst-only (Capacity > 0, RefillPer == 0) remains legal.
 	for _, lim := range []Limits{
-		p.Limits.Normal, p.Limits.Constrained, p.Limits.Emergency, p.Global,
+		p.Limits.Normal, p.Limits.Constrained, emergency, p.Global,
 	} {
 		if !validBucket(lim.Requests) || !validBucket(lim.Tokens) || !validBucket(lim.Cost) {
 			return false

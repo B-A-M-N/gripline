@@ -165,7 +165,7 @@ func TestEmergencyLimitsThrottleEstablishedTraffic(t *testing.T) {
 	// more headroom than the posture it overrides).
 	pol2 := policy.Default()
 	pol2.Limits.Normal.ConcurrencyCap = 8
-	pol2.Limits.Emergency = policy.Limits{} // unset
+	pol2.Limits.Emergency = nil // unset
 	term2, err := New(Dependencies{
 		Registry: reg, Peppers: credential.MustPepperRing(pep),
 		Lanes: lane.NewStore(nil, time.Now), Policy: pol2, Signer: signer,

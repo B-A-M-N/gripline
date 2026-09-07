@@ -68,6 +68,28 @@ func (b *TokenBucket) Available() float64 {
 	return avail
 }
 
+// RetryAfter returns the lower-bound time until amt tokens could be available
+// under the current refill configuration. It is advisory telemetry only: a
+// concurrent reservation may consume the allowance before the caller retries.
+func (b *TokenBucket) RetryAfter(amt float64) time.Duration {
+	if b == nil || amt <= 0 {
+		return 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.refillLocked()
+	avail := b.capacity - b.balance
+	if avail >= amt || b.refillPer <= 0 || b.refillIn <= 0 {
+		return 0
+	}
+	deficit := amt - avail
+	seconds := deficit / b.refillPer * b.refillIn.Seconds()
+	if seconds <= 0 {
+		return time.Second
+	}
+	return time.Duration(seconds*float64(time.Second)) + time.Nanosecond
+}
+
 // Take consumes up to `amt` tokens; returns the number actually consumed
 // (limits to what is currently available after refill). Atomic.
 func (b *TokenBucket) Take(amt float64) float64 {

@@ -83,6 +83,7 @@ type BaselineToken struct {
 	CredentialID string
 	LaneID       string
 	LaneRisk     int
+	RequestID    string
 	// Eligible reports whether the admission ran in AdaptiveAvailable posture
 	// — a degraded admission never builds baseline trust (P0.1).
 	Eligible bool
@@ -350,6 +351,9 @@ func New(dep Dependencies) (*Terminator, error) {
 	// with, so policy revision is the one authority for lane security behavior.
 	if dep.Lanes != nil {
 		dep.Lanes.SetSecurityHysteresis(compiled.LaneSecurity)
+		if setter, ok := dep.Lanes.(interface{ SetLaneLimits(func() lane.Limits) }); ok {
+			setter.SetLaneLimits(func() lane.Limits { return compiled.LaneLimits })
+		}
 	}
 	return &Terminator{
 		dep:  dep,
@@ -369,6 +373,11 @@ func newRequestID() string {
 	}
 	return "req_" + base64.RawURLEncoding.EncodeToString(b[:])
 }
+
+// NewRequestID creates a request identifier at the outer request boundary.
+// The proxy uses it before any authentication, spooling, or adapter work so
+// early failures can still be correlated with their decision record.
+func NewRequestID() string { return newRequestID() }
 
 // Admit runs the admission-state pipeline (P0.10) for a request's secret
 // carriers and normalized feature set. The ordering is:
@@ -440,7 +449,16 @@ func (t *Terminator) AdmitSource(headers map[string][]string, feat lane.Features
 // the returned Outcome's reservation is SETTLED with actuals after execution
 // (proxy lifecycle). Admit/AdmitSource delegate here with {Requests: 1}.
 func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features, src TrustedSource, est resource.UsageEstimate) *Outcome {
-	reqID := t.rand()
+	return t.AdmitUsageWithRequestID(t.rand(), headers, feat, src, est)
+}
+
+// AdmitUsageWithRequestID is the request-boundary variant of AdmitUsage. The
+// caller supplies the ID generated before ingress authentication; an empty ID
+// is replaced with a fresh one for compatibility with internal callers.
+func (t *Terminator) AdmitUsageWithRequestID(reqID string, headers map[string][]string, feat lane.Features, src TrustedSource, est resource.UsageEstimate) *Outcome {
+	if reqID == "" {
+		reqID = t.rand()
+	}
 	now := t.dep.RiskNow()
 	out := &Outcome{RequestID: reqID}
 	// P0.50: the internal decision trace lives for the whole pipeline and is
@@ -751,10 +769,10 @@ func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features,
 	// under a different rule table; evaluating it after a policy change would
 	// apply old-era risk to new-era thresholds. Filter fail-closed (stale-revision
 	// evidence is dropped); current-request sync evidence is always current-rev.
-	credentialEvidence = policyRevisionFilter(credentialEvidence, t.pol.Revision)
-	laneEvidence = policyRevisionFilter(laneEvidence, t.pol.Revision)
+	credentialEvidence = activeEvidenceAcrossPolicyRevisions(credentialEvidence, t.pol.Revision)
+	laneEvidence = activeEvidenceAcrossPolicyRevisions(laneEvidence, t.pol.Revision)
 	// P0.7 fix: source evidence must also be filtered by policy revision.
-	sourceEvidence = policyRevisionFilter(sourceEvidence, t.pol.Revision)
+	sourceEvidence = activeEvidenceAcrossPolicyRevisions(sourceEvidence, t.pol.Revision)
 	// Current-request sync evidence (scope: lane) is included in evaluation
 	// EVERY time it was minted, independent of append/snapshot success, so a
 	// store outage or read-after-write lag can never drop the current signal
@@ -832,7 +850,7 @@ func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features,
 		// remaining risk into the machine only when we have authoritative
 		// history.
 		tr, oerr := t.dep.Registry.ObserveAndCommit(
-			ctxFor(now), cred.CredentialID,
+			ctxForRequest(now, out.RequestID), cred.CredentialID,
 			credentialRisk, hy, now,
 		)
 		if oerr != nil {
@@ -840,7 +858,7 @@ func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features,
 			// authoritatively. Do NOT synthesize state from the local machine.
 			// Preserve persisted status; deny if the persisted state blocks.
 			adaptiveForObservation = AdaptiveDegraded
-			if rr, lerr := t.dep.Registry.LookupAuthoritative(ctxFor(now), cred.CredentialID); lerr == nil {
+			if rr, lerr := t.dep.Registry.LookupAuthoritative(ctxForRequest(now, out.RequestID), cred.CredentialID); lerr == nil {
 				after = rr.Status
 				updatedCred = credFrom(rr)
 				markLastSeen(t.dep.Registry, cred.CredentialID, now)
@@ -858,7 +876,7 @@ func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features,
 			case credential.TransitionConflict:
 				// A concurrent writer advanced the revision. Bounded retry once:
 				// re-read authoritative and re-commit the same risk observation.
-				rec, lerr := t.dep.Registry.LookupAuthoritative(ctxFor(now), cred.CredentialID)
+				rec, lerr := t.dep.Registry.LookupAuthoritative(ctxForRequest(now, out.RequestID), cred.CredentialID)
 				if lerr != nil {
 					adaptiveForObservation = AdaptiveDegraded
 					after = cred.Status
@@ -866,7 +884,7 @@ func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features,
 					// P0.20: Re-commit once against the authoritative record.
 					// If this also conflicts, preserve the stricter state (the
 					// concurrent writer's) rather than discarding our observation.
-					retry, rerr := t.dep.Registry.ObserveAndCommit(ctxFor(now), cred.CredentialID, credentialRisk, hy, now)
+					retry, rerr := t.dep.Registry.ObserveAndCommit(ctxForRequest(now, out.RequestID), cred.CredentialID, credentialRisk, hy, now)
 					switch {
 					case rerr == nil:
 						after = retry.Record.Status
@@ -950,7 +968,13 @@ func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features,
 	// (P0.7: lane risk must produce real lane enforcement, not just a stored score).
 	var laneSec lane.SecurityStatus
 	if t.dep.Lanes != nil {
-		rec, rerr := t.dep.Lanes.ObserveRisk(cred.CredentialID, laneID, laneRisk, now)
+		var rec *lane.LaneRecord
+		var rerr error
+		if aware, ok := t.dep.Lanes.(lane.RequestAwareRepository); ok {
+			rec, rerr = aware.ObserveRiskWithRequestID(cred.CredentialID, laneID, laneRisk, now, out.RequestID)
+		} else {
+			rec, rerr = t.dep.Lanes.ObserveRisk(cred.CredentialID, laneID, laneRisk, now)
+		}
 		if rerr == nil {
 			laneSec = rec.Security.Status
 			tr.LaneTrustAfter = rec.State.String()
@@ -1156,6 +1180,7 @@ func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features,
 			CredentialID: cred.CredentialID,
 			LaneID:       laneID,
 			LaneRisk:     laneRisk,
+			RequestID:    out.RequestID,
 			// Baseline finalization requires AVAILABLE adaptive posture (P0.1):
 			// unreliable history must not build trust upward, so a degraded
 			// admission's token is issued but the proxy-side finalize is a
@@ -1205,6 +1230,22 @@ func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features,
 	return out
 }
 
+// Preflight authenticates the external credential without touching lane,
+// evidence, resource, or assertion state. The proxy uses it before spooling
+// an unknown-length body so an invalid credential cannot force disk I/O.
+// Callers should pass a disposable header copy; extraction strips carriers
+// from the supplied map as part of the secret-boundary contract.
+func (t *Terminator) Preflight(headers map[string][]string) error {
+	presented, _, err := ExtractExternalCredential(headers)
+	StripSecretHeaders(headers)
+	if err != nil {
+		return err
+	}
+	defer presented.Zero()
+	_, err = t.authenticate(presented)
+	return err
+}
+
 // provisionMultiscope is the hard multi-scope resource gate (P0.23-P0.27). It
 // provisions SOURCE/LANE/CREDENTIAL/ACCOUNT capacity all-or-nothing through the
 // configured Governor, issues the internal assertion while holding the
@@ -1221,19 +1262,13 @@ func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features,
 // single hostile actor cannot exceed the credential cap across its lanes/sources
 // without tripping the shared budget — a conservative first posture.
 func (t *Terminator) provisionMultiscope(cred *credential.Credential, laneID string, laneSec lane.SecurityStatus, limits policy.Limits, ctx principal.AuthorizedContext, reqID string, out *Outcome, adaptiveForObservation AdaptiveStateStatus, laneRisk, credentialRisk, effectiveRisk int, evidenceCodes []string, src TrustedSource, est resource.UsageEstimate, tr *DecisionTrace) *Outcome {
-	cap := limits.ConcurrencyCap
 	// P0.35: the selected limits' per-dimension gauges (requests/tokens/cost)
 	// ride EVERY scope's spec — requests, tokens and spend are different
 	// resources with different buckets, and each scope enforces the same
-	// policy-authored gauge parameters. Zero-capacity gauges are inert at every
-	// scope (the governor skips them), so a policy that only authors
-	// ConcurrencyCap behaves exactly as before.
-	gauges := resource.BucketSpec{
-		ConcurrencyCap: cap,
-		RequestsBurst:  resource.BucketConfig{Capacity: float64(limits.Requests.Capacity), RefillPer: float64(limits.Requests.RefillPer), RefillIn: limits.Requests.RefillIn},
-		TokensBurst:    resource.BucketConfig{Capacity: float64(limits.Tokens.Capacity), RefillPer: float64(limits.Tokens.RefillPer), RefillIn: limits.Tokens.RefillIn},
-		CostBurst:      resource.BucketConfig{Capacity: float64(limits.Cost.Capacity), RefillPer: float64(limits.Cost.RefillPer), RefillIn: limits.Cost.RefillIn},
-	}
+	// policy-authored gauge parameters. Zero-capacity gauges are inert at
+	// every scope (the governor skips them), so concurrency-only policies keep
+	// their existing behavior.
+	gauges := resourceSpec(limits)
 	// Precedence order is the policy enum (P0.33): SOURCE → ACCOUNT →
 	// CREDENTIAL → LANE, GLOBAL last as the whole-plane gauge (P0.34). The
 	// SOURCE scope keys on this REQUEST's source pseudonym (P0.4) — empty
@@ -1250,12 +1285,12 @@ func (t *Terminator) provisionMultiscope(cred *credential.Credential, laneID str
 	if laneID != "" {
 		specs = append(specs, resource.ScopeSpec{Scope: resource.ScopeLane, ID: laneID, Buckets: gauges})
 	}
-	// GLOBAL scope (P0.34, P0.19): the whole-plane gauge, keyed "fleet". The
-	// cap comes from Policy.Global — the explicit replacement for the old magic
-	// Normal.ConcurrencyCap*1024 derivation. A fleet cap of 0 (unset) skips the
-	// gauge.
-	if fleetCap := t.pol.Global.ConcurrencyCap; fleetCap > 0 {
-		specs = append(specs, resource.ScopeSpec{Scope: resource.ScopeGlobal, ID: "fleet", Buckets: resource.BucketSpec{ConcurrencyCap: fleetCap}})
+	// GLOBAL scope (P0.34, P0.19): the whole-plane gauge, keyed "fleet". Any
+	// authored gauge enables the scope; checking only ConcurrencyCap silently
+	// discarded global request/token/cost limits.
+	global := resourceSpec(t.pol.Global)
+	if resourceSpecEnabled(global) {
+		specs = append(specs, resource.ScopeSpec{Scope: resource.ScopeGlobal, ID: "fleet", Buckets: global})
 	}
 
 	deny := func(reason string, err error) *Outcome {
@@ -1281,7 +1316,10 @@ func (t *Terminator) provisionMultiscope(cred *credential.Credential, laneID str
 		var sle *resource.ScopeLimitError
 		if errors.As(err, &sle) {
 			tr.ReservationScope = sle.Scope.String()
-			return deny(resourceScopeReason(sle.Scope), resourceScopeErr(sle.Scope))
+			tr.ReservationDimension = sle.Dimension.String()
+			// Preserve the typed hard-cap cause for internal traces and
+			// observers. The public reason stays scope-agnostic.
+			return deny("rate_limit", err)
 		}
 		return deny("resource_unavailable", err)
 	}
@@ -1298,43 +1336,23 @@ func (t *Terminator) provisionMultiscope(cred *credential.Credential, laneID str
 	return nil
 }
 
-// resourceScopeReason maps a resource scope denial to the external reason, per
-// the policy precedence (§58): account/cap denials read as rate limits, lane as
-// restricted, credential as restricted, source as source-restricted.
-func resourceScopeReason(s resource.Scope) string {
-	switch s {
-	case resource.ScopeSource:
-		return "source_restricted"
-	case resource.ScopeLane:
-		return "lane_restricted"
-	case resource.ScopeCredential:
-		return "credential_restricted"
-	case resource.ScopeAccount:
-		return "rate_limit"
-	case resource.ScopeGlobal:
-		return "resource_limit"
-	default:
-		return "resource_limit"
+func resourceSpec(l policy.Limits) resource.BucketSpec {
+	return resource.BucketSpec{
+		ConcurrencyCap: l.ConcurrencyCap,
+		RequestsBurst: resource.BucketConfig{
+			Capacity: float64(l.Requests.Capacity), RefillPer: float64(l.Requests.RefillPer), RefillIn: l.Requests.RefillIn,
+		},
+		TokensBurst: resource.BucketConfig{
+			Capacity: float64(l.Tokens.Capacity), RefillPer: float64(l.Tokens.RefillPer), RefillIn: l.Tokens.RefillIn,
+		},
+		CostBurst: resource.BucketConfig{
+			Capacity: float64(l.Cost.Capacity), RefillPer: float64(l.Cost.RefillPer), RefillIn: l.Cost.RefillIn,
+		},
 	}
 }
 
-// resourceScopeErr maps a resource scope denial to the highest-precedence policy
-// error so denialReason/denial errors stay consistent with §58.
-func resourceScopeErr(s resource.Scope) error {
-	switch s {
-	case resource.ScopeSource:
-		return policy.ErrSourceBlock
-	case resource.ScopeLane:
-		return policy.ErrLaneLimit
-	case resource.ScopeCredential:
-		return policy.ErrCredentialLimit
-	case resource.ScopeAccount:
-		return policy.ErrAccountLimit
-	case resource.ScopeGlobal:
-		return policy.ErrGlobalLimit
-	default:
-		return policy.ErrRiskDenial
-	}
+func resourceSpecEnabled(spec resource.BucketSpec) bool {
+	return spec.ConcurrencyCap > 0 || spec.RequestsBurst.Capacity > 0 || spec.TokensBurst.Capacity > 0 || spec.CostBurst.Capacity > 0
 }
 
 // pruneEvidence prunes expired evidence for the relevant subjects. It is a
@@ -1370,9 +1388,11 @@ func (t *Terminator) finalizeBaseline(b *BaselineToken) {
 		AllowSuspicious:          t.pol.Learning.AllowSuspiciousLanes,
 		HasDisqualifyingEvidence: t.hasActiveDisqualifyingEvidence(b.CredentialID, b.LaneID, now),
 	}
-	_, _, _ = t.dep.Lanes.RecordCleanAuthorizedAndPromote(
-		b.CredentialID, b.LaneID, b.LaneRisk, promCrit, now,
-	)
+	if aware, ok := t.dep.Lanes.(lane.RequestAwareRepository); ok {
+		_, _, _ = aware.RecordCleanAuthorizedAndPromoteWithRequestID(b.CredentialID, b.LaneID, b.LaneRisk, promCrit, now, b.RequestID)
+	} else {
+		_, _, _ = t.dep.Lanes.RecordCleanAuthorizedAndPromote(b.CredentialID, b.LaneID, b.LaneRisk, promCrit, now)
+	}
 }
 
 // scopedSignals is the result of resolving one batch of signal CODES into
@@ -1560,8 +1580,8 @@ func (t *Terminator) selectLimits(status credential.Status) policy.Limits {
 // not author an emergency profile must never see lockdown grant MORE headroom
 // than the constrained posture).
 func (t *Terminator) emergencyLimits() policy.Limits {
-	if t.pol.Limits.Emergency.ConcurrencyCap > 0 {
-		return t.pol.Limits.Emergency
+	if t.pol.Limits.Emergency != nil {
+		return *t.pol.Limits.Emergency
 	}
 	return t.pol.Limits.Constrained
 }
@@ -1751,6 +1771,10 @@ func safeReason(err error) string {
 		return "denied"
 	}
 }
+
+// PublicReason maps an authentication/preflight error to the same safe reason
+// vocabulary used by the data plane. It intentionally omits internal causes.
+func PublicReason(err error) string { return safeReason(err) }
 
 // issueAssertion mints and signs the internal identity for the context.
 func (t *Terminator) issueAssertion(ctx principal.AuthorizedContext, reqID string, cred *credential.Credential) (*Assertion, error) {

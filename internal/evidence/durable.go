@@ -139,17 +139,28 @@ func (d *durableStore) Prune(subjects []SubjectKey, now time.Time) (int, error) 
 	for _, sk := range subjects {
 		k := subjectKey(sk)
 		var kept []Evidence
+		changed := false
 		for _, ev := range d.data[k] {
 			if ev.Valid(now) {
 				kept = append(kept, ev)
 			} else {
 				pruned++
+				changed = true
 			}
 		}
 		if len(kept) == 0 {
-			delete(d.data, k)
+			if _, exists := d.data[k]; exists {
+				delete(d.data, k)
+				changed = true
+			}
 		} else {
 			d.data[k] = kept
+		}
+		if changed {
+			// Pruning is a durable mutation too. Without marking it pending,
+			// a process that prunes and immediately restarts resurrects rows
+			// that were already reported as removed.
+			d.pending++
 		}
 	}
 	return pruned, nil

@@ -36,10 +36,12 @@ var (
 	bucketLanes         = []byte("lanes")                // "credID/laneID" -> lane record
 	bucketEvidence      = []byte("evidence")             // subjectKey/id -> evidence
 	bucketOperatorAudit = []byte("operator_audit")       // seq -> OperatorRecord
+	bucketSecurityAudit = []byte("security_audit")       // seq -> SecurityTransitionRecord
 	bucketOperatorState = []byte("operator_state")       // "posture" -> Posture
 	keySchemaVersion    = []byte("schema_version")
 	keyPosture          = []byte("posture")
 	keyAuditSequence    = []byte("audit_sequence")
+	keySecuritySequence = []byte("security_sequence")
 )
 
 const currentSchemaVersion = 1
@@ -115,7 +117,7 @@ func (s *Store) init() error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		for _, b := range [][]byte{
 			bucketMeta, bucketCredentials, bucketCredVerifier, bucketLanes,
-			bucketEvidence, bucketOperatorAudit, bucketOperatorState,
+			bucketEvidence, bucketOperatorAudit, bucketSecurityAudit, bucketOperatorState,
 		} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return fmt.Errorf("statebolt: create bucket %s: %w", b, err)

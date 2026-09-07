@@ -140,11 +140,7 @@ func (s *Store) Prune(subjects []evidence.SubjectKey, now time.Time) (int, error
 			if err != nil {
 				return err
 			}
-			type keepRow struct {
-				key []byte
-				ev  evidence.Evidence
-			}
-			var kept []keepRow
+			var deleteKeys [][]byte
 			c := b.Cursor()
 			for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
 				var p persistedEvidence
@@ -153,28 +149,12 @@ func (s *Store) Prune(subjects []evidence.SubjectKey, now time.Time) (int, error
 				}
 				if !p.Item.Valid(now) {
 					pruned++
+					deleteKeys = append(deleteKeys, append([]byte(nil), k...))
 					continue
 				}
-				keyCopy := append([]byte(nil), k...)
-				kept = append(kept, keepRow{key: keyCopy, ev: p.Item})
 			}
-			if len(kept) == 0 {
-				// Delete the subject's rows (may be none — the subject simply
-				// does not exist; that is a successful no-op prune).
-				c2 := b.Cursor()
-				for k, _ := c2.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, _ = c2.Next() {
-					if err := b.Delete(append([]byte(nil), k...)); err != nil {
-						return err
-					}
-				}
-				continue
-			}
-			for _, row := range kept {
-				env, err := json.Marshal(persistedEvidence{SchemaVersion: evidenceSchemaVersion, Item: row.ev})
-				if err != nil {
-					return err
-				}
-				if err := b.Put(row.key, env); err != nil {
+			for _, key := range deleteKeys {
+				if err := b.Delete(key); err != nil {
 					return err
 				}
 			}

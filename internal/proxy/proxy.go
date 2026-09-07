@@ -17,15 +17,18 @@
 package proxy
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/B-A-M-N/gripline/internal/lane"
+	"github.com/B-A-M-N/gripline/internal/observability"
 	"github.com/B-A-M-N/gripline/internal/resource"
 	"github.com/B-A-M-N/gripline/internal/terminator"
 )
@@ -195,11 +198,18 @@ type Config struct {
 	// (P0.9): whether completion evidence persisted, and stream outcomes. It
 	// never receives request/response content. Nil means no observation.
 	Observer DecisionObserver
+	// Admission receives the authoritative decision immediately after the
+	// terminator returns, including early denials. It is separate from the
+	// completion observer because the response may stream for an arbitrary time.
+	Admission AdmissionObserver
 
 	// MaxBodyBytes caps the request body (BETA-08). Inference prompts can be
 	// large but are not unbounded. Oversized bodies are rejected with 413
 	// BEFORE admission. Zero disables the limit (not recommended).
 	MaxBodyBytes int64
+	// SpoolDir is the optional dedicated writable directory for unknown-length
+	// request bodies. Empty uses the process temp directory.
+	SpoolDir string
 
 	// WriteTimeout is the initial response budget, from WriteHeader until the
 	// first deadline expiry. Zero = no server-managed write deadline change
@@ -268,17 +278,25 @@ type DecisionObserver interface {
 	ObserveCompletion(event CompletionEvent)
 }
 
+// AdmissionObserver receives exactly one credential-safe decision projection
+// per request, immediately after admission. Implementations should make the
+// callback non-blocking or bounded so telemetry cannot become an authorization
+// dependency.
+type AdmissionObserver interface {
+	ObserveAdmission(record *observability.DecisionRecord)
+}
+
 // CompletionEvent is the non-secret completion telemetry record.
 type CompletionEvent struct {
 	// EvidenceCodes lists completion-signal codes minted for this request.
-	EvidenceCodes []string
+	EvidenceCodes []string `json:"evidence_codes"`
 	// Persisted reports whether minted evidence reached the store.
-	Persisted bool
+	Persisted bool `json:"persisted"`
 	// StreamOK reports whether the upstream stream ended cleanly.
-	StreamOK bool
+	StreamOK bool `json:"stream_ok"`
 	// Err is the completion-persistence error, when persistence was attempted
 	// and failed.
-	Err error
+	Err error `json:"error,omitempty"`
 }
 
 // DataPlane is a single terminate-and-forward proxy hop. It is CONCURRENT-SAFE
@@ -303,6 +321,9 @@ func New(cfg Config) (*DataPlane, error) {
 	}
 	if cfg.BackendURL.Scheme != "http" && cfg.BackendURL.Scheme != "https" {
 		return nil, fmt.Errorf("proxy: backend URL scheme must be http/https, got %q", cfg.BackendURL.Scheme)
+	}
+	if cfg.BackendURL.User != nil || cfg.BackendURL.RawQuery != "" || cfg.BackendURL.Fragment != "" {
+		return nil, fmt.Errorf("proxy: backend URL must not contain userinfo, query, or fragment")
 	}
 	if cfg.Audience == "" {
 		return nil, fmt.Errorf("proxy: audience required (INV-11)")
@@ -337,11 +358,44 @@ func New(cfg Config) (*DataPlane, error) {
 // re-inject the signed assertion on the trusted hop → forward to the FIXED
 // backend (P0.7) → stream back.
 func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	requestID := terminator.NewRequestID()
+	w.Header().Set("X-Gripline-Request-ID", requestID)
+	var observed bool
+	observeAdmission := func(out *terminator.Outcome) {
+		if observed || d.cfg.Admission == nil {
+			return
+		}
+		observed = true
+		d.cfg.Admission.ObserveAdmission(observability.New(out))
+	}
+	// Any guard that returns before the normal admission call still produces
+	// one correlated denial record.
+	defer func() {
+		if !observed {
+			observeAdmission(&terminator.Outcome{RequestID: requestID, Reason: "internal_error"})
+		}
+	}()
+
+	// Copy headers before any body work. Unknown-length requests are preflighted
+	// against the credential before they can force disk spooling.
+	authHeaders := copyHeaders(r.Header)
+	if d.cfg.MaxBodyBytes > 0 && r.ContentLength < 0 {
+		preflightHeaders := copyHeaders(authHeaders)
+		if err := d.cfg.Terminator.Preflight(preflightHeaders); err != nil {
+			out := &terminator.Outcome{RequestID: requestID, Authorized: false, Reason: terminator.PublicReason(err), DenialErr: err}
+			observeAdmission(out)
+			d.writeDenial(w, out)
+			return
+		}
+	}
+
 	// BETA-08: Enforce MaxBodyBytes BEFORE admission. Reject oversized
 	// bodies with 413 before any credential extraction or forwarding.
 	if d.cfg.MaxBodyBytes > 0 {
 		if r.ContentLength > d.cfg.MaxBodyBytes {
-			http.Error(w, "payload_too_large", http.StatusRequestEntityTooLarge)
+			out := &terminator.Outcome{RequestID: requestID, Authorized: false, Reason: "payload_too_large"}
+			observeAdmission(out)
+			d.writeDenial(w, out)
 			return
 		}
 		// P0.16/P0.6-fix: Bounded spooling for chunked/unknown-length bodies.
@@ -352,15 +406,23 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// the spooler sets tooLarge when input remains past it, so an
 		// oversized chunked body is rejected 413, never truncated-and-forwarded.
 		if r.ContentLength < 0 {
-			body, err := spoolBody(r.Body, d.cfg.MaxBodyBytes, spoolMemoryThreshold)
+			tempDir := d.cfg.SpoolDir
+			if tempDir == "" {
+				tempDir = spoolTempDir
+			}
+			body, err := spoolBodyInDir(r.Body, d.cfg.MaxBodyBytes, spoolMemoryThreshold, tempDir)
 			if err != nil {
-				http.Error(w, "bad_request", http.StatusBadRequest)
+				out := &terminator.Outcome{RequestID: requestID, Authorized: false, Reason: "bad_request", DenialErr: err}
+				observeAdmission(out)
+				d.writeDenial(w, out)
 				return
 			}
 			r.Body.Close()
 			if body.tooLarge {
 				_ = body.Close() // closes + removes any temp file
-				http.Error(w, "payload_too_large", http.StatusRequestEntityTooLarge)
+				out := &terminator.Outcome{RequestID: requestID, Authorized: false, Reason: "payload_too_large"}
+				observeAdmission(out)
+				d.writeDenial(w, out)
 				return
 			}
 			r.Body = body // body.Close() removes the temp file when the transport closes it
@@ -371,18 +433,15 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 1. Copy headers so stripping never mutates the caller's request, and so we
-	// keep a normalized map for extraction + a pristine one for the backend.
-	authHeaders := copyHeaders(r.Header)
-
-	// 2. Terminate the credential BEFORE any adapter sees the request (P0.6):
+	// 1. Terminate the credential BEFORE any adapter sees the request (P0.6):
 	// the extraction strips the secret carriers from our copy, and only that
 	// sanitized copy is handed to resolvers.
 	presented, _, err := terminator.ExtractExternalCredential(authHeaders)
 	if err != nil {
 		// Even on extraction failure the terminator's safe-reason mapping is
 		// reused so no header detail leaks into the response.
-		out := &terminator.Outcome{Authorized: false, Reason: "invalid_credential", DenialErr: err}
+		out := &terminator.Outcome{RequestID: requestID, Authorized: false, Reason: terminator.PublicReason(err), DenialErr: err}
+		observeAdmission(out)
 		d.writeDenial(w, out)
 		return
 	}
@@ -409,8 +468,9 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// is not an error.
 	src, srcErr := d.srcs.ResolveSource(obs)
 	if srcErr != nil {
-		w.Header().Set("X-Gripline-Reason", "source_resolution_failed")
-		http.Error(w, "source_resolution_failed", http.StatusServiceUnavailable)
+		out := &terminator.Outcome{RequestID: requestID, Authorized: false, Reason: "source_resolution_failed", DenialErr: srcErr}
+		observeAdmission(out)
+		d.writeDenial(w, out)
 		return
 	}
 	feat := d.feat.Resolve(obs)
@@ -420,7 +480,8 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	MergeSourceIntoFeatures(&feat, src)
 	est := d.cfg.Usage.Estimate(obs)
 
-	out := d.cfg.Terminator.AdmitUsage(authHeaders, feat, src, est)
+	out := d.cfg.Terminator.AdmitUsageWithRequestID(requestID, authHeaders, feat, src, est)
+	observeAdmission(out)
 
 	if !out.Authorized {
 		d.writeDenial(w, out)
@@ -479,6 +540,10 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// 6. Copy the backend response headers + status, stream the body back.
 	copyResponseHeaders(w.Header(), resp.Header)
+	// The backend is not authoritative for the ingress correlation id; restore
+	// it after reserved-header stripping so successful responses carry the same
+	// id as denials.
+	w.Header().Set("X-Gripline-Request-ID", requestID)
 	// P0.16 streaming timeouts: when stream_write_idle_timeout is configured,
 	// the initial write deadline carries the full write budget; every
 	// forwarded chunk then re-arms it to the idle bound. A live SSE stream
@@ -603,10 +668,24 @@ func (d *DataPlane) writeDenial(w http.ResponseWriter, out *terminator.Outcome) 
 		code = http.StatusTooManyRequests
 	case "invalid_credential", "credential_expired", "bad", "invalid_authentication":
 		code = http.StatusUnauthorized
-	case "backend_error", "internal_identity_failure", "resource_unavailable":
+	case "backend_error", "internal_identity_failure", "resource_unavailable", "source_resolution_failed", "internal_error":
 		code = http.StatusServiceUnavailable
+	case "bad_request":
+		code = http.StatusBadRequest
+	case "payload_too_large":
+		code = http.StatusRequestEntityTooLarge
+	}
+	if out.RequestID != "" {
+		w.Header().Set("X-Gripline-Request-ID", out.RequestID)
 	}
 	w.Header().Set("X-Gripline-Reason", out.Reason)
+	if out.Reason == "rate_limit" {
+		var limitErr *resource.ScopeLimitError
+		if errors.As(out.DenialErr, &limitErr) && limitErr.RetryAfter > 0 {
+			seconds := int64((limitErr.RetryAfter + time.Second - 1) / time.Second)
+			w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
+		}
+	}
 	http.Error(w, out.Reason, code)
 }
 

@@ -111,6 +111,24 @@ func TestLaneRepositoryRoundTrip(t *testing.T) {
 	}
 }
 
+func TestLaneSecurityTransitionIsDurablyAudited(t *testing.T) {
+	s := openTestStore(t)
+	lim := lane.DefaultLimits()
+	lim.Security.SuspectObs = 1
+	s.SetLaneLimits(func() lane.Limits { return lim })
+	mustCreateLane(t, s, "cred_security", "lane_security", time.Now())
+	if _, err := s.ObserveRiskWithRequestID("cred_security", "lane_security", lim.Security.SuspectThresh, time.Now(), "req_lane_security"); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := s.ListSecurityTransitions(0, 100)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("security transitions=%v err=%v, want one lane transition", rows, err)
+	}
+	if rows[0].Kind != "lane_security" || rows[0].RequestID != "req_lane_security" || rows[0].After != "SUSPICIOUS" {
+		t.Fatalf("unexpected lane transition: %+v", rows[0])
+	}
+}
+
 // TestLaneRepositorySameSemanticsAsMemory proves the Bolt repository and the
 // resident store produce the same outcomes for the same operation sequence
 // (shared pure reducers): borrowing, conflicts, explosion limits, risk
@@ -161,6 +179,81 @@ func TestLaneRepositorySameSemanticsAsMemory(t *testing.T) {
 	}
 	if got := memStore.ListLaneIDs("c"); len(got) != 1 || got[0] != "l1" {
 		t.Fatalf("ListLaneIDs mem = %v", got)
+	}
+}
+
+// TestLaneRetentionCommitsOnDomainError proves Bolt retains the cleanup from
+// the reducer even when the requested borrow is rejected by a lane-id
+// conflict. The memory and durable repositories must expose the same domain
+// error, but only the durable test can catch transaction rollback of cleanup.
+func TestLaneRetentionCommitsOnDomainError(t *testing.T) {
+	type clock struct{ now time.Time }
+	base := time.Now().Truncate(time.Millisecond)
+	for _, backend := range []string{"memory", "bolt"} {
+		c := &clock{now: base}
+		var repo lane.Repository
+		var durable *Store
+		var path string
+		if backend == "memory" {
+			repo = lane.NewStore(func() lane.Limits {
+				lim := lane.DefaultLimits()
+				lim.LaneIdleExpiration = time.Hour
+				return lim
+			}, func() time.Time { return c.now })
+		} else {
+			var err error
+			path = filepath.Join(t.TempDir(), "state.db")
+			durable, err = Open(path, Options{Now: func() time.Time { return c.now }})
+			if err != nil {
+				t.Fatal(err)
+			}
+			lim := lane.DefaultLimits()
+			lim.LaneIdleExpiration = time.Hour
+			durable.SetLaneLimits(func() lane.Limits { return lim })
+			repo = durable
+		}
+
+		featuresA := lane.Features{NetworkASN: "AS1", NetworkType: "residential", RegionClass: "US", ClientFamily: "client-a"}
+		featuresB := lane.Features{NetworkASN: "AS2", NetworkType: "hosting", RegionClass: "EU", ClientFamily: "client-b"}
+		ctx := lane.ClassificationContext{Revision: 1, Thresholds: lane.DefaultThresholds()}
+		if _, created, err := repo.BorrowOrCreate("cred", "lane-a", featuresA, ctx); err != nil || !created {
+			t.Fatalf("%s create A: created=%v err=%v", backend, created, err)
+		}
+		c.now = base.Add(30 * time.Minute)
+		if _, created, err := repo.BorrowOrCreate("cred", "lane-b", featuresB, ctx); err != nil || !created {
+			t.Fatalf("%s create B: created=%v err=%v", backend, created, err)
+		}
+		c.now = base.Add(80 * time.Minute)
+		_, _, err := repo.BorrowOrCreate("cred", "lane-b", lane.Features{NetworkASN: "AS2", NetworkType: "hosting", RegionClass: "EU", ClientFamily: "client-b-different"}, ctx)
+		if err != lane.ErrLaneConflict {
+			t.Fatalf("%s conflict err=%v, want ErrLaneConflict", backend, err)
+		}
+		if _, ok := repo.Get("cred", "lane-a"); ok {
+			t.Fatalf("%s expired lane survived rejected borrow", backend)
+		}
+		if _, ok := repo.Get("cred", "lane-b"); !ok {
+			t.Fatalf("%s active lane was deleted during cleanup", backend)
+		}
+		if durable != nil {
+			if err := durable.Close(); err != nil {
+				t.Fatal(err)
+			}
+			// Reopen under the same clock and prove the expired row does not
+			// return after the failed transaction.
+			reopened, err := Open(path, Options{Now: func() time.Time { return c.now }})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := reopened.Get("cred", "lane-a"); ok {
+				t.Fatal("bolt expired lane resurrected after reopen")
+			}
+			if _, ok := reopened.Get("cred", "lane-b"); !ok {
+				t.Fatal("bolt active lane missing after reopen")
+			}
+			if err := reopened.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 }
 

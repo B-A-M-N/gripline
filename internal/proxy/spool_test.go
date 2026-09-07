@@ -14,6 +14,17 @@ import (
 	"github.com/B-A-M-N/gripline/internal/terminator"
 )
 
+type countingBody struct {
+	read  bool
+	inner io.Reader
+}
+
+func (b *countingBody) Read(p []byte) (int, error) {
+	b.read = true
+	return b.inner.Read(p)
+}
+func (b *countingBody) Close() error { return nil }
+
 // readAllSpooled drains a spooled body fully and returns its content.
 func readAllSpooled(t *testing.T, b *spooledBody) string {
 	t.Helper()
@@ -193,6 +204,32 @@ func TestSpoolBodyChunkedEndToEnd(t *testing.T) {
 		if tc.code == http.StatusRequestEntityTooLarge && backendHits != hitsBefore {
 			t.Fatalf("%s: backend must NOT be reached for an oversized body", tc.name)
 		}
+	}
+}
+
+func TestChunkedInvalidCredentialPreflightDoesNotReadBody(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("invalid credential must not reach backend")
+	}))
+	defer backend.Close()
+	bu, _ := url.Parse(backend.URL)
+	dp := buildDataPlaneForBodyTest(t, bu, 1<<20)
+	body := &countingBody{inner: strings.NewReader(strings.Repeat("x", 1<<20))}
+	req := httptest.NewRequest("POST", "http://gripline.local/v1/messages", body)
+	req.Body = body
+	req.ContentLength = -1
+	req.Header.Set("Transfer-Encoding", "chunked")
+	req.Header.Set("Authorization", "Bearer definitely-not-a-valid-key")
+	rec := httptest.NewRecorder()
+	dp.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("invalid preflight status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if body.read {
+		t.Fatal("invalid credential preflight must reject before reading/spooling the body")
+	}
+	if rec.Header().Get("X-Gripline-Request-ID") == "" {
+		t.Fatal("early denial must carry request id")
 	}
 }
 

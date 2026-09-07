@@ -247,6 +247,17 @@ func TestDataPlaneDenialMapsStatus(t *testing.T) {
 	if rec.Header().Get("X-Gripline-Reason") == "" {
 		t.Fatal("denial must carry a safe reason header")
 	}
+	if rec.Header().Get("X-Gripline-Request-ID") == "" {
+		t.Fatal("denial must carry a request id")
+	}
+}
+
+func TestDataPlaneRejectsBackendURLComponents(t *testing.T) {
+	signer, _ := terminator.GenerateSigner()
+	base := &url.URL{Scheme: "http", Host: "backend.internal", User: url.User("bad"), RawQuery: "token=secret", Fragment: "bad"}
+	if _, err := New(Config{Terminator: buildTerminator(t, signer), BackendURL: base, Audience: testAudience}); err == nil {
+		t.Fatal("backend URL userinfo/query/fragment must be rejected")
+	}
 }
 
 // P0.7 regression: the client cannot select the upstream host. A request

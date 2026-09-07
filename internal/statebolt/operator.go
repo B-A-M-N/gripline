@@ -106,6 +106,40 @@ var (
 	_ control.MutationStore   = (*Store)(nil)
 )
 
+// ProvisionCredentialWithAudit inserts a new verifier-only credential and its
+// operator audit row in one Bolt transaction. Existing ids and verifier
+// ownership conflicts fail without changing either index or audit history.
+func (s *Store) ProvisionCredentialWithAudit(ctx context.Context, rec credential.CredentialRecord, audit control.OperatorRecord) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := rec.Validate(); err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		creds := tx.Bucket(bucketCredentials)
+		byVer := tx.Bucket(bucketCredVerifier)
+		if creds.Get([]byte(rec.CredentialID)) != nil {
+			return credential.ErrAlreadyExists
+		}
+		key := verKeyFor(rec.PepperVersion, rec.Verifier)
+		if owner := byVer.Get([]byte(key)); owner != nil {
+			return credential.ErrVerifierOwned
+		}
+		env, err := json.Marshal(persistedCredential{SchemaVersion: credentialSchemaVersion, Record: rec})
+		if err != nil {
+			return err
+		}
+		if err := creds.Put([]byte(rec.CredentialID), env); err != nil {
+			return err
+		}
+		if err := byVer.Put([]byte(key), []byte(rec.CredentialID)); err != nil {
+			return err
+		}
+		return appendOperatorTx(tx, audit)
+	})
+}
+
 // UnblockLaneWithAudit clears a BLOCKED lane and appends the control plane's
 // audit row in a single write transaction (P0.18/P0.49): the lane mutation
 // (pure lane.ApplyUnblock semantics), the lane-side audit entry, and the

@@ -231,6 +231,19 @@ func TestReserveAllOrNothing(t *testing.T) {
 	}
 }
 
+func TestRetryAfterReportsBucketRefillLowerBound(t *testing.T) {
+	now := time.Unix(100, 0)
+	b := NewTokenBucket(1, 1, 10*time.Second, func() time.Time { return now })
+	r := b.Reserve(1)
+	if r == nil {
+		t.Fatal("initial reservation should succeed")
+	}
+	if got := b.RetryAfter(1); got < 10*time.Second || got > 10*time.Second+time.Millisecond {
+		t.Fatalf("retry-after=%s, want approximately 10s", got)
+	}
+	r.Cancel()
+}
+
 // Regression: settlement is ownership-safe and idempotent — a reservation
 // releases exactly its own amount, exactly once, and Settle/Cancel are
 // mutually exclusive (settlement can never mint allowance, INV-15).

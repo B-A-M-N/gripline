@@ -23,13 +23,14 @@
     "read_header_timeout": "10s",
     "max_header_bytes": 65536,
     "max_body_bytes": 33554432,
-    "stream_write_idle_timeout": "30s"
+    "stream_write_idle_timeout": "30s",
+    "spool_dir": "/tmp/gripline-spool"
   },
 
   "admin": {
     "listen": "127.0.0.1:9090",
     "operator_tokens": {
-      "${GRIPLINE_OPERATOR_TOKEN}": "ops:posture.control,credential.lifecycle,lane.lifecycle,evidence.operator"
+      "${GRIPLINE_OPERATOR_TOKEN}": "ops:posture.control,credential.lifecycle,lane.lifecycle,evidence.operator,audit.read,identity.keys.rotate"
     }
   },
 

@@ -33,14 +33,25 @@ type DecisionRecord struct {
 	// freshly-observed score in that case.
 	Degraded bool `json:"degraded"`
 
-	Principal      drPrincipal `json:"principal"`
-	Scope          string      `json:"authorization_scope"` // LANE / CREDENTIAL / ...
-	LaneState      string      `json:"lane_state"`          // NEW / PROBATION / ESTABLISHED / ...
-	RiskBefore     int         `json:"risk_before"`
-	RiskAfter      int         `json:"risk_after"`
-	LaneNew        bool        `json:"lane_new"`
-	EvidenceCodes  []string    `json:"evidence"` // evidence codes that contributed
-	PolicyRevision int         `json:"policy_revision"`
+	Principal              drPrincipal `json:"principal"`
+	Scope                  string      `json:"authorization_scope"` // LANE / CREDENTIAL / ...
+	LaneID                 string      `json:"lane_id,omitempty"`
+	SourcePseudonym        string      `json:"source_pseudonym,omitempty"`
+	LaneState              string      `json:"lane_state"` // NEW / PROBATION / ESTABLISHED / ...
+	RiskBefore             int         `json:"risk_before"`
+	RiskAfter              int         `json:"risk_after"`
+	CredentialRisk         int         `json:"credential_risk"`
+	LaneRisk               int         `json:"lane_risk"`
+	CredentialStatusBefore string      `json:"credential_status_before,omitempty"`
+	CredentialStatusAfter  string      `json:"credential_status_after,omitempty"`
+	LaneSecurityBefore     string      `json:"lane_security_before,omitempty"`
+	LaneSecurityAfter      string      `json:"lane_security_after,omitempty"`
+	LimitsClass            string      `json:"limits_class,omitempty"`
+	ReservationScope       string      `json:"reservation_scope,omitempty"`
+	ReservationDimension   string      `json:"reservation_dimension,omitempty"`
+	LaneNew                bool        `json:"lane_new"`
+	EvidenceCodes          []string    `json:"evidence"` // evidence codes that contributed
+	PolicyRevision         int         `json:"policy_revision"`
 }
 
 // drPrincipal is the minimal, credential-safe principal projection.
@@ -72,15 +83,17 @@ func New(out *terminator.Outcome) *DecisionRecord {
 		return newFromTrace(out)
 	}
 	dr := &DecisionRecord{
-		RequestID:     out.RequestID,
-		At:            time.Now().UTC(),
-		Reason:        out.Reason,
-		Authorized:    out.Authorized,
-		Degraded:      out.Degraded,
-		RiskAfter:     out.RiskAfter,
-		EvidenceCodes: out.Evidence,
-		LaneNew:       out.LaneNew,
-		Action:        "AUTHORIZE",
+		RequestID:      out.RequestID,
+		At:             time.Now().UTC(),
+		Reason:         out.Reason,
+		Authorized:     out.Authorized,
+		Degraded:       out.Degraded,
+		RiskAfter:      out.RiskAfter,
+		CredentialRisk: out.CredentialRisk,
+		LaneRisk:       out.LaneRisk,
+		EvidenceCodes:  out.Evidence,
+		LaneNew:        out.LaneNew,
+		Action:         "AUTHORIZE",
 	}
 	if !out.Authorized {
 		dr.Action = "DENY"
@@ -104,14 +117,25 @@ func New(out *terminator.Outcome) *DecisionRecord {
 func newFromTrace(out *terminator.Outcome) *DecisionRecord {
 	tr := out.Trace
 	dr := &DecisionRecord{
-		RequestID:     tr.RequestID,
-		At:            time.Now().UTC(),
-		Authorized:    tr.Authorized,
-		Degraded:      out.Degraded,
-		RiskAfter:     out.RiskAfter,
-		EvidenceCodes: tr.EvidenceCodes,
-		LaneNew:       tr.LaneNew,
-		Action:        "AUTHORIZE",
+		RequestID:              tr.RequestID,
+		At:                     time.Now().UTC(),
+		Authorized:             tr.Authorized,
+		Degraded:               out.Degraded,
+		RiskAfter:              out.RiskAfter,
+		LaneID:                 tr.LaneID,
+		SourcePseudonym:        tr.SourcePseudonym,
+		CredentialRisk:         tr.CredentialRisk,
+		LaneRisk:               tr.LaneRisk,
+		CredentialStatusBefore: tr.CredentialStatusBefore,
+		CredentialStatusAfter:  tr.CredentialStatusAfter,
+		LaneSecurityBefore:     tr.LaneSecBefore,
+		LaneSecurityAfter:      tr.LaneSecAfter,
+		LimitsClass:            tr.LimitsClass,
+		ReservationScope:       tr.ReservationScope,
+		ReservationDimension:   tr.ReservationDimension,
+		EvidenceCodes:          tr.EvidenceCodes,
+		LaneNew:                tr.LaneNew,
+		Action:                 "AUTHORIZE",
 	}
 	if !tr.Authorized {
 		dr.Action = "DENY"

@@ -15,8 +15,8 @@ Legend:
 - NOT GROUNDED — no code/test/comment in the tree references this finding
   number; i.e. the finding text has no committed representation to verify.
 
-Last verified against `main` @ 55df52a. Full suite green: `go test -race ./...`
-across all 15 packages.
+Last verified against the release-candidate worktree. The final commit hash and
+release-gate results are recorded at close-out below.
 
 ---
 
@@ -37,7 +37,7 @@ across all 15 packages.
 | P0.7 | RESOLVED | `ObserveRisk` atomically updates the lane security dimension; BLOCKED → deny (`lane_restricted`/`ErrorLaneBlocked`), SUSPICIOUS → constrained limits. |
 | P0.8 | RESOLVED | `LaneRecord.Features` persists the complete normalized classification vector + `FeatSchema`; test proves full vectors distinguish lanes. |
 | P0.9 | RESOLVED | `ComparableWeight` + `MinComparableWeight=0.70`; MATCH requires renormalized similarity AND comparable mass ≥ floor; zero floor fails closed. **Closed by commit a457117.** |
-| P0.10 | PARTIAL | DEGRADED is not permanently latched (each request re-snapshots); a single-request `TransitionConflict` re-reads but does not re-apply the observation (comment says "bounded retry once" but only implements the re-read half). README documents it. |
+| P0.10 | RESOLVED | DEGRADED is evaluated per request and a `TransitionConflict` performs one bounded authoritative re-read/re-observe attempt; failures preserve the stricter persisted state. |
 | P0.11 | RESOLVED | `policy.Policy.{EvidenceRules, Classification}` carried on the compiled revision; terminator mints NEW_LANE and classifies lanes from `t.pol.*`, not package globals; `IsValid` fails closed on empty/degenerate. **Closed by commit 0509894.** |
 
 ## Evidence integrity + secret hygiene (P0.12–P0.22)
@@ -90,9 +90,9 @@ across all 15 packages.
 | P0.42 | RESOLVED | `CleanSince` seeded at creation, zeroed on security elevation, re-seeded on operator unblock, used (not FirstSeenAt) in `PromoteIfEligible`. `TestCleanSinceResetOnElevation`. |
 | P0.43 | RESOLVED | `PromoteIfEligible` returns early when `Security.Status != Normal`; `AllowSuspicious` deprecated/no-effect; SUSPICIOUS forced to constrained limits. lane/security_test. |
 | P0.44 | RESOLVED | `ObserveAndCommit` bumps `Revision++` exactly once on status change, not on NoChange; `UpdateStatusCAS` likewise. m1_test. |
-| P0.45 | PARTIAL | Evidence-revision filtering CLOSED (`policyRevisionFilter` drops stale-revision evidence from the authoritative feed; **commit 1685b35**). Lane-id part remains open: `shortTag` still hashes features only, so a policy change does not re-key lane identity (a fresh lane per §26 re-classification); documented follow-up. |
+| P0.45 | RESOLVED | Active evidence remains active across policy revisions until TTL expiry, and `laneTag` includes feature-schema plus classification-universe revisions so classification changes re-key the lane universe. |
 | P0.46/P0.47 | NOT GROUNDED | No code references P0.46/P0.47. |
-| P0.48 | PARTIAL | Clean counters advance only on authorized requests (INV-8, `RecordCleanAuthorizedAndPromote` only in the authorized path; promotion gated behind `AdaptiveAvailable`). Caveat: in DEGRADED posture the counters still advance (promotion itself is the gated action) — a conditional INV-8 reading. |
+| P0.48 | RESOLVED | Clean baseline credit is deferred to successful proxy completion and the `BaselineToken` is ineligible in `AdaptiveDegraded`; denied, failed, and degraded requests do not advance trust counters. |
 
 ## Architecture / control plane / gateway (P0.49–P0.57)
 
@@ -105,7 +105,7 @@ across all 15 packages.
 | # | Verdict | Evidence |
 |---|---------|----------|
 | P0.58 | RESOLVED (single-node beta) | `internal/statebolt` is the durable credential authority. Multi-node replication remains deliberately out of scope. |
-| P0.59 | RESOLVED | Signer key rotation / overlap: `terminator.Keyring` `Rotate()` + retained old-generation public keys; `TestDataPlaneBackendFollowsSignerRotation`. |
+| P0.59 | RESOLVED | Live signer rotation uses `Keyring.RotateAndSave`: the candidate generation is persisted before publish, old public keys overlap, the authenticated admin endpoint audits the action, and the endpoint returns the public export. |
 | P0.60 | PARTIAL | Assertion key overlap exists via Keyring, but no HSM/remote signer or automated key-management lifecycle. |
 | P0.61 | ABSENT | Multi-node / leader election: resource governor is a single-process `sync.Mutex`; no etcd/Consul/Raft. |
 | P0.62 | ABSENT | Shared leases with TTL across nodes: leases are in-process; no distributed store/TTL. |
@@ -143,13 +143,12 @@ across all 15 packages.
 > the "Public-beta re-review close-out" section at the bottom for what is now
 > true.
 
-**Hardened security-core prototype / pre-beta data-plane library.** The core
-deterministic authorization engine, the proxy trust boundary, all 10 acceptance
-gates, the source-spray detector, signer rotation, the control plane, and the
-observability decision record are committed and race-tested. At the time of
-writing all state was in-memory and lost on restart; there was no standalone
-gateway process; no multi-node lease coordination; no durable backend / WAL /
-metrics pipeline; no chaos harness; no KMS/HSM-backed keys or TLS.
+**Single-node public-beta gateway.** The deterministic authorization engine,
+proxy trust boundary, durable bbolt authority, source-spray detector, live
+signer rotation, operator control plane, bounded runtime observer, and causal
+demo are implemented and tested. Multi-node lease coordination, an external
+chaos/replay harness, metrics backends, KMS/HSM-backed keys, and a provider SDK
+matrix remain outside the beta claim.
 
 ## Production gaps (not P0 defects; architecture recommendations)
 
@@ -164,13 +163,13 @@ metrics pipeline; no chaos harness; no KMS/HSM-backed keys or TLS.
 
 ## Open / partial work queue (ordered by what blocks the e2e goal)
 
-1. ~~P0.15~~ CLOSED — CSPRNG evidence ids (commit 5b644ee).
-2. ~~P0.45 evidence-revision filter~~ CLOSED — stale-revision evidence dropped
-   from the authoritative state machine (commit 1685b35); lane-id re-keying
-   per §26 remains a separate follow-up.
-3. P0.48/P0.10 — gate clean-counter increments on adaptive status; implement the
-   single-request conflict re-observe.
-4. Durable stores + gateway process (P0.58/63/64/61/62) — before production.
+1. P0.61/P0.62 — distributed resource leases, leader election, and shared
+   multi-node hard-limit state remain out of beta scope.
+2. P0.68/P0.69 — external chaos, network-isolation, cross-process replay, and
+   SDK-matrix harnesses remain release-follow-up work.
+3. Provider adapters — stock binary exposes safe seams and request-only
+   accounting; production integrations must supply ASN/region and token/cost
+   adapters explicitly.
 ---
 
 ## Public-beta re-review close-out (2026-09)

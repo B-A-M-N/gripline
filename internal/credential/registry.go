@@ -99,6 +99,11 @@ func IsUnknownCredential(err error) bool { return errors.Is(err, ErrNotFound) }
 // one credential authenticate as another.
 var ErrVerifierOwned = errors.New("credential: verifier already owned by another credential")
 
+// ErrAlreadyExists is returned by explicit credential provisioning when the
+// requested id is already present. Provisioning must never silently replace a
+// managed credential.
+var ErrAlreadyExists = errors.New("credential: credential id already exists")
+
 // Provisioner is the startup-provisioning seam (P0.10). Bootstrap uses
 // InsertIfAbsent so an env-provided GRIPLINE_CREDENTIAL_SECRET never overwrites
 // an operator-managed (e.g. CONSTRAINED/REVOKED) credential on restart.

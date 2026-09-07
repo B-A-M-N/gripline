@@ -1,11 +1,12 @@
 package main
 
 import (
-	"crypto/tls"
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -22,6 +23,7 @@ import (
 	"github.com/B-A-M-N/gripline/internal/credential"
 	"github.com/B-A-M-N/gripline/internal/evidence"
 	"github.com/B-A-M-N/gripline/internal/ingress"
+	"github.com/B-A-M-N/gripline/internal/keyexport"
 	"github.com/B-A-M-N/gripline/internal/lane"
 	"github.com/B-A-M-N/gripline/internal/policy"
 	"github.com/B-A-M-N/gripline/internal/producers"
@@ -90,6 +92,14 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 			_ = closers[i]()
 		}
 	}()
+	if cfg.Server.SpoolDir != "" {
+		if err := os.MkdirAll(cfg.Server.SpoolDir, 0o750); err != nil {
+			return nil, fmt.Errorf("gripline: create spool dir: %w", err)
+		}
+		if err := proxy.CleanupSpoolDir(cfg.Server.SpoolDir); err != nil {
+			return nil, fmt.Errorf("gripline: cleanup spool dir: %w", err)
+		}
+	}
 
 	pepper := os.Getenv("GRIPLINE_PEPPER_V1")
 	if pepper == "" {
@@ -220,7 +230,11 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 	transport.TLSHandshakeTimeout = tlsHandshakeTimeout
 	transport.ResponseHeaderTimeout = respHeaderTimeout
 	if backend.Scheme == "https" {
-		transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+		tlsConfig, err := cfg.BackendTLSConfig()
+		if err != nil {
+			return nil, fmt.Errorf("gripline: backend tls: %w", err)
+		}
+		transport.TLSClientConfig = tlsConfig
 	}
 
 	// P0.6: Build the trusted ingress source resolver if configured.
@@ -268,7 +282,15 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		// blanket one that would kill long-lived SSE streams.
 		WriteTimeout:           cfg.Server.WriteTimeout.D(),
 		StreamWriteIdleTimeout: cfg.Server.StreamWriteIdleTimeout.D(),
+		SpoolDir:               cfg.Server.SpoolDir,
 	}
+	// Admission and completion decisions are shipped as bounded JSONL events
+	// on stderr. This is intentionally a real runtime sink, not only a library
+	// seam: operators can route stderr to journald, a sidecar, or a collector.
+	decisionObserver := newJSONLObserver(os.Stderr)
+	closers = append(closers, decisionObserver.Close)
+	proxyCfg.Admission = decisionObserver
+	proxyCfg.Observer = decisionObserver
 	// P0.6: Only wire a source resolver when ingress is configured. Leaving
 	// Sources nil defaults to NoSource (source-scoped features inert).
 	if srcResolver != nil {
@@ -349,10 +371,13 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/admin/posture", adminPosture(svc))
 		mux.HandleFunc("/admin/credentials", adminCredentials(svc, state))
+		mux.HandleFunc("/admin/credentials/add", adminCredentialAdd(svc, state))
 		mux.HandleFunc("/admin/credentials/revoke", adminCredentialRevoke(svc))
 		mux.HandleFunc("/admin/lanes", adminLanes(svc, state))
 		mux.HandleFunc("/admin/lanes/unblock", adminLaneUnblock(svc))
 		mux.HandleFunc("/admin/audit", adminAudit(svc, state))
+		mux.HandleFunc("/admin/security-events", adminSecurityEvents(svc, state))
+		mux.HandleFunc("/admin/identity/keys/rotate", adminIdentityKeyRotate(svc, signer, cfg.Paths.SignerKeyring))
 		adminSrv = &http.Server{
 			Addr:              cfg.Admin.Listen,
 			Handler:           mux,
@@ -409,8 +434,7 @@ func adminPosture(svc *control.Service) http.HandlerFunc {
 			return
 		}
 		var b body
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&b); err != nil {
-			http.Error(w, "bad request", http.StatusBadRequest)
+		if err := decodeAdminJSON(w, r, &b); err != nil {
 			return
 		}
 		token := bearer(r.Header.Get("Authorization"))
@@ -470,6 +494,64 @@ func adminCredentialRevoke(svc *control.Service) http.HandlerFunc {
 			return
 		}
 		writeAdminJSON(w, map[string]string{"credential_id": req.CredentialID, "status": "REVOKED"})
+	}
+}
+
+func adminCredentialAdd(svc *control.Service, state *statebolt.Store) http.HandlerFunc {
+	type request struct {
+		CredentialID    string `json:"credential_id"`
+		AccountID       string `json:"account_id"`
+		PolicyID        string `json:"policy_id"`
+		PlanID          string `json:"plan_id"`
+		VerifierB64     string `json:"verifier_b64"`
+		VerifierVersion int    `json:"verifier_version"`
+		PepperVersion   int    `json:"pepper_version"`
+		Reason          string `json:"reason"`
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			adminMethodNotAllowed(w)
+			return
+		}
+		var req request
+		if err := decodeAdminJSON(w, r, &req); err != nil {
+			return
+		}
+		if state == nil {
+			http.Error(w, "persistent credential authority unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if req.CredentialID == "" || req.AccountID == "" || req.PolicyID == "" || req.PlanID == "" || req.VerifierB64 == "" || req.Reason == "" {
+			http.Error(w, "credential_id, account_id, policy_id, plan_id, verifier_b64, and reason are required", http.StatusBadRequest)
+			return
+		}
+		verifier, err := base64.StdEncoding.DecodeString(req.VerifierB64)
+		if err != nil || len(verifier) == 0 {
+			http.Error(w, "verifier_b64 must be valid base64", http.StatusBadRequest)
+			return
+		}
+		defer func() {
+			for i := range verifier {
+				verifier[i] = 0
+			}
+		}()
+		if req.VerifierVersion == 0 {
+			req.VerifierVersion = 1
+		}
+		if req.PepperVersion == 0 {
+			req.PepperVersion = 1
+		}
+		rec := credential.CredentialRecord{
+			CredentialID: req.CredentialID, AccountID: req.AccountID, Verifier: verifier,
+			VerifierVersion: req.VerifierVersion, PepperVersion: req.PepperVersion,
+			Status: credential.StatusNormal, PolicyID: req.PolicyID, PlanID: req.PlanID,
+			CreatedAt: time.Now().UTC(), Revision: 1,
+		}
+		if err := svc.ProvisionCredential(r.Context(), bearer(r.Header.Get("Authorization")), rec, req.Reason); err != nil {
+			writeAdminError(w, err)
+			return
+		}
+		writeAdminJSON(w, map[string]string{"credential_id": req.CredentialID, "status": "ACTIVE"})
 	}
 }
 
@@ -552,7 +634,7 @@ func adminAudit(svc *control.Service, state *statebolt.Store) http.HandlerFunc {
 			adminMethodNotAllowed(w)
 			return
 		}
-		if _, err := svc.AuthorizeCapability(r.Context(), bearer(r.Header.Get("Authorization")), control.CapEvidence); err != nil {
+		if _, err := svc.AuthorizeCapability(r.Context(), bearer(r.Header.Get("Authorization")), control.CapAuditRead); err != nil {
 			writeAdminError(w, err)
 			return
 		}
@@ -587,9 +669,111 @@ func adminAudit(svc *control.Service, state *statebolt.Store) http.HandlerFunc {
 	}
 }
 
+func adminSecurityEvents(svc *control.Service, state *statebolt.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			adminMethodNotAllowed(w)
+			return
+		}
+		if _, err := svc.AuthorizeCapability(r.Context(), bearer(r.Header.Get("Authorization")), control.CapAuditRead); err != nil {
+			writeAdminError(w, err)
+			return
+		}
+		if state == nil {
+			http.Error(w, "persistent security audit authority unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		after, limit, err := auditCursor(r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		rows, err := state.ListSecurityTransitions(after, limit)
+		if err != nil {
+			http.Error(w, "security audit authority unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		writeAdminJSON(w, rows)
+	}
+}
+
+func adminIdentityKeyRotate(svc *control.Service, keyring *terminator.Keyring, path string) http.HandlerFunc {
+	type request struct {
+		Reason string `json:"reason"`
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			adminMethodNotAllowed(w)
+			return
+		}
+		var req request
+		if err := decodeAdminJSON(w, r, &req); err != nil {
+			return
+		}
+		kid, err := svc.RotateIdentityKeys(r.Context(), bearer(r.Header.Get("Authorization")), req.Reason, func() (int, error) {
+			return keyring.RotateAndSave(path)
+		})
+		if err != nil {
+			writeAdminError(w, err)
+			return
+		}
+		publicKeys := keyring.PublicKeys()
+		verifiers := make(map[int][]byte, len(publicKeys))
+		for publicKid, publicKey := range publicKeys {
+			verifiers[publicKid] = append([]byte(nil), publicKey...)
+		}
+		exp, err := keyexport.GenerateExport(kid, verifiers)
+		if err != nil {
+			// Rotation is already durably committed; report an operational error
+			// rather than returning incomplete verification material.
+			http.Error(w, "key export unavailable", http.StatusInternalServerError)
+			return
+		}
+		writeAdminJSON(w, exp)
+	}
+}
+
+func auditCursor(r *http.Request) (uint64, int, error) {
+	after := uint64(0)
+	if raw := r.URL.Query().Get("after"); raw != "" {
+		var err error
+		after, err = strconv.ParseUint(raw, 10, 64)
+		if err != nil {
+			return 0, 0, fmt.Errorf("invalid after cursor")
+		}
+	}
+	limit := 100
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		var err error
+		limit, err = strconv.Atoi(raw)
+		if err != nil || limit < 1 || limit > 1000 {
+			return 0, 0, fmt.Errorf("invalid limit")
+		}
+	}
+	return after, limit, nil
+}
+
 func decodeAdminJSON(w http.ResponseWriter, r *http.Request, dst any) error {
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
-	if err := dec.Decode(dst); err != nil {
+	var raw json.RawMessage
+	if err := dec.Decode(&raw); err != nil || len(bytes.TrimSpace(raw)) == 0 || bytes.TrimSpace(raw)[0] != '{' {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		if err == nil {
+			err = errors.New("admin JSON must be one object")
+		}
+		return err
+	}
+	obj := json.NewDecoder(bytes.NewReader(raw))
+	obj.DisallowUnknownFields()
+	if err := obj.Decode(dst); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return err
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			err = errors.New("multiple JSON values")
+		}
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return err
 	}
