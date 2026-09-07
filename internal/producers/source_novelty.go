@@ -6,9 +6,9 @@ import (
 )
 
 // SourceNoveltyProducer detects source-discontinuity novelty: a credential
-// appearing from a new ASN, hosting ASN, or region class. It tracks the
-// distinct ASNs/regions seen per credential within a sliding window and emits
-// a signal when a new one is observed after the baseline set is established.
+// appearing from a new keyed source pseudonym, ASN, hosting ASN, or region
+// class. The source pseudonym is useful even when no ASN database is deployed;
+// it is a continuity signal, not proof that a source is malicious.
 type SourceNoveltyProducer struct {
 	mu          sync.Mutex
 	now         func() time.Time
@@ -20,6 +20,8 @@ type SourceNoveltyProducer struct {
 	credASN map[string]*windowKey
 	// credRegion tracks distinct regions per credential.
 	credRegion map[string]*windowKey
+	// credSource tracks keyed source pseudonyms per credential.
+	credSource map[string]*windowKey
 }
 
 // NewSourceNoveltyProducer builds a SourceNoveltyProducer.
@@ -34,6 +36,7 @@ func NewSourceNoveltyProducer(now func() time.Time) *SourceNoveltyProducer {
 		maxSubjects: defaultMaxSubjects,
 		credASN:     make(map[string]*windowKey),
 		credRegion:  make(map[string]*windowKey),
+		credSource:  make(map[string]*windowKey),
 	}
 }
 
@@ -48,6 +51,12 @@ func (p *SourceNoveltyProducer) ObserveAdmission(behavior AdmissionBehavior) []S
 	now := p.now()
 	var signals []Signal
 	subject := behavior.Subjects.CredentialID
+
+	if behavior.Subjects.SourceID != "" {
+		if observeWindow(p.credSource, subject, behavior.Subjects.SourceID, 1, p.window, p.cooldown, now, p.maxSubjects) {
+			signals = append(signals, Signal{Code: "NEW_SOURCE"})
+		}
+	}
 
 	if behavior.Features.NetworkASN != "" {
 		if observeWindow(p.credASN, subject, behavior.Features.NetworkASN, 1, p.window, p.cooldown, now, p.maxSubjects) {

@@ -2,6 +2,8 @@ package resource
 
 import (
 	"errors"
+	"hash/fnv"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -172,7 +174,11 @@ func (bs BucketSpec) specFor(dim Dimension) BucketConfig {
 // request AND permanently consume capacity (a leak you can never refund
 // because the caller never learned an admission succeeded).
 type Governor struct {
-	mu      sync.Mutex
+	// metaMu protects scope metadata and the maps that resolve a scope to its
+	// independently locked resource objects. It is not held while acquiring or
+	// settling a pool/bucket, so unrelated credentials do not serialize behind a
+	// process-wide admission mutex (P1-10).
+	metaMu  sync.Mutex
 	now     func() time.Time
 	pools   map[string]*ConcurrencyPool // scopeKey <Scope>:<id> -> pool
 	buckets map[Dimension]map[string]*TokenBucket
@@ -184,14 +190,21 @@ type Governor struct {
 	sourceIdle        time.Duration
 	sourceEvictions   uint64
 	sourceSaturations uint64
+	sourceOverflows   uint64
 }
 
 type sourceScopeMeta struct{ lastUsed time.Time }
 
 const (
-	defaultMaxSourceScopes = 4096
-	defaultSourceScopeIdle = 10 * time.Minute
+	defaultMaxSourceScopes       = 4096
+	defaultSourceScopeIdle       = 10 * time.Minute
+	defaultSourceOverflowBuckets = 64
 )
+
+// DefaultMaxSourceScopes is the conservative process-local bound used when a
+// deployment leaves the source-table limit at zero. Zero in configuration means
+// "use this default", never unlimited (P1-11).
+const DefaultMaxSourceScopes = defaultMaxSourceScopes
 
 // NewGovernor builds a Governor. now may be nil (defaults to time.Now).
 func NewGovernor(now func() time.Time) *Governor {
@@ -213,13 +226,16 @@ func NewGovernor(now func() time.Time) *Governor {
 }
 
 // SetSourceScopeLimits configures the bounded table for attacker-controlled
-// source pseudonyms. A zero max disables the cap; a non-positive idle horizon
-// uses the conservative default. Call before serving traffic.
+// source pseudonyms. A zero max selects the conservative default; an idle
+// horizon of zero retains the conservative default. There is no unlimited
+// source-table mode in the production governor (P1-11).
 func (g *Governor) SetSourceScopeLimits(max int, idle time.Duration) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if max >= 0 {
+	g.metaMu.Lock()
+	defer g.metaMu.Unlock()
+	if max > 0 {
 		g.maxSourceScopes = max
+	} else if max == 0 {
+		g.maxSourceScopes = defaultMaxSourceScopes
 	}
 	if idle > 0 {
 		g.sourceIdle = idle
@@ -232,34 +248,42 @@ type GovernorStats struct {
 	MaxSourceScopes   int
 	SourceEvictions   uint64
 	SourceSaturations uint64
+	SourceOverflows   uint64
 }
 
 func (g *Governor) Stats() GovernorStats {
-	g.mu.Lock()
-	defer g.mu.Unlock()
+	g.metaMu.Lock()
+	defer g.metaMu.Unlock()
 	return GovernorStats{SourceScopes: len(g.sourceScopes), MaxSourceScopes: g.maxSourceScopes,
-		SourceEvictions: g.sourceEvictions, SourceSaturations: g.sourceSaturations}
+		SourceEvictions: g.sourceEvictions, SourceSaturations: g.sourceSaturations,
+		SourceOverflows: g.sourceOverflows}
 }
 
-func (g *Governor) ensureSourceScopeLocked(sp ScopeSpec) error {
+func (g *Governor) ensureSourceScopeLocked(sp ScopeSpec) (ScopeSpec, error) {
 	if sp.Scope != ScopeSource || sp.ID == "" {
-		return nil
+		return sp, nil
 	}
 	key := scopeKey(sp.Scope, sp.ID)
 	now := g.now()
 	if meta, ok := g.sourceScopes[key]; ok {
 		meta.lastUsed = now
 		g.sourceScopes[key] = meta
-		return nil
+		return sp, nil
 	}
 	if g.maxSourceScopes > 0 && len(g.sourceScopes) >= g.maxSourceScopes {
 		if !g.evictSourceScopeLocked(now) {
+			// A saturated global table must not become a denial oracle for every
+			// unrelated new source. Fold excess identities into a fixed set of
+			// hashed overflow scopes. Their shared allowance is conservative, but
+			// one attacker cannot exhaust all future source identities (P1-12).
 			g.sourceSaturations++
-			return ErrSourceScopeSaturated
+			g.sourceOverflows++
+			sp.ID = sourceOverflowID(sp.ID)
+			return sp, nil
 		}
 	}
 	g.sourceScopes[key] = sourceScopeMeta{lastUsed: now}
-	return nil
+	return sp, nil
 }
 
 func (g *Governor) evictSourceScopeLocked(now time.Time) bool {
@@ -291,11 +315,17 @@ func scopeKey(s Scope, id string) string {
 	return s.String() + ":" + id
 }
 
+func sourceOverflowID(id string) string {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(id))
+	return "__source_overflow_" + strconv.Itoa(int(h.Sum32()%defaultSourceOverflowBuckets))
+}
+
 // pool retrieves-or-creates the concurrency pool for a scope key. The
 // construction capacity is only the pool's high-water bound — the CURRENT
 // policy cap is supplied per acquisition via AcquireNCap (P0.2), so later
 // NORMAL→CONSTRAINED (or reverse) transitions take effect immediately without
-// recreating the pool or resetting its accounting. Caller holds g.mu.
+// recreating the pool or resetting its accounting. Caller holds g.metaMu.
 func (g *Governor) pool(key string, cap int) *ConcurrencyPool {
 	if p, ok := g.pools[key]; ok {
 		return p
@@ -309,7 +339,7 @@ func (g *Governor) pool(key string, cap int) *ConcurrencyPool {
 // call the bucket is reconfigured to the CURRENT config (P0.2): the parameters
 // in effect at first creation are not frozen — a constrained scope's tightened
 // burst/rate applies to the next reservation, and a restored scope's allowance
-// returns without resetting accounting. Caller holds g.mu.
+// returns without resetting accounting. Caller holds g.metaMu.
 func (g *Governor) bucket(dim Dimension, key string, cfg BucketConfig) *TokenBucket {
 	m := g.buckets[dim]
 	if b, ok := m[key]; ok {
@@ -389,13 +419,41 @@ func (g *Governor) ProvisionUsage(scopes []ScopeSpec, est UsageEstimate) (*Multi
 	if len(scopes) == 0 {
 		return nil, errors.New("resource: no scopes to provision")
 	}
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	for _, sp := range scopes {
-		if err := g.ensureSourceScopeLocked(sp); err != nil {
+
+	// Resolve metadata and resource objects under the metadata lock, then
+	// release it before doing any admission work. Each pool and bucket has its
+	// own lock, so requests for unrelated scopes do not serialize behind one
+	// process-wide admission mutex (P1-10).
+	type scopeRuntime struct {
+		spec ScopeSpec
+		pool *ConcurrencyPool
+	}
+	runtimes := make([]scopeRuntime, len(scopes))
+	bucketRefs := make(map[Dimension][]*TokenBucket)
+	g.metaMu.Lock()
+	for i, sp := range scopes {
+		resolved, err := g.ensureSourceScopeLocked(sp)
+		if err != nil {
+			g.metaMu.Unlock()
 			return nil, &ScopeLimitError{Scope: sp.Scope, Dimension: DimConcurrency, Cause: err}
 		}
+		runtimes[i].spec = resolved
+		key := scopeKey(resolved.Scope, resolved.ID)
+		if resolved.Buckets.ConcurrencyCap > 0 || !resolved.Buckets.hasNonConcurrencyGauge() {
+			runtimes[i].pool = g.pool(key, resolved.Buckets.ConcurrencyCap)
+		}
 	}
+	for _, dim := range []Dimension{DimRequests, DimInputTokens, DimOutputTokens, DimCombinedTokens, DimCost} {
+		refs := make([]*TokenBucket, len(runtimes))
+		for i, rt := range runtimes {
+			cfg := rt.spec.Buckets.specFor(dim)
+			if cfg.Capacity > 0 {
+				refs[i] = g.bucket(dim, scopeKey(rt.spec.Scope, rt.spec.ID), cfg)
+			}
+		}
+		bucketRefs[dim] = refs
+	}
+	g.metaMu.Unlock()
 
 	var acquired []*singleAcquired
 	defer func() {
@@ -408,17 +466,17 @@ func (g *Governor) ProvisionUsage(scopes []ScopeSpec, est UsageEstimate) (*Multi
 
 	// Round 1 — concurrency, in precedence order, each scope at its CURRENT
 	// policy cap (P0.2).
-	for _, sp := range scopes {
+	for _, rt := range runtimes {
+		sp := rt.spec
 		// A zero concurrency cap is disabled when another gauge is authored;
 		// otherwise a concurrency-only zero spec retains the historical
 		// deny-all behavior for direct resource callers.
 		if sp.Buckets.ConcurrencyCap > 0 || !sp.Buckets.hasNonConcurrencyGauge() {
-			p := g.pool(scopeKey(sp.Scope, sp.ID), sp.Buckets.ConcurrencyCap)
-			lease := p.AcquireNCap(1, sp.Buckets.ConcurrencyCap)
+			lease := rt.pool.AcquireNCap(1, sp.Buckets.ConcurrencyCap)
 			if lease == nil {
 				return nil, &ScopeLimitError{Scope: sp.Scope, Dimension: DimConcurrency}
 			}
-			acquired = append(acquired, &singleAcquired{kind: acquPool, pool: p, lease: lease})
+			acquired = append(acquired, &singleAcquired{kind: acquPool, pool: rt.pool, lease: lease})
 		}
 	}
 
@@ -431,7 +489,8 @@ func (g *Governor) ProvisionUsage(scopes []ScopeSpec, est UsageEstimate) (*Multi
 	// its own unused amount).
 	for _, dim := range []Dimension{DimRequests, DimInputTokens, DimOutputTokens, DimCombinedTokens, DimCost} {
 		amount := est.amountFor(dim)
-		for _, sp := range scopes {
+		for i, rt := range runtimes {
+			sp := rt.spec
 			cfg := sp.Buckets.specFor(dim)
 			if cfg.Capacity <= 0 {
 				continue // gauge not enforced at this scope
@@ -441,8 +500,7 @@ func (g *Governor) ProvisionUsage(scopes []ScopeSpec, est UsageEstimate) (*Multi
 			if amount < 0 {
 				continue
 			}
-			key := scopeKey(sp.Scope, sp.ID)
-			b := g.bucket(dim, key, cfg)
+			b := bucketRefs[dim][i]
 			res := b.Reserve(float64(amount))
 			if res == nil {
 				return nil, &ScopeLimitError{Scope: sp.Scope, Dimension: dim, RetryAfter: b.RetryAfter(float64(amount))}
@@ -563,10 +621,14 @@ func (r *MultiReservation) Leases() []*LeaseHandle {
 // InUseAll reports the total concurrency currently held across every scope
 // pool (diagnostics/leak-detection in tests).
 func (g *Governor) InUseAll() int {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	total := 0
+	g.metaMu.Lock()
+	pools := make([]*ConcurrencyPool, 0, len(g.pools))
 	for _, p := range g.pools {
+		pools = append(pools, p)
+	}
+	g.metaMu.Unlock()
+	total := 0
+	for _, p := range pools {
 		total += p.InUse()
 	}
 	return total
@@ -576,9 +638,10 @@ func (g *Governor) InUseAll() int {
 // (P0.4B: live concurrency value for the ResourceVelocityProducer).
 // Returns 0 when the scope has no pool yet (no admissions against it).
 func (g *Governor) InUseFor(scope Scope, id string) int {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if p, ok := g.pools[scopeKey(scope, id)]; ok {
+	g.metaMu.Lock()
+	p := g.pools[scopeKey(scope, id)]
+	g.metaMu.Unlock()
+	if p != nil {
 		return p.InUse()
 	}
 	return 0
@@ -588,15 +651,41 @@ func (g *Governor) InUseFor(scope Scope, id string) int {
 // (diagnostics/observability). Returns (0, false) when no bucket exists —
 // i.e. the gauge was never enforced for this scope.
 func (g *Governor) AvailableFor(dim Dimension, scope Scope, id string) (float64, bool) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
+	g.metaMu.Lock()
 	m := g.buckets[dim]
 	if m == nil {
+		g.metaMu.Unlock()
 		return 0, false
 	}
-	b, ok := m[scopeKey(scope, id)]
-	if !ok {
+	b := m[scopeKey(scope, id)]
+	g.metaMu.Unlock()
+	if b == nil {
 		return 0, false
 	}
 	return b.Available(), true
+}
+
+// RemoveScope removes an idle scope's resource state. It is used when a
+// dynamic scope (currently a classified lane) disappears from the durable
+// classification set. Active leases, outstanding reservations, or bucket
+// debt make the scope non-evictable; returning false preserves that state for
+// later cleanup rather than discarding accounting (P1-13).
+func (g *Governor) RemoveScope(scope Scope, id string) bool {
+	key := scopeKey(scope, id)
+	g.metaMu.Lock()
+	defer g.metaMu.Unlock()
+	if p := g.pools[key]; p != nil && p.InUse() != 0 {
+		return false
+	}
+	for _, byScope := range g.buckets {
+		if b := byScope[key]; b != nil && !b.Evictable() {
+			return false
+		}
+	}
+	delete(g.pools, key)
+	for _, byScope := range g.buckets {
+		delete(byScope, key)
+	}
+	delete(g.sourceScopes, key)
+	return true
 }

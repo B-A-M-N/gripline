@@ -227,7 +227,7 @@ func TestTraceRecordsStateTransitionsAndEvidence(t *testing.T) {
 	if tr.LaneID == "" || tr.LaneTrustBefore == "" || tr.LaneSecAfter == "" {
 		t.Fatalf("lane state not traced: %+v", tr)
 	}
-	if tr.PolicyRevision != 1 || tr.PolicyID != "fi-default-v1" {
+	if tr.PolicyRevision != 1 || tr.PolicyID != policy.DefaultPolicyID {
 		t.Fatalf("policy identity not traced: %q@%d", tr.PolicyID, tr.PolicyRevision)
 	}
 	if tr.LimitsClass != "normal" {

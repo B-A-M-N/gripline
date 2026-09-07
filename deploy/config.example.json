@@ -37,7 +37,7 @@
   },
 
   "identity": {
-    "audience": "fi-inference"
+    "audience": "gripline-inference"
   },
 
   "secrets": {
@@ -49,6 +49,13 @@
   "ingress": {
     "pseudonym_key": "${GRIPLINE_PSEUDONYM_KEY}",
     "trusted_proxies": ["10.0.0.0/8"]
+  },
+
+  "usage": {
+    "mode": "none",
+    "input_microunits_per_token": 0,
+    "output_microunits_per_token": 0,
+    "default_output_tokens": 0
   },
 
   "paths": {

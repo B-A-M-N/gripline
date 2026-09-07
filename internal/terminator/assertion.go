@@ -233,9 +233,9 @@ func requiresLaneScope(scopes []string) bool {
 // Claims decodes the payload JSON without exposing more than the claim set.
 func (a *Assertion) Claims() Claims { return a.claims }
 
-// Encode returns the wire format: base64url(payload).base64url(sig).
+// Encode returns the versioned wire format: v1.base64url(payload).base64url(sig).
 func (a *Assertion) Encode() string {
-	return base64.RawURLEncoding.EncodeToString(a.raw) + "." + base64.RawURLEncoding.EncodeToString(a.signature)
+	return assertionWireVersion + "." + base64.RawURLEncoding.EncodeToString(a.raw) + "." + base64.RawURLEncoding.EncodeToString(a.signature)
 }
 
 // ParseAndVerify validates an encoded assertion against a public key, the
@@ -256,11 +256,11 @@ func ParseAndVerify(encoded string, pub ed25519.PublicKey, expectedAudience stri
 	if len(encoded) > maxEncodedAssertionBytes {
 		return nil, ErrBadAssertion
 	}
-	dot := strings.IndexByte(encoded, '.')
-	if dot < 0 {
+	parts := strings.Split(encoded, ".")
+	if len(parts) != 3 || parts[0] != assertionWireVersion || parts[1] == "" || parts[2] == "" {
 		return nil, ErrBadAssertion
 	}
-	payloadB64, sigB64 := encoded[:dot], encoded[dot+1:]
+	payloadB64, sigB64 := parts[1], parts[2]
 	payload, err := base64.RawURLEncoding.DecodeString(payloadB64)
 	if err != nil {
 		return nil, ErrBadAssertion
@@ -330,6 +330,8 @@ const maxEncodedAssertionBytes = 8192
 
 // assertionIssuer is the only issuer internal verifiers accept.
 const assertionIssuer = "gripline"
+
+const assertionWireVersion = "v1"
 
 // maxAssertionTTLSeconds is the defensive upper bound on accepted assertion
 // lifetimes (INV-10, P0.28): the stated invariant is ≤30s, so both Issue and

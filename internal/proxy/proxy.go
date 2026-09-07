@@ -25,6 +25,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/B-A-M-N/gripline/internal/lane"
@@ -56,6 +57,10 @@ type Observation struct {
 	ProtoMajor int
 	// URLPath is the request path (no query), for endpoint-family features.
 	URLPath string
+	// BodySize is the declared request size, or -1 when unknown. It lets a
+	// provider adapter make a bounded pre-execution estimate without receiving
+	// the body itself.
+	BodySize int64
 }
 
 // FeatureResolver derives the normalized lane feature vector from a sanitized
@@ -324,6 +329,35 @@ type DataPlane struct {
 	srcs    SourceResolver
 	backend *url.URL
 	spool   *SpoolBudget
+	metrics proxyMetrics
+}
+
+// MetricsSnapshot is a low-cardinality operational view of the data plane.
+// It intentionally contains counts and outcome classes only; request IDs,
+// credentials, paths, and provider content do not belong in a metrics label.
+type MetricsSnapshot struct {
+	Admissions         uint64
+	Authorizations     uint64
+	Denials            uint64
+	AuthenticationFail uint64
+	SpoolRejects       uint64
+	CompletionFailures uint64
+}
+
+type proxyMetrics struct {
+	admissions, authorizations, denials, authenticationFail atomic.Uint64
+	spoolRejects, completionFailures                        atomic.Uint64
+}
+
+func (d *DataPlane) Metrics() MetricsSnapshot {
+	if d == nil {
+		return MetricsSnapshot{}
+	}
+	return MetricsSnapshot{
+		Admissions: d.metrics.admissions.Load(), Authorizations: d.metrics.authorizations.Load(),
+		Denials: d.metrics.denials.Load(), AuthenticationFail: d.metrics.authenticationFail.Load(),
+		SpoolRejects: d.metrics.spoolRejects.Load(), CompletionFailures: d.metrics.completionFailures.Load(),
+	}
 }
 
 // New validates the required seams and returns a DataPlane. Fail-closed: a
@@ -384,6 +418,20 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		observed = true
+		d.metrics.admissions.Add(1)
+		if out != nil && out.Authorized {
+			d.metrics.authorizations.Add(1)
+		} else {
+			d.metrics.denials.Add(1)
+			if out != nil {
+				switch out.Reason {
+				case "invalid_authentication", "invalid_credential", "credential_revoked", "credential_restricted", "credential_expired":
+					d.metrics.authenticationFail.Add(1)
+				case "spool_capacity_exhausted":
+					d.metrics.spoolRejects.Add(1)
+				}
+			}
+		}
 		d.cfg.Admission.ObserveAdmission(observability.New(out))
 	}
 	// Any guard that returns before the normal admission call still produces
@@ -398,6 +446,13 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// admission pipeline run before unknown-length request bodies can force disk
 	// spooling.
 	authHeaders := copyHeaders(r.Header)
+	// Remove recognized credential carriers and the reserved internal namespace
+	// from the original request immediately. The auth copy above is the only
+	// place that may still carry the external credential, and it is consumed by
+	// the terminator below. Keeping the raw header on r longer would enlarge the
+	// accidental logging/panic/heap exposure window even though it is never sent
+	// upstream (P1-16).
+	terminator.StripSecretHeaders(r.Header)
 
 	// BETA-08: Enforce MaxBodyBytes BEFORE admission. Reject oversized
 	// bodies with 413 before credential extraction or forwarding when the
@@ -413,8 +468,8 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 1. Terminate the credential BEFORE any adapter sees the request (P0.6):
-	// the extraction strips the secret carriers from our copy, and only that
-	// sanitized copy is handed to resolvers.
+	// the extraction uses the private auth copy, and only the sanitized request
+	// view is handed to resolvers.
 	presented, _, err := terminator.ExtractExternalCredential(authHeaders)
 	if err != nil {
 		// Even on extraction failure the terminator's safe-reason mapping is
@@ -439,6 +494,7 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		RemoteAddr: remoteIP(r),
 		ProtoMajor: r.ProtoMajor,
 		URLPath:    r.URL.Path,
+		BodySize:   r.ContentLength,
 	}
 	// P0.11-fix: a configured source resolver that FAILS must fail the request
 	// closed, not silently degrade to "no source" (which would disable the
@@ -655,6 +711,9 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// is false when the upstream stream failed, so a corrupt/failed stream is
 	// not credited as clean velocity. This affects SUBSEQUENT admissions.
 	completion := out.Complete(actual, streamErr == nil)
+	if completion.Err != nil {
+		d.metrics.completionFailures.Add(1)
+	}
 	// P0.9: surface completion-persistence failure through the observer seam —
 	// the client response is already delivered and must not change, but a
 	// shipping binary must not silently discard the Complete() result.

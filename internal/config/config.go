@@ -96,6 +96,10 @@ type Config struct {
 	// Ingress configures trusted source identity resolution (P0.6).
 	Ingress *IngressSection `json:"ingress,omitempty"`
 
+	// Usage configures one of the bounded provider-compatible usage adapters.
+	// Empty/none intentionally keeps token/cost accounting disabled.
+	Usage UsageSection `json:"usage,omitempty"`
+
 	// Deployment carries the deployment-posture switches (P0.18). The safe
 	// production path is the DEFAULT: persistent state is required at boot.
 	Deployment DeploymentSection `json:"deployment,omitempty"`
@@ -135,9 +139,34 @@ type IngressSection struct {
 	// PseudonymKey is the HMAC key for source pseudonymization. Must be
 	// distinct from the credential verifier pepper. Env-injected.
 	PseudonymKey string `json:"pseudonym_key"`
+	// PseudonymKeys is the versioned rotation window. The highest version is
+	// used for new source identifiers; older versions remain accepted by the
+	// resolver while stored identifiers migrate.
+	PseudonymKeys map[string]string `json:"pseudonym_keys,omitempty"`
 	// TrustedProxies is the set of CIDR prefixes that may supply forwarding
 	// headers. Empty means no trusted proxies (direct peer is canonical).
 	TrustedProxies []string `json:"trusted_proxies,omitempty"`
+	// Networks is a provider-authored local CIDR map. It is consulted only
+	// after trusted-proxy/source canonicalization.
+	Networks []NetworkSection `json:"networks,omitempty"`
+}
+
+// NetworkSection maps a canonical source prefix to bounded metadata used by
+// source novelty and lane classification.
+type NetworkSection struct {
+	CIDR        string `json:"cidr"`
+	ASN         string `json:"asn,omitempty"`
+	NetworkType string `json:"network_type,omitempty"`
+	Region      string `json:"region,omitempty"`
+}
+
+// UsageSection selects the built-in provider-compatible usage adapter.
+type UsageSection struct {
+	// Mode is "none", "openai", or "anthropic". The empty value means none.
+	Mode                     string `json:"mode,omitempty"`
+	InputMicrounitsPerToken  int64  `json:"input_microunits_per_token,omitempty"`
+	OutputMicrounitsPerToken int64  `json:"output_microunits_per_token,omitempty"`
+	DefaultOutputTokens      int64  `json:"default_output_tokens,omitempty"`
 }
 
 // TLSSection configures the public listener's TLS.
@@ -213,10 +242,10 @@ type ServerSection struct {
 	// In a read-only-root container, point this at a writable tmpfs mount.
 	SpoolDir string `json:"spool_dir,omitempty"`
 	// SpoolMaxBytes bounds aggregate unknown-length body reservations. Zero
-	// leaves the aggregate byte bound disabled (the per-request cap remains).
+	// resolves to a conservative production default.
 	SpoolMaxBytes int64 `json:"spool_max_bytes,omitempty"`
 	// SpoolMaxFiles bounds concurrent unknown-length body reservations. Zero
-	// leaves the aggregate file/concurrency bound disabled.
+	// resolves to a conservative production default.
 	SpoolMaxFiles int `json:"spool_max_files,omitempty"`
 	// MaxSourceScopes bounds source pseudonym state in the process-local
 	// governor. Zero uses the conservative runtime default.
@@ -405,6 +434,18 @@ func (c *Config) Validate() error {
 	if c.Server.SpoolMaxBytes < 0 || c.Server.SpoolMaxFiles < 0 {
 		return fmt.Errorf("server.spool_max_bytes/spool_max_files must be non-negative")
 	}
+	// Unknown-length request bodies consume process and filesystem resources
+	// before the backend can help. Persistent deployments must never silently
+	// opt into an unlimited aggregate spool budget. The values are intentionally
+	// conservative and remain overridable for a known workload.
+	if !c.Deployment.AllowEphemeralState {
+		if c.Server.SpoolMaxBytes == 0 {
+			c.Server.SpoolMaxBytes = 64 << 20
+		}
+		if c.Server.SpoolMaxFiles == 0 {
+			c.Server.SpoolMaxFiles = 64
+		}
+	}
 	if c.Server.MaxSourceScopes < 0 || c.Server.SourceScopeIdle.D() < 0 {
 		return fmt.Errorf("server.max_source_scopes/source_scope_idle must be non-negative")
 	}
@@ -418,6 +459,34 @@ func (c *Config) Validate() error {
 		}
 		if strings.TrimSpace(value) == "" {
 			return fmt.Errorf("secrets.pepper_versions[%q] must not be empty", version)
+		}
+	}
+	if c.Usage.Mode != "" && c.Usage.Mode != "none" && c.Usage.Mode != "openai" && c.Usage.Mode != "anthropic" {
+		return fmt.Errorf("usage.mode must be none, openai, or anthropic, got %q", c.Usage.Mode)
+	}
+	if c.Usage.InputMicrounitsPerToken < 0 || c.Usage.OutputMicrounitsPerToken < 0 || c.Usage.DefaultOutputTokens < 0 {
+		return fmt.Errorf("usage pricing and default_output_tokens must be non-negative")
+	}
+	if c.Ingress != nil {
+		for version, value := range c.Ingress.PseudonymKeys {
+			n, err := strconv.Atoi(version)
+			if err != nil || n < 1 {
+				return fmt.Errorf("ingress.pseudonym_keys key %q must be a positive decimal version", version)
+			}
+			if strings.TrimSpace(value) == "" {
+				return fmt.Errorf("ingress.pseudonym_keys[%q] must not be empty", version)
+			}
+		}
+		for i, network := range c.Ingress.Networks {
+			if _, err := netip.ParsePrefix(network.CIDR); err != nil {
+				return fmt.Errorf("ingress.networks[%d].cidr %q: %w", i, network.CIDR, err)
+			}
+			if network.ASN == "" && network.NetworkType == "" && network.Region == "" {
+				return fmt.Errorf("ingress.networks[%d] must provide metadata", i)
+			}
+			if network.NetworkType != "" && network.NetworkType != "residential" && network.NetworkType != "hosting" && network.NetworkType != "mobile" && network.NetworkType != "unknown" {
+				return fmt.Errorf("ingress.networks[%d].network_type %q is unsupported", i, network.NetworkType)
+			}
 		}
 	}
 

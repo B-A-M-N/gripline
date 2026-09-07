@@ -4,12 +4,15 @@
 
 Resource windows are process-local and volatile in the beta. They reset when
 the process restarts; durable credential, lane, evidence, audit, and posture
-state do not. Multi-node shared leases and window persistence are out of scope.
+state do not. Multi-node shared leases and window persistence are target
+architecture and are not claimed by this implementation.
 
-All policy is versioned (`id` + monotonically increasing `revision`). The data
-plane loads only authenticated + validated policy; the previous validated
-revision stays available for rollback (§57). Data-plane reload of policy on
-service outage uses **last validated policy** (§60).
+All policy is versioned (`id` + monotonically increasing `revision`). The
+`policy.Manager` prepare/activate lifecycle validates candidates, persists an
+active manifest before swapping the immutable snapshot, retains known-good
+revisions for explicit audited rollback, and rejects replayed revisions. The
+data plane still requires the deployment to authenticate policy artifacts
+(signature/KMS verification is an integration seam) before loading them.
 
 ```go
 type Policy struct {

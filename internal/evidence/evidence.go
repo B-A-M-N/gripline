@@ -277,6 +277,7 @@ func DefaultTable() Table {
 	}
 
 	return Table{
+		"NEW_SOURCE":      mk("NEW_SOURCE", FamilySourceDiscontinuity, ScopeCredential, 5, 1, 45, "source", d),
 		"NEW_ASN":         mk("NEW_ASN", FamilySourceDiscontinuity, ScopeLane, 10, 2, 60, "location", d),
 		"NEW_HOSTING_ASN": mk("NEW_HOSTING_ASN", FamilySourceDiscontinuity, ScopeLane, 15, 3, 70, "location", d),
 		"NEW_COUNTRY":     mk("NEW_COUNTRY", FamilySourceDiscontinuity, ScopeLane, 15, 3, 65, "location", d),

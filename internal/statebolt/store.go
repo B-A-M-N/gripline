@@ -38,20 +38,31 @@ var (
 	bucketOperatorAudit = []byte("operator_audit")       // seq -> OperatorRecord
 	bucketSecurityAudit = []byte("security_audit")       // seq -> SecurityTransitionRecord
 	bucketOperatorState = []byte("operator_state")       // "posture" -> Posture
+	bucketDetectorState = []byte("detector_state")       // bounded detector snapshots
 	keySchemaVersion    = []byte("schema_version")
 	keyPosture          = []byte("posture")
 	keyAuditSequence    = []byte("audit_sequence")
 	keySecuritySequence = []byte("security_sequence")
 )
 
-const currentSchemaVersion = 1
+const currentSchemaVersion = 2
 
 // ErrMigrationRequired is returned when a database carries a schema version
-// other than the one this build understands (P1.22). Until real migration
-// machinery exists, an OLDER schema must fail closed too — silently accepting
-// it would make the "versioned/migratable" claim a lie the first time the
-// schema actually changes.
-var ErrMigrationRequired = errors.New("statebolt: database schema version requires migration (unsupported for this build)")
+// newer than this build or cannot be migrated safely.
+var ErrMigrationRequired = errors.New("statebolt: database schema version requires migration or is unsupported")
+
+type schemaMigration struct {
+	From  int
+	To    int
+	Apply func(*bolt.Tx) error
+}
+
+var schemaMigrations = []schemaMigration{
+	{From: 1, To: 2, Apply: func(tx *bolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists(bucketDetectorState)
+		return err
+	}},
+}
 
 // Options configures opening a state database.
 type Options struct {
@@ -63,11 +74,14 @@ type Options struct {
 // bbolt serializes writers. It satisfies credential.Registry, lane.Repository,
 // and evidence.Store.
 type Store struct {
-	db               *bolt.DB
-	now              func() time.Time
-	lastSeenMu       sync.Mutex
-	lastSeen         map[string]time.Time
-	lastSeenInterval time.Duration
+	db                 *bolt.DB
+	now                func() time.Time
+	lastSeenMu         sync.Mutex
+	lastSeen           map[string]time.Time
+	lastSeenInterval   time.Duration
+	evidenceSweepMu    sync.Mutex
+	evidenceSweepAfter []byte
+	evidenceSweepStats EvidenceSweepStats
 	// mu guards the small policy-side knobs below (they are written once at
 	// terminator construction, read on every lane admission).
 	mu sync.RWMutex
@@ -101,6 +115,9 @@ func Open(path string, opts Options) (*Store, error) {
 			return nil, fmt.Errorf("statebolt: create dir: %w", err)
 		}
 	}
+	if err := validateStateFile(path, true); err != nil {
+		return nil, err
+	}
 	// 0600: the DB holds verifiers (public material) and operator audit but its
 	// on-disk access must still be restricted by default (defense in depth).
 	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: 5 * time.Second})
@@ -115,12 +132,47 @@ func Open(path string, opts Options) (*Store, error) {
 	return s, nil
 }
 
+func validateStateFile(path string, allowMissing bool) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if allowMissing && errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("statebolt: inspect %s: %w", path, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("statebolt: database %s must not be a symlink", path)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("statebolt: database %s is not a regular file", path)
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return fmt.Errorf("statebolt: database %s permissions %04o are too broad; require 0600", path, info.Mode().Perm())
+	}
+	return nil
+}
+
 // init creates the schema buckets and stamps/validates the schema version.
 func (s *Store) init() error {
+	var existingVersion int
+	if err := s.db.View(func(tx *bolt.Tx) error {
+		if meta := tx.Bucket(bucketMeta); meta != nil && meta.Get(keySchemaVersion) != nil {
+			existingVersion = btoi(meta.Get(keySchemaVersion))
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	if existingVersion > 0 && existingVersion < currentSchemaVersion {
+		backupPath := fmt.Sprintf("%s.pre-migration-v%d", s.db.Path(), existingVersion)
+		if err := s.db.View(func(tx *bolt.Tx) error { return tx.CopyFile(backupPath, 0o600) }); err != nil {
+			return fmt.Errorf("statebolt: pre-migration backup: %w", err)
+		}
+	}
 	return s.db.Update(func(tx *bolt.Tx) error {
 		for _, b := range [][]byte{
 			bucketMeta, bucketCredentials, bucketCredVerifier, bucketLanes,
-			bucketEvidence, bucketOperatorAudit, bucketSecurityAudit, bucketOperatorState,
+			bucketEvidence, bucketOperatorAudit, bucketSecurityAudit, bucketOperatorState, bucketDetectorState,
 		} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return fmt.Errorf("statebolt: create bucket %s: %w", b, err)
@@ -131,15 +183,28 @@ func (s *Store) init() error {
 		if v == nil {
 			return meta.Put(keySchemaVersion, itob(currentSchemaVersion))
 		}
-		// P1.22: until explicit migrations exist, ONLY the exact current schema
-		// is acceptable — an older database fails closed with
-		// ErrMigrationRequired rather than being silently read with semantics
-		// it was not written under.
 		got := btoi(v)
-		if got != currentSchemaVersion {
-			return fmt.Errorf("statebolt: database schema %d, supported %d: %w", got, currentSchemaVersion, ErrMigrationRequired)
+		if got > currentSchemaVersion || got < 1 {
+			return fmt.Errorf("statebolt: database schema %d, supported through %d: %w", got, currentSchemaVersion, ErrMigrationRequired)
 		}
-		return nil
+		for got < currentSchemaVersion {
+			migrated := false
+			for _, migration := range schemaMigrations {
+				if migration.From != got {
+					continue
+				}
+				if err := migration.Apply(tx); err != nil {
+					return fmt.Errorf("statebolt: migrate schema %d to %d: %w", migration.From, migration.To, err)
+				}
+				got = migration.To
+				migrated = true
+				break
+			}
+			if !migrated {
+				return fmt.Errorf("statebolt: no migration path from schema %d: %w", got, ErrMigrationRequired)
+			}
+		}
+		return meta.Put(keySchemaVersion, itob(currentSchemaVersion))
 	})
 }
 

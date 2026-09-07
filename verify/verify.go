@@ -25,11 +25,13 @@ import (
 const (
 	// AssertionHeader is the single trusted-hop carrier.
 	AssertionHeader = "X-Gripline-Assertion"
-	issuer          = "gripline"
-	maxTTLSeconds   = 30
-	maxScopes       = 8
-	maxPayloadBytes = 4096
-	maxTokenBytes   = 8192
+	// AssertionWireVersion is the frozen version prefix for assertion tokens.
+	AssertionWireVersion = "v1"
+	issuer               = "gripline"
+	maxTTLSeconds        = 30
+	maxScopes            = 8
+	maxPayloadBytes      = 4096
+	maxTokenBytes        = 8192
 )
 
 // Claims is the authenticated, non-secret principal passed to the provider.
@@ -259,15 +261,15 @@ func (v *Verifier) verifyEncoded(encoded string) (*Claims, error) {
 	if encoded == "" || len(encoded) > maxTokenBytes {
 		return nil, ErrBadAssertion
 	}
-	dot := strings.IndexByte(encoded, '.')
-	if dot <= 0 || strings.IndexByte(encoded[dot+1:], '.') >= 0 {
+	parts := strings.Split(encoded, ".")
+	if len(parts) != 3 || parts[0] != AssertionWireVersion || parts[1] == "" || parts[2] == "" {
 		return nil, ErrBadAssertion
 	}
-	payload, err := base64.RawURLEncoding.DecodeString(encoded[:dot])
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil || len(payload) == 0 || len(payload) > maxPayloadBytes {
 		return nil, ErrBadAssertion
 	}
-	sig, err := base64.RawURLEncoding.DecodeString(encoded[dot+1:])
+	sig, err := base64.RawURLEncoding.DecodeString(parts[2])
 	if err != nil || len(sig) != ed25519.SignatureSize {
 		return nil, ErrBadAssertion
 	}

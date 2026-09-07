@@ -127,6 +127,60 @@ func (s *Store) InsertIfAbsent(rec *credential.CredentialRecord) (bool, error) {
 	return created, err
 }
 
+// RotateVerifierCAS migrates one record to a newer pepper and updates the
+// verifier index plus credential revision in one bbolt transaction.
+func (s *Store) RotateVerifierCAS(credentialID string, expectedRevision int, pepperVersion int, verifier []byte) (*credential.CredentialRecord, error) {
+	if pepperVersion < 1 || len(verifier) == 0 {
+		return nil, errors.New("credential: invalid rotated verifier")
+	}
+	var out *credential.CredentialRecord
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		creds, byVer := tx.Bucket(bucketCredentials), tx.Bucket(bucketCredVerifier)
+		raw := creds.Get([]byte(credentialID))
+		if raw == nil {
+			return credential.ErrNotFound
+		}
+		var env persistedCredential
+		if err := json.Unmarshal(raw, &env); err != nil || env.SchemaVersion != credentialSchemaVersion {
+			return credential.ErrCorrupt
+		}
+		if env.Record.Revision != expectedRevision {
+			return credential.ErrStaleCAS
+		}
+		newKey := verKeyFor(pepperVersion, verifier)
+		if owner := byVer.Get([]byte(newKey)); owner != nil && string(owner) != credentialID {
+			return credential.ErrVerifierOwned
+		}
+		oldKey := verKeyFor(env.Record.PepperVersion, env.Record.Verifier)
+		if err := byVer.Delete([]byte(oldKey)); err != nil {
+			return err
+		}
+		env.Record.Verifier = append([]byte(nil), verifier...)
+		env.Record.VerifierVersion = 1
+		env.Record.PepperVersion = pepperVersion
+		env.Record.Revision++
+		env.Record.RotatedAt = s.now()
+		if err := env.Record.Validate(); err != nil {
+			return err
+		}
+		encoded, err := json.Marshal(env)
+		if err != nil {
+			return err
+		}
+		if err := creds.Put([]byte(credentialID), encoded); err != nil {
+			return err
+		}
+		if err := byVer.Put([]byte(newKey), []byte(credentialID)); err != nil {
+			return err
+		}
+		copyRec := env.Record
+		copyRec.Verifier = append([]byte(nil), env.Record.Verifier...)
+		out = &copyRec
+		return nil
+	})
+	return out, err
+}
+
 // Lookup implements credential.Registry: resolve a record by id, inside a
 // read transaction.
 func (s *Store) Lookup(credentialID string) (*credential.CredentialRecord, bool) {

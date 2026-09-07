@@ -12,7 +12,7 @@ assertion** carrying the principal and authorization scope.
   "sub": "account_217",
   "cid": "cred_83ab",
   "ctx": "lane_29c",
-  "aud": "fi-inference",
+  "aud": "gripline-inference",
   "iat": 1788581000,
   "exp": 1788581030,
   "jti": "req_0193...",
@@ -49,9 +49,16 @@ Provider backends should use the public [`verify`](../../verify/) package rather
 than importing `internal/terminator`. It consumes only the JSON public-key
 publication emitted by `gripline keys export`, rejects duplicate claim/header
 carriers, requires `kid`, and strips the assertion after verification. The
-custom wire format is versioned by this contract and remains deliberately
-small; changing it requires a protocol revision and updated conformance
-vectors.
+wire format is explicitly `v1.base64url(payload).base64url(signature)`;
+unversioned or unknown-version tokens are rejected. Changing it requires a
+protocol revision and updated conformance vectors.
+
+Signing-key rotation is a persisted lifecycle: prepare a candidate while the
+old signer remains active, export the candidate public key, verify backend
+acceptance with a canary, activate the candidate, retain the old public key
+for the maximum assertion TTL plus clock skew, then retire it. A crash leaves
+the prepared candidate on disk for an explicit retry; activation refuses to
+proceed without the backend-acceptance callback.
 
 ## 5. Sender-constrained mode (HARDENED, future)
 

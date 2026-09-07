@@ -1,6 +1,9 @@
 package terminator
 
 import (
+	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -91,5 +94,64 @@ func TestKeyringWrongAudienceRejected(t *testing.T) {
 	tok := issue(t, k, "acct_z")
 	if _, err := k.Verify(tok.Encode(), "wrong-aud", time.Now()); err == nil {
 		t.Fatal("INV-11: wrong audience must be rejected even on a valid-generation token")
+	}
+}
+
+func TestPreparedRotationRequiresBackendAcceptanceBeforeActivation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "keyring.json")
+	k, err := NewKeyring()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := k.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := k.PrepareRotation(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if candidate.KID != 2 || k.ActiveKid() != 1 {
+		t.Fatalf("prepared rotation: candidate=%d active=%d", candidate.KID, k.ActiveKid())
+	}
+	reloaded, err := LoadExistingKeyring(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.ActiveKid() != 1 {
+		t.Fatalf("prepared key must not become active on restart: got %d", reloaded.ActiveKid())
+	}
+	if _, ok := reloaded.Public(candidate.KID); !ok {
+		t.Fatal("prepared public key was not persisted for backend publication")
+	}
+	if err := k.ActivatePrepared(path, candidate.KID, func(public []byte) error {
+		if len(public) == 0 {
+			t.Fatal("backend acceptance callback received no public key")
+		}
+		return errors.New("backend not updated")
+	}); err == nil {
+		t.Fatal("activation must wait for backend acceptance")
+	}
+	if k.ActiveKid() != 1 {
+		t.Fatal("failed backend acceptance changed the active signer")
+	}
+	if err := k.ActivatePrepared(path, candidate.KID, func(public []byte) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if k.ActiveKid() != candidate.KID {
+		t.Fatalf("active kid=%d, want %d", k.ActiveKid(), candidate.KID)
+	}
+	if err := k.Retire(path, 1); err != nil {
+		t.Fatal(err)
+	}
+	final, err := LoadExistingKeyring(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := final.Public(1); ok {
+		t.Fatal("retired public key remained published")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -57,7 +57,7 @@ func (b *sseBackend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing_assertion", http.StatusUnauthorized)
 		return
 	}
-	claims, err := b.verifier.Verify(assertion, b.audience, time.Now())
+	claims, err := b.verifier.VerifyAndStrip(r)
 	if err != nil {
 		b.rejected.Add(1)
 		http.Error(w, "invalid_assertion", http.StatusUnauthorized)
@@ -279,7 +279,7 @@ func (b *stalledStreamBackend) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "missing_assertion", http.StatusUnauthorized)
 		return
 	}
-	claims, err := b.verifier.Verify(assertion, b.audience, time.Now())
+	claims, err := b.verifier.VerifyAndStrip(r)
 	if err != nil {
 		b.rejected.Add(1)
 		http.Error(w, "invalid_assertion", http.StatusUnauthorized)

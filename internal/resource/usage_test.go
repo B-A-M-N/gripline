@@ -110,11 +110,11 @@ func TestSettleRefundsOnlyOwnUnused(t *testing.T) {
 	r.Settle(UsageEstimate{InputTokens: 200, OutputTokens: 30, CombinedTokens: 120})
 	r.Release()
 
-	g.mu.Lock()
+	g.metaMu.Lock()
 	in := g.bucket(DimInputTokens, scopeKey(ScopeCredential, "c"), specs[0].Buckets.TokensBurst)
 	out := g.bucket(DimOutputTokens, scopeKey(ScopeCredential, "c"), specs[0].Buckets.TokensBurst)
 	comb := g.bucket(DimCombinedTokens, scopeKey(ScopeCredential, "c"), specs[0].Buckets.TokensBurst)
-	g.mu.Unlock()
+	g.metaMu.Unlock()
 
 	if avail := in.Available(); avail != 800 {
 		t.Fatalf("input fully consumed → nothing refunded; avail = %v, want 800", avail)
@@ -144,10 +144,10 @@ func TestReleaseWithoutSettleCancelsFullHold(t *testing.T) {
 		t.Fatal("fresh reservation must not report settled")
 	}
 	r.Release() // abandoned: concurrency returned AND full token hold cancelled
-	g.mu.Lock()
+	g.metaMu.Lock()
 	b := g.bucket(DimCombinedTokens, scopeKey(ScopeCredential, "c"), specs[0].Buckets.TokensBurst)
 	p := g.pools[scopeKey(ScopeCredential, "c")]
-	g.mu.Unlock()
+	g.metaMu.Unlock()
 	if avail := b.Available(); avail != 100 {
 		t.Fatalf("abandoned reservation must refund the full hold, avail = %v, want 100", avail)
 	}

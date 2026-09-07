@@ -95,6 +95,24 @@ type Detector struct {
 	srcCred map[string]*winSet
 	// srcInvalid: source -> (invalid-key pseudonym -> lastSeen) (P0.30).
 	srcInvalid map[string]*winSet
+	store      StateStore
+	stateName  string
+	stateErr   error
+	dropped    uint64
+}
+
+// Stats reports bounded-state pressure without exposing detector subjects.
+type Stats struct {
+	Dropped uint64
+}
+
+func (d *Detector) Stats() Stats {
+	if d == nil {
+		return Stats{}
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return Stats{Dropped: d.dropped}
 }
 
 // NewDetector builds a Detector. now may be nil (defaults time.Now). The
@@ -180,6 +198,7 @@ func (d *Detector) evictColdestLocked(m map[string]*winSet, now time.Time) {
 	}
 	if coldestK != "" {
 		delete(m, coldestK)
+		d.dropped++
 	}
 }
 
@@ -204,6 +223,7 @@ func (d *Detector) Observe(source, credentialID, asn string, now time.Time) []Si
 	if source != "" && d.observe(d.srcCred, source, credentialID, "SOURCE_ATTEMPTING_MANY_UNRELATED_CREDENTIALS", d.th.MaxCredentialsPerSourceWindow, now) {
 		out = append(out, Signal{Code: "SOURCE_ATTEMPTING_MANY_UNRELATED_CREDENTIALS"})
 	}
+	d.persistLocked()
 	return out
 }
 
@@ -223,7 +243,9 @@ func (d *Detector) ObserveInvalidCredential(source, candidate string, now time.T
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.observe(d.srcInvalid, source, candidate, "SOURCE_ATTEMPTING_MANY_INVALID_CREDENTIALS", d.th.MaxInvalidPerSourceWindow, now) {
+		d.persistLocked()
 		return []Signal{{Code: "SOURCE_ATTEMPTING_MANY_INVALID_CREDENTIALS"}}
 	}
+	d.persistLocked()
 	return nil
 }

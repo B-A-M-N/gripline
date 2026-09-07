@@ -94,7 +94,7 @@ func TestWrongIssuerRejected(t *testing.T) {
 		IssuedAt: time.Now().Unix(), ExpiresAt: time.Now().Add(30 * time.Second).Unix()}
 	payload, _ := json.Marshal(forged)
 	sig := ed25519.Sign(signer.priv, payload)
-	enc := base64.RawURLEncoding.EncodeToString(payload) + "." + base64.RawURLEncoding.EncodeToString(sig)
+	enc := assertionWireVersion + "." + base64.RawURLEncoding.EncodeToString(payload) + "." + base64.RawURLEncoding.EncodeToString(sig)
 	if _, err := ParseAndVerify(enc, signer.Public(), "aud", time.Now()); err != ErrWrongIssuer {
 		t.Fatalf("want ErrWrongIssuer, got %v", err)
 	}
@@ -116,7 +116,7 @@ func TestOverTTLAssertionRejected(t *testing.T) {
 	}
 	payload, _ := json.Marshal(claims)
 	sig := ed25519.Sign(signer.priv, payload)
-	enc := base64.RawURLEncoding.EncodeToString(payload) + "." + base64.RawURLEncoding.EncodeToString(sig)
+	enc := assertionWireVersion + "." + base64.RawURLEncoding.EncodeToString(payload) + "." + base64.RawURLEncoding.EncodeToString(sig)
 	if _, err := ParseAndVerify(enc, signer.Public(), "aud", now); err != ErrTTLTooLong {
 		t.Fatalf("want ErrTTLTooLong, got %v", err)
 	}

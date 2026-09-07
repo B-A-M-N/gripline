@@ -220,3 +220,79 @@ func (s *Store) CountEvidence() (int, error) {
 	})
 	return n, err
 }
+
+// EvidenceSweepStats reports bounded global evidence-maintenance activity.
+type EvidenceSweepStats struct {
+	Scanned     uint64
+	Deleted     uint64
+	LastSuccess time.Time
+	LastError   string
+}
+
+// SweepExpiredEvidence removes expired rows across all subjects with a bounded
+// cursor. Unlike Prune, it eventually reaches one-shot sources that no longer
+// participate in traffic. The cursor is retained in memory and resets after a
+// complete pass.
+func (s *Store) SweepExpiredEvidence(now time.Time, batch int) (int, error) {
+	if batch <= 0 {
+		batch = 256
+	}
+	s.evidenceSweepMu.Lock()
+	defer s.evidenceSweepMu.Unlock()
+	var deleted int
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketEvidence)
+		c := b.Cursor()
+		var k, v []byte
+		if len(s.evidenceSweepAfter) == 0 {
+			k, v = c.First()
+		} else {
+			k, v = c.Seek(s.evidenceSweepAfter)
+			if k != nil && bytes.Equal(k, s.evidenceSweepAfter) {
+				k, v = c.Next()
+			}
+		}
+		var remove [][]byte
+		processed := 0
+		for k != nil && processed < batch {
+			last := append([]byte(nil), k...)
+			var p persistedEvidence
+			if err := json.Unmarshal(v, &p); err != nil || p.SchemaVersion != evidenceSchemaVersion {
+				return errCorruptEvidence
+			}
+			processed++
+			if !p.Item.Valid(now) {
+				remove = append(remove, last)
+			}
+			s.evidenceSweepAfter = last
+			k, v = c.Next()
+		}
+		for _, key := range remove {
+			if err := b.Delete(key); err != nil {
+				return err
+			}
+			deleted++
+		}
+		if k == nil {
+			s.evidenceSweepAfter = nil
+		}
+		s.evidenceSweepStats.Scanned += uint64(processed)
+		s.evidenceSweepStats.Deleted += uint64(len(remove))
+		return nil
+	})
+	if err == nil {
+		s.evidenceSweepStats.LastSuccess = s.now()
+		s.evidenceSweepStats.LastError = ""
+	} else {
+		s.evidenceSweepStats.LastError = err.Error()
+	}
+	return deleted, err
+}
+
+// EvidenceSweepStats returns maintenance counters without exposing evidence
+// contents or subject identifiers.
+func (s *Store) EvidenceSweepStats() EvidenceSweepStats {
+	s.evidenceSweepMu.Lock()
+	defer s.evidenceSweepMu.Unlock()
+	return s.evidenceSweepStats
+}

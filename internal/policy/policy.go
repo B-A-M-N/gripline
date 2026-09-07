@@ -6,6 +6,8 @@
 package policy
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +19,30 @@ import (
 	"github.com/B-A-M-N/gripline/internal/evidence"
 	"github.com/B-A-M-N/gripline/internal/lane"
 )
+
+const (
+	// DefaultPolicyID is the provider-neutral policy identifier used for new
+	// deployments and credential provisioning.
+	DefaultPolicyID = "gripline-default-v1"
+	// LegacyDefaultPolicyID is accepted only as a migration alias for records
+	// created by the public-beta default.
+	LegacyDefaultPolicyID = "fi-default-v1"
+)
+
+// Digest returns the stable SHA-256 digest of a compiled policy's canonical
+// JSON representation. It is safe to publish in status and recovery metadata;
+// it contains no credentials or secret material.
+func Digest(p *Policy) (string, error) {
+	if p == nil {
+		return "", errors.New("policy: nil policy")
+	}
+	b, err := json.Marshal(p)
+	if err != nil {
+		return "", fmt.Errorf("policy: digest: %w", err)
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:]), nil
+}
 
 // LoadFile reads a policy artifact, rejects unknown/trailing JSON, and compiles
 // it before returning. The artifact is immutable for the lifetime of the
@@ -249,7 +275,7 @@ type Policy struct {
 // Default returns the spec §56 example defaults.
 func Default() *Policy {
 	return &Policy{
-		ID:       "fi-default-v1",
+		ID:       DefaultPolicyID,
 		Revision: 1,
 		Risk: RiskThresholds{
 			Watch:                 30,

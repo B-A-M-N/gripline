@@ -109,7 +109,7 @@ func signRaw(t *testing.T, s *Signer, c Claims, now time.Time) (*Claims, error) 
 	c.KeyID = s.Kid()
 	payload, _ := json.Marshal(c)
 	sig := ed25519.Sign(s.priv, payload)
-	enc := base64.RawURLEncoding.EncodeToString(payload) + "." + base64.RawURLEncoding.EncodeToString(sig)
+	enc := assertionWireVersion + "." + base64.RawURLEncoding.EncodeToString(payload) + "." + base64.RawURLEncoding.EncodeToString(sig)
 	return ParseAndVerify(enc, s.Public(), "aud", now)
 }
 

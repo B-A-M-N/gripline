@@ -18,6 +18,8 @@ import (
 	"sync"
 	"time"
 
+	publicingress "github.com/B-A-M-N/gripline/adapter/ingress"
+	publicusage "github.com/B-A-M-N/gripline/adapter/usage"
 	"github.com/B-A-M-N/gripline/internal/anomaly"
 	"github.com/B-A-M-N/gripline/internal/config"
 	"github.com/B-A-M-N/gripline/internal/control"
@@ -48,19 +50,20 @@ type Runtime struct {
 	// mux is the operator surface for it.
 	AdminService *control.Service
 
-	Evidence  evidence.Store
-	Resource  *resource.Governor
-	Control   *control.ControlPlane
-	Spray     *anomaly.Detector
-	Signer    terminator.AssertionSigner
-	Policy    *policy.Policy
-	State     *statebolt.Store // non-nil when backed by the transactional store
-	Audience  string
-	DataPlane http.Handler
-	Admin     *http.Server
-	closers   []func() error
-	closeOnce sync.Once
-	closeErr  error
+	Evidence      evidence.Store
+	Resource      *resource.Governor
+	Control       *control.ControlPlane
+	Spray         *anomaly.Detector
+	Signer        terminator.AssertionSigner
+	Policy        *policy.Policy
+	PolicyManager *policy.Manager
+	State         *statebolt.Store // non-nil when backed by the transactional store
+	Audience      string
+	DataPlane     http.Handler
+	Admin         *http.Server
+	closers       []func() error
+	closeOnce     sync.Once
+	closeErr      error
 }
 
 // controlService returns the admin control-plane service (test/CLI seam).
@@ -138,6 +141,10 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		}
 		state = s
 		closers = append(closers, func() error { return s.Close() })
+		// Sweep expired evidence that no longer has a live traffic subject. The
+		// stop function is appended after the DB close function so close order
+		// joins the worker before releasing the database (P1-14).
+		closers = append(closers, startStateMaintenance(s))
 		reg = s
 		lanes = s   // durable lane.Repository (P0.10)
 		evStore = s // durable evidence.Store (P0.2-fix)
@@ -161,10 +168,22 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 
 	// P0.1 fix: Instantiate each authority exactly once
 	governor := resource.NewGovernor(nil)
-	if cfg.Server.MaxSourceScopes > 0 || cfg.Server.SourceScopeIdle.D() > 0 {
+	// A configured idle horizon must not turn a zero max into an unlimited
+	// attacker-controlled source table. The governor normalizes zero to its
+	// conservative default; calling it for either knob keeps the runtime config
+	// semantics explicit (P1-11).
+	if cfg.Server.MaxSourceScopes != 0 || cfg.Server.SourceScopeIdle.D() > 0 {
 		governor.SetSourceScopeLimits(cfg.Server.MaxSourceScopes, cfg.Server.SourceScopeIdle.D())
 	}
-	spray := anomaly.NewDetector(time.Now, anomaly.DefaultThresholds())
+	var spray *anomaly.Detector
+	if state != nil {
+		spray, err = anomaly.NewPersistentDetector(time.Now, anomaly.DefaultThresholds(), state, "spray")
+		if err != nil {
+			return nil, fmt.Errorf("gripline: spray state: %w", err)
+		}
+	} else {
+		spray = anomaly.NewDetector(time.Now, anomaly.DefaultThresholds())
+	}
 	ctrl := control.New(0)
 	// P0.10: restore the persisted operator posture so a process restart in
 	// EMERGENCY_LOCKDOWN does not silently boot into NORMAL.
@@ -180,24 +199,46 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 	if err != nil {
 		return nil, fmt.Errorf("gripline: policy: %w", err)
 	}
+	policyManager, err := policy.NewManager(pol, policy.Options{})
+	if err != nil {
+		return nil, fmt.Errorf("gripline: policy manager: %w", err)
+	}
+	compiledPolicy := policyManager.Current()
+	pol = &compiledPolicy.Policy
+
+	producerList := []producers.Producer{
+		producers.NewSourceNoveltyProducer(time.Now),
+		producers.NewResourceVelocityProducer(time.Now),
+		producers.NewEnumerationProducer(time.Now),
+	}
+	if state != nil {
+		names := []string{"source_novelty", "resource_velocity", "enumeration"}
+		for i, name := range names {
+			snapshot, ok := producerList[i].(producers.StateSnapshotter)
+			if !ok {
+				return nil, fmt.Errorf("gripline: producer %s does not support persistence", name)
+			}
+			persistent, perr := producers.NewPersistentProducer(producerList[i], snapshot, state, name)
+			if perr != nil {
+				return nil, fmt.Errorf("gripline: producer state %s: %w", name, perr)
+			}
+			producerList[i] = persistent
+		}
+	}
 
 	term, err := terminator.New(terminator.Dependencies{
-		Registry: reg,
-		Peppers:  peppers,
-		Lanes:    lanes, // Shared lane authority
-		Policy:   pol,
-		Signer:   signer,
-		Audience: cfg.Identity.Audience,
-		Evidence: evStore,
-		Mode:     terminator.ModeEnforce,
-		Resource: governor, // Shared resource governor
-		Control:  ctrl,     // Shared control plane
-		Spray:    spray,    // Shared spray detector
-		Producers: []producers.Producer{
-			producers.NewSourceNoveltyProducer(time.Now),
-			producers.NewResourceVelocityProducer(time.Now),
-			producers.NewEnumerationProducer(time.Now),
-		},
+		Registry:  reg,
+		Peppers:   peppers,
+		Lanes:     lanes, // Shared lane authority
+		Policy:    pol,
+		Signer:    signer,
+		Audience:  cfg.Identity.Audience,
+		Evidence:  evStore,
+		Mode:      terminator.ModeEnforce,
+		Resource:  governor, // Shared resource governor
+		Control:   ctrl,     // Shared control plane
+		Spray:     spray,    // Shared spray detector
+		Producers: producerList,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("gripline: terminator: %w", err)
@@ -241,26 +282,10 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 
 	// P0.6: Build the trusted ingress source resolver if configured.
 	var srcResolver *proxy.IngressSourceResolver
-	if cfg.Ingress != nil && cfg.Ingress.PseudonymKey != "" {
-		pseudoKey, err := decodeSecretKey("ingress.pseudonym_key", cfg.Ingress.PseudonymKey, 32)
+	if cfg.Ingress != nil && (cfg.Ingress.PseudonymKey != "" || len(cfg.Ingress.PseudonymKeys) > 0) {
+		pseudonyms, err := pseudonymRingFromConfig(cfg, peppers)
 		if err != nil {
 			return nil, err
-		}
-		defer zeroBytes(pseudoKey)
-		// P0-17: key-separation — the pseudonymization HMAC key must differ
-		// from the credential verifier pepper; reusing one secret across two
-		// domains lets a value in either domain be replayed into the other.
-		for _, version := range peppers.Versions() {
-			pepperKey, ok := peppers.Get(version)
-			if ok && bytes.Equal(pseudoKey, pepperKey) {
-				zeroBytes(pepperKey)
-				return nil, fmt.Errorf("gripline: ingress.pseudonym_key must differ from every configured verifier pepper (key separation; version %d)", version)
-			}
-			zeroBytes(pepperKey)
-		}
-		pseudonyms, err := pseudonymRingFromKey(pseudoKey)
-		if err != nil {
-			return nil, fmt.Errorf("gripline: ingress pseudonym key: %w", err)
 		}
 		prefixes := make([]netip.Prefix, 0, len(cfg.Ingress.TrustedProxies))
 		for _, cidr := range cfg.Ingress.TrustedProxies {
@@ -273,6 +298,19 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		resolver := &ingress.Resolver{
 			Pseudonyms:     pseudonyms,
 			TrustedProxies: prefixes,
+		}
+		if len(cfg.Ingress.Networks) > 0 {
+			networks := make(publicingress.StaticNetworks, 0, len(cfg.Ingress.Networks))
+			for _, network := range cfg.Ingress.Networks {
+				prefix, err := netip.ParsePrefix(network.CIDR)
+				if err != nil {
+					return nil, fmt.Errorf("gripline: ingress network %q: %w", network.CIDR, err)
+				}
+				networks = append(networks, publicingress.NetworkMapping{
+					Prefix: prefix, ASN: network.ASN, NetworkType: network.NetworkType, Region: network.Region,
+				})
+			}
+			resolver.Networks = networks
 		}
 		srcResolver = proxy.NewIngressSourceResolver(resolver)
 	}
@@ -293,6 +331,20 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		SpoolDir:               cfg.Server.SpoolDir,
 		SpoolMaxBytes:          cfg.Server.SpoolMaxBytes,
 		SpoolMaxFiles:          cfg.Server.SpoolMaxFiles,
+	}
+	if cfg.Usage.Mode == "openai" || cfg.Usage.Mode == "anthropic" {
+		format := publicusage.FormatOpenAI
+		if cfg.Usage.Mode == "anthropic" {
+			format = publicusage.FormatAnthropic
+		}
+		provider, err := publicusage.NewJSONProvider(format, publicusage.Pricing{
+			InputMicrounitsPerToken:  cfg.Usage.InputMicrounitsPerToken,
+			OutputMicrounitsPerToken: cfg.Usage.OutputMicrounitsPerToken,
+		}, cfg.Usage.DefaultOutputTokens)
+		if err != nil {
+			return nil, fmt.Errorf("gripline: usage adapter: %w", err)
+		}
+		proxyCfg.Usage = proxy.AdaptUsageProvider(provider)
 	}
 	// Admission and completion decisions are shipped as bounded JSONL events
 	// on stderr. This is intentionally a real runtime sink, not only a library
@@ -387,6 +439,7 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		mux.HandleFunc("/admin/lanes/unblock", adminLaneUnblock(svc))
 		mux.HandleFunc("/admin/audit", adminAudit(svc, state))
 		mux.HandleFunc("/admin/security-events", adminSecurityEvents(svc, state))
+		mux.HandleFunc("/admin/metrics", adminMetrics(svc, dp, governor, state, spray, decisionObserver))
 		adminSrv = &http.Server{
 			Addr:              cfg.Admin.Listen,
 			Handler:           mux,
@@ -398,20 +451,21 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 	}
 
 	return &Runtime{
-		Registry:     reg,
-		Lanes:        lanes, // Shared lane authority
-		AdminService: adminSvc,
-		Evidence:     evStore,
-		Resource:     governor, // Shared resource governor
-		Control:      ctrl,     // Shared control plane
-		Spray:        spray,    // Shared spray detector
-		Signer:       signer,
-		Policy:       pol,
-		State:        state,
-		Audience:     cfg.Identity.Audience,
-		DataPlane:    dp,
-		Admin:        adminSrv,
-		closers:      closers,
+		Registry:      reg,
+		Lanes:         lanes, // Shared lane authority
+		AdminService:  adminSvc,
+		Evidence:      evStore,
+		Resource:      governor, // Shared resource governor
+		Control:       ctrl,     // Shared control plane
+		Spray:         spray,    // Shared spray detector
+		Signer:        signer,
+		Policy:        pol,
+		PolicyManager: policyManager,
+		State:         state,
+		Audience:      cfg.Identity.Audience,
+		DataPlane:     dp,
+		Admin:         adminSrv,
+		closers:       closers,
 	}, nil
 }
 
@@ -775,6 +829,52 @@ func adminSecurityEvents(svc *control.Service, state *statebolt.Store) http.Hand
 	}
 }
 
+func adminMetrics(svc *control.Service, dp *proxy.DataPlane, governor *resource.Governor, state *statebolt.Store, spray *anomaly.Detector, observer *jsonlObserver) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			adminMethodNotAllowed(w)
+			return
+		}
+		if _, err := svc.AuthorizeCapability(r.Context(), bearer(r.Header.Get("Authorization")), control.CapAuditRead); err != nil {
+			writeAdminError(w, err)
+			return
+		}
+		var b strings.Builder
+		writeMetric := func(name string, value any) { fmt.Fprintf(&b, "gripline_%s %v\n", name, value) }
+		if dp != nil {
+			m := dp.Metrics()
+			writeMetric("admissions_total", m.Admissions)
+			writeMetric("authorizations_total", m.Authorizations)
+			writeMetric("denials_total", m.Denials)
+			writeMetric("authentication_failures_total", m.AuthenticationFail)
+			writeMetric("spool_rejects_total", m.SpoolRejects)
+			writeMetric("completion_failures_total", m.CompletionFailures)
+		}
+		if governor != nil {
+			m := governor.Stats()
+			writeMetric("source_scopes", m.SourceScopes)
+			writeMetric("source_scope_saturations_total", m.SourceSaturations)
+			writeMetric("source_scope_overflows_total", m.SourceOverflows)
+			writeMetric("source_scope_evictions_total", m.SourceEvictions)
+		}
+		if state != nil {
+			m := state.EvidenceSweepStats()
+			writeMetric("evidence_sweep_scanned_total", m.Scanned)
+			writeMetric("evidence_sweep_deleted_total", m.Deleted)
+		}
+		if spray != nil {
+			writeMetric("detector_drops_total", spray.Stats().Dropped)
+		}
+		if observer != nil {
+			m := observer.Stats()
+			writeMetric("telemetry_drops_total", m.Dropped)
+			writeMetric("telemetry_sink_failures_total", m.SinkFailures)
+		}
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		_, _ = w.Write([]byte(b.String()))
+	}
+}
+
 func auditCursor(r *http.Request) (uint64, int, error) {
 	after := uint64(0)
 	if raw := r.URL.Query().Get("after"); raw != "" {
@@ -903,12 +1003,55 @@ func bootstrapCredentials(reg credential.Registry) error {
 	return nil
 }
 
-// pseudonymRingFromKey builds an ingress.PseudonymRing from a raw HMAC key
-// (P0.6). The pseudonym key MUST be distinct from the credential pepper.
-func pseudonymRingFromKey(key []byte) (ingress.PseudonymRing, error) {
-	ring, err := pseudonym.NewRing(&pseudonym.Key{Version: 1, Secret: key})
+func pseudonymRingFromConfig(cfg *config.Config, peppers *credential.PepperRing) (ingress.PseudonymRing, error) {
+	if cfg == nil || cfg.Ingress == nil {
+		return nil, fmt.Errorf("gripline: ingress pseudonym configuration missing")
+	}
+	values := make(map[int]string, len(cfg.Ingress.PseudonymKeys)+1)
+	if cfg.Ingress.PseudonymKey != "" {
+		values[1] = cfg.Ingress.PseudonymKey
+	}
+	for rawVersion, encoded := range cfg.Ingress.PseudonymKeys {
+		version, err := strconv.Atoi(rawVersion)
+		if err != nil || version < 1 {
+			return nil, fmt.Errorf("gripline: ingress pseudonym key version %q must be a positive decimal", rawVersion)
+		}
+		if _, exists := values[version]; exists {
+			return nil, fmt.Errorf("gripline: duplicate ingress pseudonym key version %d", version)
+		}
+		values[version] = encoded
+	}
+	versions := make([]int, 0, len(values))
+	for version := range values {
+		versions = append(versions, version)
+	}
+	sort.Ints(versions)
+	keys := make([]*pseudonym.Key, 0, len(versions))
+	for _, version := range versions {
+		key, err := decodeSecretKey(fmt.Sprintf("ingress pseudonym key version %d", version), values[version], 32)
+		if err != nil {
+			for _, prior := range keys {
+				zeroBytes(prior.Secret)
+			}
+			return nil, err
+		}
+		for _, pepperVersion := range peppers.Versions() {
+			if peppers.Matches(pepperVersion, key) {
+				zeroBytes(key)
+				for _, prior := range keys {
+					zeroBytes(prior.Secret)
+				}
+				return nil, fmt.Errorf("gripline: key separation: ingress pseudonym key version %d must differ from verifier pepper version %d", version, pepperVersion)
+			}
+		}
+		keys = append(keys, &pseudonym.Key{Version: version, Secret: key})
+	}
+	ring, err := pseudonym.NewRing(keys...)
+	for _, key := range keys {
+		zeroBytes(key.Secret)
+	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("gripline: ingress pseudonym ring: %w", err)
 	}
 	return &pseudonymRingAdapter{ring: ring}, nil
 }

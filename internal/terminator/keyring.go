@@ -19,10 +19,16 @@ import (
 // It carries the active private key AND all retained public keys so a
 // restart recovers signing authority without key rotation.
 type keyringPersist struct {
-	ActiveKid int            `json:"active_kid"` // P0.14: persist kid for rotation correctness
-	Active    string         `json:"active"`     // base64-encoded private key
-	Verifiers map[int]string `json:"verifiers"`  // kid -> base64-encoded public key
-	Next      int            `json:"next"`
+	ActiveKid int                      `json:"active_kid"` // P0.14: persist kid for rotation correctness
+	Active    string                   `json:"active"`     // base64-encoded private key
+	Verifiers map[int]string           `json:"verifiers"`  // kid -> base64-encoded public key
+	Next      int                      `json:"next"`
+	Candidate *keyringCandidatePersist `json:"candidate,omitempty"`
+}
+
+type keyringCandidatePersist struct {
+	Kid     int    `json:"kid"`
+	Private string `json:"private"`
 }
 
 // Save writes the keyring's active private key and all retained public keys
@@ -33,12 +39,15 @@ func (k *Keyring) Save(path string) error {
 	if path == "" {
 		return nil
 	}
+	if err := validateKeyringFile(path, true); err != nil {
+		return err
+	}
 	k.st.mu.Lock()
 	defer k.st.mu.Unlock()
-	return saveKeyringLocked(path, k.st.active, k.st.next, k.st.verifiers)
+	return saveKeyringLocked(path, k.st.active, k.st.next, k.st.verifiers, k.st.pending)
 }
 
-func saveKeyringLocked(path string, active *Signer, next int, verifiers map[int][]byte) error {
+func saveKeyringLocked(path string, active *Signer, next int, verifiers map[int][]byte, pending *Signer) error {
 	persist := keyringPersist{
 		ActiveKid: active.Kid(),
 		Active:    base64.StdEncoding.EncodeToString([]byte(active.Private())),
@@ -48,22 +57,27 @@ func saveKeyringLocked(path string, active *Signer, next int, verifiers map[int]
 	for kid, pub := range verifiers {
 		persist.Verifiers[kid] = base64.StdEncoding.EncodeToString(pub)
 	}
+	if pending != nil {
+		persist.Candidate = &keyringCandidatePersist{Kid: pending.Kid(), Private: base64.StdEncoding.EncodeToString([]byte(pending.Private()))}
+	}
 
 	data, err := json.Marshal(persist)
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
+	dirPath := filepath.Dir(path)
+	tmpFile, err := os.CreateTemp(dirPath, ".gripline-keyring-*")
+	if err != nil {
+		return err
+	}
+	tmp := tmpFile.Name()
 	committed := false
 	defer func() {
 		if !committed {
 			_ = os.Remove(tmp)
 		}
 	}()
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-	if err != nil {
-		return err
-	}
+	f := tmpFile
 	if err := f.Chmod(0o600); err != nil {
 		_ = f.Close()
 		return err
@@ -97,15 +111,21 @@ func saveKeyringLocked(path string, active *Signer, next int, verifiers map[int]
 	return nil
 }
 
-// RotateAndSave atomically persists a candidate generation before publishing
-// it as active. A failed write leaves the current signer untouched, so a live
-// process can never publish a key that a restart would forget.
+// RotateAndSave is the legacy one-step rotation primitive. New production
+// integrations should use PrepareRotation followed by ActivatePrepared so a
+// backend can accept the candidate public key before the signer activates it.
 func (k *Keyring) RotateAndSave(path string) (int, error) {
 	if path == "" {
 		return 0, errors.New("terminator: keyring path required for live rotation")
 	}
+	if err := validateKeyringFile(path, true); err != nil {
+		return 0, err
+	}
 	k.st.mu.Lock()
 	defer k.st.mu.Unlock()
+	if k.st.pending != nil {
+		return 0, errors.New("terminator: signing rotation already prepared")
+	}
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return 0, fmt.Errorf("terminator: rotate keyring: %w", err)
@@ -117,11 +137,122 @@ func (k *Keyring) RotateAndSave(path string) (int, error) {
 		verifiers[oldKid] = append([]byte(nil), pub...)
 	}
 	verifiers[kid] = []byte(candidate.Public())
-	if err := saveKeyringLocked(path, candidate, kid+1, verifiers); err != nil {
+	if err := saveKeyringLocked(path, candidate, kid+1, verifiers, nil); err != nil {
 		return 0, fmt.Errorf("terminator: persist rotated keyring: %w", err)
 	}
 	k.st.verifiers, k.st.active, k.st.next = verifiers, candidate, kid+1
 	return kid, nil
+}
+
+// RotationCandidate is the public portion of a persisted-but-not-yet-active
+// signing generation. Publish this key to the backend verifier and confirm it
+// can validate a canary assertion before calling ActivatePrepared.
+type RotationCandidate struct {
+	KID       int
+	PublicKey []byte
+}
+
+// PrepareRotation creates and durably records a candidate while leaving the
+// current signer active. The candidate public key is included by PublicKeys,
+// so a subsequent keys export can publish it during the overlap phase.
+func (k *Keyring) PrepareRotation(path string) (*RotationCandidate, error) {
+	if path == "" {
+		return nil, errors.New("terminator: keyring path required for rotation preparation")
+	}
+	if err := validateKeyringFile(path, true); err != nil {
+		return nil, err
+	}
+	k.st.mu.Lock()
+	defer k.st.mu.Unlock()
+	if k.st.pending != nil {
+		return nil, errors.New("terminator: signing rotation already prepared")
+	}
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("terminator: prepare key rotation: %w", err)
+	}
+	kid := k.st.next
+	candidate := &Signer{priv: priv, Version: kid}
+	verifiers := clonePublicKeys(k.st.verifiers)
+	verifiers[kid] = []byte(candidate.Public())
+	if err := saveKeyringLocked(path, k.st.active, kid+1, verifiers, candidate); err != nil {
+		return nil, fmt.Errorf("terminator: persist prepared key rotation: %w", err)
+	}
+	k.st.verifiers, k.st.next, k.st.pending = verifiers, kid+1, candidate
+	return &RotationCandidate{KID: kid, PublicKey: append([]byte(nil), verifiers[kid]...)}, nil
+}
+
+// ActivatePrepared verifies backend acceptance of a candidate, then durably
+// activates it. A failed verifier callback leaves the old signer active and
+// the prepared candidate available for retry. The callback runs without the
+// keyring lock and receives only a copy of the public key.
+func (k *Keyring) ActivatePrepared(path string, kid int, backendAccepted func([]byte) error) error {
+	if path == "" {
+		return errors.New("terminator: keyring path required for rotation activation")
+	}
+	if backendAccepted == nil {
+		return errors.New("terminator: backend acceptance check required before key activation")
+	}
+	if err := validateKeyringFile(path, true); err != nil {
+		return err
+	}
+	k.st.mu.Lock()
+	pending := k.st.pending
+	if pending == nil || pending.Kid() != kid {
+		k.st.mu.Unlock()
+		return fmt.Errorf("terminator: prepared signing key %d not found", kid)
+	}
+	publicKey := append([]byte(nil), pending.Public()...)
+	k.st.mu.Unlock()
+	if err := backendAccepted(publicKey); err != nil {
+		return fmt.Errorf("terminator: backend rejected signing key %d: %w", kid, err)
+	}
+
+	k.st.mu.Lock()
+	defer k.st.mu.Unlock()
+	if k.st.pending == nil || k.st.pending.Kid() != kid {
+		return fmt.Errorf("terminator: prepared signing key %d changed during activation", kid)
+	}
+	if err := saveKeyringLocked(path, k.st.pending, k.st.next, k.st.verifiers, nil); err != nil {
+		return fmt.Errorf("terminator: persist activated key %d: %w", kid, err)
+	}
+	k.st.active, k.st.pending = k.st.pending, nil
+	return nil
+}
+
+// Retire removes an old public generation after the deployment has waited
+// longer than the maximum assertion TTL plus clock-skew allowance. It cannot
+// remove the active or prepared generation and persists the change atomically.
+func (k *Keyring) Retire(path string, kid int) error {
+	if path == "" {
+		return errors.New("terminator: keyring path required for key retirement")
+	}
+	if err := validateKeyringFile(path, true); err != nil {
+		return err
+	}
+	k.st.mu.Lock()
+	defer k.st.mu.Unlock()
+	if kid == k.st.active.Kid() || (k.st.pending != nil && kid == k.st.pending.Kid()) {
+		return fmt.Errorf("terminator: cannot retire active or prepared key %d", kid)
+	}
+	if _, ok := k.st.verifiers[kid]; !ok {
+		return fmt.Errorf("terminator: signing key %d not found", kid)
+	}
+	verifiers := clonePublicKeys(k.st.verifiers)
+	delete(verifiers, kid)
+	if err := saveKeyringLocked(path, k.st.active, k.st.next, verifiers, k.st.pending); err != nil {
+		return fmt.Errorf("terminator: persist retired key %d: %w", kid, err)
+	}
+	k.st.verifiers = verifiers
+	return nil
+}
+
+func clonePublicKeys(src map[int][]byte) map[int][]byte {
+	out := make(map[int][]byte, len(src))
+	for kid, pub := range src {
+		out[kid] = append([]byte(nil), pub...)
+	}
+	return out
 }
 
 // LoadKeyring reads a keyring from a file with load-or-create semantics: a
@@ -144,7 +275,7 @@ func LoadOrCreateKeyring(path string) (*Keyring, error) {
 		}
 	}
 
-	_, err := os.Stat(path)
+	_, err := os.Lstat(path)
 	switch {
 	case err == nil:
 		// File exists: load below.
@@ -175,7 +306,7 @@ func LoadExistingKeyring(path string) (*Keyring, error) {
 	if path == "" {
 		return nil, errors.New("terminator: keyring path required for read-only load")
 	}
-	if _, err := os.Stat(path); err != nil {
+	if err := validateKeyringFile(path, false); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, fmt.Errorf("terminator: keyring %s does not exist (read-only load refuses to create a signing identity)", path)
 		}
@@ -187,6 +318,9 @@ func LoadExistingKeyring(path string) (*Keyring, error) {
 // loadKeyringFile reads and validates an existing keyring file without any
 // create/write behavior.
 func loadKeyringFile(path string) (*Keyring, error) {
+	if err := validateKeyringFile(path, false); err != nil {
+		return nil, err
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -243,7 +377,50 @@ func loadKeyringFile(path string) (*Keyring, error) {
 		}
 		k.st.verifiers[kid] = pub
 	}
+	if p.Candidate != nil {
+		if p.Candidate.Kid <= p.ActiveKid {
+			return nil, fmt.Errorf("terminator: persisted candidate kid %d is not newer than active kid %d", p.Candidate.Kid, p.ActiveKid)
+		}
+		candidatePriv, err := base64.StdEncoding.DecodeString(p.Candidate.Private)
+		if err != nil || len(candidatePriv) != ed25519.PrivateKeySize {
+			return nil, fmt.Errorf("terminator: invalid persisted candidate private key")
+		}
+		candidate := &Signer{priv: ed25519.PrivateKey(candidatePriv), Version: p.Candidate.Kid}
+		candidatePub := candidate.Public()
+		persistedPub, ok := k.st.verifiers[p.Candidate.Kid]
+		if !ok || !bytes.Equal(persistedPub, candidatePub) {
+			return nil, fmt.Errorf("terminator: persisted candidate public key does not match candidate private key")
+		}
+		if p.Next <= p.Candidate.Kid {
+			return nil, fmt.Errorf("terminator: persisted next kid %d must exceed candidate kid %d", p.Next, p.Candidate.Kid)
+		}
+		k.st.pending = candidate
+	}
 	return k, nil
+}
+
+// validateKeyringFile rejects symlinks, special files, and group/world
+// readable key material before any read or overwrite. The create path allows
+// a missing file; callers then generate it through the exclusive temp-file
+// commit in Save.
+func validateKeyringFile(path string, allowMissing bool) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if allowMissing && errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("terminator: keyring %s must not be a symlink", path)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("terminator: keyring %s is not a regular file", path)
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return fmt.Errorf("terminator: keyring %s permissions %04o are too broad; require 0600", path, info.Mode().Perm())
+	}
+	return nil
 }
 
 // Keyring is a rotating set of assertion signers (generations), mirroring the
@@ -271,6 +448,7 @@ type Keyring struct {
 type keyringState struct {
 	mu        sync.Mutex
 	active    *Signer          // current signing generation (highest kid)
+	pending   *Signer          // prepared generation awaiting backend acceptance
 	verifiers map[int][]byte   // kid -> public key (all retained generations)
 	next      int              // next kid to assign
 	now       func() time.Time // clock (tests)
@@ -339,6 +517,9 @@ func (k *Keyring) ActiveKid() int {
 func (k *Keyring) Rotate() (int, error) {
 	k.st.mu.Lock()
 	defer k.st.mu.Unlock()
+	if k.st.pending != nil {
+		return 0, errors.New("terminator: signing rotation already prepared")
+	}
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return 0, fmt.Errorf("terminator: rotate keyring: %w", err)
@@ -528,11 +709,11 @@ func (k *VerifierKeyring) Verify(encoded, audience string, now time.Time) (*Clai
 // right key. The returned kid is NOT trusted for authorization — the full
 // ParseAndVerify signature check still gates acceptance.
 func extractKid(encoded string) (int, error) {
-	dot := strings.IndexByte(encoded, '.')
-	if dot < 0 {
+	parts := strings.Split(encoded, ".")
+	if len(parts) != 3 || parts[0] != assertionWireVersion {
 		return 0, ErrBadAssertion
 	}
-	payloadB64 := encoded[:dot]
+	payloadB64 := parts[1]
 	payload, err := base64.RawURLEncoding.DecodeString(payloadB64)
 	if err != nil {
 		return 0, ErrBadAssertion

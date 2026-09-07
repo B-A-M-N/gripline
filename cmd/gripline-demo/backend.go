@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/B-A-M-N/gripline/internal/proxy"
+	"github.com/B-A-M-N/gripline/internal/keyexport"
 	"github.com/B-A-M-N/gripline/internal/terminator"
+	"github.com/B-A-M-N/gripline/verify"
 )
 
 type demoBarrier struct {
@@ -86,8 +89,31 @@ type backendStats struct {
 	DirectRawRejected int `json:"direct_raw_rejected"`
 }
 
-func newProtectedBackend(verifier *terminator.VerifierKeyring, audience string, stats *backendStats, barrier *demoBarrier) http.Handler {
-	bv := proxy.NewBackendVerifierKeyring(verifier, audience)
+func newProtectedBackend(keyring *terminator.Keyring, audience string, stats *backendStats, barrier *demoBarrier) (http.Handler, error) {
+	// Exercise the same public verifier publication path that a real backend
+	// uses. The demo must not accidentally prove the private internal verifier
+	// API instead of the deployable trust boundary.
+	publicKeys := keyring.PublicKeys()
+	verifiers := make(map[int][]byte, len(publicKeys))
+	for kid, publicKey := range publicKeys {
+		verifiers[kid] = publicKey
+	}
+	exp, err := keyexport.GenerateExport(keyring.ActiveKid(), verifiers)
+	if err != nil {
+		return nil, err
+	}
+	data, err := json.Marshal(exp)
+	if err != nil {
+		return nil, err
+	}
+	set, err := verify.LoadKeySet(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	bv, err := verify.New(set, audience)
+	if err != nil {
+		return nil, err
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		stats.mu.Lock()
 		// RawAuthorization/RawAPIKey measure raw credentials arriving on the
@@ -101,7 +127,7 @@ func newProtectedBackend(verifier *terminator.VerifierKeyring, audience string, 
 			stats.RawAPIKey++
 		}
 		stats.mu.Unlock()
-		claims, err := bv.Verify(r)
+		claims, err := bv.VerifyAndStrip(r)
 		if err != nil {
 			stats.mu.Lock()
 			stats.InvalidOrForged++
@@ -121,10 +147,9 @@ func newProtectedBackend(verifier *terminator.VerifierKeyring, audience string, 
 		// Keep admitted requests overlapping so the stock resource-velocity
 		// producer observes real in-flight lane concurrency.
 		time.Sleep(500 * time.Millisecond)
-		bv.StripAssertion(r)
 		w.Header().Set("X-Demo-Assertion-Verified", "true")
 		w.Header().Set("X-Demo-Principal", claims.CredID)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"backend":"protected","identity":"assertion"}`))
-	})
+	}), nil
 }

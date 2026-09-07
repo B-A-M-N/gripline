@@ -9,7 +9,7 @@
 package credential
 
 import (
-	"crypto/hmac"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"sort"
@@ -145,6 +145,9 @@ func (rec *CredentialRecord) Validate() error {
 	if rec.PolicyID == "" {
 		return errors.New("credential: empty policy id")
 	}
+	if rec.PlanID == "" {
+		return errors.New("credential: empty plan id")
+	}
 	if len(rec.Verifier) == 0 {
 		return errors.New("credential: record has no verifier")
 	}
@@ -276,16 +279,12 @@ func (r *PepperRing) WithClock(now func() time.Time) *PepperRing {
 	return r
 }
 
-// Get returns a COPY of the key material for a version, or false if unknown.
-// Returning the internal slice would let a caller mutate the live pepper ring
-// (P0.16); callers that only need a verifier should use DeriveVerifier instead
-// so key bytes never leave the ring.
-func (r *PepperRing) Get(version int) ([]byte, bool) {
+// Matches reports whether candidate equals a retained pepper version without
+// returning a copy of the live key material. It is used for construction-time
+// key-separation checks; the caller owns and can wipe candidate afterward.
+func (r *PepperRing) Matches(version int, candidate []byte) bool {
 	k, ok := r.active[version]
-	if !ok {
-		return nil, false
-	}
-	return append([]byte(nil), k...), true
+	return ok && subtle.ConstantTimeCompare(k, candidate) == 1
 }
 
 // DeriveVerifier folds a sealed secret under the pepper key for a version,
@@ -299,6 +298,17 @@ func (r *PepperRing) DeriveVerifier(presented *secret.SealedSecret, version int)
 		return nil
 	}
 	return presented.DigestHMAC(k)
+}
+
+// DeriveSprayPseudonym performs the domain-separated invalid-credential
+// transform while keeping pepper bytes inside the ring. Callers receive only
+// the short-lived pseudonym, never a copy of the key material.
+func (r *PepperRing) DeriveSprayPseudonym(presented *secret.SealedSecret, version int) string {
+	k, ok := r.active[version]
+	if !ok || len(k) == 0 {
+		return ""
+	}
+	return presented.SprayPseudonym(k)
 }
 
 // DeriveAllActiveVerifiers folds a sealed secret under every active pepper
@@ -348,12 +358,11 @@ func (r *PepperRing) Validate(presented *secret.SealedSecret, rec *CredentialRec
 	if err := rec.Authenticatable(r.now()); err != nil {
 		return nil, err
 	}
-	key, ok := r.Get(rec.PepperVersion)
-	if !ok {
+	if _, ok := r.active[rec.PepperVersion]; !ok {
 		return nil, fmt.Errorf("credential: no pepper for version %d", rec.PepperVersion)
 	}
-	derived := presented.DigestHMAC(key)
-	if !hmac.Equal(derived, rec.Verifier) {
+	derived := r.DeriveVerifier(presented, rec.PepperVersion)
+	if subtle.ConstantTimeCompare(derived, rec.Verifier) != 1 {
 		return nil, ErrUnknown
 	}
 	return &Credential{

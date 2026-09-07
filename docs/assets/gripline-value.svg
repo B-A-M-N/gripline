@@ -44,7 +44,7 @@
     <rect x="458" y="90" width="162" height="52" rx="12" fill="#7f1d1d"/><text x="480" y="122" class="small">CONSTRAIN / DENY</text>
     <line x1="428" y1="-18" x2="428" y2="278" stroke="#fef08a" stroke-width="3" stroke-dasharray="5 5"/>
     <text x="438" y="174" class="tiny" transform="rotate(90 438 174)">RAW CREDENTIAL STOPS HERE</text>
-    <text x="30" y="236" class="small">The legitimate lane continues; suspicious use gets policy limits.</text>
+    <text x="30" y="236" class="small">Configured policy may constrain the suspicious lane.</text>
   </g>
-  <text x="48" y="482" class="label">Same legacy client. Smaller credential blast radius.</text>
+  <text x="48" y="482" class="label">Same legacy client. Smaller blast radius when the backend trusts assertions.</text>
 </svg>

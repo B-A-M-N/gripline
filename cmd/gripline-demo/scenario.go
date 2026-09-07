@@ -114,7 +114,11 @@ func (s *Scenario) build() error {
 
 	s.obs, s.baseStats, s.backendStats = newDemoObserver(), &baselineStats{}, &backendStats{}
 	s.barrier = newDemoBarrier()
-	s.backend = httptest.NewServer(newProtectedBackend(keyring.PublishVerifier(), demoAudience, s.backendStats, s.barrier))
+	protectedBackend, err := newProtectedBackend(keyring, demoAudience, s.backendStats, s.barrier)
+	if err != nil {
+		return fmt.Errorf("protected backend verifier: %w", err)
+	}
+	s.backend = httptest.NewServer(protectedBackend)
 	backendURL, _ := url.Parse(s.backend.URL)
 	demoRing, err := pseudonym.NewRing(&pseudonym.Key{Version: 1, Secret: []byte("gripline-demo-ingress-key-material-32!!")})
 	if err != nil {

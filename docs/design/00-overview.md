@@ -19,8 +19,9 @@ provider (initial target FreeInference.org). It:
 3. **Isolates** suspicious manifestations of a credential into independently
    enforceable **security lanes**, so a compromised lane can be constrained
    without disabling legitimate lanes.
-4. **Enforces hard resource limits** (concurrency, token/cost velocity,
-   request bursts) independent of adaptive scoring.
+4. **Enforces hard resource limits** (concurrency and request bursts in the
+   stock runtime; token/cost velocity when a provider usage adapter is wired)
+   independent of adaptive scoring.
 5. **Authenticates** toward the backend using short-lived, audience-bound,
    signed internal assertions — never the user's credential.
 
@@ -98,7 +99,9 @@ where credentials can propagate
 | `HARDENED` | optional proof-of-possession (DPoP / mTLS-bound) | opt-in for clients |
 
 The initial implementation targets `TERMINATE` + `ENFORCE` core semantics, with
-`HYGIENE` redaction and `OBSERVE` shadow evidence available.
+`HYGIENE` redaction and `OBSERVE` shadow evidence available. The shipped
+resource authority is single-node/process-local; distributed leases and
+durable budget continuity are target architecture, not a current guarantee.
 
 ---
 

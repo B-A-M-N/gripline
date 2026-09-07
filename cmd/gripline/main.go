@@ -71,7 +71,7 @@ func parseSubcommand(args []string) (string, []string) {
 //	gripline credential list|revoke --config path.json [...]
 //	gripline lane list|unblock --config path.json [...]
 //	gripline audit list|export --config path.json
-//	gripline state check|backup|restore --config path.json
+//	gripline state check|backup|restore|compact --config path.json
 //	gripline status --config path.json
 //	gripline version
 //

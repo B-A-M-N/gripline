@@ -15,14 +15,14 @@
 
 <p align="center">
   <a href="https://github.com/B-A-M-N/gripline/actions/workflows/ci.yaml"><img src="https://github.com/B-A-M-N/gripline/actions/workflows/ci.yaml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white" alt="Go 1.25">
+  <img src="https://img.shields.io/badge/Go-1.25.13-00ADD8?logo=go&logoColor=white" alt="Go 1.25.13">
   <img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="Apache-2.0">
   <img src="https://img.shields.io/badge/status-public--beta-orange" alt="Public beta">
 </p>
 
 <p align="center"><strong>Credentials stop at the line · Authority continues across it · Legacy clients keep working</strong></p>
 
-<p align="center"><img src="docs/assets/gripline-value.svg" alt="Without Gripline, a stolen API key reaches the backend. With Gripline, the raw credential stops at the trust boundary and suspicious use is constrained while the legitimate lane continues."></p>
+<p align="center"><img src="docs/assets/gripline-value.svg" alt="Without Gripline, a stolen API key reaches the backend. With Gripline, the raw credential is not forwarded past the trust boundary, and configured policy can constrain suspicious use while the legitimate lane continues."></p>
 
 ## Why I built this
 
@@ -59,16 +59,16 @@ Client (legacy API compatible)
    │  presents reusable external credential
    ▼
 Gripline data plane
-   ├── terminate: extract + strip the external secret (it never crosses)
+   ├── terminate: extract + strip the external secret before provider adapters
    ├── classify: lane features + trusted source identity (sanitized view only)
    ├── evaluate: evidence → deterministic risk → policy precedence
-   ├── constrain: hard concurrency/request/token/cost limits per posture
+   ├── constrain: hard concurrency/request limits; token/cost when metering is wired
    └── re-inject: short-lived signed internal assertion (≤30s, audience-bound)
    ▼
 Private inference backend
    │  verifies the assertion — it never saw the external credential
    ▼
-Streamed response (SSE passes through chunk-by-chunk, metered, bounded)
+Streamed response (SSE passes through chunk-by-chunk; bounded metering when configured)
 ```
 
 The external credential stops at Gripline. Downstream systems authenticate a
@@ -172,13 +172,14 @@ secret injector, not in the state database.
 
 ## Guarantees (and how they are proven)
 
-- **The raw external secret never crosses the boundary** — stripped before any
-  adapter runs; only a signed assertion is re-injected on the trusted hop
-  (INV-1/10/11/12). Verified by hostile-adapter tests that fail if any
-  resolver ever sees a secret carrier.
+- **The raw external secret is not forwarded past the boundary** — stripped
+  immediately from the inbound header map before source/usage adapters run;
+  only a signed assertion is re-injected on the trusted hop (INV-1/10/11/12).
+  As with any Go process, caller-owned immutable input bytes may still exist in
+  runtime memory; Gripline zeroes every mutable copy it owns.
 - **Containment survives restart** — credential CONSTRAINED/REVOKED, lane
-  SUSPICIOUS/BLOCKED, evidence, emergency posture, and the signer identity all
-  restore from one transactional bbolt database
+  SUSPICIOUS/BLOCKED, evidence, emergency posture, and signer identity restore
+  from the transactional bbolt state plus the restricted signer keyring
   (`TestAcceptanceRestartContainment`).
 - **Operator mutations are atomic with their audit** — revoke, unblock, and
   posture changes commit mutation + audit row in one transaction
@@ -191,10 +192,12 @@ secret injector, not in the state database.
   pepper/pseudonym keys that must differ, real `/readyz` probing the state
   authority.
 
-Verification: `go vet`, `staticcheck`, `gofmt`, and `go test -race ./...` green
-across all packages; executable acceptance suite (restart containment, real
-streaming, stalled-stream cut, transactional operator mutations, oversized
-bodies, admin lockdown) green; §112 admission-latency budget p95 ≈ 0.5ms.
+Verification: `go vet`, `staticcheck`, `gofmt`, and `go test -race ./...` are
+repository gates; the compiled release harness starts the gateway and a
+separate public-verifier backend and proves a real request/response path. The
+networked executable acceptance suite still requires a host network namespace.
+The current in-process benchmark is a development signal, not a production
+latency SLO; deployers must measure p95/p99 on their hardware.
 
 ## Definitive causal demo
 
@@ -206,8 +209,9 @@ go run ./cmd/gripline-demo
 
 Open the printed URL and run `RUN FULL DEMO`. The two panels use the same exact
 credential: the baseline accepts the stolen-key client, while Gripline's real
-HTTP path observes a residential-to-hosting source change, mints live evidence,
-blocks only the attacking lane, and continues serving the legitimate lane.
+HTTP path uses the demo's configured source adapter to observe a
+residential-to-hosting source change, mints live evidence, blocks only the
+attacking lane, and continues serving the legitimate lane.
 The timeline is emitted by the admission observer and includes request IDs,
 source pseudonyms, evidence, risks, transitions, decisions, and assertion
 verification. CI/release checks can run the non-interactive proof with:
@@ -242,7 +246,7 @@ audience and issuer, enforces the short TTL and revision claims, rejects
 duplicate carriers/claims, and removes the assertion after successful
 verification. It never receives signing keys or reusable credentials.
 
-The wire format is intentionally explicit: `base64url(payload).base64url(Ed25519
+The wire format is intentionally explicit: `v1.base64url(payload).base64url(Ed25519
 signature)`, with the claim set documented in
 [`05-internal-identity.md`](docs/design/05-internal-identity.md). The public
 verifier's conformance tests cover valid, expired, wrong-audience,
@@ -283,11 +287,11 @@ reviews; the known-gaps list below is the binding honesty surface.
 13. ✅ source-spray anomaly detector, bounded under one-shot-subject floods
     (`internal/anomaly`, P0.30–P0.32)
 14. ◇ acceptance-gate COMPONENT tests (`internal/gates`, spec §111) — in-process
-    component approximations of gates A–J, honestly named (`...Component`).
-    These are NOT the gates: gate-level evidence (multi-node resource proofs,
-    network isolation, cross-process replay, external telemetry canary) requires
-    the external release harness, which does not exist yet. Passing this package
-    must never be reported as "gates A–J green".
+    component approximations of gates A–J, honestly named (`...Component`), plus
+    a compiled single-node release harness covering the public verifier hop.
+    These are NOT the full gates: multi-node resource proofs, network isolation,
+    cross-process replay, and external telemetry canaries remain deployment
+    evidence. Passing this package must never be reported as "gates A–J green".
 15. ✅ shadow-first auto-quarantine — `Risk.EnableAutomaticQuarantine=false` default;
     request-level denial still fires, persisted quarantine stays operator-set
 16. ✅ deployable executable — `cmd/gripline` + `internal/config`: boot-validated
@@ -323,7 +327,8 @@ internal/resource      atomic token buckets with all-or-nothing Reservations, co
 internal/terminator    admission flow (§53): extract → strip secret+internal headers → authenticate →
                        policy binding → lane → evidence → risk → policy resolver → hard limit →
                        internal identity; policy snapshot at New; explicit TERMINATE/ENFORCE modes;
-                       128-bit random request ids; Ed25519 keyring with overlap rotation
+                       128-bit random request ids; Ed25519 keyring with
+                       prepare/publish/accept/activate/retire rotation lifecycle
 internal/proxy         terminate-and-forward data plane: strip reserved headers (INV-12), re-inject
                        signed assertion on the trusted hop, stream unchanged (INV-1/10/11);
                        bounded body spooling, streaming metering sessions, idle-bound stream cuts
@@ -343,37 +348,44 @@ These are known-unfinished parts of the system, stated here so no invariant is
 claimed beyond what the implementation establishes:
 
 - **Policy immutability:** the terminator enforces a compiled deep-copy
-  snapshot (`policy.Compile`, tested against post-construction mutation of
-  every reference-bearing field), but a POLICY MANAGER — authenticated/signed
-  artifact load, monotonic revision enforcement, last-known-good, explicit
-  authorized rollback — is not built yet.
+  snapshot and `policy.Manager` provides monotonic prepare/activate,
+  last-known-good rollback, durable-manifest and audit seams. Artifact
+  signature/KMS integration remains deployment-specific and must be supplied
+  before accepting untrusted policy files.
+- **One policy per process:** the shipped runtime selects one compiled policy
+  snapshot for each process. `PlanID` is required credential metadata, but a
+  multi-plan provider policy resolver is not shipped; deployments that need
+  multiple plans must run separate policy-bound processes or add that resolver
+  at the integration seam.
 - **Single-node durable authority:** containment state is durable in one
   transactional bbolt database and restart-proven, but this is a SINGLE-NODE
   authority. Cross-replication (a BLOCKED lane blocked on every replica,
   shared resource leases across nodes, leader election) is out of beta scope.
 - **Single-process resources:** the concurrency pool and token buckets prove
-  the atomic accounting invariants in-process. Cross-node leases, reservation
-  TTLs, and orphan recovery need a shared backend (see `07-deployment.md`).
+  the atomic accounting invariants in-process. Resource windows are explicitly
+  process-lifetime and volatile; cross-node leases, reservation TTLs, orphan
+  recovery, and durable budget continuity need a shared backend (see
+  `07-deployment.md`).
 - **Streaming equivalence is gate-tested, not SDK-proven:** the proxy streams
   generic HTTP + SSE pass-through with per-chunk flush and is acceptance-tested
   for byte fidelity, incremental chunk arrival, and stalled-stream cuts. The
   real third-party SDK matrix (OpenAI/Anthropic Python-TS, Claude Code, Codex)
   is not run in this repo; connector-level equivalence is verified in the
   hosting integration.
-- **Provider adapters are explicit seams:** the runtime ships with
-  `HeaderFeatures`, `NoSource`, and `NoUsage`. A hosting integration must wire
-  trusted-edge source resolution, `NetworkMetadataResolver` for ASN/region, and
-  `UsageProvider`/`UsageSession` for token/cost metering. Until then, the status
-  command reports those capabilities as off/unknown; token and cost dimensions
-  remain inert and no untrusted header is promoted to trusted metadata.
+- **Provider adapters are explicit seams:** public `adapter/ingress` and
+  `adapter/usage` contracts are shipped, with bounded OpenAI/Anthropic JSON
+  metering and static CIDR metadata as reference adapters. A hosting
+  integration must still wire authenticated edge source resolution and its
+  authoritative provider usage semantics; `NoUsage` remains request-only.
 - **Legacy Gob evidence:** `internal/evidence` remains for compatibility and
   explicitly ephemeral use. Production deployments must use `internal/statebolt`
   as the single transactional credential/lane/evidence/audit authority.
 - **Acceptance gates are components, not gates:** `internal/gates` proves
   in-process approximations of the §111 properties under honest names. The
-  external release harness — telemetry canary sweeps, network-isolation
-  proofs, cross-process decision replay, multi-node resource accounting —
-  does not exist. Do not certify release from this repo's tests alone.
+  compiled release harness proves the single-node gateway-to-public-verifier
+  path; telemetry canary sweeps, network-isolation proofs, cross-process
+  decision replay, and multi-node resource accounting remain deployment
+  evidence. Do not certify release from this repo's tests alone.
 
 ## Invariants
 

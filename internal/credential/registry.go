@@ -89,6 +89,13 @@ type VerifierLookup interface {
 	FindByVerifierContext(ctx context.Context, verifier []byte, pepperVersion int) (*CredentialRecord, error)
 }
 
+// VerifierRotator is an optional atomic pepper-migration seam. A successful
+// rotation replaces the verifier index and bumps the credential revision in
+// one transaction, invalidating assertions minted against the old record.
+type VerifierRotator interface {
+	RotateVerifierCAS(credentialID string, expectedRevision int, pepperVersion int, verifier []byte) (*CredentialRecord, error)
+}
+
 // IsUnknownCredential reports whether err is the typed "no such credential"
 // answer from a VerifierLookup (as opposed to an outage/timeouts/corruption).
 func IsUnknownCredential(err error) bool { return errors.Is(err, ErrNotFound) }
@@ -208,6 +215,37 @@ func (m *MemoryRegistry) InsertIfAbsent(rec *CredentialRecord) (bool, error) {
 		m.byVer[newKey] = rec.CredentialID
 	}
 	return true, nil
+}
+
+// RotateVerifierCAS migrates a live record to a newer pepper without exposing
+// raw credential material. The verifier index replacement and revision bump
+// are one critical-section operation.
+func (m *MemoryRegistry) RotateVerifierCAS(credentialID string, expectedRevision int, pepperVersion int, verifier []byte) (*CredentialRecord, error) {
+	if pepperVersion < 1 || len(verifier) == 0 {
+		return nil, errors.New("credential: invalid rotated verifier")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rec, ok := m.records[credentialID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	if rec.Revision != expectedRevision {
+		return nil, ErrStaleCAS
+	}
+	newKey := verKeyFor(pepperVersion, verifier)
+	if owner, taken := m.byVer[newKey]; taken && owner != credentialID {
+		return nil, ErrVerifierOwned
+	}
+	oldKey := verKeyFor(rec.PepperVersion, rec.Verifier)
+	delete(m.byVer, oldKey)
+	rec.Verifier = append([]byte(nil), verifier...)
+	rec.VerifierVersion = supportedVerifierVersion
+	rec.PepperVersion = pepperVersion
+	rec.Revision++
+	rec.RotatedAt = m.now()
+	m.byVer[newKey] = credentialID
+	return cloneRecord(rec), nil
 }
 
 // Lookup implements SecurityStateRepository with typed errors (P0.20): the

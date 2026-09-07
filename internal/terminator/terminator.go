@@ -539,8 +539,7 @@ func (t *Terminator) AdmitUsageWithRequestID(reqID string, headers map[string][]
 			// The spray key is the latest pepper key: SprayPseudonym is
 			// domain-separated from verifier derivation inside the sealed
 			// boundary, so the same key material never cross-purposes.
-			if key, ok := t.dep.Peppers.Get(t.dep.Peppers.Latest()); ok {
-				cand := presented.SprayPseudonym(key)
+			if cand := t.dep.Peppers.DeriveSprayPseudonym(presented, t.dep.Peppers.Latest()); cand != "" {
 				if sigs := t.dep.Spray.ObserveInvalidCredential(src.sourceID(), cand, now); len(sigs) > 0 {
 					// P0.8: the detector signals WHAT happened; the compiled policy
 					// rule's scope resolves the subject from the request context
@@ -594,7 +593,7 @@ func (t *Terminator) AdmitUsageWithRequestID(reqID string, headers map[string][]
 	}
 
 	// 3. Policy binding.
-	if cred.PolicyID != t.pol.ID {
+	if cred.PolicyID != t.pol.ID && !(t.pol.ID == policy.DefaultPolicyID && cred.PolicyID == policy.LegacyDefaultPolicyID) {
 		out.Authorized = false
 		out.Reason = "policy_unavailable"
 		out.DenialErr = fmt.Errorf("terminator: credential policy %q not loaded (loaded %q)", cred.PolicyID, t.pol.ID)
@@ -602,7 +601,15 @@ func (t *Terminator) AdmitUsageWithRequestID(reqID string, headers map[string][]
 	}
 
 	// 4. Classify lane.
+	var lanesBefore, lanesAfter []string
+	if t.dep.Lanes != nil {
+		lanesBefore = t.dep.Lanes.ListLaneIDs(cred.CredentialID)
+	}
 	laneID, laneRec, laneNew, lerr := t.classifyLane(cred.CredentialID, feat)
+	if t.dep.Lanes != nil {
+		lanesAfter = t.dep.Lanes.ListLaneIDs(cred.CredentialID)
+	}
+	cleanupRemovedLaneResources(t.dep.Resource, lanesBefore, lanesAfter)
 	tr.LaneID = laneID
 	tr.LaneNew = laneNew
 	if laneRec != nil {
@@ -1641,12 +1648,31 @@ func (t *Terminator) authenticate(presented *secret.SealedSecret) (*credential.C
 			if aerr := rec.Authenticatable(t.dep.RiskNow()); aerr != nil {
 				return credFrom(rec), aerr
 			}
-			return credFrom(rec), nil
+			// Opportunistically migrate a successful legacy match into the
+			// latest pepper version. The CAS update is best-effort for the
+			// current request; authentication remains valid if a concurrent
+			// lifecycle mutation wins the race.
+			return credFrom(t.migrateVerifier(rec, verifier, latest)), nil
 		} else if !errors.Is(err, credential.ErrNotFound) {
 			return nil, err
 		}
 	}
 	return nil, credential.ErrUnknown
+}
+
+func (t *Terminator) migrateVerifier(rec *credential.CredentialRecord, verifier []byte, latest int) *credential.CredentialRecord {
+	if rec == nil || rec.PepperVersion == latest {
+		return rec
+	}
+	rotator, ok := t.dep.Registry.(credential.VerifierRotator)
+	if !ok {
+		return rec
+	}
+	updated, err := rotator.RotateVerifierCAS(rec.CredentialID, rec.Revision, latest, verifier)
+	if err != nil {
+		return rec
+	}
+	return updated
 }
 
 // lookupVerifier resolves a derived verifier through the typed seam (P0.28)
@@ -1670,6 +1696,25 @@ func credFrom(rec *credential.CredentialRecord) *credential.Credential {
 		PlanID:       rec.PlanID,
 		Status:       rec.Status,
 		Revision:     rec.Revision,
+	}
+}
+
+// cleanupRemovedLaneResources mirrors lane retention with the governor's
+// resource-table lifecycle. Lane rows may be deleted by BorrowOrCreate while
+// resolving an incoming request; their resource objects must be removed only
+// after the row disappears and only when all accounting is idle.
+func cleanupRemovedLaneResources(g *resource.Governor, before, after []string) {
+	if g == nil || len(before) == 0 {
+		return
+	}
+	remaining := make(map[string]struct{}, len(after))
+	for _, id := range after {
+		remaining[id] = struct{}{}
+	}
+	for _, id := range before {
+		if _, ok := remaining[id]; !ok {
+			_ = g.RemoveScope(resource.ScopeLane, id)
+		}
 	}
 }
 

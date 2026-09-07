@@ -1,6 +1,6 @@
 module github.com/B-A-M-N/gripline
 
-go 1.25.9
+go 1.25.13
 
 require go.etcd.io/bbolt v1.5.0
 

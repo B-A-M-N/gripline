@@ -69,6 +69,31 @@ func TestValidateSuccessAndDRotation(t *testing.T) {
 	raw.Zero()
 }
 
+func TestRotateVerifierCASMigratesPepperAndInvalidatesOldIndex(t *testing.T) {
+	pep1 := testKey()
+	pep2 := &PepperKey{Version: 2, Key: []byte("newer-pepper-2")}
+	rec, raw := newNormalRecord("cred_rotate", "acct_rotate", pep1)
+	defer raw.Zero()
+	reg := NewMemoryRegistry()
+	if err := reg.Insert(rec); err != nil {
+		t.Fatal(err)
+	}
+	newVerifier := Verifier(raw, pep2)
+	updated, err := reg.RotateVerifierCAS(rec.CredentialID, rec.Revision, pep2.Version, newVerifier)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.PepperVersion != 2 || updated.Revision != 2 {
+		t.Fatalf("unexpected migrated record: %+v", updated)
+	}
+	if _, ok := reg.FindByVerifier(rec.Verifier, pep1.Version); ok {
+		t.Fatal("old verifier index must be removed after migration")
+	}
+	if got, ok := reg.FindByVerifier(newVerifier, pep2.Version); !ok || got.CredentialID != rec.CredentialID {
+		t.Fatal("new verifier index must resolve the migrated credential")
+	}
+}
+
 func TestValidateFailsForWrongSecret(t *testing.T) {
 	pep := testKey()
 	rec, _ := newNormalRecord("cred_2", "acct_2", pep)

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
@@ -17,14 +18,17 @@ import (
 
 	"github.com/B-A-M-N/gripline/internal/config"
 	"github.com/B-A-M-N/gripline/internal/credential"
+	"github.com/B-A-M-N/gripline/internal/keyexport"
 	"github.com/B-A-M-N/gripline/internal/secret"
 	"github.com/B-A-M-N/gripline/internal/terminator"
+	"github.com/B-A-M-N/gripline/verify"
 )
 
 // backendVerifier is a test backend that verifies the internal assertion
-// like a real private backend would (P0.17).
+// through the public provider-facing package, like a real private backend
+// would (P0.17/P0.23).
 type backendVerifier struct {
-	verifier   *terminator.VerifierKeyring
+	verifier   *verify.Verifier
 	audience   string
 	hits       atomic.Int64
 	authorized atomic.Int64
@@ -33,8 +37,29 @@ type backendVerifier struct {
 }
 
 func newBackendVerifierFromKeyring(kr *terminator.Keyring, audience string) *backendVerifier {
+	publicKeys := kr.PublicKeys()
+	verifiers := make(map[int][]byte, len(publicKeys))
+	for kid, pub := range publicKeys {
+		verifiers[kid] = append([]byte(nil), pub...)
+	}
+	export, err := keyexport.GenerateExport(kr.ActiveKid(), verifiers)
+	if err != nil {
+		panic(fmt.Sprintf("export verifier keys: %v", err))
+	}
+	exportJSON, err := json.Marshal(export)
+	if err != nil {
+		panic(fmt.Sprintf("marshal verifier keys: %v", err))
+	}
+	keySet, err := verify.LoadKeySet(bytes.NewReader(exportJSON))
+	if err != nil {
+		panic(fmt.Sprintf("load public verifier keys: %v", err))
+	}
+	verifier, err := verify.New(keySet, audience)
+	if err != nil {
+		panic(fmt.Sprintf("construct public verifier: %v", err))
+	}
 	return &backendVerifier{
-		verifier: kr.PublishVerifier(),
+		verifier: verifier,
 		audience: audience,
 	}
 }
@@ -46,13 +71,7 @@ func (b *backendVerifier) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "raw_credential_rejected", http.StatusForbidden)
 		return
 	}
-	assertion := r.Header.Get("X-Gripline-Assertion")
-	if assertion == "" {
-		b.rejected.Add(1)
-		http.Error(w, "missing_assertion", http.StatusUnauthorized)
-		return
-	}
-	claims, err := b.verifier.Verify(assertion, b.audience, time.Now())
+	claims, err := b.verifier.VerifyAndStrip(r)
 	if err != nil {
 		b.rejected.Add(1)
 		http.Error(w, "invalid_assertion", http.StatusUnauthorized)
@@ -137,7 +156,7 @@ func TestAcceptanceEndToEnd(t *testing.T) {
 	if claimsVal == nil {
 		t.Fatal("backend did not record claims")
 	}
-	if c := claimsVal.(*terminator.Claims); c.CredID != "cred_e2e" {
+	if c := claimsVal.(*verify.Claims); c.CredID != "cred_e2e" {
 		t.Fatalf("expected claimed CredID cred_e2e (from the provisioned record), got %s", c.CredID)
 	}
 	req2, _ := http.NewRequest("POST", baseURL+"/v1/messages", strings.NewReader(`{"text":"x"}`))
@@ -284,7 +303,7 @@ func TestAcceptanceSharedAuthorities(t *testing.T) {
 	if claimsVal == nil {
 		t.Fatal("backend did not record claims")
 	}
-	claims := claimsVal.(*terminator.Claims)
+	claims := claimsVal.(*verify.Claims)
 	if claims.CredID != "cred_shared" {
 		t.Fatalf("expected credID cred_shared, got %s", claims.CredID)
 	}

@@ -50,10 +50,10 @@ func TestGovernorAllOrNothingAcrossScopes(t *testing.T) {
 
 	// Rollback proof: the SOURCE and LANE pools must have their FULL capacity
 	// back (the failed admission's partial holds were released).
-	g.mu.Lock()
+	g.metaMu.Lock()
 	src := g.pools[scopeKey(ScopeSource, "src-1")]
 	lane := g.pools[scopeKey(ScopeLane, "lane-1")]
-	g.mu.Unlock()
+	g.metaMu.Unlock()
 	if got := src.Balance(); got != 4-2 {
 		t.Fatalf("P0.23: SOURCE balance = %d, want %d (2 held by live admissions, failed one rolled back)", got, 4-2)
 	}
@@ -105,9 +105,9 @@ func TestGovernorDenyAllScope(t *testing.T) {
 	if sle == nil || sle.Scope != ScopeLane {
 		t.Fatalf("want LANE denial, got %+v", err)
 	}
-	g.mu.Lock()
+	g.metaMu.Lock()
 	src := g.pools[scopeKey(ScopeSource, "s")]
-	g.mu.Unlock()
+	g.metaMu.Unlock()
 	if got := src.Balance(); got != 4 {
 		t.Fatalf("SOURCE must be fully rolled back after LANE deny-all, balance=%d", got)
 	}
@@ -133,9 +133,9 @@ func TestGovernorTokenSettleConsumesCancelRefunds(t *testing.T) {
 	r1.Settle(UsageEstimate{CombinedTokens: 10})
 	r1.Release() // concurrency returns, tokens stay settled
 
-	g.mu.Lock()
+	g.metaMu.Lock()
 	b := g.bucket(DimCombinedTokens, scopeKey(ScopeCredential, "c"), scopes[0].Buckets.TokensBurst)
-	g.mu.Unlock()
+	g.metaMu.Unlock()
 	afterSettle := b.Available()
 	if afterSettle != 90 {
 		t.Fatalf("settle(actual 10) must consume 10 and refund 20; available = %v, want 90", afterSettle)
@@ -200,10 +200,56 @@ func TestGovernorBalanceNeverNegative(t *testing.T) {
 	}
 	wg.Wait()
 
-	g.mu.Lock()
+	g.metaMu.Lock()
 	p := g.pools[scopeKey(ScopeCredential, "c")]
-	g.mu.Unlock()
+	g.metaMu.Unlock()
 	if bal := p.Balance(); bal != 8 {
 		t.Fatalf("P0.27/INV-15: final balance = %d, want 8 (must return to full, never negative)", bal)
+	}
+}
+
+func TestSourceScopeSaturationUsesBoundedOverflowScopes(t *testing.T) {
+	g := NewGovernor(nil)
+	g.SetSourceScopeLimits(1, time.Hour)
+	spec := func(id string) []ScopeSpec {
+		return []ScopeSpec{{Scope: ScopeSource, ID: id, Buckets: BucketSpec{ConcurrencyCap: 1}}}
+	}
+
+	first, err := g.ProvisionUsage(spec("source-a"), UsageEstimate{Requests: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Release()
+
+	second, err := g.ProvisionUsage(spec("source-b"), UsageEstimate{Requests: 1})
+	if err != nil {
+		t.Fatalf("a full source table should fold excess identities, got %v", err)
+	}
+	second.Release()
+	stats := g.Stats()
+	if stats.SourceScopes != 1 || stats.MaxSourceScopes != 1 {
+		t.Fatalf("source table escaped bound: %+v", stats)
+	}
+	if stats.SourceSaturations != 1 || stats.SourceOverflows != 1 {
+		t.Fatalf("missing saturation telemetry: %+v", stats)
+	}
+}
+
+func TestRemoveScopePreservesActiveAccounting(t *testing.T) {
+	g := NewGovernor(nil)
+	spec := []ScopeSpec{{Scope: ScopeLane, ID: "lane-1", Buckets: BucketSpec{ConcurrencyCap: 1}}}
+	res, err := g.ProvisionUsage(spec, UsageEstimate{Requests: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.RemoveScope(ScopeLane, "lane-1") {
+		t.Fatal("active scope must not be removed")
+	}
+	res.Release()
+	if !g.RemoveScope(ScopeLane, "lane-1") {
+		t.Fatal("idle scope should be removable")
+	}
+	if got := g.InUseFor(ScopeLane, "lane-1"); got != 0 {
+		t.Fatalf("removed scope still reports usage: %d", got)
 	}
 }
