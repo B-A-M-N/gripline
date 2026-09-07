@@ -20,6 +20,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/B-A-M-N/gripline/internal/control"
 )
 
 // Duration is a JSON-friendly time.Duration: it accepts string forms
@@ -125,7 +127,7 @@ type TLSSection struct {
 
 // BackendSection is the fixed upstream (P0.7).
 type BackendSection struct {
-	// URL is the upstream origin, e.g. "https://provider.internal:443/v1".
+	// URL is the upstream origin, e.g. "https://provider.internal:443".
 	URL string `json:"url"`
 	// Timeout bounds the full upstream exchange (dial + headers + body). It
 	// also serves as the default for each of the split timeouts below when
@@ -189,9 +191,9 @@ type IdentitySection struct {
 
 // PathsSection names durable-state locations.
 type PathsSection struct {
-	// AuditLog is the append-only operator audit JSONL (P0.47). Required when
-	// Admin is configured WITHOUT a state database; optional (a mirror) when
-	// paths.state is the authority (P0.5).
+	// AuditLog is the append-only operator audit JSONL used only by the
+	// explicitly ephemeral administrative mode. It is rejected alongside
+	// paths.state so there cannot be two audit authorities.
 	AuditLog string `json:"audit_log"`
 	// Evidence is the LEGACY gob-file evidence store path (BETA-09). It must
 	// be empty when paths.state is configured (P0.2: the Bolt database is the
@@ -325,6 +327,12 @@ func (c *Config) Validate() error {
 	if c.Identity.Audience == "" {
 		return fmt.Errorf("identity.audience required (INV-11: assertions are audience-bound)")
 	}
+	// P0.7: state-backed deployments use Bolt as the sole operator-audit
+	// authority. Reject a second JSONL path even when the admin listener is
+	// currently disabled, so enabling it later cannot introduce split history.
+	if c.Paths.State != "" && c.Paths.AuditLog != "" {
+		return fmt.Errorf("paths.audit_log must be empty when paths.state is configured: Bolt is the sole operator-audit authority")
+	}
 
 	// Admin: if exposed, it must be fully configured (P0.47).
 	if c.Admin != nil {
@@ -338,6 +346,9 @@ func (c *Config) Validate() error {
 			if tok == "" {
 				return fmt.Errorf("admin.operator_tokens contains an empty token")
 			}
+			if len([]byte(tok)) < control.MinOperatorTokenBytes {
+				return fmt.Errorf("admin.operator_tokens token must contain at least %d bytes (generate with openssl rand -base64 32)", control.MinOperatorTokenBytes)
+			}
 			name, caps, err := parseOperatorSpec(spec)
 			if err != nil {
 				return fmt.Errorf("admin.operator_tokens: %w", err)
@@ -345,11 +356,12 @@ func (c *Config) Validate() error {
 			if name == "" || len(caps) == 0 {
 				return fmt.Errorf("admin.operator_tokens: entry must be \"name:cap1,cap2\"")
 			}
+			for _, rawCap := range caps {
+				if _, err := control.ParseCapability(rawCap); err != nil {
+					return fmt.Errorf("admin.operator_tokens: %w", err)
+				}
+			}
 		}
-		// P0.47/P0.5: the admin surface requires a durable audit authority. With
-		// a state database configured, the Bolt store IS that authority and
-		// audit_log is an optional JSONL mirror; without one, the JSONL file is
-		// required.
 		if c.Paths.AuditLog == "" && c.Paths.State == "" {
 			return fmt.Errorf("paths.audit_log required when the admin section is present without paths.state (P0.47: durable operator audit)")
 		}

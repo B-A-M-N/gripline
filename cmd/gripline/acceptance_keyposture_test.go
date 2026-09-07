@@ -1,12 +1,58 @@
 package main
 
 import (
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/B-A-M-N/gripline/internal/keyexport"
+	"github.com/B-A-M-N/gripline/internal/terminator"
 )
 
 // validPepper is a base64-encoded 40-byte key (>= 32 decoded bytes of entropy).
 const validPepper = testPepperEnv
+
+func TestAcceptanceKeysExportIsReadOnly(t *testing.T) {
+	dir := t.TempDir()
+	keyringPath := filepath.Join(dir, "keyring.json")
+	configPath := filepath.Join(dir, "config.json")
+	configBody := `{"listen":"127.0.0.1:8080","backend":{"url":"http://backend.invalid:80","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"test-audience"},"tls":{"terminate_tls_upstream":true},"paths":{"signer_keyring":"` + keyringPath + `"}}`
+	if err := os.WriteFile(configPath, []byte(configBody), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := runKeysExport(configPath); err == nil || errors.Is(err, errSubcommand) {
+		t.Fatal("missing keyring must fail without creating a signing identity")
+	}
+	if _, err := os.Stat(keyringPath); !os.IsNotExist(err) {
+		t.Fatalf("read-only export created keyring: stat err=%v", err)
+	}
+
+	kr, err := terminator.NewKeyring()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := kr.Save(keyringPath); err != nil {
+		t.Fatal(err)
+	}
+	out := captureStdout(t, func() {
+		if err := runKeysExport(configPath); !errors.Is(err, errSubcommand) {
+			t.Fatalf("successful export returned %v", err)
+		}
+	})
+	var exported keyexport.Export
+	if err := json.Unmarshal([]byte(out), &exported); err != nil {
+		t.Fatalf("export JSON: %v", err)
+	}
+	if exported.ActiveKID != kr.ActiveKid() || len(exported.Keys) == 0 {
+		t.Fatalf("unexpected public export: %+v", exported)
+	}
+	if strings.Contains(out, "private") || strings.Contains(out, "active") && strings.Contains(out, "seed") {
+		t.Fatalf("export contains private-key material: %s", out)
+	}
+}
 
 // TestAcceptancePepperEntropyRequired (P0-17) proves the runtime refuses to
 // boot on weak or mis-encoded pepper material: raw ASCII passphrases, short

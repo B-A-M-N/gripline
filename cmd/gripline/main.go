@@ -59,6 +59,7 @@ func parseSubcommand(args []string) (string, []string) {
 //	gripline keys export --config path.json
 //	gripline credential list|revoke --config path.json [...]
 //	gripline lane list|unblock --config path.json [...]
+//	gripline audit list|export --config path.json
 //	gripline status --config path.json
 //
 // keys export prints the PUBLIC backend verification material (active kid +
@@ -83,6 +84,8 @@ func dispatchSubcommand(sub string, args []string) error {
 		return runCredentialCLI(args)
 	case "lane":
 		return runLaneCLI(args)
+	case "audit":
+		return runAuditCLI(args)
 	case "status":
 		fs := flag.NewFlagSet("status", flag.ExitOnError)
 		cfgPath := fs.String("config", "/etc/gripline/config.json", "path to the deployment configuration")
@@ -91,7 +94,7 @@ func dispatchSubcommand(sub string, args []string) error {
 		}
 		return runStatusCLI(*cfgPath)
 	default:
-		return fmt.Errorf("unknown subcommand %q (expected: keys, credential, lane, status)", sub)
+		return fmt.Errorf("unknown subcommand %q (expected: keys, credential, lane, audit, status)", sub)
 	}
 }
 
@@ -108,7 +111,7 @@ func runKeysExport(cfgPath string) error {
 	if cfg.Paths.SignerKeyring == "" {
 		return fmt.Errorf("keys export: config.paths.signer_keyring is not set")
 	}
-	kr, err := terminator.LoadKeyring(cfg.Paths.SignerKeyring)
+	kr, err := terminator.LoadExistingKeyring(cfg.Paths.SignerKeyring)
 	if err != nil {
 		return fmt.Errorf("keys export: load keyring: %w", err)
 	}
@@ -129,7 +132,7 @@ func runKeysExport(cfgPath string) error {
 	return errSubcommand // success — do not fall through to the server
 }
 
-func run(cfgPath string) error {
+func run(cfgPath string) (retErr error) {
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		return err
@@ -143,12 +146,12 @@ func run(cfgPath string) error {
 	if err != nil {
 		return err
 	}
-	// P1-23: a failed Close (unflushed audit mirror, bbolt corruption on
+	// P1-23: a failed Close (unflushed audit sink, bbolt corruption on
 	// final sync) is an operational error, not something to discard — it must
 	// propagate after the (successful) shutdown path so supervision sees it.
 	defer func() {
-		if cerr := rt.Close(); cerr != nil && err == nil {
-			err = cerr
+		if cerr := rt.Close(); cerr != nil {
+			retErr = errors.Join(retErr, cerr)
 		}
 	}()
 
@@ -208,51 +211,78 @@ func run(cfgPath string) error {
 	log.Printf("gripline: data plane listening on %s (tls=%v) → backend %s",
 		cfg.Listen, srv.TLSConfig != nil, cfg.Backend.URL)
 
+	// Both servers report unexpected termination through one lifecycle channel.
+	// An admin failure is therefore a process failure, not a log-only event.
+	errCh := make(chan error, 2)
+	go func() {
+		var serveErr error
+		if srv.TLSConfig != nil {
+			serveErr = srv.ServeTLS(ln, cfg.TLS.CertFile, cfg.TLS.KeyFile)
+		} else {
+			serveErr = srv.Serve(ln)
+		}
+		if serveErr != nil && serveErr != http.ErrServerClosed {
+			errCh <- fmt.Errorf("gripline: data server: %w", serveErr)
+		}
+	}()
+
 	// --- Optional admin/control-plane listener (P0.47) ----------------------
 	if rt.Admin != nil {
-		ln, err := net.Listen("tcp", cfg.Admin.Listen)
+		adminLn, err := net.Listen("tcp", cfg.Admin.Listen)
 		if err != nil {
+			_ = ln.Close()
 			return fmt.Errorf("gripline: admin listen %s: %w", cfg.Admin.Listen, err)
 		}
 		go func() {
 			log.Printf("gripline: admin control plane listening on %s", cfg.Admin.Listen)
-			if err := rt.Admin.Serve(ln); err != nil && err != http.ErrServerClosed {
-				log.Printf("gripline: admin server: %v", err)
+			if serveErr := rt.Admin.Serve(adminLn); serveErr != nil && serveErr != http.ErrServerClosed {
+				errCh <- fmt.Errorf("gripline: admin server: %w", serveErr)
 			}
 		}()
 	}
 
 	// --- Signal handling + graceful drain ------------------------------------
-	errCh := make(chan error, 1)
-	go func() {
-		var err error
-		if srv.TLSConfig != nil {
-			err = srv.ServeTLS(ln, cfg.TLS.CertFile, cfg.TLS.KeyFile)
-		} else {
-			err = srv.Serve(ln)
-		}
-		if err != nil && err != http.ErrServerClosed {
-			errCh <- err
-		}
-	}()
-
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sig)
+	var lifecycleErr error
 	select {
-	case err := <-errCh:
-		return fmt.Errorf("gripline: server: %w", err)
+	case lifecycleErr = <-errCh:
+		ready.Store(false)
 	case s := <-sig:
 		log.Printf("gripline: %v received — draining", s)
+		ready.Store(false)
 	}
 
-	ready.Store(false)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	// Give each server its own bounded shutdown context. This lets a stuck
+	// admin handler consume its own budget without preventing the data plane
+	// from draining, while preserving every shutdown error for the caller.
+	shutdownErrCh := make(chan error, 2)
+	shutdownCount := 1
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		shutdownErrCh <- srv.Shutdown(ctx)
+	}()
 	if rt.Admin != nil {
-		_ = rt.Admin.Shutdown(ctx)
+		shutdownCount++
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			shutdownErrCh <- rt.Admin.Shutdown(ctx)
+		}()
 	}
-	if err := srv.Shutdown(ctx); err != nil {
-		return fmt.Errorf("gripline: drain: %w", err)
+	var shutdownErrs []error
+	for i := 0; i < shutdownCount; i++ {
+		if err := <-shutdownErrCh; err != nil {
+			shutdownErrs = append(shutdownErrs, err)
+		}
+	}
+	if shutdownErr := errors.Join(shutdownErrs...); shutdownErr != nil {
+		lifecycleErr = errors.Join(lifecycleErr, fmt.Errorf("gripline: drain: %w", shutdownErr))
+	}
+	if lifecycleErr != nil {
+		return lifecycleErr
 	}
 	log.Printf("gripline: drained, exiting")
 	return nil

@@ -58,11 +58,16 @@ func TestStreamWriteIdleTimeoutDeadlineScheme(t *testing.T) {
 	if got := rec.setCallsCount(); got < 2 {
 		t.Fatalf("write deadline must be re-armed after chunks: %d SetWriteDeadline calls", got)
 	}
-	// The FINAL SetWriteDeadline must use the idle bound, not the full budget.
+	// The last non-zero deadline must use the idle bound, not the full budget.
 	// (Chunk reads may coalesce — a single Write can carry every chunk and the
 	// re-arm then happens after the last write — so write snapshots alone
-	// cannot prove the re-arm value; the set-call log can.)
-	lastSet := rec.lastSet()
+	// cannot prove the re-arm value; the set-call log can.) The final call then
+	// clears the per-request deadline for keep-alive reuse (P0-9).
+	sets := rec.setDeadlines()
+	if len(sets) < 2 || !sets[len(sets)-1].IsZero() {
+		t.Fatalf("stream completion must clear the write deadline: %v", sets)
+	}
+	lastSet := sets[len(sets)-2]
 	if until := time.Until(lastSet); until > 2*time.Second+time.Second {
 		t.Fatalf("final write deadline must use the idle bound (2s), got %v from now", until)
 	}
@@ -98,14 +103,10 @@ func (d *deadlineRecorder) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
-// lastSet returns the most recent deadline passed to SetWriteDeadline.
-func (d *deadlineRecorder) lastSet() time.Time {
+func (d *deadlineRecorder) setDeadlines() []time.Time {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if len(d.sets) == 0 {
-		return time.Time{}
-	}
-	return d.sets[len(d.sets)-1]
+	return append([]time.Time(nil), d.sets...)
 }
 
 func (d *deadlineRecorder) Write(p []byte) (int, error) {

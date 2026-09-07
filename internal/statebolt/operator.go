@@ -18,8 +18,8 @@ import (
 // control package's OperatorRecord (already INV-3: no secrets) inside a
 // schema-versioned envelope.
 type persistedOperatorRecord struct {
-	SchemaVersion int
-	Record        control.OperatorRecord
+	SchemaVersion int                    `json:"schema_version"`
+	Record        control.OperatorRecord `json:"record"`
 }
 
 const operatorRecordSchemaVersion = 1
@@ -124,7 +124,7 @@ func (s *Store) UnblockLaneWithAudit(ctx context.Context, credID, laneID string,
 			return lane.ErrLaneNotFound
 		}
 		var p persistedLane
-		if err := json.Unmarshal(v, &p); err != nil || p.SchemaVersion > laneSchemaVersion {
+		if err := json.Unmarshal(v, &p); err != nil || p.SchemaVersion != laneSchemaVersion {
 			return errCorruptLane
 		}
 		rec := p.Record
@@ -161,7 +161,7 @@ func (s *Store) RevokeCredentialWithAudit(ctx context.Context, credID string, au
 			return credential.ErrNotFound
 		}
 		var p persistedCredential
-		if err := json.Unmarshal(env, &p); err != nil {
+		if err := json.Unmarshal(env, &p); err != nil || p.SchemaVersion != credentialSchemaVersion {
 			return credential.ErrCorrupt
 		}
 		p.Record.Status = credential.StatusRevoked
@@ -203,4 +203,36 @@ func (s *Store) CountAuditRecords() (int, error) {
 		})
 	})
 	return n, err
+}
+
+// ListOperatorAudit returns committed operator records after the supplied
+// sequence number in append order. The sequence is a cursor only; record
+// contents remain the sanitized control.OperatorRecord envelope.
+func (s *Store) ListOperatorAudit(after uint64, limit int) ([]control.OperatorRecord, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 1000
+	}
+	var out []control.OperatorRecord
+	err := s.db.View(func(tx *bolt.Tx) error {
+		c := tx.Bucket(bucketOperatorAudit).Cursor()
+		for k, v := c.First(); k != nil && len(out) < limit; k, v = c.Next() {
+			if string(k) == string(keyAuditSequence) {
+				continue
+			}
+			if len(k) != 8 {
+				return fmt.Errorf("statebolt: corrupt operator audit key: %w", ErrMigrationRequired)
+			}
+			seq := btoi(k)
+			if uint64(seq) <= after {
+				continue
+			}
+			var p persistedOperatorRecord
+			if err := json.Unmarshal(v, &p); err != nil || p.SchemaVersion != operatorRecordSchemaVersion {
+				return fmt.Errorf("statebolt: corrupt operator audit record: %w", ErrMigrationRequired)
+			}
+			out = append(out, p.Record)
+		}
+		return nil
+	})
+	return out, err
 }

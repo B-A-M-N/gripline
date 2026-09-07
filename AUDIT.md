@@ -44,9 +44,9 @@ across all 15 packages.
 
 | # | Verdict | Evidence |
 |---|---------|----------|
-| P0.12 | RESOLVED | `Evidence.NonEvictable` marks FamilyOperatorIOC + zero-ExpiresAt critical; `compactLocked` skips them and fails safe (keeps all) if nothing evictable. `TestM1CriticalEvidenceNotEvictedByFlood`. |
-| P0.13 | RESOLVED | `Append` validates the whole batch under one lock before storing anything (atomic gate → `ErrInvalidEvidence`); per-subject bound `maxEvidencePerSubject=2048`; empty-subject pruned. `TestAppendAtomicBatchRejectsPartial`. |
-| P0.14 | RESOLVED | `Evidence.Valid` rejects `!now.Before(ExpiresAt)` — inclusive-invalid at the boundary; `purgeExpiredLocked` + `Snapshot`/`Prune` reuse it. `TestExpiryIsInclusiveInvalidAtBoundary`. |
+| P0.12 | RESOLVED | `Evidence.NonEvictable` marks FamilyOperatorIOC + zero-ExpiresAt critical; shared `evidence.CompactSubject` skips them and fails safe (keeps all) if nothing evictable. `TestM1CriticalEvidenceNotEvictedByFlood`. |
+| P0.13 | RESOLVED | Every backend validates the whole batch before mutation, merges by subject, deduplicates IDs, and priority-compacts at `MaxEvidencePerSubject=2048`; invalid batches return `ErrInvalidEvidence`. `TestAppendAtomicBatchRejectsPartial` plus the durable/Bolt cap tests. |
+| P0.14 | RESOLVED | `Evidence.Valid` rejects `!now.Before(ExpiresAt)` — inclusive-invalid at the boundary; all `Snapshot`/`Prune` implementations reuse the same evaluation rule. `TestExpiryIsInclusiveInvalidAtBoundary`. |
 | P0.15 | RESOLVED | `evidence.Mint` stamps a CSPRNG id; `MintID` accepts an explicit idgen (nil fails closed); terminator + spray detector all produce uniform, unpredictable `ev_...` ids. **Closed by commit 5b644ee.** |
 | P0.16 | RESOLVED | `PepperRing.Get` returns a copy; key bytes never leave the ring; ring copies on ingestion. |
 | P0.17 | RESOLVED | `CredentialRecord.Validate` rejects empty id/verifier, unknown verifier version, invalid revision, future CreatedAt; `Insert` clones verifier bytes. |
@@ -104,18 +104,18 @@ across all 15 packages.
 
 | # | Verdict | Evidence |
 |---|---------|----------|
-| P0.58 | ABSENT | Durable credential store backend: only `MemoryRegistry` exists; no Postgres/SQLite/FS backend. |
+| P0.58 | RESOLVED (single-node beta) | `internal/statebolt` is the durable credential authority. Multi-node replication remains deliberately out of scope. |
 | P0.59 | RESOLVED | Signer key rotation / overlap: `terminator.Keyring` `Rotate()` + retained old-generation public keys; `TestDataPlaneBackendFollowsSignerRotation`. |
 | P0.60 | PARTIAL | Assertion key overlap exists via Keyring, but no HSM/remote signer or automated key-management lifecycle. |
 | P0.61 | ABSENT | Multi-node / leader election: resource governor is a single-process `sync.Mutex`; no etcd/Consul/Raft. |
 | P0.62 | ABSENT | Shared leases with TTL across nodes: leases are in-process; no distributed store/TTL. |
-| P0.63 | ABSENT | Lane-store restart recovery: `map[string]map[string]*LaneRecord` in-memory only; no persistence layer. |
-| P0.64 | ABSENT | Evidence-store restart recovery: `memoryStore` only; no WAL/disk/remote. |
-| P0.65 | PARTIAL | Credential `SecurityState` designed durable, but only `MemoryRegistry`; `StateMachine` hysteresis (`watchStreak`, `belowSince`, `lastScoreTime`) is explicitly process-local. |
-| P0.66 | ABSENT | No WAL / journal / durable append path. |
+| P0.63 | RESOLVED (single-node beta) | `statebolt.Store` implements `lane.Repository`; full lane records and security state survive restart. The resident lane store remains the explicit ephemeral implementation. |
+| P0.64 | RESOLVED (single-node beta) | `statebolt.Store` implements `evidence.Store`; evidence survives restart. The legacy Gob store is compatibility-only and is not a production authority. |
+| P0.65 | PARTIAL | Credential `SecurityState` and its authoritative transitions are durable in `statebolt`; process-local governor buckets and adapters remain volatile by design. |
+| P0.66 | RESOLVED (single-node beta) | bbolt supplies the transactional append path for the beta authority; external WAL/replication and multi-node recovery remain out of scope. |
 | P0.67 | RESOLVED | Source-spray anomaly detector: `anomaly.Detector` wired via `Dependencies.Spray`; `internal/anomaly/spray.go` + `m6_test.go`. |
 | P0.68 | ABSENT | Dependency chaos / failure-injection harness: docs mention it (`docs/design/08-testing.md`) but no implementation; Gate F hand-codes one `failingStore`, not a harness. |
-| P0.69 | RESOLVED | Acceptance gates A–J: all 10 present and asserted in `internal/gates/gates_test.go`; §112 perf gate in `internal/terminator/bench_test.go`. |
+| P0.69 | PARTIAL (honest scope) | `internal/gates` contains component proofs for A–J and the latency test covers §112; the external release harness, network isolation, cross-process replay, and multi-node proofs remain pending. |
 
 ---
 
@@ -198,9 +198,11 @@ and how it is proven:
   the SAME pure mutation reducers as the memory store (semantic drift is
   structurally impossible: both call `lane.ApplyBorrowOrCreate` et al).
 - One bbolt database is the credential + lane + evidence + operator-audit +
-  posture authority; split Bolt/Gob configuration is a boot error.
+  posture authority; split Bolt/Gob configuration is a boot error. A state-backed
+  `paths.audit_log` mirror is also rejected, so there is one audit authority.
 - `control.MutationStore`: revoke / unblock / posture commit mutation + audit
-  row in one transaction. Bolt is the authoritative audit when state-backed.
+  row in one transaction. Bolt is the sole audit authority when state-backed;
+  JSONL remains only for explicitly ephemeral admin mode.
 - Persistent state is mandatory unless `deployment.allow_ephemeral_state=true`.
 - Restart containment acceptance: `TestAcceptanceRestartContainment`.
 - Data race in the lane memory store fixed (returned records are copies).
@@ -224,14 +226,16 @@ and how it is proven:
   propagates Close errors.
 
 **Phase 5 — operator/release usability**
-- `gripline credential list|revoke`, `gripline lane list|unblock`,
-  `gripline status` (capability/durability honesty table) — through the
-  authorization + atomic mutation/audit seams, never touching raw secrets.
+- `gripline credential list|revoke`, `gripline lane list|unblock`, `gripline audit
+  list|export`, and `gripline status` use the running private admin listener by
+  default; `--offline` is explicit stopped-database maintenance. They use the
+  authorization + atomic mutation/audit seams and never touch raw secrets.
 - bbolt is a direct dependency; CI: go-version-file, vet, staticcheck, build,
   race, gates, executable acceptance, gofmt.
 - Release assets: LICENSE (Apache-2.0), SECURITY.md, CHANGELOG.md,
   deploy/config.example.json (validated by `gripline status`), deploy/Dockerfile
-  (distroless, non-root, image build verified).
+  (distroless, explicit UID 65532, image build verified); `.dockerignore` is
+  present and staticcheck is pinned to v0.7.0.
 
 **Verification at close-out:** `go vet ./...`, `staticcheck`, `go build ./...`,
 `go test -race ./...` (all packages) green; executable acceptance suite green;

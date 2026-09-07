@@ -14,7 +14,7 @@ import (
 // Evidence under the same transactional authority as credentials, lanes, and
 // operator state (P0.2-fix). Keys are subjectKey + 0x00 + EvidenceID; rows are
 // versioned JSON envelopes. Append/Snapshot/Prune apply the SHARED evidence
-// semantics (evidence.ValidateForStore / evidence.IsExpired /
+// semantics (evidence.ValidateForStore / evidence.MergeSubject /
 // evidence.CompactSubject) so the Bolt backend is behaviorally
 // interchangeable with the resident memory store — not a third dialect.
 
@@ -75,36 +75,29 @@ func (s *Store) Append(items ...evidence.Evidence) error {
 				return err
 			}
 			for _, item := range batch {
-				key, err := evidenceKey(sk, item.EvidenceID)
-				if err != nil {
+				if _, err := evidenceKey(sk, item.EvidenceID); err != nil {
 					return err
 				}
-				if b.Get(key) != nil {
-					continue // idempotent: already stored
-				}
-				existing = append(existing, item)
 			}
-			compacted := evidence.CompactSubject(existing)
-			if len(compacted) != len(existing) {
-				// Priority compaction evicted items: delete every stored row
-				// that did not survive, then rewrite the survivors (their row
-				// content is unchanged; the rewrite keeps rows canonical).
-				survive := make(map[string]struct{}, len(compacted))
-				for _, item := range compacted {
-					survive[item.EvidenceID] = struct{}{}
-				}
-				prefix := []byte(k + "\x00")
-				c := b.Cursor()
-				for key, _ := c.Seek(prefix); key != nil && bytes.HasPrefix(key, prefix); key, _ = c.Next() {
-					id := evidenceIDFromKey(key, len(prefix))
-					if _, keep := survive[id]; !keep {
-						if err := b.Delete(append([]byte(nil), key...)); err != nil {
-							return err
-						}
+			merged := evidence.MergeSubject(existing, batch, s.now())
+			// Delete every persisted row that did not survive the shared merge.
+			// This also removes expired rows and any duplicate rows written by an
+			// older implementation, even when the resulting count is unchanged.
+			survive := make(map[string]struct{}, len(merged))
+			for _, item := range merged {
+				survive[item.EvidenceID] = struct{}{}
+			}
+			prefix := []byte(k + "\x00")
+			c := b.Cursor()
+			for key, _ := c.Seek(prefix); key != nil && bytes.HasPrefix(key, prefix); key, _ = c.Next() {
+				id := evidenceIDFromKey(key, len(prefix))
+				if _, keep := survive[id]; !keep {
+					if err := b.Delete(append([]byte(nil), key...)); err != nil {
+						return err
 					}
 				}
 			}
-			for _, item := range compacted {
+			for _, item := range merged {
 				if err := putEvidenceTx(tx, item); err != nil {
 					return err
 				}
@@ -125,7 +118,7 @@ func (s *Store) Snapshot(subjects []evidence.SubjectKey, now time.Time) ([]evide
 				return err
 			}
 			for _, ev := range items {
-				if !evidence.IsExpired(ev, now) {
+				if ev.Valid(now) {
 					out = append(out, ev)
 				}
 			}
@@ -155,10 +148,10 @@ func (s *Store) Prune(subjects []evidence.SubjectKey, now time.Time) (int, error
 			c := b.Cursor()
 			for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
 				var p persistedEvidence
-				if err := json.Unmarshal(v, &p); err != nil || p.SchemaVersion > evidenceSchemaVersion {
+				if err := json.Unmarshal(v, &p); err != nil || p.SchemaVersion != evidenceSchemaVersion {
 					return errCorruptEvidence
 				}
-				if evidence.IsExpired(p.Item, now) {
+				if !p.Item.Valid(now) {
 					pruned++
 					continue
 				}
@@ -199,7 +192,7 @@ func loadSubjectTx(tx *bolt.Tx, subjKey string) ([]evidence.Evidence, error) {
 	c := b.Cursor()
 	for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
 		var p persistedEvidence
-		if err := json.Unmarshal(v, &p); err != nil || p.SchemaVersion > evidenceSchemaVersion {
+		if err := json.Unmarshal(v, &p); err != nil || p.SchemaVersion != evidenceSchemaVersion {
 			return nil, errCorruptEvidence
 		}
 		out = append(out, p.Item)

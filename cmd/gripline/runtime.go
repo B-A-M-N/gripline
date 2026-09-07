@@ -4,12 +4,14 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"net/netip"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -78,15 +80,16 @@ func (rt *Runtime) Ready() error {
 
 // BuildRuntime constructs the full application from configuration.
 // P0.1 fix: Every authority is instantiated exactly once and shared.
-func BuildRuntime(cfg *config.Config) (*Runtime, error) {
+func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 	var closers []func() error
-	// failCleanup releases every descriptor opened so far if construction
-	// fails partway (P1.23).
-	failCleanup := func() {
+	defer func() {
+		if retErr == nil {
+			return
+		}
 		for i := len(closers) - 1; i >= 0; i-- {
 			_ = closers[i]()
 		}
-	}
+	}()
 
 	pepper := os.Getenv("GRIPLINE_PEPPER_V1")
 	if pepper == "" {
@@ -146,13 +149,11 @@ func BuildRuntime(cfg *config.Config) (*Runtime, error) {
 		evStore = evidence.NewMemoryStore()
 	}
 	if err := bootstrapCredentials(reg, pepperKey); err != nil {
-		failCleanup()
 		return nil, err
 	}
 
 	signer, err := terminator.LoadOrCreateKeyring(cfg.Paths.SignerKeyring)
 	if err != nil {
-		failCleanup()
 		return nil, fmt.Errorf("gripline: signer: %w", err)
 	}
 
@@ -165,7 +166,6 @@ func BuildRuntime(cfg *config.Config) (*Runtime, error) {
 	if state != nil {
 		p, err := state.LoadPosture()
 		if err != nil {
-			failCleanup()
 			return nil, fmt.Errorf("gripline: load posture: %w", err)
 		}
 		ctrl.Restore(p)
@@ -192,7 +192,6 @@ func BuildRuntime(cfg *config.Config) (*Runtime, error) {
 		},
 	})
 	if err != nil {
-		failCleanup()
 		return nil, fmt.Errorf("gripline: terminator: %w", err)
 	}
 
@@ -277,33 +276,22 @@ func BuildRuntime(cfg *config.Config) (*Runtime, error) {
 	}
 	dp, err := proxy.New(proxyCfg)
 	if err != nil {
-		failCleanup()
 		return nil, fmt.Errorf("gripline: proxy: %w", err)
 	}
 
 	var adminSrv *http.Server
 	var adminSvc *control.Service
 	if cfg.Admin != nil {
-		// P0.5-fix: when state-backed, the Bolt store is the AUTHORITATIVE
-		// operator audit sink — every operator action appends into the same
-		// transactional database as the mutation it documents. The JSONL file
-		// is an optional post-commit mirror, never a second authority.
+		// P0.5/P0.7: when state-backed, the Bolt store is the sole operator
+		// audit sink — every operator action appends into the same transaction
+		// as the mutation it documents. Config validation rejects a JSONL path
+		// here so a mirror can never be mistaken for authoritative history.
 		var audit control.AuditRepository
 		if state != nil {
 			audit = state
-			if cfg.Paths.AuditLog != "" {
-				log.Printf("gripline: paths.audit_log %q is an optional JSONL mirror; the state database is the authoritative operator audit", cfg.Paths.AuditLog)
-				mirror, err := control.NewFileAuditRepository(cfg.Paths.AuditLog)
-				if err != nil {
-					failCleanup()
-					return nil, err
-				}
-				closers = append(closers, func() error { return mirror.Close() })
-			}
 		} else {
 			fileAudit, err := control.NewFileAuditRepository(cfg.Paths.AuditLog)
 			if err != nil {
-				failCleanup()
 				return nil, err
 			}
 			audit = fileAudit
@@ -314,18 +302,20 @@ func BuildRuntime(cfg *config.Config) (*Runtime, error) {
 		for tok, spec := range cfg.Admin.OperatorTokens {
 			name, caps, err := parseSpec(spec)
 			if err != nil {
-				failCleanup()
 				return nil, fmt.Errorf("gripline: admin token: %w", err)
 			}
 			cs := make([]control.Capability, 0, len(caps))
 			for _, c := range caps {
-				cs = append(cs, control.Capability(c))
+				capability, err := control.ParseCapability(c)
+				if err != nil {
+					return nil, fmt.Errorf("gripline: admin token: %w", err)
+				}
+				cs = append(cs, capability)
 			}
 			tokens[tok] = &control.Identity{Name: name, Capabilities: cs}
 		}
 		auth, err := control.NewTokenAuthenticator(tokens)
 		if err != nil {
-			failCleanup()
 			return nil, err
 		}
 
@@ -352,13 +342,17 @@ func BuildRuntime(cfg *config.Config) (*Runtime, error) {
 		}
 		svc, err := control.NewService(ctrl, auth, audit, opts...)
 		if err != nil {
-			failCleanup()
 			return nil, err
 		}
 		adminSvc = svc
 
 		mux := http.NewServeMux()
 		mux.HandleFunc("/admin/posture", adminPosture(svc))
+		mux.HandleFunc("/admin/credentials", adminCredentials(svc, state))
+		mux.HandleFunc("/admin/credentials/revoke", adminCredentialRevoke(svc))
+		mux.HandleFunc("/admin/lanes", adminLanes(svc, state))
+		mux.HandleFunc("/admin/lanes/unblock", adminLaneUnblock(svc))
+		mux.HandleFunc("/admin/audit", adminAudit(svc, state))
 		adminSrv = &http.Server{
 			Addr:              cfg.Admin.Listen,
 			Handler:           mux,
@@ -392,13 +386,13 @@ func BuildRuntime(cfg *config.Config) (*Runtime, error) {
 func (rt *Runtime) Close() error {
 	rt.closeOnce.Do(func() {
 		var errs []error
-		for _, fn := range rt.closers {
-			if err := fn(); err != nil {
+		for i := len(rt.closers) - 1; i >= 0; i-- {
+			if err := rt.closers[i](); err != nil {
 				errs = append(errs, err)
 			}
 		}
 		if len(errs) > 0 {
-			rt.closeErr = fmt.Errorf("gripline: close errors: %v", errs)
+			rt.closeErr = fmt.Errorf("gripline: close errors: %w", errors.Join(errs...))
 		}
 	})
 	return rt.closeErr
@@ -422,11 +416,207 @@ func adminPosture(svc *control.Service) http.HandlerFunc {
 		token := bearer(r.Header.Get("Authorization"))
 		posture, err := svc.SetEmergency(r.Context(), token, b.On, b.Reason)
 		if err != nil {
-			http.Error(w, "forbidden", http.StatusForbidden)
+			writeAdminError(w, err)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"posture": posture.String()})
+	}
+}
+
+func adminCredentials(svc *control.Service, state *statebolt.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			adminMethodNotAllowed(w)
+			return
+		}
+		if _, err := svc.AuthorizeCapability(r.Context(), bearer(r.Header.Get("Authorization")), control.CapCredentialLifecycle); err != nil {
+			writeAdminError(w, err)
+			return
+		}
+		if state == nil {
+			http.Error(w, "persistent credential authority unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		rows, err := state.ListCredentials()
+		if err != nil {
+			http.Error(w, "credential authority unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		writeAdminJSON(w, rows)
+	}
+}
+
+func adminCredentialRevoke(svc *control.Service) http.HandlerFunc {
+	type request struct {
+		CredentialID string `json:"credential_id"`
+		Reason       string `json:"reason"`
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			adminMethodNotAllowed(w)
+			return
+		}
+		var req request
+		if err := decodeAdminJSON(w, r, &req); err != nil {
+			return
+		}
+		if req.CredentialID == "" || req.Reason == "" {
+			http.Error(w, "credential_id and reason are required", http.StatusBadRequest)
+			return
+		}
+		if err := svc.RevokeCredential(r.Context(), bearer(r.Header.Get("Authorization")), req.CredentialID, req.Reason); err != nil {
+			writeAdminError(w, err)
+			return
+		}
+		writeAdminJSON(w, map[string]string{"credential_id": req.CredentialID, "status": "REVOKED"})
+	}
+}
+
+func adminLanes(svc *control.Service, state *statebolt.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			adminMethodNotAllowed(w)
+			return
+		}
+		if _, err := svc.AuthorizeCapability(r.Context(), bearer(r.Header.Get("Authorization")), control.CapLaneLifecycle); err != nil {
+			writeAdminError(w, err)
+			return
+		}
+		if state == nil {
+			http.Error(w, "persistent lane authority unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		credentialID := r.URL.Query().Get("credential")
+		if credentialID == "" {
+			http.Error(w, "credential query parameter is required", http.StatusBadRequest)
+			return
+		}
+		rows, err := state.ListLaneRecords(credentialID)
+		if err != nil {
+			http.Error(w, "lane authority unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		type summary struct {
+			LaneID       string    `json:"lane_id"`
+			CredentialID string    `json:"credential_id"`
+			State        string    `json:"state"`
+			Security     string    `json:"security_state"`
+			RiskScore    int       `json:"risk_score"`
+			RequestCount int64     `json:"request_count"`
+			LastSeenAt   time.Time `json:"last_seen_at"`
+			Revision     int       `json:"revision"`
+		}
+		out := make([]summary, 0, len(rows))
+		for _, row := range rows {
+			out = append(out, summary{
+				LaneID: row.LaneID, CredentialID: row.CredentialID, State: row.State.String(),
+				Security: row.Security.Status.String(), RiskScore: row.RiskScore,
+				RequestCount: row.RequestCount, LastSeenAt: row.LastSeenAt.UTC(), Revision: row.Revision,
+			})
+		}
+		writeAdminJSON(w, out)
+	}
+}
+
+func adminLaneUnblock(svc *control.Service) http.HandlerFunc {
+	type request struct {
+		CredentialID string `json:"credential_id"`
+		LaneID       string `json:"lane_id"`
+		Reason       string `json:"reason"`
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			adminMethodNotAllowed(w)
+			return
+		}
+		var req request
+		if err := decodeAdminJSON(w, r, &req); err != nil {
+			return
+		}
+		if req.CredentialID == "" || req.LaneID == "" || req.Reason == "" {
+			http.Error(w, "credential_id, lane_id, and reason are required", http.StatusBadRequest)
+			return
+		}
+		if err := svc.UnblockLane(r.Context(), bearer(r.Header.Get("Authorization")), req.CredentialID, req.LaneID, req.Reason); err != nil {
+			writeAdminError(w, err)
+			return
+		}
+		writeAdminJSON(w, map[string]string{"credential_id": req.CredentialID, "lane_id": req.LaneID, "status": "NORMAL"})
+	}
+}
+
+func adminAudit(svc *control.Service, state *statebolt.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			adminMethodNotAllowed(w)
+			return
+		}
+		if _, err := svc.AuthorizeCapability(r.Context(), bearer(r.Header.Get("Authorization")), control.CapEvidence); err != nil {
+			writeAdminError(w, err)
+			return
+		}
+		if state == nil {
+			http.Error(w, "persistent audit authority unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		after := uint64(0)
+		if raw := r.URL.Query().Get("after"); raw != "" {
+			var err error
+			after, err = strconv.ParseUint(raw, 10, 64)
+			if err != nil {
+				http.Error(w, "invalid after cursor", http.StatusBadRequest)
+				return
+			}
+		}
+		limit := 100
+		if raw := r.URL.Query().Get("limit"); raw != "" {
+			var err error
+			limit, err = strconv.Atoi(raw)
+			if err != nil || limit < 1 || limit > 1000 {
+				http.Error(w, "invalid limit", http.StatusBadRequest)
+				return
+			}
+		}
+		rows, err := state.ListOperatorAudit(after, limit)
+		if err != nil {
+			http.Error(w, "audit authority unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		writeAdminJSON(w, rows)
+	}
+}
+
+func decodeAdminJSON(w http.ResponseWriter, r *http.Request, dst any) error {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
+	if err := dec.Decode(dst); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return err
+	}
+	return nil
+}
+
+func writeAdminJSON(w http.ResponseWriter, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(value)
+}
+
+func adminMethodNotAllowed(w http.ResponseWriter) {
+	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+}
+
+func writeAdminError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, control.ErrUnauthenticated):
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	case errors.Is(err, control.ErrUnauthorized):
+		http.Error(w, "forbidden", http.StatusForbidden)
+	case errors.Is(err, control.ErrReasonRequired):
+		http.Error(w, "reason required", http.StatusBadRequest)
+	case errors.Is(err, credential.ErrNotFound), errors.Is(err, lane.ErrLaneNotFound):
+		http.Error(w, "not found", http.StatusNotFound)
+	default:
+		http.Error(w, "operator action failed", http.StatusInternalServerError)
 	}
 }
 
@@ -487,6 +677,7 @@ func bootstrapCredentials(reg credential.Registry, pepperKey []byte) error {
 	if credSecret := os.Getenv("GRIPLINE_CREDENTIAL_SECRET"); credSecret != "" {
 		sealed := secret.NewFromBytes([]byte(credSecret))
 		verifier := credential.Verifier(sealed, &credential.PepperKey{Version: 1, Key: pepperKey})
+		sealed.Zero()
 		credID := os.Getenv("GRIPLINE_CREDENTIAL_ID")
 		if credID == "" {
 			credID = "cred_bootstrap"

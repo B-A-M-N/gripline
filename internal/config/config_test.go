@@ -58,17 +58,19 @@ func TestLoadValid(t *testing.T) {
 // Every security-consequential zero is a boot failure, not a degraded default.
 func TestValidateRejectsMissingSecurityDecisions(t *testing.T) {
 	cases := map[string]string{
-		"no tls posture":       `{"listen":":8080","backend":{"url":"https://b","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"}}`,
-		"no backend":           `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"}}`,
-		"no backend timeout":   `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"https://b"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"}}`,
-		"unbounded read":       `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"https://b","timeout":"5s"},"server":{"write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"}}`,
-		"unbounded write":      `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"https://b","timeout":"5s"},"server":{"read_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"}}`,
-		"unbounded idle":       `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"https://b","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"}}`,
-		"no header bound":      `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"https://b","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s"},"identity":{"audience":"a"}}`,
-		"no audience":          `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"https://b","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{}}`,
-		"admin without audit":  `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"https://b","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"},"admin":{"listen":":9090","operator_tokens":{"t":"op:posture.control"}}}`,
-		"admin without tokens": `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"https://b","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"},"admin":{"listen":":9090"},"paths":{"audit_log":"a.jsonl"}}`,
-		"bad min version":      `{"listen":":8080","tls":{"terminate_tls_upstream":true,"min_version":"1.1"},"backend":{"url":"https://b","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"}}`,
+		"no tls posture":         `{"listen":":8080","backend":{"url":"https://b","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"}}`,
+		"no backend":             `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"}}`,
+		"no backend timeout":     `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"https://b"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"}}`,
+		"unbounded read":         `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"https://b","timeout":"5s"},"server":{"write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"}}`,
+		"unbounded write":        `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"https://b","timeout":"5s"},"server":{"read_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"}}`,
+		"unbounded idle":         `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"https://b","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"}}`,
+		"no header bound":        `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"https://b","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s"},"identity":{"audience":"a"}}`,
+		"no audience":            `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"https://b","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{}}`,
+		"admin without audit":    `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"https://b","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"},"admin":{"listen":":9090","operator_tokens":{"t":"op:posture.control"}}}`,
+		"admin without tokens":   `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"https://b","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"},"admin":{"listen":":9090"},"paths":{"audit_log":"a.jsonl"}}`,
+		"state and audit mirror": `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"https://b","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"},"paths":{"state":"state.db","audit_log":"audit.jsonl"}}`,
+		"unknown capability":     `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"https://b","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"},"admin":{"listen":"127.0.0.1:9090","operator_tokens":{"01234567890123456789012345678901":"op:posture.typo"}},"paths":{"audit_log":"audit.jsonl"}}`,
+		"bad min version":        `{"listen":":8080","tls":{"terminate_tls_upstream":true,"min_version":"1.1"},"backend":{"url":"https://b","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"}}`,
 	}
 	for name, body := range cases {
 		if _, err := Load(writeCfg(t, body)); err == nil {
@@ -88,7 +90,7 @@ func TestTLSExclusivity(t *testing.T) {
 // ${VAR} expansion: set variables substitute; unset variables are load errors.
 func TestEnvExpansion(t *testing.T) {
 	t.Setenv("GP_BACKEND", "https://real.internal/v1")
-	t.Setenv("GP_TOKEN", "op-secret")
+	t.Setenv("GP_TOKEN", "op-secret-0123456789abcdef0123456789abcdef")
 	body := `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"${GP_BACKEND}","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"},"admin":{"listen":"127.0.0.1:9090","operator_tokens":{"${GP_TOKEN}":"op:posture.control"}},"paths":{"audit_log":"audit.jsonl"}}`
 	c, err := Load(writeCfg(t, body))
 	if err != nil {
@@ -97,7 +99,7 @@ func TestEnvExpansion(t *testing.T) {
 	if c.Backend.URL != "https://real.internal/v1" {
 		t.Fatalf("expansion failed: %q", c.Backend.URL)
 	}
-	if _, ok := c.Admin.OperatorTokens["op-secret"]; !ok {
+	if _, ok := c.Admin.OperatorTokens["op-secret-0123456789abcdef0123456789abcdef"]; !ok {
 		t.Fatal("token variable not expanded")
 	}
 
@@ -150,7 +152,7 @@ func TestAdminBindValidation(t *testing.T) {
 		if allowPublic {
 			ap = `,"allow_public":true`
 		}
-		return `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"https://b","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"},"admin":{"listen":"` + listen + `","operator_tokens":{"t":"op:posture.control"}` + ap + `},"paths":{"audit_log":"a.jsonl"}}`
+		return `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"https://b","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"},"admin":{"listen":"` + listen + `","operator_tokens":{"test-token-0123456789abcdef0123456789abcdef":"op:posture.control"}` + ap + `},"paths":{"audit_log":"a.jsonl"}}`
 	}
 
 	// Valid: loopback, RFC1918 private, IPv6 loopback.

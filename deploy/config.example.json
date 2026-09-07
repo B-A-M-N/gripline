@@ -8,7 +8,7 @@
   },
 
   "backend": {
-    "url": "https://provider.internal:443/v1",
+    "url": "https://provider.internal:443",
     "timeout": "30s",
     "dial_timeout": "5s",
     "tls_handshake_timeout": "5s",
@@ -29,7 +29,7 @@
   "admin": {
     "listen": "127.0.0.1:9090",
     "operator_tokens": {
-      "${GRIPLINE_OPERATOR_TOKEN}": "ops:posture.control,credential.lifecycle,lane.lifecycle"
+      "${GRIPLINE_OPERATOR_TOKEN}": "ops:posture.control,credential.lifecycle,lane.lifecycle,evidence.operator"
     }
   },
 
@@ -44,8 +44,7 @@
 
   "paths": {
     "state": "/var/lib/gripline/state.db",
-    "signer_keyring": "/var/lib/gripline/keyring.json",
-    "audit_log": "/var/lib/gripline/audit.jsonl"
+    "signer_keyring": "/var/lib/gripline/keyring.json"
   },
 
   "deployment": {}

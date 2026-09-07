@@ -7,10 +7,9 @@ import (
 	"time"
 )
 
-// TestDurableStoreBatchAtomicityAtCap (P0.9A) verifies that when a batch
-// would exceed the per-subject cap, the entire batch is rejected and no
-// state is modified.
-func TestDurableStoreBatchAtomicityAtCap(t *testing.T) {
+// TestDurableStoreBatchCompactionAtCap verifies that a multi-item batch is
+// merged and compacted as one subject-level operation.
+func TestDurableStoreBatchCompactionAtCap(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "evidence.gob")
 
@@ -43,7 +42,8 @@ func TestDurableStoreBatchAtomicityAtCap(t *testing.T) {
 		}
 	}
 
-	// A batch with 3 items where only 1 can fit should fail atomically.
+	// A batch with 3 items where only 1 can fit is compacted atomically: all
+	// three new items survive and the oldest evictable rows leave the cap.
 	batch := []Evidence{
 		{EvidenceID: "ev_batch_1", Code: "NEW_LANE", Family: FamilyClientNovelty, Scope: ScopeLane, SubjectID: subjectID, Score: 10, Confidence: 60, CreatedAt: now, ExpiresAt: now.Add(time.Hour), PolicyRevision: 1},
 		{EvidenceID: "ev_batch_2", Code: "NEW_LANE", Family: FamilyClientNovelty, Scope: ScopeLane, SubjectID: subjectID, Score: 10, Confidence: 60, CreatedAt: now, ExpiresAt: now.Add(time.Hour), PolicyRevision: 1},
@@ -51,27 +51,37 @@ func TestDurableStoreBatchAtomicityAtCap(t *testing.T) {
 	}
 
 	err = store.Append(batch...)
-	if err == nil {
-		t.Fatal("expected error for batch exceeding cap")
+	if err != nil {
+		t.Fatalf("batch append: %v", err)
 	}
 
-	// Verify the subject still has exactly maxEvidencePerSubject-1 items
-	// (none of the batch were stored).
+	// Verify the subject is exactly at the cap and the batch was not partially
+	// rejected.
 	snap, err := store.Snapshot([]SubjectKey{{Scope: ScopeLane, ID: subjectID}}, now.Add(time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(snap) != maxEvidencePerSubject-1 {
-		t.Fatalf("expected %d items, got %d (batch was not atomic)", maxEvidencePerSubject-1, len(snap))
+	if len(snap) != maxEvidencePerSubject {
+		t.Fatalf("expected %d items, got %d", maxEvidencePerSubject, len(snap))
+	}
+	for _, id := range []string{"ev_batch_1", "ev_batch_2", "ev_batch_3"} {
+		found := false
+		for _, ev := range snap {
+			if ev.EvidenceID == id {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("batch evidence %q was not retained", id)
+		}
 	}
 }
 
-// TestDurableStoreBatchAtomicityAtCapTwoItems targets the exact overflow shape:
-// a subject one below the cap receiving a 2-item batch where item 1 fits and
-// item 2 would overflow. The ENTIRE batch must be rejected with NO partial
-// items stored (all-or-nothing), so the subject count must stay pinned below the
-// cap and the following legitimate single item must still be accepted.
-func TestDurableStoreBatchAtomicityAtCapTwoItems(t *testing.T) {
+// TestDurableStoreBatchCompactionAtCapTwoItems targets the exact overflow
+// shape: a subject one below the cap receives a two-item batch. Both new rows
+// must be retained while the oldest evictable row is compacted.
+func TestDurableStoreBatchCompactionAtCapTwoItems(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "evidence.gob")
 
@@ -104,31 +114,39 @@ func TestDurableStoreBatchAtomicityAtCapTwoItems(t *testing.T) {
 		}
 	}
 
-	// Batch of 2: item 1 fits (slot to 2048), item 2 overflows. Both share the
-	// subject, so the whole batch must be refused before anything is stored.
-	over := store.Append(
+	// Both share the subject, so the batch is merged before compaction.
+	err = store.Append(
 		Evidence{EvidenceID: "ev_fit_1", Code: "NEW_LANE", Family: FamilyClientNovelty, Scope: ScopeLane, SubjectID: subjectID, Score: 10, Confidence: 60, CreatedAt: now, ExpiresAt: now.Add(time.Hour), PolicyRevision: 1},
 		Evidence{EvidenceID: "ev_overflow_2", Code: "NEW_LANE", Family: FamilyClientNovelty, Scope: ScopeLane, SubjectID: subjectID, Score: 10, Confidence: 60, CreatedAt: now, ExpiresAt: now.Add(time.Hour), PolicyRevision: 1},
 	)
-	if over == nil {
-		t.Fatal("expected error for 2-item batch whose second item overflows the cap")
+	if err != nil {
+		t.Fatalf("batch append: %v", err)
 	}
 
-	// Nothing from the rejected batch may have been stored: count stays at
-	// maxEvidencePerSubject-1.
+	// Both batch items survive and the subject remains at the cap.
 	snap, err := store.Snapshot([]SubjectKey{{Scope: ScopeLane, ID: subjectID}}, now.Add(time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(snap) != maxEvidencePerSubject-1 {
-		t.Fatalf("after rejected batch expected %d items, got %d (partial items stored)", maxEvidencePerSubject-1, len(snap))
+	if len(snap) != maxEvidencePerSubject {
+		t.Fatalf("expected %d items, got %d", maxEvidencePerSubject, len(snap))
+	}
+	for _, id := range []string{"ev_fit_1", "ev_overflow_2"} {
+		found := false
+		for _, ev := range snap {
+			if ev.EvidenceID == id {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("batch evidence %q was not retained", id)
+		}
 	}
 
-	// A subsequent legitimate single item (the one slot that IS free) must be
-	// accepted, proving the rejection did not wedge or corrupt the subject.
-	ok := store.Append(Evidence{EvidenceID: "ev_legit_after", Code: "NEW_LANE", Family: FamilyClientNovelty, Scope: ScopeLane, SubjectID: subjectID, Score: 10, Confidence: 60, CreatedAt: now, ExpiresAt: now.Add(time.Hour), PolicyRevision: 1})
-	if ok != nil {
-		t.Fatalf("expected single item to fit after batch rejection, got %v", ok)
+	// A subsequent item is also accepted and compacted at the same cap.
+	if err := store.Append(Evidence{EvidenceID: "ev_legit_after", Code: "NEW_LANE", Family: FamilyClientNovelty, Scope: ScopeLane, SubjectID: subjectID, Score: 10, Confidence: 60, CreatedAt: now, ExpiresAt: now.Add(time.Hour), PolicyRevision: 1}); err != nil {
+		t.Fatalf("expected subsequent append to fit, got %v", err)
 	}
 	snap2, err := store.Snapshot([]SubjectKey{{Scope: ScopeLane, ID: subjectID}}, now.Add(time.Second))
 	if err != nil {

@@ -26,7 +26,7 @@ func writeStatefulConfig(t *testing.T, dir string, backendURL string, extraAdmin
 	cfgPath := filepath.Join(dir, "config.json")
 	admin := ""
 	if extraAdmin {
-		admin = `,"admin":{"listen":"127.0.0.1:0","operator_tokens":{"op-tok-restart-123456":"operator:posture.control,credential.lifecycle,lane.lifecycle"}},"paths":{"audit_log":"` + filepath.Join(dir, "audit.jsonl") + `"}`
+		admin = `,"admin":{"listen":"127.0.0.1:0","operator_tokens":{"op-tok-restart-0123456789abcdef0123456789abcdef":"operator:posture.control,credential.lifecycle,lane.lifecycle,evidence.operator"}}`
 	}
 	cfgJSON := `{"listen":"127.0.0.1:0","backend":{"url":"` + backendURL + `","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"test-audience"}` + admin + `,"tls":{"terminate_tls_upstream":true},"paths":{"state":"` + filepath.Join(dir, "state.db") + `","signer_keyring":"` + filepath.Join(dir, "keyring.json") + `"}}`
 	if err := os.WriteFile(cfgPath, []byte(cfgJSON), 0o640); err != nil {
@@ -340,7 +340,7 @@ func TestAcceptanceTransactionalOperatorMutations(t *testing.T) {
 	}
 
 	// Transactional credential revoke via the control service seam.
-	opToken := "op-tok-restart-123456"
+	opToken := "op-tok-restart-0123456789abcdef0123456789abcdef"
 	if err := rt.controlService().RevokeCredential(t.Context(), opToken, "cred_op", "acceptance revoke"); err != nil {
 		t.Fatalf("RevokeCredential: %v", err)
 	}

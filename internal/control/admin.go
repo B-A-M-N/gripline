@@ -37,6 +37,13 @@ type AuditRepository interface {
 	AppendOperator(ctx context.Context, rec OperatorRecord) error
 }
 
+// AuditRecordReader is the read-only operator-audit surface used by the
+// authenticated admin API and CLI export. It exposes sanitized records only;
+// the caller never receives credential or signer material.
+type AuditRecordReader interface {
+	ListOperatorAudit(after uint64, limit int) ([]OperatorRecord, error)
+}
+
 // OperatorRecord is one durable operator-action audit row. It carries WHO
 // (authenticated identity), WHAT (action), ON WHICH TARGET, WHEN, the
 // justification, the posture at action time, and the OUTCOME — everything a
@@ -143,7 +150,7 @@ var ErrUnauthorized = errors.New("control: operator lacks required capability")
 var ErrReasonRequired = errors.New("control: operator action requires a reason")
 
 // TokenAuthenticator authenticates operators via bearer tokens. Tokens are
-// stored and compared as HMAC-SHA256 digests — the raw token is never
+// stored and compared as domain-separated SHA-256 digests — the raw token is never
 // retained, so a read of the authenticator's table does not yield usable
 // credentials (INV-1). Production deployments back Authenticator with their
 // SSO/mTLS stack; this implementation serves as the documented default.
@@ -151,6 +158,11 @@ type TokenAuthenticator struct {
 	mu     sync.RWMutex
 	digest map[string]*Identity // token digest → identity
 }
+
+// MinOperatorTokenBytes is the minimum bearer-token length accepted by the
+// built-in authenticator. Deployments should use generated values such as
+// `openssl rand -base64 32`, not human-chosen passphrases.
+const MinOperatorTokenBytes = 32
 
 // NewTokenAuthenticator builds an authenticator from token→identity pairs.
 // Empty tokens are rejected: an empty bearer would authenticate anyone.
@@ -160,12 +172,28 @@ func NewTokenAuthenticator(tokens map[string]*Identity) (*TokenAuthenticator, er
 		if tok == "" {
 			return nil, errors.New("control: empty operator token")
 		}
+		if len([]byte(tok)) < MinOperatorTokenBytes {
+			return nil, fmt.Errorf("control: operator token must contain at least %d bytes", MinOperatorTokenBytes)
+		}
 		if id == nil || id.Name == "" {
 			return nil, errors.New("control: operator identity requires a name")
 		}
 		a.digest[tokenDigest(tok)] = id
 	}
 	return a, nil
+}
+
+// ParseCapability validates and returns one of the capabilities understood by
+// the control plane. Configuration must fail closed on typos rather than boot
+// with an operator identity that can never authorize its intended action.
+func ParseCapability(s string) (Capability, error) {
+	capability := Capability(s)
+	switch capability {
+	case CapCredentialLifecycle, CapLaneLifecycle, CapPosture, CapEvidence, CapPolicyInstall:
+		return capability, nil
+	default:
+		return "", fmt.Errorf("control: unknown capability %q", s)
+	}
 }
 
 func tokenDigest(tok string) string {
@@ -326,6 +354,20 @@ func (s *Service) authorize(ctx context.Context, token string, cap Capability, r
 	if reason == "" {
 		return nil, ErrReasonRequired
 	}
+	id, err := s.auth.Authenticate(ctx, token)
+	if err != nil {
+		return nil, err
+	}
+	if err := Authorize(id, cap); err != nil {
+		return nil, err
+	}
+	return id, nil
+}
+
+// AuthorizeCapability authenticates a read-only operator request and checks its
+// capability without creating an audit row. State-changing requests must use
+// the reason-bearing methods below so their mutation and audit remain coupled.
+func (s *Service) AuthorizeCapability(ctx context.Context, token string, cap Capability) (*Identity, error) {
 	id, err := s.auth.Authenticate(ctx, token)
 	if err != nil {
 		return nil, err

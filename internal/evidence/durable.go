@@ -1,7 +1,9 @@
-// Package evidence (durable extension) provides a file-backed Store for
-// restart safety (BETA-09). The durable store holds evidence in memory and
-// writes gob-encoded snapshots to disk atomically (temp file + rename) on a
-// background flush interval and on Close.
+// Package evidence (durable extension) provides the LEGACY Gob compatibility
+// Store. It holds evidence in memory and writes gob-encoded snapshots to disk
+// atomically (temp file + rename) on a background flush interval and on Close.
+// Production deployments use internal/statebolt as the single transactional
+// authority; this backend is retained only for explicitly ephemeral or legacy
+// compatibility use.
 //
 // It satisfies the same Store contract as memoryStore: atomic append (all or
 // nothing), dedup by EvidenceId, consistent expiration semantics.
@@ -78,11 +80,9 @@ func NewDurableStore(cfg DurableConfig) (Store, func() error, error) {
 	return ds, func() error { return ds.close() }, nil
 }
 
-// Append implements Store.Append with atomic all-or-nothing semantics.
-// The ENTIRE batch is preflighted before any mutation: if any item is
-// structurally invalid, is rejected as a duplicate, or would push a subject
-// over maxEvidencePerSubject, the whole batch is rejected and no in-memory
-// state or pending-flush count changes (P0.9A/P0.9B).
+// Append implements Store.Append with atomic all-or-nothing semantics and the
+// same merge/expiry/dedup/priority-compaction contract as the memory and Bolt
+// stores. The legacy Gob backend remains only for ephemeral compatibility.
 func (d *durableStore) Append(items ...Evidence) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -94,59 +94,25 @@ func (d *durableStore) Append(items ...Evidence) error {
 		}
 	}
 
-	// 2) Preflight projected per-subject counts. projected[k] is the number of
-	//    items subject k would hold AFTER this batch. Within-batch duplicates
-	//    are tracked per (subject, EvidenceID) so the projected count exactly
-	//    matches what the mutation phase will append for each subject: an ID
-	//    intended for a different subject can never under-count a near-cap
-	//    subject and silently let it overflow.
-	projected := make(map[string]int, len(d.data))
-	for k, v := range d.data {
-		projected[k] = len(v)
-	}
-	seen := make(map[string]struct{}) // "subjectKey/EvidenceID"
+	bySubject := make(map[string][]Evidence)
 	for _, ev := range items {
 		k := subjectKey(SubjectKey{Scope: ev.Scope, ID: ev.SubjectID})
-		dedupKey := k + "/" + ev.EvidenceID
-		if _, dup := seen[dedupKey]; dup {
-			continue // this ID already counted for this subject in this batch
-		}
-		if d.hasIDLocked(k, ev.EvidenceID) {
-			continue // already stored for this subject (idempotent append)
-		}
-		seen[dedupKey] = struct{}{}
-		// Durable store bounds a subject by a hard cap (no eviction path), so
-		// overshoot must reject the whole batch atomically.
-		if projected[k]+1 > maxEvidencePerSubject {
-			return fmt.Errorf("evidence: per-subject cap reached for %s", k)
-		}
-		projected[k]++
+		bySubject[k] = append(bySubject[k], ev)
 	}
-
-	// 3) All checks passed — apply the whole batch.
-	for _, ev := range items {
-		k := subjectKey(SubjectKey{Scope: ev.Scope, ID: ev.SubjectID})
-		if d.hasIDLocked(k, ev.EvidenceID) {
-			continue // already stored (covers items appended earlier this batch)
+	for k, incoming := range bySubject {
+		merged := MergeSubject(d.data[k], incoming, time.Now())
+		if len(merged) == 0 {
+			delete(d.data, k)
+		} else {
+			d.data[k] = merged
 		}
-		d.data[k] = append(d.data[k], ev)
 		d.pending++
 	}
 	return nil
 }
 
-// hasIDLocked reports whether a subject key already holds an EvidenceID.
-// Caller must hold d.mu.
-func (d *durableStore) hasIDLocked(k string, id string) bool {
-	for i := range d.data[k] {
-		if d.data[k][i].EvidenceID == id {
-			return true
-		}
-	}
-	return false
-}
-
-// Snapshot implements Store.Snapshot with consistent expiration semantics.
+// Snapshot implements Store.Snapshot with the same evaluation semantics as
+// the memory and Bolt stores, including rejecting future-created evidence.
 func (d *durableStore) Snapshot(subjects []SubjectKey, now time.Time) ([]Evidence, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -155,18 +121,16 @@ func (d *durableStore) Snapshot(subjects []SubjectKey, now time.Time) ([]Evidenc
 	for _, sk := range subjects {
 		k := subjectKey(sk)
 		for _, ev := range d.data[k] {
-			// P0.9 fix: match memoryStore expiration semantics exactly.
-			// Expired when now >= ExpiresAt (not ExpiresAt.Before(now)).
-			if !ev.ExpiresAt.IsZero() && !ev.ExpiresAt.After(now) {
-				continue
+			if ev.Valid(now) {
+				out = append(out, ev)
 			}
-			out = append(out, ev)
 		}
 	}
 	return out, nil
 }
 
-// Prune implements Store.Prune with consistent expiration semantics.
+// Prune implements Store.Prune with the same evaluation semantics as the
+// memory and Bolt stores.
 func (d *durableStore) Prune(subjects []SubjectKey, now time.Time) (int, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -176,11 +140,11 @@ func (d *durableStore) Prune(subjects []SubjectKey, now time.Time) (int, error) 
 		k := subjectKey(sk)
 		var kept []Evidence
 		for _, ev := range d.data[k] {
-			if !ev.ExpiresAt.IsZero() && !ev.ExpiresAt.After(now) {
+			if ev.Valid(now) {
+				kept = append(kept, ev)
+			} else {
 				pruned++
-				continue
 			}
-			kept = append(kept, ev)
 		}
 		if len(kept) == 0 {
 			delete(d.data, k)

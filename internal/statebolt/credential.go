@@ -56,7 +56,7 @@ func (s *Store) Insert(rec *credential.CredentialRecord) error {
 		}
 		if prev := creds.Get([]byte(rec.CredentialID)); prev != nil {
 			var old persistedCredential
-			if err := json.Unmarshal(prev, &old); err != nil {
+			if err := json.Unmarshal(prev, &old); err != nil || old.SchemaVersion != credentialSchemaVersion {
 				return credential.ErrCorrupt
 			}
 			if len(old.Record.Verifier) > 0 {
@@ -159,7 +159,7 @@ func (s *Store) lookup(credentialID string) (*credential.CredentialRecord, error
 			return nil
 		}
 		var p persistedCredential
-		if err := json.Unmarshal(env, &p); err != nil {
+		if err := json.Unmarshal(env, &p); err != nil || p.SchemaVersion != credentialSchemaVersion {
 			return credential.ErrCorrupt
 		}
 		r := p.Record
@@ -210,7 +210,7 @@ func (s *Store) lookupByVerifier(verifier []byte, pepperVersion int) (*credentia
 			return nil
 		}
 		var p persistedCredential
-		if err := json.Unmarshal(env, &p); err != nil {
+		if err := json.Unmarshal(env, &p); err != nil || p.SchemaVersion != credentialSchemaVersion {
 			return credential.ErrCorrupt
 		}
 		if p.Record.PepperVersion != pepperVersion || !bytes.Equal(p.Record.Verifier, verifier) {
@@ -262,7 +262,7 @@ func (s *Store) UpdateStatusCAS(credentialID string, expectedRevision int, fromS
 			return credential.ErrNotFound
 		}
 		var p persistedCredential
-		if err := json.Unmarshal(env, &p); err != nil {
+		if err := json.Unmarshal(env, &p); err != nil || p.SchemaVersion != credentialSchemaVersion {
 			return credential.ErrCorrupt
 		}
 		rec := &p.Record
@@ -326,7 +326,7 @@ func (s *Store) ObserveAndCommit(
 			return credential.ErrNotFound
 		}
 		var p persistedCredential
-		if err := json.Unmarshal(env, &p); err != nil {
+		if err := json.Unmarshal(env, &p); err != nil || p.SchemaVersion != credentialSchemaVersion {
 			return credential.ErrCorrupt
 		}
 		rec := &p.Record
@@ -395,7 +395,7 @@ func (s *Store) updateInPlace(credentialID string, mutate func(*credential.Crede
 			return credential.ErrNotFound
 		}
 		var p persistedCredential
-		if err := json.Unmarshal(env, &p); err != nil {
+		if err := json.Unmarshal(env, &p); err != nil || p.SchemaVersion != credentialSchemaVersion {
 			return credential.ErrCorrupt
 		}
 		if err := mutate(&p.Record); err != nil {
@@ -432,7 +432,7 @@ func (s *Store) ListCredentials() ([]credential.Summary, error) {
 		c := tx.Bucket(bucketCredentials).Cursor()
 		for k, v := c.First(); k != nil; k, v = c.Next() {
 			var p persistedCredential
-			if err := json.Unmarshal(v, &p); err != nil {
+			if err := json.Unmarshal(v, &p); err != nil || p.SchemaVersion != credentialSchemaVersion {
 				return credential.ErrCorrupt
 			}
 			out = append(out, credential.Summary{

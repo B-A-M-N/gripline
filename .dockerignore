@@ -1,0 +1,11 @@
+.git
+.github
+.claude
+.env
+.env.*
+*.db
+*.gob
+*.jsonl
+coverage*
+dist/
+tmp/

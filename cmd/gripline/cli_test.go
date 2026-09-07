@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -21,7 +22,7 @@ import (
 func cliStatefulConfig(t *testing.T, dir, backendURL string) string {
 	t.Helper()
 	t.Setenv("GRIPLINE_PEPPER_V1", testPepperEnv)
-	cfgJSON := `{"listen":"127.0.0.1:0","backend":{"url":"` + backendURL + `","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"test-audience"},"admin":{"listen":"127.0.0.1:0","operator_tokens":{"op-tok-cli-123456789012345":"cli:credential.lifecycle,lane.lifecycle"}},"tls":{"terminate_tls_upstream":true},"paths":{"state":"` + filepath.Join(dir, "state.db") + `","signer_keyring":"` + filepath.Join(dir, "keyring.json") + `"}}`
+	cfgJSON := `{"listen":"127.0.0.1:0","backend":{"url":"` + backendURL + `","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"test-audience"},"admin":{"listen":"127.0.0.1:0","operator_tokens":{"op-tok-cli-0123456789abcdef0123456789abcdef":"cli:credential.lifecycle,lane.lifecycle"}},"tls":{"terminate_tls_upstream":true},"paths":{"state":"` + filepath.Join(dir, "state.db") + `","signer_keyring":"` + filepath.Join(dir, "keyring.json") + `"}}`
 	p := filepath.Join(dir, "config.json")
 	if err := os.WriteFile(p, []byte(cfgJSON), 0o640); err != nil {
 		t.Fatal(err)
@@ -55,6 +56,63 @@ func TestCLIStatusCommand(t *testing.T) {
 	}
 	if !strings.Contains(out, "source blocking") || !strings.Contains(out, "off") {
 		t.Fatalf("status output must report source blocking shadow-only:\n%s", out)
+	}
+}
+
+// TestCLILifecycleUsesLiveAdmin proves the normal lifecycle commands talk to
+// the running private admin listener. The raw-state helpers remain available
+// only behind the explicit --offline flag.
+func TestCLILifecycleUsesLiveAdmin(t *testing.T) {
+	const token = "op-live-cli-0123456789abcdef0123456789abcdef"
+	var revoked bool
+	admin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/admin/credentials":
+			_ = json.NewEncoder(w).Encode([]credential.Summary{{
+				CredentialID: "cred_live", AccountID: "acct_live", Status: "NORMAL",
+				PolicyID: "fi-default-v1", CreatedAt: time.Unix(1, 0).UTC(), Revision: 3,
+			}})
+		case r.Method == http.MethodPost && r.URL.Path == "/admin/credentials/revoke":
+			revoked = true
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"REVOKED"}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/admin/lanes":
+			_ = json.NewEncoder(w).Encode([]adminLaneSummary{{LaneID: "lane_live", CredentialID: "cred_live", State: "NEW"}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer admin.Close()
+
+	dir := t.TempDir()
+	adminAddr := strings.TrimPrefix(admin.URL, "http://")
+	cfgJSON := `{"listen":"127.0.0.1:8080","backend":{"url":"http://backend.invalid:80","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"test-audience"},"admin":{"listen":"` + adminAddr + `","operator_tokens":{"` + token + `":"ops:credential.lifecycle,lane.lifecycle"}},"tls":{"terminate_tls_upstream":true},"paths":{"audit_log":"` + filepath.Join(dir, "audit.jsonl") + `"}}`
+	cfgPath := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(cfgPath, []byte(cfgJSON), 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	out := captureStdout(t, func() {
+		if err := runCredentialCLI([]string{"list", "--config", cfgPath, "--token", token}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(out, "cred_live") {
+		t.Fatalf("live credential list did not use admin response: %s", out)
+	}
+	if err := runCredentialCLI([]string{"revoke", "--config", cfgPath, "--id", "cred_live", "--reason", "live test", "--token", token}); err != nil {
+		t.Fatalf("live credential revoke: %v", err)
+	}
+	if !revoked {
+		t.Fatal("credential revoke did not reach the live admin listener")
+	}
+	out = captureStdout(t, func() {
+		if err := runLaneCLI([]string{"list", "--config", cfgPath, "--credential", "cred_live", "--token", token}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(out, "lane_live") {
+		t.Fatalf("live lane list did not use admin response: %s", out)
 	}
 }
 
@@ -107,7 +165,7 @@ func TestCLICredentialLifecycle(t *testing.T) {
 	}
 
 	// revoke requires a reason.
-	if err := runCredentialRevoke(cfgPath, "cred_cli", "", "op-tok-cli-123456789012345"); err == nil {
+	if err := runCredentialRevoke(cfgPath, "cred_cli", "", "op-tok-cli-0123456789abcdef0123456789abcdef"); err == nil {
 		t.Fatal("revoke without a reason must fail")
 	}
 	// revoke requires a token.
@@ -119,7 +177,7 @@ func TestCLICredentialLifecycle(t *testing.T) {
 		t.Fatal("revoke with an invalid operator token must fail")
 	}
 	// revoke succeeds.
-	if err := runCredentialRevoke(cfgPath, "cred_cli", "cli acceptance revoke", "op-tok-cli-123456789012345"); err != nil {
+	if err := runCredentialRevoke(cfgPath, "cred_cli", "cli acceptance revoke", "op-tok-cli-0123456789abcdef0123456789abcdef"); err != nil {
 		t.Fatalf("revoke: %v", err)
 	}
 

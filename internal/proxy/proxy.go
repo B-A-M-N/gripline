@@ -489,6 +489,12 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		rc = http.NewResponseController(w)
 		streamIdle = d.cfg.StreamWriteIdleTimeout
 		_ = rc.SetWriteDeadline(time.Now().Add(d.cfg.WriteTimeout))
+		defer func() {
+			// A streamed response may leave the HTTP connection alive. Clear
+			// the per-request deadline so it cannot poison the next request on
+			// that keep-alive connection.
+			_ = rc.SetWriteDeadline(time.Time{})
+		}()
 	}
 	w.WriteHeader(resp.StatusCode)
 	// P0.8: open the streaming metering session NOW — before any body byte

@@ -471,7 +471,7 @@ func TestAcceptanceAdminPostureLockdown(t *testing.T) {
 	if err := kr.Save(keyringPath); err != nil {
 		t.Fatal(err)
 	}
-	opToken := "op-token-acceptance-123456"
+	opToken := "op-token-acceptance-0123456789abcdef0123456789abcdef"
 	cfgPath := filepath.Join(dir, "config.json")
 	cfgJSON := fmt.Sprintf(`{"listen":"127.0.0.1:0","backend":{"url":"%s","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"test-audience"},"deployment":{"allow_ephemeral_state":true},"admin":{"listen":"127.0.0.1:0","operator_tokens":{"%s":"operator:posture.control"}},"tls":{"terminate_tls_upstream":true},"paths":{"evidence":"%s","signer_keyring":"%s","audit_log":"%s"}}`, backend.URL, opToken, filepath.Join(dir, "evidence.gob"), keyringPath, filepath.Join(dir, "audit.jsonl"))
 	if err := os.WriteFile(cfgPath, []byte(cfgJSON), 0o640); err != nil {
@@ -516,7 +516,7 @@ func TestAcceptanceAdminPostureLockdown(t *testing.T) {
 		t.Fatal("expected normal posture after boot")
 	}
 
-	// Unauthenticated admin POST must be rejected (403) — proves admin auth.
+	// Unauthenticated admin POST must be rejected (401) — proves admin auth.
 	unauth, err := http.NewRequest("POST", admURL+"/admin/posture", strings.NewReader(`{"on":true,"reason":"acceptance"}`))
 	if err != nil {
 		t.Fatal(err)
@@ -528,8 +528,8 @@ func TestAcceptanceAdminPostureLockdown(t *testing.T) {
 	}
 	io.Copy(io.Discard, uresp.Body)
 	uresp.Body.Close()
-	if uresp.StatusCode != http.StatusForbidden {
-		t.Fatalf("admin without bearer token: expected 403, got %d", uresp.StatusCode)
+	if uresp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("admin without bearer token: expected 401, got %d", uresp.StatusCode)
 	}
 	// A WRONG token is equally rejected.
 	wrong, _ := http.NewRequest("POST", admURL+"/admin/posture", strings.NewReader(`{"on":true,"reason":"acceptance"}`))
@@ -540,8 +540,8 @@ func TestAcceptanceAdminPostureLockdown(t *testing.T) {
 	}
 	io.Copy(io.Discard, wresp.Body)
 	wresp.Body.Close()
-	if wresp.StatusCode != http.StatusForbidden {
-		t.Fatalf("admin with wrong token: expected 403, got %d", wresp.StatusCode)
+	if wresp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("admin with wrong token: expected 401, got %d", wresp.StatusCode)
 	}
 
 	// Authorized OP turns EMERGENCY ON via the real endpoint.

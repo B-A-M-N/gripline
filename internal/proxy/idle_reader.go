@@ -25,11 +25,12 @@ var ErrStreamIdle = errors.New("proxy: upstream stream exceeded the write-idle b
 // body's Close is valid concurrently with a pending Read (it aborts the
 // read).
 type idleTimeoutReader struct {
-	mu     sync.Mutex
-	body   io.ReadCloser
-	idle   time.Duration
-	timer  *time.Timer
-	closed bool
+	mu       sync.Mutex
+	body     io.ReadCloser
+	idle     time.Duration
+	timer    *time.Timer
+	closed   bool
+	timedOut bool
 }
 
 func newIdleTimeoutReader(body io.ReadCloser, idle time.Duration) *idleTimeoutReader {
@@ -39,13 +40,22 @@ func newIdleTimeoutReader(body io.ReadCloser, idle time.Duration) *idleTimeoutRe
 func (r *idleTimeoutReader) Read(p []byte) (int, error) {
 	r.armWatchdog()
 	n, err := r.body.Read(p)
+	r.mu.Lock()
+	timedOut := r.timedOut
+	r.mu.Unlock()
 	if n > 0 {
 		// Bytes are flowing: disarm until the next gap.
 		r.disarmWatchdog()
 	}
-	if err == io.EOF {
-		// Stream finished cleanly before the bound: stop the watchdog.
+	if err != nil && !timedOut {
+		// Any terminal body result (EOF, reset, cancellation, or another
+		// upstream error) finished the read before the idle watchdog fired.
 		r.stopWatchdog()
+	}
+	if timedOut && err != nil {
+		// Preserve n: a body may return its final bytes together with the
+		// close error raised by the watchdog.
+		return n, ErrStreamIdle
 	}
 	return n, err
 }
@@ -62,6 +72,7 @@ func (r *idleTimeoutReader) armWatchdog() {
 			r.mu.Unlock()
 			return
 		}
+		r.timedOut = true
 		r.closed = true
 		body := r.body
 		r.mu.Unlock()

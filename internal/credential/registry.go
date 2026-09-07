@@ -426,13 +426,13 @@ func (m *MemoryRegistry) UpdateStatusCAS(credentialID string, expectedRevision i
 // Summary is a credential's operator-facing view (CLI/diagnostics, P1-26).
 // It never carries verifier material — only identity, state, and bookkeeping.
 type Summary struct {
-	CredentialID string
-	AccountID    string
-	Status       string
-	PolicyID     string
-	PlanID       string
-	CreatedAt    time.Time
-	Revision     int
+	CredentialID string    `json:"credential_id"`
+	AccountID    string    `json:"account_id"`
+	Status       string    `json:"status"`
+	PolicyID     string    `json:"policy_id"`
+	PlanID       string    `json:"plan_id"`
+	CreatedAt    time.Time `json:"created_at"`
+	Revision     int       `json:"revision"`
 }
 
 // Lister is the optional enumeration seam for operator tooling: list every

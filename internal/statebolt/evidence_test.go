@@ -1,6 +1,7 @@
 package statebolt
 
 import (
+	"strconv"
 	"testing"
 	"time"
 
@@ -8,7 +9,9 @@ import (
 )
 
 func testEvidence(id string, scope evidence.Scope, subject string, exp time.Time) evidence.Evidence {
-	now := time.Now()
+	// Keep the test clock ahead of wall time so every row is non-future when
+	// Snapshot applies Evidence.Valid across all backends.
+	now := time.Now().Add(time.Hour)
 	return evidence.Evidence{
 		EvidenceID: id, Code: "TEST_SIGNAL", Family: evidence.FamilyAbuseCorrelation,
 		Scope: scope, SubjectID: subject, Score: 10, Severity: 1, Confidence: 50,
@@ -29,10 +32,11 @@ func TestEvidenceStoreRoundTripAndExpiry(t *testing.T) {
 		t.Fatal(err)
 	}
 	subj := []evidence.SubjectKey{{Scope: evidence.ScopeCredential, ID: "cred_1"}}
-	if err := s.Append(
-		testEvidence("ev_1", evidence.ScopeCredential, "cred_1", now.Add(time.Hour)),
-		testEvidence("ev_2", evidence.ScopeCredential, "cred_1", now.Add(-time.Minute)), // already expired
-	); err != nil {
+	active := testEvidence("ev_1", evidence.ScopeCredential, "cred_1", now.Add(time.Hour))
+	active.CreatedAt = now.Add(-time.Second)
+	expired := testEvidence("ev_2", evidence.ScopeCredential, "cred_1", now.Add(-time.Minute))
+	expired.CreatedAt = now.Add(-2 * time.Minute)
+	if err := s.Append(active, expired); err != nil {
 		t.Fatal(err)
 	}
 	got, err := s.Snapshot(subj, now)
@@ -67,11 +71,10 @@ func TestEvidenceStoreRoundTripAndExpiry(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("duplicate append must be a no-op, got %d", len(got))
 	}
-	// Prune removes the expired remainder: both rows expire by now+2h
-	// (persistence is independent of evaluation, so the already-expired ev_2
-	// row was durably stored and is reaped here too).
+	// The re-append also applies the shared merge contract and removes the
+	// already-expired persisted ev_2 row before pressure is considered.
 	pruned, err := s2.Prune(subj, now.Add(2*time.Hour))
-	if err != nil || pruned != 2 {
+	if err != nil || pruned != 1 {
 		t.Fatalf("prune=%d err=%v", pruned, err)
 	}
 	got, _ = s2.Snapshot(subj, now.Add(2*time.Hour))
@@ -106,7 +109,7 @@ func TestEvidenceStoreSharedSemantics(t *testing.T) {
 	batch := make([]evidence.Evidence, 0, 256)
 	for i := 0; i < evidence.MaxEvidencePerSubject; i++ {
 		ev := testEvidence("ev_"+string(rune('a'+i%26))+string(rune('0'+i/26)), subj, "cred_p", now.Add(time.Hour))
-		ev.CreatedAt = now.Add(time.Duration(i) * time.Second)
+		ev.CreatedAt = now.Add(-time.Duration(evidence.MaxEvidencePerSubject-i) * time.Second)
 		batch = append(batch, ev)
 		if len(batch) == 256 {
 			if err := s.Append(batch...); err != nil {
@@ -121,10 +124,12 @@ func TestEvidenceStoreSharedSemantics(t *testing.T) {
 		}
 	}
 	anchor := testEvidence("ev_anchor", subj, "cred_p", time.Time{}) // non-expiring → NonEvictable
+	anchor.CreatedAt = now.Add(-time.Second)
 	if err := s.Append(anchor); err != nil {
 		t.Fatal(err)
 	}
 	overflow := testEvidence("ev_overflow", subj, "cred_p", now.Add(time.Hour))
+	overflow.CreatedAt = now.Add(-time.Second)
 	if err := s.Append(overflow); err != nil {
 		t.Fatal(err)
 	}
@@ -140,6 +145,75 @@ func TestEvidenceStoreSharedSemantics(t *testing.T) {
 	}
 	if !foundAnchor {
 		t.Fatal("NonEvictable evidence must survive generic pressure compaction (P0.12)")
+	}
+}
+
+// TestEvidenceBatchCompactsToExactCap proves a near-cap seed plus a 256-item
+// batch is compacted to exactly the configured cap, rather than storing only
+// the first item or rejecting the whole batch.
+func TestEvidenceBatchCompactsToExactCap(t *testing.T) {
+	s := openTestStore(t)
+	now := time.Now()
+	const subject = "cred_batch_cap"
+	seed := make([]evidence.Evidence, 0, evidence.MaxEvidencePerSubject-10)
+	for i := 0; i < evidence.MaxEvidencePerSubject-10; i++ {
+		ev := testEvidence("seed_"+strconv.Itoa(i), evidence.ScopeCredential, subject, now.Add(time.Hour))
+		ev.CreatedAt = now.Add(-2*time.Hour + time.Duration(i)*time.Millisecond)
+		seed = append(seed, ev)
+	}
+	if err := s.Append(seed...); err != nil {
+		t.Fatal(err)
+	}
+	batch := make([]evidence.Evidence, 0, 256)
+	for i := 0; i < 256; i++ {
+		ev := testEvidence("batch_"+strconv.Itoa(i), evidence.ScopeCredential, subject, now.Add(time.Hour))
+		ev.CreatedAt = now.Add(-time.Minute + time.Duration(i)*time.Millisecond)
+		batch = append(batch, ev)
+	}
+	if err := s.Append(batch...); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Snapshot([]evidence.SubjectKey{{Scope: evidence.ScopeCredential, ID: subject}}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != evidence.MaxEvidencePerSubject {
+		t.Fatalf("seed cap-10 + batch 256: got %d rows, want exact cap %d", len(got), evidence.MaxEvidencePerSubject)
+	}
+	for _, ev := range batch {
+		found := false
+		for _, retained := range got {
+			if retained.EvidenceID == ev.EvidenceID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("batch row %q was not retained", ev.EvidenceID)
+		}
+	}
+	before := append([]evidence.Evidence(nil), got...)
+	if err := s.Append(batch...); err != nil {
+		t.Fatal(err)
+	}
+	after, err := s.Snapshot([]evidence.SubjectKey{{Scope: evidence.ScopeCredential, ID: subject}}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("repeated batch changed cap: before=%d after=%d", len(before), len(after))
+	}
+	for _, ev := range before {
+		found := false
+		for _, retained := range after {
+			if retained.EvidenceID == ev.EvidenceID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("repeated batch evicted unrelated evidence %q", ev.EvidenceID)
+		}
 	}
 }
 

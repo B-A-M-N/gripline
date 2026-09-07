@@ -43,8 +43,11 @@ explosion.
 | Analytics | proxy continues; buffer events within strict bounds |
 | Internal signer | **fail closed** for new upstream authorization (alternate hot signer → HA) |
 
-Control-plane failure must not stop the data plane (§61). Data plane loads only
-authenticated+versioned+validated policy.
+Control-plane dependency degradation must not silently weaken the data plane
+(§61): data-plane admission remains fail-closed and loads only
+authenticated+versioned+validated policy. A configured admin listener is part
+of the process lifecycle, so listener construction or serve failure is
+reported and the supervisor drains both servers.
 
 ## 5. FreeInference integration
 

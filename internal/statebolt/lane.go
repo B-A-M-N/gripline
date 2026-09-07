@@ -74,7 +74,7 @@ func loadLanesTx(tx *bolt.Tx, credID string) ([]*lane.LaneRecord, error) {
 		if err := json.Unmarshal(v, &p); err != nil {
 			return nil, errCorruptLane
 		}
-		if p.SchemaVersion > laneSchemaVersion {
+		if p.SchemaVersion != laneSchemaVersion {
 			return nil, errCorruptLane
 		}
 		r := p.Record // JSON round-trip already detached the row from the buffer
@@ -173,7 +173,7 @@ func (s *Store) Get(credID, laneID string) (*lane.LaneRecord, bool) {
 			return nil
 		}
 		var p persistedLane
-		if err := json.Unmarshal(v, &p); err != nil || p.SchemaVersion > laneSchemaVersion {
+		if err := json.Unmarshal(v, &p); err != nil || p.SchemaVersion != laneSchemaVersion {
 			return errCorruptLane // fail closed: unreadable row is not "absent"
 		}
 		r := p.Record
@@ -225,6 +225,44 @@ func (s *Store) ListLaneIDs(credID string) []string {
 	return ids
 }
 
+// ListLaneRecords returns sanitized, fully decoded lane records for
+// administrative consumers. Unlike the lane.Repository compatibility methods,
+// it preserves database read errors so an unavailable authority cannot look
+// like an empty lane set.
+func (s *Store) ListLaneRecords(credID string) ([]*lane.LaneRecord, error) {
+	var records []*lane.LaneRecord
+	err := s.db.View(func(tx *bolt.Tx) error {
+		var err error
+		records, err = loadLanesTx(tx, credID)
+		return err
+	})
+	return records, err
+}
+
+// LookupLane is the strict administrative counterpart to Repository.Get. It
+// returns the underlying read error instead of collapsing it into ok=false.
+func (s *Store) LookupLane(credID, laneID string) (*lane.LaneRecord, bool, error) {
+	key, err := laneKey(credID, laneID)
+	if err != nil {
+		return nil, false, err
+	}
+	var rec *lane.LaneRecord
+	err = s.db.View(func(tx *bolt.Tx) error {
+		v := tx.Bucket(bucketLanes).Get(key)
+		if v == nil {
+			return nil
+		}
+		var p persistedLane
+		if err := json.Unmarshal(v, &p); err != nil || p.SchemaVersion != laneSchemaVersion {
+			return errCorruptLane
+		}
+		r := p.Record
+		rec = &r
+		return nil
+	})
+	return rec, rec != nil, err
+}
+
 // mutateLane loads one lane, applies mut, and persists the row in one write
 // transaction. Unknown lanes fail with lane.ErrLaneNotFound.
 func (s *Store) mutateLane(credID, laneID string, mut func(*lane.LaneRecord) error) (*lane.LaneRecord, error) {
@@ -239,7 +277,7 @@ func (s *Store) mutateLane(credID, laneID string, mut func(*lane.LaneRecord) err
 			return lane.ErrLaneNotFound
 		}
 		var p persistedLane
-		if err := json.Unmarshal(v, &p); err != nil || p.SchemaVersion > laneSchemaVersion {
+		if err := json.Unmarshal(v, &p); err != nil || p.SchemaVersion != laneSchemaVersion {
 			return errCorruptLane
 		}
 		rec := p.Record
@@ -311,7 +349,7 @@ func (s *Store) Unblock(credID, laneID, actor, reason string, now time.Time) err
 			return lane.ErrLaneNotFound
 		}
 		var p persistedLane
-		if err := json.Unmarshal(v, &p); err != nil || p.SchemaVersion > laneSchemaVersion {
+		if err := json.Unmarshal(v, &p); err != nil || p.SchemaVersion != laneSchemaVersion {
 			return errCorruptLane
 		}
 		rec := p.Record

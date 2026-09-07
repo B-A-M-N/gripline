@@ -120,87 +120,20 @@ func (s *memoryStore) Append(items ...Evidence) error {
 		}
 	}
 
+	bySubject := make(map[string][]Evidence)
 	for _, item := range items {
 		k := subjectKey(SubjectKey{Scope: item.Scope, ID: item.SubjectID})
-		// Idempotency: a duplicate EvidenceID within the same batch stores only
-		// once (the loop dedups against already-stored ids for this subject).
-		if s.hasIDLocked(k, item.EvidenceID) {
+		bySubject[k] = append(bySubject[k], item)
+	}
+	for k, incoming := range bySubject {
+		merged := MergeSubject(s.data[k], incoming, s.now())
+		if len(merged) == 0 {
+			delete(s.data, k)
 			continue
 		}
-		// Prune expired entries FIRST before enforcing bound.
-		s.purgeExpiredLocked(k)
-		s.data[k] = append(s.data[k], item)
-		s.compactLocked(k)
+		s.data[k] = merged
 	}
 	return nil
-}
-
-// hasIDLocked reports whether a subject key already holds an EvidenceID (dedup).
-func (s *memoryStore) hasIDLocked(k string, id string) bool {
-	for i := range s.data[k] {
-		if s.data[k][i].EvidenceID == id {
-			return true
-		}
-	}
-	return false
-}
-
-// compactLocked bounds a subject's evidence via priority compaction (P0.12):
-// it drops the oldest NON-critical item when over the cap, but never evicts a
-// security-critical (operator-IOC / non-expiring) item through generic pressure.
-func (s *memoryStore) compactLocked(k string) {
-	list := s.data[k]
-	if len(list) <= maxEvidencePerSubject {
-		return
-	}
-	// Find the oldest EVICTABLE index (non-evictable items are retained).
-	oldestEvictable := -1
-	for i := range list {
-		if list[i].NonEvictable() {
-			continue
-		}
-		if oldestEvictable < 0 || list[i].CreatedAt.Before(list[oldestEvictable].CreatedAt) {
-			oldestEvictable = i
-		}
-	}
-	if oldestEvictable < 0 {
-		// All items are security-critical; the bound cannot be enforced without
-		// dropping authority. Fail-safe: keep them (better to bound the subject
-		// count at the admission layer than to lose security evidence).
-		return
-	}
-	copy(list[oldestEvictable:], list[oldestEvictable+1:])
-	s.data[k] = list[:len(list)-1]
-}
-
-// purgeExpiredLocked discards expired evidence for a subject key. Expiry is
-// inclusive-invalid (now == ExpiresAt expires), matching Evidence.Valid (P0.14).
-// Must be called while holding s.mu.
-func (s *memoryStore) purgeExpiredLocked(k string) {
-	items, ok := s.data[k]
-	if !ok {
-		return
-	}
-	now := s.now()
-	kept := make([]Evidence, 0, len(items))
-	changed := false
-	for i := range items {
-		if items[i].Valid(now) {
-			kept = append(kept, items[i])
-		} else {
-			changed = true
-		}
-	}
-	if !changed {
-		return
-	}
-	if len(kept) == 0 {
-		// Delete the empty subject entry so an attacker-controlled cardinality
-		// cannot accumulate empty keys (P0.13 memory-bound guarantee).
-		delete(s.data, k)
-		return
-	}
-	s.data[k] = kept
 }
 
 func (s *memoryStore) Snapshot(subjects []SubjectKey, now time.Time) ([]Evidence, error) {
@@ -291,27 +224,52 @@ func IsExpired(ev Evidence, now time.Time) bool {
 // bounded slice. Shared by every backend so pressure behavior is
 // interchangeable.
 func CompactSubject(list []Evidence) []Evidence {
-	if len(list) <= maxEvidencePerSubject {
-		return list
+	out := append([]Evidence(nil), list...)
+	for len(out) > maxEvidencePerSubject {
+		// Find the oldest EVICTABLE index (non-evictable items are retained).
+		oldestEvictable := -1
+		for i := range out {
+			if out[i].NonEvictable() {
+				continue
+			}
+			if oldestEvictable < 0 || out[i].CreatedAt.Before(out[oldestEvictable].CreatedAt) {
+				oldestEvictable = i
+			}
+		}
+		if oldestEvictable < 0 {
+			// All items are security-critical; the bound cannot be enforced
+			// without dropping authority. Keep them.
+			return out
+		}
+		out = append(out[:oldestEvictable], out[oldestEvictable+1:]...)
 	}
-	// Find the oldest EVICTABLE index (non-evictable items are retained).
-	oldestEvictable := -1
-	for i := range list {
-		if list[i].NonEvictable() {
+	return out
+}
+
+// MergeSubject applies the complete append contract for one subject. Expired
+// persisted rows are removed before pressure is applied, while incoming rows
+// are retained even when already expired so persistence remains independent of
+// evaluation. IDs are deduplicated before compaction so duplicate input cannot
+// evict unrelated evidence.
+func MergeSubject(existing, incoming []Evidence, now time.Time) []Evidence {
+	out := make([]Evidence, 0, len(existing)+len(incoming))
+	seen := make(map[string]struct{}, len(existing)+len(incoming))
+	for _, ev := range existing {
+		if IsExpired(ev, now) {
 			continue
 		}
-		if oldestEvictable < 0 || list[i].CreatedAt.Before(list[oldestEvictable].CreatedAt) {
-			oldestEvictable = i
+		if _, ok := seen[ev.EvidenceID]; ok {
+			continue
 		}
+		seen[ev.EvidenceID] = struct{}{}
+		out = append(out, ev)
 	}
-	if oldestEvictable < 0 {
-		// All items are security-critical; the bound cannot be enforced without
-		// dropping authority. Keep them (better to bound the subject count at
-		// the admission layer than to lose security evidence).
-		return list
+	for _, ev := range incoming {
+		if _, ok := seen[ev.EvidenceID]; ok {
+			continue
+		}
+		seen[ev.EvidenceID] = struct{}{}
+		out = append(out, ev)
 	}
-	out := make([]Evidence, 0, len(list)-1)
-	out = append(out, list[:oldestEvictable]...)
-	out = append(out, list[oldestEvictable+1:]...)
-	return out
+	return CompactSubject(out)
 }

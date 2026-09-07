@@ -70,6 +70,8 @@ Build and run against a private backend:
 go build -o gripline ./cmd/gripline
 
 export GRIPLINE_PEPPER_V1="$(openssl rand -base64 32)"   # verifier pepper (>=32 bytes entropy)
+export GRIPLINE_OPERATOR_TOKEN="$(openssl rand -base64 32)" # admin bearer token (>=32 bytes)
+export GRIPLINE_PSEUDONYM_KEY="$(openssl rand -base64 32)"  # trusted-ingress key (>=32 bytes)
 gripline -config deploy/config.example.json
 ```
 
@@ -82,17 +84,31 @@ Operator lifecycle:
 
 ```bash
 gripline status     --config /etc/gripline/config.json   # what is durable / on / off, honestly
-gripline credential list   --config c.json
+gripline credential list   --config c.json --token "$GRIPLINE_OPERATOR_TOKEN"
 gripline credential revoke --config c.json --id <cred> --reason "..." --token "$GRIPLINE_OPERATOR_TOKEN"
-gripline lane list         --config c.json --credential <cred>
+gripline lane list         --config c.json --credential <cred> --token "$GRIPLINE_OPERATOR_TOKEN"
 gripline lane unblock      --config c.json --credential <cred> --id <lane> --reason "..." --token "$GRIPLINE_OPERATOR_TOKEN"
+gripline audit list        --config c.json --token "$GRIPLINE_OPERATOR_TOKEN"
+gripline audit export      --config c.json --token "$GRIPLINE_OPERATOR_TOKEN" > audit.jsonl
 gripline keys export       --config c.json   # public backend verification material only
 ```
+
+Lifecycle and audit commands use the running private admin listener by default;
+`--offline` is an explicit stopped-database maintenance mode for credential and
+lane commands. Generate operator tokens with `openssl rand -base64 32` (or a
+stronger secret source); tokens shorter than 32 bytes are rejected at startup.
 
 Container:
 
 ```bash
 docker build -t gripline -f deploy/Dockerfile .
+
+# For a bind-mounted volume, pre-create it for the image's non-root UID.
+install -d -o 65532 -g 65532 ./gripline-state
+chmod 0644 ./config.json       # the distroless UID 65532 must be able to read it
+docker run --user 65532:65532 \
+  -v "$PWD/config.json:/etc/gripline/config.json:ro" \
+  -v "$PWD/gripline-state:/var/lib/gripline" gripline
 ```
 
 The state database and signer keyring must be on a persistent volume; the
@@ -232,17 +248,6 @@ internal/gates         component invariant tests for the §111 gate properties (
 These are known-unfinished parts of the system, stated here so no invariant is
 claimed beyond what the implementation establishes:
 
-- **Admission-state integration (P0.10):** the credential `StateMachine`,
-  lane promotion, and persistent evidence accumulation are wired into the
-  live admission path (`Admit`). Evidence persists across requests; credential
-  risk and lane risk are computed independently; CONSTRAINED credentials
-  receive restricted concurrency caps; lanes promote through
-  NEW→PROBATION→ESTABLISHED. However, WATCH/CONSTRAINED limit selection
-  uses the credential status (persisted), not the live state-machine
-  observation — so an immediate downgrade from a single high-risk request
-  requires the CAS path to succeed first. Velocity/source-spray signals are
-  collected as evidence and drive risk/scope enforcement through the evidence
-  pipeline; the gap is limit-selection timing only.
 - **Policy immutability:** the terminator enforces a compiled deep-copy
   snapshot (`policy.Compile`, tested against post-construction mutation of
   every reference-bearing field), but a POLICY MANAGER — authenticated/signed
@@ -261,12 +266,15 @@ claimed beyond what the implementation establishes:
   real third-party SDK matrix (OpenAI/Anthropic Python-TS, Claude Code, Codex)
   is not run in this repo; connector-level equivalence is verified in the
   hosting integration.
-- **Provider adapters are stubbed:** real ASN/region attribution, trusted-edge
-  RealIP (`SourceResolver`), and streaming usage metering (`UsageProvider`/
-  `UsageSession`) are seams with deterministic defaults (`HeaderFeatures`,
-  `NoSource`, `NoUsage`); a hosting provider must wire its adapters.
-  Non-supplied features are treated as unknown (never falsely matched);
-  without a UsageProvider, token/cost resource dimensions stay inert (item 7).
+- **Provider adapters are explicit seams:** the runtime ships with
+  `HeaderFeatures`, `NoSource`, and `NoUsage`. A hosting integration must wire
+  trusted-edge source resolution, `NetworkMetadataResolver` for ASN/region, and
+  `UsageProvider`/`UsageSession` for token/cost metering. Until then, the status
+  command reports those capabilities as off/unknown; token and cost dimensions
+  remain inert and no untrusted header is promoted to trusted metadata.
+- **Legacy Gob evidence:** `internal/evidence` remains for compatibility and
+  explicitly ephemeral use. Production deployments must use `internal/statebolt`
+  as the single transactional credential/lane/evidence/audit authority.
 - **Acceptance gates are components, not gates:** `internal/gates` proves
   in-process approximations of the §111 properties under honest names. The
   external release harness — telemetry canary sweeps, network-isolation

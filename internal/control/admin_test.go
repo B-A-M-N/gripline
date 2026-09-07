@@ -279,14 +279,18 @@ func TestTokenAuthenticatorRejectsEmptyToken(t *testing.T) {
 	if _, err := NewTokenAuthenticator(map[string]*Identity{"": {Name: "x"}}); err == nil {
 		t.Fatal("empty token must be refused")
 	}
+	if _, err := NewTokenAuthenticator(map[string]*Identity{"short": {Name: "x"}}); err == nil {
+		t.Fatal("short token must be refused")
+	}
 	if _, err := NewTokenAuthenticator(map[string]*Identity{"tok": nil}); err == nil {
 		t.Fatal("nil identity must be refused")
 	}
-	a, err := NewTokenAuthenticator(map[string]*Identity{"real-token": {Name: "op", Capabilities: []Capability{CapPosture}}})
+	const realToken = "real-token-0123456789abcdef0123456789abcdef"
+	a, err := NewTokenAuthenticator(map[string]*Identity{realToken: {Name: "op", Capabilities: []Capability{CapPosture}}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	id, err := a.Authenticate(context.Background(), "real-token")
+	id, err := a.Authenticate(context.Background(), realToken)
 	if err != nil || id.Name != "op" {
 		t.Fatalf("valid token must authenticate, got %v %v", id, err)
 	}
@@ -298,7 +302,7 @@ func TestTokenAuthenticatorRejectsEmptyToken(t *testing.T) {
 	}
 	// The raw token must never be retained anywhere greppable in the struct.
 	dump := jsonMarshalSafe(a)
-	if strings.Contains(dump, "real-token") {
+	if strings.Contains(dump, realToken) {
 		t.Fatal("INV-1: authenticator must not retain the raw token")
 	}
 }

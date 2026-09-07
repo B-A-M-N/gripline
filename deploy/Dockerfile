@@ -15,9 +15,12 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/gripline ./cmd/gripline
+RUN mkdir -p /out/state
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/gripline /usr/local/bin/gripline
+COPY --from=build --chown=65532:65532 /out/state/ /var/lib/gripline/
+USER 65532:65532
 
 # Config (read-only mount) and durable state (volume).
 #   docker run -v ./config.json:/etc/gripline/config.json:ro \
