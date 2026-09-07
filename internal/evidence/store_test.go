@@ -13,16 +13,16 @@ func TestMemoryStore_AppendAndSnapshot(t *testing.T) {
 	store := NewMemoryStore()
 
 	ev := Evidence{
-		EvidenceID:  "ev_1",
-		Code:        "NEW_LANE",
-		Family:      FamilyClientNovelty,
-		Scope:       ScopeLane,
-		SubjectID:   "lane_1",
-		Score:       5,
-		Severity:    1,
-		Confidence:  40,
-		CreatedAt:   now,
-		ExpiresAt:   now.Add(7 * 24 * time.Hour),
+		EvidenceID:     "ev_1",
+		Code:           "NEW_LANE",
+		Family:         FamilyClientNovelty,
+		Scope:          ScopeLane,
+		SubjectID:      "lane_1",
+		Score:          5,
+		Severity:       1,
+		Confidence:     40,
+		CreatedAt:      now,
+		ExpiresAt:      now.Add(7 * 24 * time.Hour),
 		PolicyRevision: 1,
 	}
 
@@ -165,16 +165,16 @@ func TestMemoryStore_EvidenceBoundedPerSubject(t *testing.T) {
 	// Insert more than maxEvidencePerSubject.
 	for i := 0; i < maxEvidencePerSubject+10; i++ {
 		ev := Evidence{
-			EvidenceID:       fmt.Sprintf("ev_%d", i),
-			Code:             "NEW_ASN",
-			Family:           FamilySourceDiscontinuity,
-			Scope:            ScopeLane,
-			SubjectID:        "lane_x",
-			Score:            10,
-			Confidence:       60,
-			CreatedAt:        now.Add(time.Duration(i) * time.Second),
-			ExpiresAt:        now.Add(7 * 24 * time.Hour + time.Duration(i)*time.Second),
-			PolicyRevision:   1,
+			EvidenceID:     fmt.Sprintf("ev_%d", i),
+			Code:           "NEW_ASN",
+			Family:         FamilySourceDiscontinuity,
+			Scope:          ScopeLane,
+			SubjectID:      "lane_x",
+			Score:          10,
+			Confidence:     60,
+			CreatedAt:      now.Add(time.Duration(i) * time.Second),
+			ExpiresAt:      now.Add(7*24*time.Hour + time.Duration(i)*time.Second),
+			PolicyRevision: 1,
 		}
 		if err := store.Append(ev); err != nil {
 			t.Fatalf("Append %d: %v", i, err)
@@ -202,16 +202,16 @@ func TestMemoryStore_ConcurrentAccess(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < 100; i++ {
 				ev := Evidence{
-					EvidenceID:       fmt.Sprintf("ev_g%d_%d", gid, i),
-					Code:             "NEW_ASN",
-					Family:           FamilySourceDiscontinuity,
-					Scope:            ScopeLane,
-					SubjectID:        fmt.Sprintf("lane_g%d_i%d", gid, i),
-					Score:            10,
-					Confidence:       60,
-					CreatedAt:        now,
-					ExpiresAt:        now.Add(time.Hour),
-					PolicyRevision:   1,
+					EvidenceID:     fmt.Sprintf("ev_g%d_%d", gid, i),
+					Code:           "NEW_ASN",
+					Family:         FamilySourceDiscontinuity,
+					Scope:          ScopeLane,
+					SubjectID:      fmt.Sprintf("lane_g%d_i%d", gid, i),
+					Score:          10,
+					Confidence:     60,
+					CreatedAt:      now,
+					ExpiresAt:      now.Add(time.Hour),
+					PolicyRevision: 1,
 				}
 				if err := store.Append(ev); err != nil {
 					t.Errorf("Append: %v", err)

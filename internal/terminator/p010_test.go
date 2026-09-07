@@ -39,11 +39,11 @@ func TestEvidenceAppendFailureDoesNotFailOpen(t *testing.T) {
 
 	dep := Dependencies{
 		Registry: reg, Peppers: credential.MustPepperRing(pep),
-		Lanes:    lane.NewStore(nil, time.Now),
-		Policy:   policy.Default(),
-		Signer:   signer,
-		Audience: "fi-inference",
-		Evidence: store,
+		Lanes:       lane.NewStore(nil, time.Now),
+		Policy:      policy.Default(),
+		Signer:      signer,
+		Audience:    "fi-inference",
+		Evidence:    store,
 		Concurrency: &fakePool{resource.NewConcurrencyPool(100)},
 	}
 	term, err := New(dep)
@@ -120,10 +120,10 @@ func TestAdmitEvidenceExplainability(t *testing.T) {
 
 	dep := Dependencies{
 		Registry: reg, Peppers: credential.MustPepperRing(pep),
-		Lanes:    lane.NewStore(nil, time.Now),
-		Policy:   policy.Default(),
-		Signer:   signer,
-		Audience: "fi-inference",
+		Lanes:       lane.NewStore(nil, time.Now),
+		Policy:      policy.Default(),
+		Signer:      signer,
+		Audience:    "fi-inference",
 		Concurrency: &fakePool{resource.NewConcurrencyPool(100)},
 	}
 	term, err := New(dep)
@@ -180,11 +180,11 @@ func TestAdmitEvidenceFromStore(t *testing.T) {
 
 	dep := Dependencies{
 		Registry: reg, Peppers: credential.MustPepperRing(pep),
-		Lanes:    lane.NewStore(nil, time.Now),
-		Policy:   policy.Default(),
-		Signer:   signer,
-		Audience: "fi-inference",
-		Evidence: store,
+		Lanes:       lane.NewStore(nil, time.Now),
+		Policy:      policy.Default(),
+		Signer:      signer,
+		Audience:    "fi-inference",
+		Evidence:    store,
 		Concurrency: &fakePool{resource.NewConcurrencyPool(100)},
 	}
 	term, err := New(dep)
@@ -308,10 +308,10 @@ func TestObservationNotTiedToAuthorization(t *testing.T) {
 
 	dep := Dependencies{
 		Registry: reg, Peppers: credential.MustPepperRing(pep),
-		Lanes:    lane.NewStore(nil, time.Now),
-		Policy:   policy.Default(),
-		Signer:   signer,
-		Audience: "fi-inference",
+		Lanes:       lane.NewStore(nil, time.Now),
+		Policy:      policy.Default(),
+		Signer:      signer,
+		Audience:    "fi-inference",
 		Concurrency: &fakePool{resource.NewConcurrencyPool(100)},
 	}
 	term, err := New(dep)
@@ -373,10 +373,10 @@ func TestPromotionUsesCleanCounters(t *testing.T) {
 	store := lane.NewStore(nil, func() time.Time { return now })
 	dep := Dependencies{
 		Registry: reg, Peppers: credential.MustPepperRing(pep),
-		Lanes:    store,
-		Policy:   pol,
-		Signer:   signer,
-		Audience: "fi-inference",
+		Lanes:       store,
+		Policy:      pol,
+		Signer:      signer,
+		Audience:    "fi-inference",
 		Concurrency: &fakePool{resource.NewConcurrencyPool(100)},
 	}
 	term, err := New(dep)
@@ -504,10 +504,10 @@ func TestAuthorizedContextLaneStateIsAuthoritative(t *testing.T) {
 
 	dep := Dependencies{
 		Registry: reg, Peppers: credential.MustPepperRing(pep),
-		Lanes:    store,
-		Policy:   pol,
-		Signer:   signer,
-		Audience: "fi-inference",
+		Lanes:       store,
+		Policy:      pol,
+		Signer:      signer,
+		Audience:    "fi-inference",
 		Concurrency: &fakePool{resource.NewConcurrencyPool(100)},
 	}
 	term, err := New(dep)
@@ -558,11 +558,11 @@ func TestAuthorizedContextLaneStateIsAuthoritative(t *testing.T) {
 func TestAllowSuspiciousDoesNotOverrideINV8(t *testing.T) {
 	now := time.Now()
 	crit := lane.PromotionCriteria{
-		AllowNewLanes:    true,
-		AllowSuspicious:  true, // DEPRECATED — should have no effect
-		MinCleanAge:      0,
-		MinCleanRequests: 0,
-		MinCleanActiveDays: 0,
+		AllowNewLanes:        true,
+		AllowSuspicious:      true, // DEPRECATED — should have no effect
+		MinCleanAge:          0,
+		MinCleanRequests:     0,
+		MinCleanActiveDays:   0,
 		MaxEstablishmentRisk: 100,
 	}
 
@@ -584,10 +584,10 @@ func TestAllowSuspiciousDoesNotOverrideINV8(t *testing.T) {
 func TestLaneLifecycleSeparatesNewProbation(t *testing.T) {
 	now := time.Now()
 	crit := lane.PromotionCriteria{
-		AllowNewLanes:    true,
-		MinCleanAge:      7 * 24 * time.Hour,
-		MinCleanRequests: 200,
-		MinCleanActiveDays: 3,
+		AllowNewLanes:        true,
+		MinCleanAge:          7 * 24 * time.Hour,
+		MinCleanRequests:     200,
+		MinCleanActiveDays:   3,
 		MaxEstablishmentRisk: 15,
 	}
 
@@ -603,10 +603,10 @@ func TestLaneLifecycleSeparatesNewProbation(t *testing.T) {
 
 	// PROBATION lane → needs ALL criteria.
 	rec.State = lane.StateProbation
-	rec.FirstSeenAt = now.Add(-24 * 24 * time.Hour)  // old enough
-	rec.AuthorizedCleanRequests = 500                 // above threshold
-	rec.CleanActiveDays = 5                           // above threshold
-	rec.RiskScore = 5                                 // below threshold
+	rec.FirstSeenAt = now.Add(-24 * 24 * time.Hour) // old enough
+	rec.AuthorizedCleanRequests = 500               // above threshold
+	rec.CleanActiveDays = 5                         // above threshold
+	rec.RiskScore = 5                               // below threshold
 	state, promoted = lane.PromoteIfEligible(rec, crit, now)
 	if !promoted {
 		t.Fatal("PROBATION→ESTABLISHED should promote when all criteria met")
@@ -637,10 +637,10 @@ func TestAuthorizedContextContents(t *testing.T) {
 
 	dep := Dependencies{
 		Registry: reg, Peppers: credential.MustPepperRing(pep),
-		Lanes:    lane.NewStore(nil, time.Now),
-		Policy:   policy.Default(),
-		Signer:   signer,
-		Audience: "fi-inference",
+		Lanes:       lane.NewStore(nil, time.Now),
+		Policy:      policy.Default(),
+		Signer:      signer,
+		Audience:    "fi-inference",
 		Concurrency: &fakePool{resource.NewConcurrencyPool(100)},
 	}
 	term, err := New(dep)
@@ -740,11 +740,11 @@ func TestConcurrentAdmitStateStore(t *testing.T) {
 
 	dep := Dependencies{
 		Registry: reg, Peppers: credential.MustPepperRing(pep),
-		Lanes:    lane.NewStore(nil, time.Now),
-		Policy:   policy.Default(),
-		Signer:   signer,
-		Audience: "fi-inference",
-		Evidence: store,
+		Lanes:       lane.NewStore(nil, time.Now),
+		Policy:      policy.Default(),
+		Signer:      signer,
+		Audience:    "fi-inference",
+		Evidence:    store,
 		Concurrency: &fakePool{resource.NewConcurrencyPool(100)},
 	}
 	term, err := New(dep)

@@ -40,8 +40,8 @@ func buildTerminatorWithSigner(t *testing.T, signer terminator.AssertionSigner) 
 	if err := reg.Insert(&credential.CredentialRecord{
 		CredentialID: "cred_dp", AccountID: "acct_dp",
 		Verifier: credential.Verifier(secret.NewFromBytes([]byte(raw)), pep), VerifierVersion: 1, PepperVersion: 1,
-		Status:    credential.StatusNormal,
-		PolicyID:  "fi-default-v1", PlanID: "plan-a",
+		Status:   credential.StatusNormal,
+		PolicyID: "fi-default-v1", PlanID: "plan-a",
 		CreatedAt: time.Now().Add(-time.Hour), Revision: 1,
 	}); err != nil {
 		t.Fatal(err)
@@ -76,8 +76,8 @@ func buildTerminatorWithGovernor(t *testing.T, signer terminator.AssertionSigner
 	if err := reg.Insert(&credential.CredentialRecord{
 		CredentialID: "cred_dp", AccountID: "acct_dp",
 		Verifier: credential.Verifier(secret.NewFromBytes([]byte(raw)), pep), VerifierVersion: 1, PepperVersion: 1,
-		Status:    credential.StatusNormal,
-		PolicyID:  "fi-default-v1", PlanID: "plan-a",
+		Status:   credential.StatusNormal,
+		PolicyID: "fi-default-v1", PlanID: "plan-a",
 		CreatedAt: time.Now().Add(-time.Hour), Revision: 1,
 	}); err != nil {
 		t.Fatal(err)
@@ -248,6 +248,7 @@ func TestDataPlaneDenialMapsStatus(t *testing.T) {
 		t.Fatal("denial must carry a safe reason header")
 	}
 }
+
 // P0.7 regression: the client cannot select the upstream host. A request
 // addressed at ANY origin is forwarded to the CONFIGURED backend only — the
 // client-supplied scheme/host are discarded and the path is safely joined.
@@ -358,7 +359,6 @@ func TestDataPlaneReservationReleasedOnSuccessAndTransportError(t *testing.T) {
 	}
 }
 
-
 // TestDataPlaneCredentialLeakIntoResolvers (BETA-01) verifies that resolvers
 // (FeatureResolver, SourceResolver, UsageEstimator) never receive secret
 // carriers or the reserved Gripline-* namespace. Each resolver is hostile:
@@ -401,23 +401,32 @@ type hostileSource struct {
 	t *testing.T
 }
 
-func (h hostileSource) ResolveSource(obs Observation) terminator.TrustedSource {
+func (h hostileSource) ResolveSource(obs Observation) (terminator.TrustedSource, error) {
 	assertSanitized(h.t, obs.Header, "SourceResolver")
-	return terminator.TrustedSource{}
+	return terminator.TrustedSource{}, nil
 }
 
-// hostileUsage is a UsageEstimator that fails the test if it sees secret carriers.
+// hostileUsage is a UsageProvider that fails the test if it sees secret carriers.
 type hostileUsage struct {
 	t *testing.T
 }
 
 func (h hostileUsage) Estimate(obs Observation) resource.UsageEstimate {
-	assertSanitized(h.t, obs.Header, "UsageEstimator.Estimate")
+	assertSanitized(h.t, obs.Header, "UsageProvider.Estimate")
 	return resource.UsageEstimate{Requests: 1}
 }
 
-func (h hostileUsage) Actual(obs Observation, _ *http.Response) resource.UsageEstimate {
-	assertSanitized(h.t, obs.Header, "UsageEstimator.Actual")
+func (h hostileUsage) Begin(obs Observation, _ *http.Response) UsageSession {
+	assertSanitized(h.t, obs.Header, "UsageProvider.Begin")
+	return hostileSession(h)
+}
+
+type hostileSession struct {
+	t *testing.T
+}
+
+func (h hostileSession) ObserveChunk([]byte) {}
+func (h hostileSession) Finish(error) resource.UsageEstimate {
 	return resource.UsageEstimate{Requests: 1}
 }
 

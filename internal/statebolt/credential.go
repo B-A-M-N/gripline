@@ -30,6 +30,10 @@ const credentialSchemaVersion = 1
 // the same lock that writes the new one, so a replaced credential's old
 // verifier can never remain an authentication path. Verifier ownership
 // conflicts (another credential holding this verifier) are rejected.
+//
+// Transaction discipline (P0.3-fix): every failure — domain or I/O — is
+// returned FROM the callback so bbolt rolls the transaction back. A
+// mid-mutation I/O failure can never commit a partially transformed row.
 func (s *Store) Insert(rec *credential.CredentialRecord) error {
 	if rec == nil {
 		return errors.New("credential: nil record")
@@ -37,8 +41,7 @@ func (s *Store) Insert(rec *credential.CredentialRecord) error {
 	if err := rec.Validate(); err != nil {
 		return err
 	}
-	var outErr error
-	s.db.Update(func(tx *bolt.Tx) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
 		creds := tx.Bucket(bucketCredentials)
 		byVer := tx.Bucket(bucketCredVerifier)
 
@@ -47,42 +50,36 @@ func (s *Store) Insert(rec *credential.CredentialRecord) error {
 			newKey = verKeyFor(rec.PepperVersion, rec.Verifier)
 			if owner := byVer.Get([]byte(newKey)); owner != nil {
 				if string(owner) != rec.CredentialID {
-					outErr = credential.ErrVerifierOwned
-					return nil
+					return credential.ErrVerifierOwned
 				}
 			}
 		}
 		if prev := creds.Get([]byte(rec.CredentialID)); prev != nil {
 			var old persistedCredential
 			if err := json.Unmarshal(prev, &old); err != nil {
-				outErr = credential.ErrCorrupt
-				return nil
+				return credential.ErrCorrupt
 			}
 			if len(old.Record.Verifier) > 0 {
 				oldKey := verKeyFor(old.Record.PepperVersion, old.Record.Verifier)
 				if oldKey != newKey { // same-key replacement keeps its index entry
 					if err := byVer.Delete([]byte(oldKey)); err != nil {
-						outErr = err
-						return nil
+						return err
 					}
 				}
 			}
 		}
 		env, err := json.Marshal(persistedCredential{SchemaVersion: credentialSchemaVersion, Record: *rec})
 		if err != nil {
-			outErr = err
-			return nil
+			return err
 		}
 		if err := creds.Put([]byte(rec.CredentialID), env); err != nil {
-			outErr = err
-			return nil
+			return err
 		}
 		if newKey != "" {
 			return byVer.Put([]byte(newKey), []byte(rec.CredentialID))
 		}
 		return nil
 	})
-	return outErr
 }
 
 // InsertIfAbsent implements provisioning (P0.10/§6): it creates the credential
@@ -98,8 +95,7 @@ func (s *Store) InsertIfAbsent(rec *credential.CredentialRecord) (bool, error) {
 	if err := rec.Validate(); err != nil {
 		return false, err
 	}
-	var created bool
-	var outErr error
+	created := false
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		creds := tx.Bucket(bucketCredentials)
 		byVer := tx.Bucket(bucketCredVerifier)
@@ -109,32 +105,25 @@ func (s *Store) InsertIfAbsent(rec *credential.CredentialRecord) (bool, error) {
 		if len(rec.Verifier) > 0 {
 			k := verKeyFor(rec.PepperVersion, rec.Verifier)
 			if owner := byVer.Get([]byte(k)); owner != nil && string(owner) != rec.CredentialID {
-				outErr = credential.ErrVerifierOwned
-				return nil
+				return credential.ErrVerifierOwned
 			}
 		}
 		env, err := json.Marshal(persistedCredential{SchemaVersion: credentialSchemaVersion, Record: *rec})
 		if err != nil {
-			outErr = err
-			return nil
+			return err
 		}
 		if err := creds.Put([]byte(rec.CredentialID), env); err != nil {
-			outErr = err
-			return nil
+			return err
 		}
 		if len(rec.Verifier) > 0 {
 			if err := byVer.Put([]byte(verKeyFor(rec.PepperVersion, rec.Verifier)), []byte(rec.CredentialID)); err != nil {
-				outErr = err
-				return nil
+				return err
 			}
 		}
 		created = true
 		return nil
 	})
-	if err != nil {
-		return created, err
-	}
-	return created, outErr
+	return created, err
 }
 
 // Lookup implements credential.Registry: resolve a record by id, inside a
@@ -267,38 +256,30 @@ func (s *Store) TouchLastSeen(credentialID string, at time.Time) {
 // revision increments by exactly 1 — all in one transaction.
 func (s *Store) UpdateStatusCAS(credentialID string, expectedRevision int, fromStatus, toStatus credential.Status) (*credential.CredentialRecord, error) {
 	var result *credential.CredentialRecord
-	var outErr error
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		env := tx.Bucket(bucketCredentials).Get([]byte(credentialID))
 		if env == nil {
-			outErr = credential.ErrNotFound
-			return nil
+			return credential.ErrNotFound
 		}
 		var p persistedCredential
 		if err := json.Unmarshal(env, &p); err != nil {
-			outErr = credential.ErrCorrupt
-			return nil
+			return credential.ErrCorrupt
 		}
 		rec := &p.Record
 		if rec.Revision != expectedRevision {
-			outErr = credential.ErrStaleCAS
-			return nil
+			return credential.ErrStaleCAS
 		}
 		if rec.Status != fromStatus {
-			outErr = credential.ErrStaleCAS
-			return nil
+			return credential.ErrStaleCAS
 		}
 		if toStatus == fromStatus {
-			outErr = errors.New("credential: no status change requested")
-			return nil
+			return errors.New("credential: no status change requested")
 		}
 		if fromStatus == credential.StatusQuarantined {
-			outErr = errors.New("credential: quarantined status cannot be downgraded through admission")
-			return nil
+			return errors.New("credential: quarantined status cannot be downgraded through admission")
 		}
 		if fromStatus == credential.StatusRevoked {
-			outErr = errors.New("credential: revoked is terminal")
-			return nil
+			return errors.New("credential: revoked is terminal")
 		}
 		rec.Status = toStatus
 		rec.Revision++
@@ -306,12 +287,10 @@ func (s *Store) UpdateStatusCAS(credentialID string, expectedRevision int, fromS
 		p.Record = *rec
 		b, err := json.Marshal(p)
 		if err != nil {
-			outErr = err
-			return nil
+			return err
 		}
 		if err := tx.Bucket(bucketCredentials).Put([]byte(credentialID), b); err != nil {
-			outErr = err
-			return nil
+			return err
 		}
 		r := *rec
 		r.Verifier = append([]byte(nil), rec.Verifier...)
@@ -321,7 +300,7 @@ func (s *Store) UpdateStatusCAS(credentialID string, expectedRevision int, fromS
 	if err != nil {
 		return nil, err
 	}
-	return result, outErr
+	return result, nil
 }
 
 // ObserveAndCommit implements the authoritative atomic risk-observation apply
@@ -340,18 +319,15 @@ func (s *Store) ObserveAndCommit(
 		return credential.TransitionResult{}, credential.ErrLookupTimeout
 	}
 	var result credential.TransitionResult
-	var outErr error
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		creds := tx.Bucket(bucketCredentials)
 		env := creds.Get([]byte(credentialID))
 		if env == nil {
-			outErr = credential.ErrNotFound
-			return nil
+			return credential.ErrNotFound
 		}
 		var p persistedCredential
 		if err := json.Unmarshal(env, &p); err != nil {
-			outErr = credential.ErrCorrupt
-			return nil
+			return credential.ErrCorrupt
 		}
 		rec := &p.Record
 		before := clone(rec)
@@ -364,12 +340,10 @@ func (s *Store) ObserveAndCommit(
 			rec.Security = reduced.Next
 			b, err := json.Marshal(p)
 			if err != nil {
-				outErr = err
-				return nil
+				return err
 			}
 			if err := creds.Put([]byte(credentialID), b); err != nil {
-				outErr = err
-				return nil
+				return err
 			}
 			result = credential.TransitionResult{
 				Status: credential.TransitionNoChange,
@@ -381,12 +355,10 @@ func (s *Store) ObserveAndCommit(
 		// Status changed — serial CAS (single writer, but keep the guard for
 		// revision hygiene across callers).
 		if rec.Revision != before.Revision || rec.Status != before.Status {
-			outErr = credential.ErrStaleCAS
-			return nil
+			return credential.ErrStaleCAS
 		}
 		if rec.Status == credential.StatusQuarantined || rec.Status == credential.StatusRevoked {
-			outErr = errors.New("credential: terminal/elevated state cannot be transitioned through admission")
-			return nil
+			return errors.New("credential: terminal/elevated state cannot be transitioned through admission")
 		}
 		rec.Status = reduced.Status
 		rec.Security = reduced.Next
@@ -395,12 +367,10 @@ func (s *Store) ObserveAndCommit(
 		rec.RotatedAt = now
 		b, err := json.Marshal(p)
 		if err != nil {
-			outErr = err
-			return nil
+			return err
 		}
 		if err := creds.Put([]byte(credentialID), b); err != nil {
-			outErr = err
-			return nil
+			return err
 		}
 		result = credential.TransitionResult{
 			Status: credential.TransitionCommitted,
@@ -412,37 +382,31 @@ func (s *Store) ObserveAndCommit(
 	if err != nil {
 		return credential.TransitionResult{}, err
 	}
-	return result, outErr
+	return result, nil
 }
 
-// updateInPlace mutates a credential's row inside one write transaction.
+// updateInPlace mutates a credential's row inside one write transaction. Every
+// failure is returned from the callback so bbolt rolls back (P0.3-fix).
 func (s *Store) updateInPlace(credentialID string, mutate func(*credential.CredentialRecord) error) error {
-	var outErr error
-	s.db.Update(func(tx *bolt.Tx) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
 		creds := tx.Bucket(bucketCredentials)
 		env := creds.Get([]byte(credentialID))
 		if env == nil {
-			outErr = credential.ErrNotFound
-			return nil
+			return credential.ErrNotFound
 		}
 		var p persistedCredential
 		if err := json.Unmarshal(env, &p); err != nil {
-			outErr = credential.ErrCorrupt
-			return nil
+			return credential.ErrCorrupt
 		}
 		if err := mutate(&p.Record); err != nil {
-			outErr = err
-			return nil
+			return err
 		}
 		b, err := json.Marshal(p)
 		if err != nil {
-			outErr = err
-			return nil
+			return err
 		}
-		outErr = creds.Put([]byte(credentialID), b)
-		return nil
+		return creds.Put([]byte(credentialID), b)
 	})
-	return outErr
 }
 
 func clone(rec *credential.CredentialRecord) *credential.CredentialRecord {
@@ -455,4 +419,33 @@ func clone(rec *credential.CredentialRecord) *credential.CredentialRecord {
 
 func verKeyFor(pepperVersion int, verifier []byte) string {
 	return strconv.Itoa(pepperVersion) + "/" + base64.StdEncoding.EncodeToString(verifier)
+}
+
+// ListCredentials returns every credential's summary (CLI/diagnostics seam,
+// P1-26). Rows are returned in credential-id order. Verifier material is NOT
+// included — the summary never carries authentication material.
+type CredentialSummary = credential.Summary
+
+func (s *Store) ListCredentials() ([]credential.Summary, error) {
+	var out []credential.Summary
+	err := s.db.View(func(tx *bolt.Tx) error {
+		c := tx.Bucket(bucketCredentials).Cursor()
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			var p persistedCredential
+			if err := json.Unmarshal(v, &p); err != nil {
+				return credential.ErrCorrupt
+			}
+			out = append(out, credential.Summary{
+				CredentialID: p.Record.CredentialID,
+				AccountID:    p.Record.AccountID,
+				Status:       p.Record.Status.String(),
+				PolicyID:     p.Record.PolicyID,
+				PlanID:       p.Record.PlanID,
+				CreatedAt:    p.Record.CreatedAt,
+				Revision:     p.Record.Revision,
+			})
+		}
+		return nil
+	})
+	return out, err
 }

@@ -50,9 +50,9 @@ const (
 
 // memoryStore is an in-memory concurrency-safe Store.
 type memoryStore struct {
-	mu    sync.Mutex
-	data  map[string][]Evidence // "scope/id" -> evidence items
-	now   func() time.Time
+	mu   sync.Mutex
+	data map[string][]Evidence // "scope/id" -> evidence items
+	now  func() time.Time
 }
 
 // NewMemoryStore returns a new in-memory Store.
@@ -256,4 +256,62 @@ func (s *memoryStore) Prune(subjects []SubjectKey, now time.Time) (int, error) {
 		s.data[k] = kept
 	}
 	return pruned, nil
+}
+
+// --- shared store semantics (P0.2-fix) ----------------------------------------
+//
+// Every Store backend — resident memory, legacy Gob file, and the durable Bolt
+// authority — must apply IDENTICAL validation, expiration, and pressure rules.
+// These helpers are the one implementation; backends that roll their own drift
+// into non-interchangeable behavior (the Gob store hard-erroring at the cap
+// while memory priority-compacts was exactly that drift).
+
+// MaxEvidencePerSubject is the per-subject storage bound shared by all
+// backends. Exported so durable implementations enforce the same cap instead
+// of inventing their own.
+const MaxEvidencePerSubject = maxEvidencePerSubject
+
+// ValidateForStore checks the STRUCTURAL well-formedness of evidence before
+// storage (P0.13). Shared by every backend: missing IDs, out-of-range enums,
+// empty code are rejected; valid-but-expired items are persisted (persistence
+// is independent of evaluation, P0.3) and excluded at Snapshot time.
+func ValidateForStore(e Evidence) error { return validate(e) }
+
+// IsExpired reports whether ev is expired at now, with the inclusive-invalid
+// rule shared across backends: evidence is expired exactly AT ExpiresAt
+// (now == ExpiresAt expires), matching Evidence.Valid (P0.14). A zero
+// ExpiresAt never expires.
+func IsExpired(ev Evidence, now time.Time) bool {
+	return !ev.ExpiresAt.IsZero() && !ev.ExpiresAt.After(now)
+}
+
+// CompactSubject bounds one subject's evidence via priority compaction (P0.12):
+// it drops the oldest NON-critical item when over the cap, but never evicts a
+// security-critical (NonEvictable) item through generic pressure. Returns the
+// bounded slice. Shared by every backend so pressure behavior is
+// interchangeable.
+func CompactSubject(list []Evidence) []Evidence {
+	if len(list) <= maxEvidencePerSubject {
+		return list
+	}
+	// Find the oldest EVICTABLE index (non-evictable items are retained).
+	oldestEvictable := -1
+	for i := range list {
+		if list[i].NonEvictable() {
+			continue
+		}
+		if oldestEvictable < 0 || list[i].CreatedAt.Before(list[oldestEvictable].CreatedAt) {
+			oldestEvictable = i
+		}
+	}
+	if oldestEvictable < 0 {
+		// All items are security-critical; the bound cannot be enforced without
+		// dropping authority. Keep them (better to bound the subject count at
+		// the admission layer than to lose security evidence).
+		return list
+	}
+	out := make([]Evidence, 0, len(list)-1)
+	out = append(out, list[:oldestEvictable]...)
+	out = append(out, list[oldestEvictable+1:]...)
+	return out
 }

@@ -541,8 +541,8 @@ func TestPolicyMutationAfterNewCannotAlterEnforcement(t *testing.T) {
 	enfPol := policy.Default()
 	enfTerm, err := New(Dependencies{
 		Registry: tc.reg, Peppers: credential.MustPepperRing(pep),
-		Lanes:    lane.NewStore(nil, time.Now),
-		Policy:   enfPol, Signer: signer, Audience: "fi-inference",
+		Lanes:  lane.NewStore(nil, time.Now),
+		Policy: enfPol, Signer: signer, Audience: "fi-inference",
 		Evidence:    evidence.NewMemoryStore(),
 		Concurrency: &fakePool{resource.NewConcurrencyPool(16)},
 	})

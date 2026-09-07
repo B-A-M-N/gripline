@@ -20,17 +20,17 @@ import (
 // Restart/multi-node durable hysteresis is NOT solved by merely persisting
 // CredentialRecord.Status.
 type CredentialStateStore struct {
-	mu      sync.Mutex
-	hy      credential.Hysteresis
-	now     func() time.Time
+	mu  sync.Mutex
+	hy  credential.Hysteresis
+	now func() time.Time
 	// Per-credential lock: maps credID → per-credential mutex + state machine.
 	machines map[string]*credMachine
 }
 
 type credMachine struct {
-	mu       sync.Mutex
-	machine  *credential.StateMachine
-	status   credential.Status // current known status from registry
+	mu      sync.Mutex
+	machine *credential.StateMachine
+	status  credential.Status // current known status from registry
 }
 
 // NewCredentialStateStore builds a store. hy is the hysteresis config; now is
@@ -65,8 +65,8 @@ func (s *CredentialStateStore) Observe(
 	cm, ok := s.machines[credentialID]
 	if !ok {
 		cm = &credMachine{
-			status:   current,
-			machine:  credential.NewStateMachine(s.hy, s.now),
+			status:  current,
+			machine: credential.NewStateMachine(s.hy, s.now),
 		}
 		// Seed the machine's current status. If the credential is already in
 		// an elevated state, we set it explicitly. NORMAL is the default.
@@ -107,8 +107,8 @@ func (s *CredentialStateStore) ObserveAndCAS(
 	cm, ok := s.machines[credentialID]
 	if !ok {
 		cm = &credMachine{
-			status:   current,
-			machine:  credential.NewStateMachine(s.hy, s.now),
+			status:  current,
+			machine: credential.NewStateMachine(s.hy, s.now),
 		}
 		if current != credential.StatusNormal {
 			cm.machine.SetStatus(current)

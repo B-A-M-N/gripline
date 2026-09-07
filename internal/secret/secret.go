@@ -34,10 +34,10 @@
 package secret
 
 import (
-	"encoding/base64"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
 )

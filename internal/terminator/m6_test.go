@@ -26,8 +26,8 @@ func m6Terminator(t *testing.T, cp *control.ControlPlane) (*Terminator, string) 
 	if err := reg.Insert(&credential.CredentialRecord{
 		CredentialID: "cred_m6", AccountID: "acct_1",
 		Verifier: credential.Verifier(secret.NewFromBytes([]byte(raw)), pep), VerifierVersion: 1, PepperVersion: 1,
-		Status:    credential.StatusNormal,
-		PolicyID:  "fi-default-v1", PlanID: "plan-a",
+		Status:   credential.StatusNormal,
+		PolicyID: "fi-default-v1", PlanID: "plan-a",
 		CreatedAt: time.Now().Add(-time.Hour), Revision: 1,
 	}); err != nil {
 		t.Fatal(err)
@@ -171,8 +171,8 @@ func TestM6SprayDetectorPersistsEvidence(t *testing.T) {
 	if err := reg.Insert(&credential.CredentialRecord{
 		CredentialID: "cred_m6s", AccountID: "acct_1",
 		Verifier: credential.Verifier(sealed, pep), VerifierVersion: 1, PepperVersion: 1,
-		Status:    credential.StatusNormal,
-		PolicyID:  "fi-default-v1", PlanID: "plan-a",
+		Status:   credential.StatusNormal,
+		PolicyID: "fi-default-v1", PlanID: "plan-a",
 		CreatedAt: time.Now().Add(-time.Hour), Revision: 1,
 	}); err != nil {
 		t.Fatal(err)

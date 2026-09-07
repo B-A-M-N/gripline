@@ -28,7 +28,7 @@ func TestM2LaneScopedContainment(t *testing.T) {
 	if err := reg.Insert(&credential.CredentialRecord{
 		CredentialID: "cred_m2", AccountID: "acct_1",
 		Verifier: credential.Verifier(sealed, pep), VerifierVersion: 1, PepperVersion: 1,
-		Status: credential.StatusNormal,
+		Status:   credential.StatusNormal,
 		PolicyID: "fi-default-v1", PlanID: "plan-a",
 		CreatedAt: time.Now().Add(-time.Hour), Revision: 1,
 	}); err != nil {
@@ -44,12 +44,12 @@ func TestM2LaneScopedContainment(t *testing.T) {
 	pol.LaneSecurity.EnableAutomaticBlock = true
 	dep := Dependencies{
 		Registry: reg, Peppers: credential.MustPepperRing(pep),
-		Lanes:     ls,
-		Policy:    pol,
-		Signer:    signer,
-		Audience:  "fi-inference",
-		Evidence:  store,
-		Mode:      ModeEnforce, // lane enforcement is a REQUIRED seam (P0.2)
+		Lanes:       ls,
+		Policy:      pol,
+		Signer:      signer,
+		Audience:    "fi-inference",
+		Evidence:    store,
+		Mode:        ModeEnforce, // lane enforcement is a REQUIRED seam (P0.2)
 		Concurrency: &fakePool{resource.NewConcurrencyPool(100)},
 	}
 	term, err := New(dep)

@@ -18,21 +18,44 @@ import (
 	"github.com/B-A-M-N/gripline/internal/terminator"
 )
 
-// scriptedUsage is a UsageEstimator returning canned estimate/actual values,
-// recording the responses Actual saw.
+// scriptedUsage is a UsageProvider returning canned estimate/actual values,
+// recording the response headers Begin saw and the chunks its session metered.
 type scriptedUsage struct {
-	est    resource.UsageEstimate
-	actual resource.UsageEstimate
-	mu     sync.Mutex
-	gotResps []*http.Response
+	est        resource.UsageEstimate
+	actual     resource.UsageEstimate
+	mu         sync.Mutex
+	gotResps   []*http.Response
+	gotChunks  [][]byte
+	finishErrs []error
 }
 
 func (s *scriptedUsage) Estimate(Observation) resource.UsageEstimate { return s.est }
-func (s *scriptedUsage) Actual(_ Observation, resp *http.Response) resource.UsageEstimate {
+
+func (s *scriptedUsage) Begin(_ Observation, resp *http.Response) UsageSession {
 	s.mu.Lock()
 	s.gotResps = append(s.gotResps, resp)
 	s.mu.Unlock()
-	return s.actual
+	return &scriptedSession{u: s, actual: s.actual}
+}
+
+type scriptedSession struct {
+	u      *scriptedUsage
+	actual resource.UsageEstimate
+}
+
+func (ss *scriptedSession) ObserveChunk(chunk []byte) {
+	ss.u.mu.Lock()
+	c := make([]byte, len(chunk))
+	copy(c, chunk)
+	ss.u.gotChunks = append(ss.u.gotChunks, c)
+	ss.u.mu.Unlock()
+}
+
+func (ss *scriptedSession) Finish(err error) resource.UsageEstimate {
+	ss.u.mu.Lock()
+	ss.u.finishErrs = append(ss.u.finishErrs, err)
+	ss.u.mu.Unlock()
+	return ss.actual
 }
 
 // P0.3 end-to-end at the proxy: the estimator's Estimate is reserved at
@@ -103,7 +126,29 @@ func TestDataPlaneSettlesReservationWithActualUsage(t *testing.T) {
 		t.Fatalf("proxy must succeed, got %d: %s", rec.Code, rec.Body.String())
 	}
 	if len(usage.gotResps) != 1 {
-		t.Fatalf("Actual must see the backend response once, saw %d", len(usage.gotResps))
+		t.Fatalf("Begin must see the backend response once, saw %d", len(usage.gotResps))
+	}
+	usage.mu.Lock()
+	chunks, finishErrs := len(usage.gotChunks), len(usage.finishErrs)
+	sawPayload := false
+	for _, c := range usage.gotChunks {
+		if strings.Contains(string(c), `"ok":true`) {
+			sawPayload = true
+		}
+	}
+	var finishErr error
+	if finishErrs == 1 {
+		finishErr = usage.finishErrs[0]
+	}
+	usage.mu.Unlock()
+	if chunks == 0 {
+		t.Fatal("metering session must observe the streamed body chunks")
+	}
+	if !sawPayload {
+		t.Fatal("metering session must see the final usage-bearing payload chunk")
+	}
+	if finishErrs != 1 || finishErr != nil {
+		t.Fatalf("Finish must be called exactly once with nil stream error, got n=%d err=%v", finishErrs, finishErr)
 	}
 
 	// Actual usage was charged: 100 - 10 = 90 available (est 50 was refunded).
@@ -117,7 +162,7 @@ func TestDataPlaneSettlesReservationWithActualUsage(t *testing.T) {
 
 	// Transport failure: no settle → deferred Release cancels the full hold.
 	fail := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	fail.Close() // closed server guarantees a transport error
+	fail.Close()                              // closed server guarantees a transport error
 	fbu, _ := url.Parse("http://127.0.0.1:1") // nothing listens
 	_ = fail
 	dpFail, err := New(Config{

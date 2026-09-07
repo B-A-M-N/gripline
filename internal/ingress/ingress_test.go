@@ -65,8 +65,8 @@ func resolve(t *testing.T, r *Resolver, remoteAddr string, headers http.Header) 
 // IP, never the forged value.
 func TestDirectPeerIgnoresSpoofedForwardedFor(t *testing.T) {
 	r := &Resolver{
-		Pseudonyms:      testPseudonyms(t),
-		TrustedProxies:  []netip.Prefix{}, // trust nothing
+		Pseudonyms:     testPseudonyms(t),
+		TrustedProxies: []netip.Prefix{}, // trust nothing
 	}
 	spoofed := hdr("X-Forwarded-For", "203.0.113.66")
 	direct := resolve(t, r, "198.51.100.10:443", spoofed)
@@ -204,8 +204,8 @@ func TestIPv6ZoneHandling(t *testing.T) {
 // malformed entry must not become the source identity.
 func TestMalformedForwardingEntriesDegradeSafely(t *testing.T) {
 	cases := []struct {
-		name    string
-		xff     string
+		name string
+		xff  string
 	}{
 		{name: "garbage-single", xff: "not-an-ip"},
 		{name: "garbage-mixed", xff: "203.0.113.2,..garbage, 10.0.0.1"},

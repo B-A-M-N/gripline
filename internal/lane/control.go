@@ -102,8 +102,9 @@ func (s *Store) Unblock(credID, laneID, actor, reason string, now time.Time) (*A
 // durable AuditSink is wired, the entry is appended while the store lock is
 // held and BEFORE the mutation becomes visible; a sink failure aborts the
 // transition (state unchanged, no half-applied operator action, no lost audit
-// record). reseedClean controls whether CleanSince is reset to now (true for an
-// unblock: the clean window starts fresh after operator clearing).
+// record). The state mutation itself is the pure ApplyUnblock reducer, so the
+// resident store and the durable Bolt repository apply identical operator
+// semantics.
 func (s *Store) operatorTransition(action OperatorAction, expectFrom, to SecurityStatus, credID, laneID, actor, reason string, now time.Time, reseedClean bool) (*AuditEntry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -127,14 +128,13 @@ func (s *Store) operatorTransition(action OperatorAction, expectFrom, to Securit
 			return nil, aerr
 		}
 	}
-	rec.Security.Status = to
-	if reseedClean {
-		rec.CleanSince = now
+	// The state mutation is the pure ApplyUnblock reducer, so the resident
+	// store and the durable Bolt repository apply identical operator
+	// semantics. It runs only after the audit commit succeeded: a failed
+	// transaction must not bump revision.
+	if _, err := ApplyUnblock(rec, now); err != nil {
+		return nil, err
 	}
-	rec.Security.SuspectStreak = 0
-	rec.Security.ClearSince = time.Time{}
-	rec.Security.RiskScore = 0
-	rec.Revision++
 	entry.Revision = rec.Revision
 	return entry, nil
 }

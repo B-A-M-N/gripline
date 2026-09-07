@@ -422,3 +422,22 @@ func (m *MemoryRegistry) UpdateStatusCAS(credentialID string, expectedRevision i
 	c := cloneRecord(rec)
 	return c, nil
 }
+
+// Summary is a credential's operator-facing view (CLI/diagnostics, P1-26).
+// It never carries verifier material — only identity, state, and bookkeeping.
+type Summary struct {
+	CredentialID string
+	AccountID    string
+	Status       string
+	PolicyID     string
+	PlanID       string
+	CreatedAt    time.Time
+	Revision     int
+}
+
+// Lister is the optional enumeration seam for operator tooling: list every
+// credential's summary. Implemented by the durable store; the memory registry
+// does not implement it (ephemeral mode has nothing worth listing).
+type Lister interface {
+	ListCredentials() ([]Summary, error)
+}

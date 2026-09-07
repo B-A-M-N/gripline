@@ -29,11 +29,11 @@ type DurableConfig struct {
 }
 
 type durableStore struct {
-	mu       sync.Mutex
-	cfg      DurableConfig
-	data     map[string][]Evidence // "scope/id" -> evidence items
-	pending  int
-	done     chan struct{}
+	mu        sync.Mutex
+	cfg       DurableConfig
+	data      map[string][]Evidence // "scope/id" -> evidence items
+	pending   int
+	done      chan struct{}
 	lastFlush error // last flush error (for diagnostics)
 }
 

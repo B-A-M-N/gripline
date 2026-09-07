@@ -66,6 +66,7 @@ func TestObserveAndCommitSecondNodeConverges(t *testing.T) {
 		t.Fatalf("P0.5: node B reads WatchStreak %d, want 2", rec.Security.WatchStreak)
 	}
 }
+
 // P0.14: the automatic-escalation ceiling is expressed as MaxAutomaticStatus,
 // not by mutilating the risk score. The old clamp (score = Constrained-1)
 // could never cross the CONSTRAINED threshold, so hot credentials stuck at

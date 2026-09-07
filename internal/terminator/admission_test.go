@@ -270,10 +270,10 @@ func TestConstrainedStateUsesConstrainedConcurrencyCap(t *testing.T) {
 	pool := resource.NewConcurrencyPool(32)
 	dep := Dependencies{
 		Registry: reg, Peppers: credential.MustPepperRing(pep),
-		Lanes:    lane.NewStore(nil, time.Now),
-		Policy:   policy.Default(),
-		Signer:   signer,
-		Audience: "fi-inference",
+		Lanes:       lane.NewStore(nil, time.Now),
+		Policy:      policy.Default(),
+		Signer:      signer,
+		Audience:    "fi-inference",
 		Concurrency: &fakePool{pool},
 	}
 	term, err := New(dep)
@@ -353,9 +353,9 @@ func TestPromotionRequiresMinCleanActiveDays(t *testing.T) {
 	// MinCleanActiveDays = 3.
 	rec := &lane.LaneRecord{
 		LaneID: "l_test", CredentialID: "c_test", State: lane.StateProbation,
-		FirstSeenAt: now.Add(-10 * 24 * time.Hour),
+		FirstSeenAt:  now.Add(-10 * 24 * time.Hour),
 		RequestCount: 500, RiskScore: 5,
-		ActiveDays:         5,
+		ActiveDays:              5,
 		AuthorizedCleanRequests: 200,
 	}
 	// Has enough age, requests, active days, and low risk — but CleanActiveDays < MinCleanActiveDays.
@@ -378,10 +378,10 @@ func TestPromotionScoreIsExactly100(t *testing.T) {
 	crit := lane.DefaultPromotionCriteria()
 	rec := &lane.LaneRecord{
 		LaneID: "l_test", CredentialID: "c_test", State: lane.StateProbation,
-		FirstSeenAt: now.Add(-10 * 24 * time.Hour),
+		FirstSeenAt:  now.Add(-10 * 24 * time.Hour),
 		RequestCount: 500, RiskScore: 5,
-		ActiveDays:         5,
-		CleanActiveDays:    3,
+		ActiveDays:              5,
+		CleanActiveDays:         3,
 		AuthorizedCleanRequests: 200,
 	}
 	_, promoted := lane.PromoteIfEligible(rec, crit, now)
@@ -401,7 +401,7 @@ func TestSuspiciousLanesNeverPromote(t *testing.T) {
 	for _, state := range cases {
 		rec := &lane.LaneRecord{
 			LaneID: "l_test", State: state,
-			FirstSeenAt: now.Add(-30 * 24 * time.Hour),
+			FirstSeenAt:  now.Add(-30 * 24 * time.Hour),
 			RequestCount: 9999, RiskScore: 0,
 			ActiveDays: 10, CleanActiveDays: 5,
 		}
@@ -433,11 +433,11 @@ func TestConcurrentAdmissionRace(t *testing.T) {
 
 	dep := Dependencies{
 		Registry: reg, Peppers: credential.MustPepperRing(pep),
-		Lanes:    lane.NewStore(nil, time.Now),
-		Policy:   policy.Default(),
-		Signer:   signer,
-		Audience: "fi-inference",
-		Evidence: store,
+		Lanes:       lane.NewStore(nil, time.Now),
+		Policy:      policy.Default(),
+		Signer:      signer,
+		Audience:    "fi-inference",
+		Evidence:    store,
 		Concurrency: &fakePool{resource.NewConcurrencyPool(100)},
 	}
 	term, err := New(dep)
@@ -474,10 +474,10 @@ func TestFullPromotionPipeline(t *testing.T) {
 	now := time.Now()
 	pol := policy.Default()
 	pol.Learning.AllowNewLanes = true
-	pol.Learning.MinCleanAge = time.Hour         // 1 hour
-	pol.Learning.MinCleanRequests = 1            // 1 request
-	pol.Learning.MinCleanActiveDays = 1          // 1 day
-	pol.Learning.MaxEstablishmentRisk = 20       // 20
+	pol.Learning.MinCleanAge = time.Hour   // 1 hour
+	pol.Learning.MinCleanRequests = 1      // 1 request
+	pol.Learning.MinCleanActiveDays = 1    // 1 day
+	pol.Learning.MaxEstablishmentRisk = 20 // 20
 
 	signer, _ := GenerateSigner()
 	pep := &credential.PepperKey{Version: 1, Key: []byte("test-pepper")}
@@ -498,10 +498,10 @@ func TestFullPromotionPipeline(t *testing.T) {
 	store := lane.NewStore(nil, func() time.Time { return now })
 	dep := Dependencies{
 		Registry: reg, Peppers: credential.MustPepperRing(pep),
-		Lanes:    store,
-		Policy:   pol,
-		Signer:   signer,
-		Audience: "fi-inference",
+		Lanes:       store,
+		Policy:      pol,
+		Signer:      signer,
+		Audience:    "fi-inference",
 		Concurrency: &fakePool{resource.NewConcurrencyPool(100)},
 	}
 	term, err := New(dep)

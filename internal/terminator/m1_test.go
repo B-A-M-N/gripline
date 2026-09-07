@@ -37,7 +37,9 @@ func (f *failingEvidenceStore) Snapshot(subjects []evidence.SubjectKey, now time
 	}
 	return evSnapshot(f.stored, subjects, now), nil
 }
-func (f *failingEvidenceStore) Prune(subjects []evidence.SubjectKey, now time.Time) (int, error) { return 0, nil }
+func (f *failingEvidenceStore) Prune(subjects []evidence.SubjectKey, now time.Time) (int, error) {
+	return 0, nil
+}
 
 func evSnapshot(items []evidence.Evidence, subjects []evidence.SubjectKey, now time.Time) []evidence.Evidence {
 	out := []evidence.Evidence{}
@@ -69,7 +71,7 @@ func buildCredential(t *testing.T, reg *credential.MemoryRegistry, id string, st
 	if err := reg.Insert(&credential.CredentialRecord{
 		CredentialID: id, AccountID: "acct_1",
 		Verifier: credential.Verifier(sealed, pep), VerifierVersion: 1, PepperVersion: 1,
-		Status: status,
+		Status:   status,
 		PolicyID: "fi-default-v1", PlanID: "plan-a",
 		CreatedAt: time.Now().Add(-time.Hour), Revision: rev,
 	}); err != nil {
@@ -88,11 +90,11 @@ func m1Terminator(t *testing.T, reg *credential.MemoryRegistry, pep *credential.
 	}
 	dep := Dependencies{
 		Registry: reg, Peppers: credential.MustPepperRing(pep),
-		Lanes:     lane.NewStore(nil, time.Now),
-		Policy:    pol,
-		Signer:    signer,
-		Audience:  "fi-inference",
-		Evidence:  store,
+		Lanes:       lane.NewStore(nil, time.Now),
+		Policy:      pol,
+		Signer:      signer,
+		Audience:    "fi-inference",
+		Evidence:    store,
 		Concurrency: &fakePool{resource.NewConcurrencyPool(100)},
 	}
 	term, err := New(dep)
@@ -155,7 +157,7 @@ func TestP01OutageBlockedStaysBlocked(t *testing.T) {
 	if err := reg.Insert(&credential.CredentialRecord{
 		CredentialID: "cred_p01b", AccountID: "acct_1",
 		Verifier: credential.Verifier(sealed, pep), VerifierVersion: 1, PepperVersion: 1,
-		Status: credential.StatusQuarantined,
+		Status:   credential.StatusQuarantined,
 		PolicyID: "fi-default-v1", PlanID: "plan-a",
 		CreatedAt: time.Now().Add(-time.Hour), Revision: 1,
 	}); err != nil {
@@ -189,7 +191,7 @@ func TestP05PersistedHysteresisSurvivesRestart(t *testing.T) {
 	if err := reg.Insert(&credential.CredentialRecord{
 		CredentialID: "cred_p05", AccountID: "acct_1",
 		Verifier: credential.Verifier(sealed, pep), VerifierVersion: 1, PepperVersion: 1,
-		Status: credential.StatusNormal,
+		Status:   credential.StatusNormal,
 		PolicyID: "fi-default-v1", PlanID: "plan-a",
 		CreatedAt: base.Add(-time.Hour), Revision: 1,
 	}); err != nil {
@@ -241,7 +243,7 @@ func TestP06ConflictReturnsConflict(t *testing.T) {
 	if err := reg.Insert(&credential.CredentialRecord{
 		CredentialID: "cred_p06", AccountID: "acct_1",
 		Verifier: credential.Verifier(sealed, pep), VerifierVersion: 1, PepperVersion: 1,
-		Status: credential.StatusNormal,
+		Status:   credential.StatusNormal,
 		PolicyID: "fi-default-v1", PlanID: "plan-a",
 		CreatedAt: time.Now().Add(-time.Hour), Revision: 1,
 	}); err != nil {
@@ -372,7 +374,7 @@ func TestP01NilEvidenceDegradesNotDowngrades(t *testing.T) {
 	if err := reg.Insert(&credential.CredentialRecord{
 		CredentialID: "cred_p01nil", AccountID: "acct_1",
 		Verifier: credential.Verifier(sealed, pep), VerifierVersion: 1, PepperVersion: 1,
-		Status: credential.StatusConstrained,
+		Status:   credential.StatusConstrained,
 		PolicyID: "fi-default-v1", PlanID: "plan-a",
 		CreatedAt: time.Now().Add(-time.Hour), Revision: 1,
 	}); err != nil {
@@ -381,10 +383,10 @@ func TestP01NilEvidenceDegradesNotDowngrades(t *testing.T) {
 	signer, _ := GenerateSigner()
 	dep := Dependencies{
 		Registry: reg, Peppers: credential.MustPepperRing(pep),
-		Lanes:     lane.NewStore(nil, time.Now),
-		Policy:    policy.Default(),
-		Signer:    signer,
-		Audience:  "fi-inference",
+		Lanes:       lane.NewStore(nil, time.Now),
+		Policy:      policy.Default(),
+		Signer:      signer,
+		Audience:    "fi-inference",
 		Concurrency: &fakePool{resource.NewConcurrencyPool(100)},
 	}
 	term, err := New(dep)

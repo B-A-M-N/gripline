@@ -79,7 +79,7 @@ func TestAcceptanceEndToEnd(t *testing.T) {
 	os.Setenv("GRIPLINE_CREDENTIAL_SECRET", externalSecret)
 	os.Setenv("GRIPLINE_CREDENTIAL_ID", "cred_e2e")
 	os.Setenv("GRIPLINE_ACCOUNT_ID", "acct_e2e")
-	os.Setenv("GRIPLINE_PEPPER_V1", "test-pepper-123456789012345678")
+	os.Setenv("GRIPLINE_PEPPER_V1", testPepperEnv)
 	defer func() {
 		os.Unsetenv("GRIPLINE_CREDENTIAL_SECRET")
 		os.Unsetenv("GRIPLINE_CREDENTIAL_ID")
@@ -98,7 +98,7 @@ func TestAcceptanceEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfgPath := filepath.Join(dir, "config.json")
-	cfgJSON := fmt.Sprintf(`{"listen":"127.0.0.1:0","backend":{"url":"%s","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"test-audience"},"tls":{"terminate_tls_upstream":true},"paths":{"evidence":"%s","signer_keyring":"%s"}}`, backend.URL, filepath.Join(dir, "evidence.gob"), keyringPath)
+	cfgJSON := fmt.Sprintf(`{"listen":"127.0.0.1:0","backend":{"url":"%s","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"test-audience"},"deployment":{"allow_ephemeral_state":true},"tls":{"terminate_tls_upstream":true},"paths":{"evidence":"%s","signer_keyring":"%s"}}`, backend.URL, filepath.Join(dir, "evidence.gob"), keyringPath)
 	if err := os.WriteFile(cfgPath, []byte(cfgJSON), 0o640); err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +181,7 @@ func TestAcceptanceOversizedBody(t *testing.T) {
 	os.Setenv("GRIPLINE_CREDENTIAL_SECRET", externalSecret)
 	os.Setenv("GRIPLINE_CREDENTIAL_ID", "cred_size")
 	os.Setenv("GRIPLINE_ACCOUNT_ID", "acct_size")
-	os.Setenv("GRIPLINE_PEPPER_V1", "test-pepper-123456789012345678")
+	os.Setenv("GRIPLINE_PEPPER_V1", testPepperEnv)
 	defer func() {
 		os.Unsetenv("GRIPLINE_CREDENTIAL_SECRET")
 		os.Unsetenv("GRIPLINE_CREDENTIAL_ID")
@@ -200,7 +200,7 @@ func TestAcceptanceOversizedBody(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfgPath := filepath.Join(dir, "config.json")
-	cfgJSON := fmt.Sprintf(`{"listen":"127.0.0.1:0","backend":{"url":"%s","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s","max_body_bytes":1024},"identity":{"audience":"test-audience"},"tls":{"terminate_tls_upstream":true},"paths":{"signer_keyring":"%s"}}`, backend.URL, keyringPath)
+	cfgJSON := fmt.Sprintf(`{"listen":"127.0.0.1:0","backend":{"url":"%s","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s","max_body_bytes":1024},"identity":{"audience":"test-audience"},"deployment":{"allow_ephemeral_state":true},"tls":{"terminate_tls_upstream":true},"paths":{"signer_keyring":"%s"}}`, backend.URL, keyringPath)
 	if err := os.WriteFile(cfgPath, []byte(cfgJSON), 0o640); err != nil {
 		t.Fatal(err)
 	}
@@ -244,7 +244,7 @@ func TestAcceptanceSharedAuthorities(t *testing.T) {
 	os.Setenv("GRIPLINE_CREDENTIAL_SECRET", "sk-test-shared-auth-1234567890")
 	os.Setenv("GRIPLINE_CREDENTIAL_ID", "cred_shared")
 	os.Setenv("GRIPLINE_ACCOUNT_ID", "acct_shared")
-	os.Setenv("GRIPLINE_PEPPER_V1", "test-pepper-123456789012345678")
+	os.Setenv("GRIPLINE_PEPPER_V1", testPepperEnv)
 	defer func() {
 		os.Unsetenv("GRIPLINE_CREDENTIAL_SECRET")
 		os.Unsetenv("GRIPLINE_CREDENTIAL_ID")
@@ -263,7 +263,7 @@ func TestAcceptanceSharedAuthorities(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfgPath := filepath.Join(dir, "config.json")
-	cfgJSON := fmt.Sprintf(`{"listen":"127.0.0.1:0","backend":{"url":"%s","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"test-audience"},"tls":{"terminate_tls_upstream":true},"paths":{"evidence":"%s","signer_keyring":"%s"}}`, backend.URL, filepath.Join(dir, "evidence.gob"), keyringPath)
+	cfgJSON := fmt.Sprintf(`{"listen":"127.0.0.1:0","backend":{"url":"%s","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"test-audience"},"deployment":{"allow_ephemeral_state":true},"tls":{"terminate_tls_upstream":true},"paths":{"evidence":"%s","signer_keyring":"%s"}}`, backend.URL, filepath.Join(dir, "evidence.gob"), keyringPath)
 	if err := os.WriteFile(cfgPath, []byte(cfgJSON), 0o640); err != nil {
 		t.Fatal(err)
 	}
@@ -320,7 +320,7 @@ func TestAcceptanceSharedAuthorities(t *testing.T) {
 func mustInsertCred(t *testing.T, reg *credential.MemoryRegistry, id, secretStr string) {
 	t.Helper()
 	sealed := secret.NewFromBytes([]byte(secretStr))
-	ver := credential.Verifier(sealed, &credential.PepperKey{Version: 1, Key: []byte("test-pepper-123456789012345678")})
+	ver := credential.Verifier(sealed, &credential.PepperKey{Version: 1, Key: testPepperKey()})
 	if err := reg.Insert(&credential.CredentialRecord{
 		CredentialID:  id,
 		AccountID:     "acct_behavior",
@@ -361,7 +361,7 @@ func TestAcceptanceSharedControlBehavioral(t *testing.T) {
 	os.Setenv("GRIPLINE_CREDENTIAL_SECRET", "sk-behavioral-base-123456789012345678")
 	os.Setenv("GRIPLINE_CREDENTIAL_ID", "cred_behavioral")
 	os.Setenv("GRIPLINE_ACCOUNT_ID", "acct_behavioral")
-	os.Setenv("GRIPLINE_PEPPER_V1", "test-pepper-123456789012345678")
+	os.Setenv("GRIPLINE_PEPPER_V1", testPepperEnv)
 	defer func() {
 		os.Unsetenv("GRIPLINE_CREDENTIAL_SECRET")
 		os.Unsetenv("GRIPLINE_CREDENTIAL_ID")
@@ -380,7 +380,7 @@ func TestAcceptanceSharedControlBehavioral(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfgPath := filepath.Join(dir, "config.json")
-	cfgJSON := fmt.Sprintf(`{"listen":"127.0.0.1:0","backend":{"url":"%s","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"test-audience"},"tls":{"terminate_tls_upstream":true},"paths":{"evidence":"%s","signer_keyring":"%s"}}`, backend.URL, filepath.Join(dir, "evidence.gob"), keyringPath)
+	cfgJSON := fmt.Sprintf(`{"listen":"127.0.0.1:0","backend":{"url":"%s","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"test-audience"},"deployment":{"allow_ephemeral_state":true},"tls":{"terminate_tls_upstream":true},"paths":{"evidence":"%s","signer_keyring":"%s"}}`, backend.URL, filepath.Join(dir, "evidence.gob"), keyringPath)
 	if err := os.WriteFile(cfgPath, []byte(cfgJSON), 0o640); err != nil {
 		t.Fatal(err)
 	}
@@ -453,7 +453,7 @@ func TestAcceptanceAdminPostureLockdown(t *testing.T) {
 	os.Setenv("GRIPLINE_CREDENTIAL_SECRET", "sk-admin-base-12345678901234567890")
 	os.Setenv("GRIPLINE_CREDENTIAL_ID", "cred_admin")
 	os.Setenv("GRIPLINE_ACCOUNT_ID", "acct_admin")
-	os.Setenv("GRIPLINE_PEPPER_V1", "test-pepper-123456789012345678")
+	os.Setenv("GRIPLINE_PEPPER_V1", testPepperEnv)
 	defer func() {
 		os.Unsetenv("GRIPLINE_CREDENTIAL_SECRET")
 		os.Unsetenv("GRIPLINE_CREDENTIAL_ID")
@@ -473,7 +473,7 @@ func TestAcceptanceAdminPostureLockdown(t *testing.T) {
 	}
 	opToken := "op-token-acceptance-123456"
 	cfgPath := filepath.Join(dir, "config.json")
-	cfgJSON := fmt.Sprintf(`{"listen":"127.0.0.1:0","backend":{"url":"%s","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"test-audience"},"admin":{"listen":"127.0.0.1:0","operator_tokens":{"%s":"operator:posture.control"}},"tls":{"terminate_tls_upstream":true},"paths":{"evidence":"%s","signer_keyring":"%s","audit_log":"%s"}}`, backend.URL, opToken, filepath.Join(dir, "evidence.gob"), keyringPath, filepath.Join(dir, "audit.jsonl"))
+	cfgJSON := fmt.Sprintf(`{"listen":"127.0.0.1:0","backend":{"url":"%s","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"test-audience"},"deployment":{"allow_ephemeral_state":true},"admin":{"listen":"127.0.0.1:0","operator_tokens":{"%s":"operator:posture.control"}},"tls":{"terminate_tls_upstream":true},"paths":{"evidence":"%s","signer_keyring":"%s","audit_log":"%s"}}`, backend.URL, opToken, filepath.Join(dir, "evidence.gob"), keyringPath, filepath.Join(dir, "audit.jsonl"))
 	if err := os.WriteFile(cfgPath, []byte(cfgJSON), 0o640); err != nil {
 		t.Fatal(err)
 	}

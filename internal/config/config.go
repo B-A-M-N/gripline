@@ -83,6 +83,21 @@ type Config struct {
 
 	// Ingress configures trusted source identity resolution (P0.6).
 	Ingress *IngressSection `json:"ingress,omitempty"`
+
+	// Deployment carries the deployment-posture switches (P0.18). The safe
+	// production path is the DEFAULT: persistent state is required at boot.
+	Deployment DeploymentSection `json:"deployment,omitempty"`
+}
+
+// DeploymentSection carries the deployment-posture switches (P0.18).
+type DeploymentSection struct {
+	// AllowEphemeralState is the explicit development escape hatch. When
+	// false (the default), boot REQUIRES paths.state and paths.signer_keyring
+	// so an operator cannot accidentally run a security gateway that forgets
+	// credentials, lanes, and posture on restart. Set true ONLY for
+	// tests/development: every authority then degrades to its in-memory or
+	// ephemeral form.
+	AllowEphemeralState bool `json:"allow_ephemeral_state,omitempty"`
 }
 
 // IngressSection configures trusted source identity resolution (P0.6).
@@ -112,8 +127,17 @@ type TLSSection struct {
 type BackendSection struct {
 	// URL is the upstream origin, e.g. "https://provider.internal:443/v1".
 	URL string `json:"url"`
-	// Timeout bounds the full upstream exchange (dial + headers + body).
+	// Timeout bounds the full upstream exchange (dial + headers + body). It
+	// also serves as the default for each of the split timeouts below when
+	// they are unset.
 	Timeout Duration `json:"timeout"`
+	// DialTimeout bounds establishing the TCP connection. Zero = Timeout.
+	DialTimeout Duration `json:"dial_timeout,omitempty"`
+	// TLSHandshakeTimeout bounds the upstream TLS handshake. Zero = Timeout.
+	TLSHandshakeTimeout Duration `json:"tls_handshake_timeout,omitempty"`
+	// ResponseHeaderTimeout bounds waiting for the upstream response HEADERS
+	// (the slowest failure mode of a loaded inference backend). Zero = Timeout.
+	ResponseHeaderTimeout Duration `json:"response_header_timeout,omitempty"`
 	// MaxIdleConnsPerHost tunes connection pooling (0 = default).
 	MaxIdleConnsPerHost int `json:"max_idle_conns_per_host,omitempty"`
 }
@@ -135,6 +159,14 @@ type ServerSection struct {
 	MaxBodyBytes int64 `json:"max_body_bytes,omitempty"`
 	// ReadHeaderTimeout bounds header reads specifically (slowloris).
 	ReadHeaderTimeout Duration `json:"read_header_timeout"`
+	// StreamWriteIdleTimeout bounds how long a streaming response may stall
+	// without forwarding any bytes to the client (P0.16). Long-lived SSE
+	// inference streams are legitimate; a DEAD stream (backend hung, no
+	// tokens flowing) is not — each idle stretch longer than this is cut.
+	// Zero = server.write_timeout applies as-is (no streaming exemption).
+	// Required to be positive when set; must be <= write_timeout is NOT
+	// enforced (streams legitimately outlive short header-phase budgets).
+	StreamWriteIdleTimeout Duration `json:"stream_write_idle_timeout,omitempty"`
 }
 
 // AdminSection configures the operator control-plane listener (P0.47).
@@ -146,10 +178,6 @@ type AdminSection struct {
 	// only here (env-injected); the control plane stores digests. At least
 	// one token with each needed capability must be configured.
 	OperatorTokens map[string]string `json:"operator_tokens"` // token -> "name:cap1,cap2"
-	// AllowPublic opts out of the private-only admin bind check (P0.7). The
-	// operator explicitly accepts an internet-facing control plane. Never set
-	// this in the default posture.
-	AllowPublic bool `json:"allow_public,omitempty"`
 }
 
 // IdentitySection is the internal assertion boundary.
@@ -162,20 +190,22 @@ type IdentitySection struct {
 // PathsSection names durable-state locations.
 type PathsSection struct {
 	// AuditLog is the append-only operator audit JSONL (P0.47). Required when
-	// Admin is configured.
+	// Admin is configured WITHOUT a state database; optional (a mirror) when
+	// paths.state is the authority (P0.5).
 	AuditLog string `json:"audit_log"`
-	// Evidence is the file path for the durable evidence store (BETA-09).
-	// Empty means in-memory only (evidence lost on restart).
+	// Evidence is the LEGACY gob-file evidence store path (BETA-09). It must
+	// be empty when paths.state is configured (P0.2: the Bolt database is the
+	// single evidence authority). Development-only otherwise: empty means
+	// in-memory evidence.
 	Evidence string `json:"evidence"`
 	// SignerKeyring is the file path for the persistent signing keyring (BETA-10).
-	// Empty means ephemeral: a fresh keyring is generated at every restart,
-	// so previously issued assertions will not verify after a restart.
+	// Required unless deployment.allow_ephemeral_state is true (P0.18).
 	SignerKeyring string `json:"signer_keyring"`
 	// State is the file path for the single transactional state database
-	// (P0.10): credentials + verifier index + security state, lanes, operator
-	// audit, and operator posture all in one bbolt file. Empty means the
-	// in-memory registry + file-based audit sink (beta default, not durable
-	// for credentials across restart).
+	// (P0.10): credentials + verifier index + security state, lanes, evidence,
+	// operator audit, and operator posture all in one bbolt file. Empty means
+	// the ephemeral (in-memory) mode, which requires
+	// deployment.allow_ephemeral_state=true (P0.18).
 	State string `json:"state"`
 }
 
@@ -244,6 +274,15 @@ func (c *Config) Validate() error {
 	default:
 		return fmt.Errorf("tls.min_version must be \"1.2\" or \"1.3\", got %q", c.TLS.MinVersion)
 	}
+	// P0-15: plain HTTP is only legitimate behind a trusted fronting proxy on
+	// a PRIVATE network. A terminate_tls_upstream listener bound to a
+	// wildcard or public interface would carry inference credentials in
+	// cleartext over a network hop — fail the boot instead.
+	if c.TLS.TerminateTLSUpstream && c.TLS.CertFile == "" {
+		if err := requirePrivateBind(c.Listen, "listen"); err != nil {
+			return err
+		}
+	}
 
 	// Fixed backend (P0.7).
 	if c.Backend.URL == "" {
@@ -275,6 +314,12 @@ func (c *Config) Validate() error {
 	if c.Server.MaxBodyBytes == 0 {
 		c.Server.MaxBodyBytes = 32 << 20
 	}
+	if c.Server.MaxHeaderBytes < 0 || c.Server.MaxBodyBytes < 0 {
+		return fmt.Errorf("server.max_header_bytes/max_body_bytes must be non-negative")
+	}
+	if c.Server.StreamWriteIdleTimeout.D() < 0 {
+		return fmt.Errorf("server.stream_write_idle_timeout must be non-negative")
+	}
 
 	// Identity boundary.
 	if c.Identity.Audience == "" {
@@ -301,14 +346,19 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("admin.operator_tokens: entry must be \"name:cap1,cap2\"")
 			}
 		}
-		if c.Paths.AuditLog == "" {
-			return fmt.Errorf("paths.audit_log required when the admin section is present (P0.47: durable operator audit)")
+		// P0.47/P0.5: the admin surface requires a durable audit authority. With
+		// a state database configured, the Bolt store IS that authority and
+		// audit_log is an optional JSONL mirror; without one, the JSONL file is
+		// required.
+		if c.Paths.AuditLog == "" && c.Paths.State == "" {
+			return fmt.Errorf("paths.audit_log required when the admin section is present without paths.state (P0.47: durable operator audit)")
 		}
 		// P0.7 hardening: reject a public/unspecified admin bind. The admin
-		// listener is the operator control plane (posture + lifecycle actions);
-		// binding it to a wildcard or public interface contradicts the
-		// "private interface only" contract unless an operator explicitly opts
-		// into a non-loopback/private bind (admin.allow_public).
+		// listener is the operator control plane (posture + lifecycle
+		// actions); binding it to a wildcard or public interface contradicts
+		// the "private interface only" contract. There is NO override: an
+		// internet-facing plaintext-token control plane is not a deployable
+		// posture (P0-14 removal of admin.allow_public).
 		if err := validateAdminBind(c.Admin); err != nil {
 			return err
 		}
@@ -316,35 +366,37 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// validateAdminBind enforces that the admin listener binds loopback or a
-// private (RFC1918 / unique-local / link-local) interface address. An
-// unspecified/wildcard host (`:port`, `0.0.0.0`, `::`) or a public IP is
-// rejected unless the operator set admin.allow_public = true (a deliberate,
-// externally-visible control-plane override — which also forces TLS).
-func validateAdminBind(a *AdminSection) error {
-	if a.AllowPublic {
-		return nil
-	}
-	host := a.Listen
-	if h, _, err := net.SplitHostPort(a.Listen); err == nil {
+// requirePrivateBind enforces that a listener address binds loopback or a
+// private (RFC1918 / unique-local / link-local) interface. Used for listeners
+// whose traffic is only safe on a private network (the admin control plane;
+// the public listener when TLS is terminated upstream).
+func requirePrivateBind(listen, what string) error {
+	host := listen
+	if h, _, err := net.SplitHostPort(listen); err == nil {
 		host = h
 	}
 	if host == "" {
-		return fmt.Errorf("admin.listen %q: unspecified/wildcard host requires an explicit loopback or private interface (or admin.allow_public=true)", a.Listen)
+		return fmt.Errorf("%s %q: wildcard host is not allowed for this listener (bind 127.0.0.1 or a private interface)", what, listen)
 	}
-	// A bare non-numeric hostname is not an address we can classify; require a
-	// numeric address for the private-only check.
 	addr, err := netip.ParseAddr(host)
 	if err != nil {
-		return fmt.Errorf("admin.listen %q: must be a numeric loopback or private address (or admin.allow_public=true)", a.Listen)
+		return fmt.Errorf("%s %q: must be a numeric loopback or private address", what, listen)
 	}
 	if addr.IsLoopback() || addr.IsPrivate() || addr.IsLinkLocalUnicast() {
 		return nil
 	}
 	if addr.IsUnspecified() {
-		return fmt.Errorf("admin.listen %q: unspecified address requires an explicit loopback or private interface (or admin.allow_public=true)", a.Listen)
+		return fmt.Errorf("%s %q: unspecified address is not allowed for this listener (bind 127.0.0.1 or a private interface)", what, listen)
 	}
-	return fmt.Errorf("admin.listen %q: public address is not allowed for the admin control plane (use 127.0.0.1 or a private interface, or set admin.allow_public=true)", a.Listen)
+	return fmt.Errorf("%s %q: public address is not allowed for this listener (traffic is unencrypted on this bind; use 127.0.0.1 or a private interface)", what, listen)
+}
+
+// validateAdminBind enforces that the admin listener binds loopback or a
+// private (RFC1918 / unique-local / link-local) interface address. An
+// unspecified/wildcard host (`:port`, `0.0.0.0`, `::`) or a public IP is
+// rejected unconditionally — the control plane must sit on a private network.
+func validateAdminBind(a *AdminSection) error {
+	return requirePrivateBind(a.Listen, "admin.listen")
 }
 
 // parseOperatorSpec parses "name:cap1,cap2".

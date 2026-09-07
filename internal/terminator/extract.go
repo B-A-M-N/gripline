@@ -18,8 +18,6 @@ const (
 	carrierProvider
 )
 
-
-
 // maxCredentialLen bounds the accepted raw credential size (§15 oversized).
 const maxCredentialLen = 1024
 

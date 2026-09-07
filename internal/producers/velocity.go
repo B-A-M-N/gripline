@@ -111,11 +111,15 @@ func (p *ResourceVelocityProducer) ObserveCompletion(behavior CompletionBehavior
 		}
 	}
 
-	// Cost velocity — per credential, and ONLY when it clears the absolute floor
-	// in addition to the multiple. The evidence name is
-	// COST_VELOCITY_OVER_4X_BASELINE_AND_ABSOLUTE_FLOOR: both predicates must hold.
-	if behavior.Actual.Cost >= absoluteCostFloorMicrounits {
-		if sig := p.checkVelocity(p.costBaseline, cred+":cost", float64(behavior.Actual.Cost), now, "COST_VELOCITY_OVER_4X_BASELINE_AND_ABSOLUTE_FLOOR", ""); sig != "" {
+	// Cost velocity — per credential. EVERY positive cost observation updates
+	// the baseline (a sub-floor norm must still be LEARNED, or a later spike
+	// becomes "baseline observation #1" instead of a spike against an
+	// established low-cost norm — P0.10-fix). The absolute floor gates
+	// EMISSION only: the evidence name
+	// COST_VELOCITY_OVER_4X_BASELINE_AND_ABSOLUTE_FLOOR requires BOTH the
+	// 4x multiple AND the floor, so a sub-floor 4x blip still never emits.
+	if behavior.Actual.Cost > 0 {
+		if sig := p.checkVelocity(p.costBaseline, cred+":cost", float64(behavior.Actual.Cost), now, "COST_VELOCITY_OVER_4X_BASELINE_AND_ABSOLUTE_FLOOR", ""); sig != "" && behavior.Actual.Cost >= absoluteCostFloorMicrounits {
 			signals = append(signals, Signal{Code: sig})
 		}
 	}

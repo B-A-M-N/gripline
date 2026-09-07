@@ -56,11 +56,11 @@ type LaneRecord struct {
 	// re-keyed classification from silently laundering pre-change history.
 	ClassificationRevision int
 
-	RequestCount          int64  // total requests seen (includes denied)
-	ActiveDays            int    // distinct active days observed (§29 clean-active-days)
-	LastActiveDay         string // "YYYY-MM-DD" of the last request (ActiveDays dedup)
-	RiskScore             int
-	EstablishmentScore    int
+	RequestCount       int64  // total requests seen (includes denied)
+	ActiveDays         int    // distinct active days observed (§29 clean-active-days)
+	LastActiveDay      string // "YYYY-MM-DD" of the last request (ActiveDays dedup)
+	RiskScore          int
+	EstablishmentScore int
 	// Security is the RISK-DRIVEN enforcement dimension (P0.7): a separate axis
 	// from the trust ladder (State). It drives lane-scoped limits and denial.
 	Security SecurityState
@@ -94,8 +94,6 @@ type Features struct {
 	ConcurrencyPattern string // interactive / automation / burst / ...
 	EndpointFamily     string
 }
-
-
 
 // ClassificationThresholds carries the similarity cutoffs (policy-controlled):
 // similarity >= Match → candidate existing lane; >= Related → related context /

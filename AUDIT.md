@@ -138,32 +138,29 @@ across all 15 packages.
 
 ## Production classification
 
+> **NOTE (public-beta re-review pass):** the classification and gap list below
+> predate the deployable gateway and the transactional state authority. See
+> the "Public-beta re-review close-out" section at the bottom for what is now
+> true.
+
 **Hardened security-core prototype / pre-beta data-plane library.** The core
 deterministic authorization engine, the proxy trust boundary, all 10 acceptance
 gates, the source-spray detector, signer rotation, the control plane, and the
-observability decision record are committed and race-tested. It is NOT
-production-stable because all state is in-memory and lost on restart; there is
-no standalone gateway process; no multi-node lease coordination; no durable
-backend / WAL / metrics pipeline; no chaos harness; no KMS/HSM-backed keys or
-TLS.
+observability decision record are committed and race-tested. At the time of
+writing all state was in-memory and lost on restart; there was no standalone
+gateway process; no multi-node lease coordination; no durable backend / WAL /
+metrics pipeline; no chaos harness; no KMS/HSM-backed keys or TLS.
 
 ## Production gaps (not P0 defects; architecture recommendations)
 
-1. **Gateway process** — no `cmd/`, no `main.go`, no socket listener; the
-   library is in-memory-test-only. Required before production traffic.
-2. **Durable stores** — lane/evidence/credential/lease state is in-memory and
-   lost on restart (P0.58/P0.63–66); no WAL/durable append.
-3. **Multi-node coordination + TTL leases** — `resource.Governor` is a
-   single-process mutex; no leader election or shared lease store (P0.61/62).
-4. **Dependency chaos / failure-injection harness** — only Gate F hand-codes one
-   evidence outage; no systematic harness (P0.68).
-5. **Metrics / telemetry pipeline** — decision records + control-plane audit only;
-   no Prometheus/OTel sink.
-6. **KMS/HSM key management + TLS** — pepper keys are `[]byte` in config;
-   assertion signer is in-memory Ed25519; no HSM/KMS/mTLS.
-7. **Source-identity attribution (M4 seam)** — `proxy.HeaderFeatures` cannot
-   resolve trusted ASN/region. The e2e gate injects a resolver; a real provider
-   adapter is the flagged M4 default.
+> **Status updates from the public-beta close-out:** (1) RESOLVED —
+> `cmd/gripline` is the deployable executable with boot-validated config.
+> (2) LARGELY RESOLVED — credentials, lanes, evidence, operator audit, and
+> posture are durable in one transactional bbolt database
+> (`internal/statebolt`); restart containment is acceptance-proven. (3) STILL
+> OPEN (deliberately out of beta scope) — multi-node coordination/TTL leases,
+> chaos harness, metrics pipeline, KMS/HSM. (4) PARTIAL — source-identity
+> attribution remains the provider-adapter seam.
 
 ## Open / partial work queue (ordered by what blocks the e2e goal)
 
@@ -174,3 +171,68 @@ TLS.
 3. P0.48/P0.10 — gate clean-counter increments on adaptive status; implement the
    single-request conflict re-observe.
 4. Durable stores + gateway process (P0.58/63/64/61/62) — before production.
+---
+
+## Public-beta re-review close-out (2026-09)
+
+The second external review ("Gripline Public-Beta Re-review", 35 findings,
+5-phase fix order) was implemented in full. Summary of what each phase changed
+and how it is proven:
+
+**Phase 1 — immediate correctness defects**
+- Body spooler limit bypass/truncation + temp-file leak: `proxy.spoolBody` reads
+  exactly `maxBytes+1` (overflow-safe), flags `tooLarge`, and cleanup is the
+  body's own idempotent `Close` (every path). Proven: `TestSpoolBodyLimitBoundaries`,
+  `TestSpoolBodyTooLargeNotForwardable`, `TestSpoolBodyTempFileCleanedOnNormalClose`,
+  `TestSpoolBodyChunkedEndToEnd`, `TestSpoolBodyTempFilesDoNotLeakEndToEnd`.
+- bbolt transaction error swallowing: every `statebolt` mutation returns
+  transaction failures from the callback (bbolt rolls back). Proven by the
+  statebolt suite + restart acceptance.
+- Cost-velocity baseline: EMA learns sub-floor baselines; the absolute floor
+  gates emission only. `producers/velocity_baseline_test.go`.
+- Source-resolution failure now fails closed (503), never silently degrades to
+  "no source". `proxy/source_resolution_test.go`.
+
+**Phase 2 — single-node security authority**
+- `internal/statebolt` implements `lane.Repository` and `evidence.Store` over
+  the SAME pure mutation reducers as the memory store (semantic drift is
+  structurally impossible: both call `lane.ApplyBorrowOrCreate` et al).
+- One bbolt database is the credential + lane + evidence + operator-audit +
+  posture authority; split Bolt/Gob configuration is a boot error.
+- `control.MutationStore`: revoke / unblock / posture commit mutation + audit
+  row in one transaction. Bolt is the authoritative audit when state-backed.
+- Persistent state is mandatory unless `deployment.allow_ephemeral_state=true`.
+- Restart containment acceptance: `TestAcceptanceRestartContainment`.
+- Data race in the lane memory store fixed (returned records are copies).
+
+**Phase 3 — live inference lifecycle**
+- `UsageProvider.Begin → UsageSession{ObserveChunk, Finish}`: settlement
+  charges the final streamed usage envelope; the meter sees every chunk
+  without buffering or retaining content. `proxy/usage_test.go`.
+- `DecisionObserver` surfaces completion-evidence persistence failures.
+  `proxy/observer_test.go`.
+- Streaming timeouts: `server.stream_write_idle_timeout` re-arms per chunk and
+  the idle reader cuts a STALLED upstream; live SSE runs indefinitely.
+  `TestAcceptanceRealStreaming`, `TestAcceptanceStalledStreamCut`.
+- Split backend timeouts (dial / TLS handshake / response headers).
+
+**Phase 4 — deployment fail-closed**
+- Negative header/body/idle limits rejected; `admin.allow_public` REMOVED
+  (private admin bind is unconditional); `tls.terminate_tls_upstream` requires
+  a loopback/private bind; pepper + pseudonym keys must be base64 >= 32 bytes
+  and distinct; `/readyz` probes the state authority (`Runtime.Ready`); run()
+  propagates Close errors.
+
+**Phase 5 — operator/release usability**
+- `gripline credential list|revoke`, `gripline lane list|unblock`,
+  `gripline status` (capability/durability honesty table) — through the
+  authorization + atomic mutation/audit seams, never touching raw secrets.
+- bbolt is a direct dependency; CI: go-version-file, vet, staticcheck, build,
+  race, gates, executable acceptance, gofmt.
+- Release assets: LICENSE (Apache-2.0), SECURITY.md, CHANGELOG.md,
+  deploy/config.example.json (validated by `gripline status`), deploy/Dockerfile
+  (distroless, non-root, image build verified).
+
+**Verification at close-out:** `go vet ./...`, `staticcheck`, `go build ./...`,
+`go test -race ./...` (all packages) green; executable acceptance suite green;
+Docker image builds.

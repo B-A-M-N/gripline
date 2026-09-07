@@ -1,15 +1,17 @@
 package main
 
 import (
-	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/netip"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/B-A-M-N/gripline/internal/anomaly"
@@ -32,8 +34,17 @@ import (
 // Runtime is the single application composition root (P0.1/P0.2).
 // All security-critical state is instantiated once and shared.
 type Runtime struct {
-	Registry  credential.Registry
-	Lanes     *lane.Store
+	Registry credential.Registry
+	// Lanes is the lane authority (P0.10): the durable Bolt repository when
+	// state-backed, the resident store otherwise. The terminator accepts the
+	// Repository interface; the runtime no longer forces the memory
+	// implementation.
+	Lanes lane.Repository
+	// AdminService is the production control-plane service (nil when no admin
+	// section is configured). CLI/lifecycle tooling uses it; the HTTP admin
+	// mux is the operator surface for it.
+	AdminService *control.Service
+
 	Evidence  evidence.Store
 	Resource  *resource.Governor
 	Control   *control.ControlPlane
@@ -45,12 +56,37 @@ type Runtime struct {
 	DataPlane http.Handler
 	Admin     *http.Server
 	closers   []func() error
+	closeOnce sync.Once
+	closeErr  error
+}
+
+// controlService returns the admin control-plane service (test/CLI seam).
+func (rt *Runtime) controlService() *control.Service { return rt.AdminService }
+
+// Ready reports whether the runtime can actually serve: the authorities are
+// constructed (guaranteed by BuildRuntime returning) and, when state-backed,
+// the Bolt database answers a probe read. A /readyz handler that only echoes a
+// static flag is a lie — this is the check behind the endpoint (P1-24).
+func (rt *Runtime) Ready() error {
+	if rt.State != nil {
+		if err := rt.State.Ping(); err != nil {
+			return fmt.Errorf("gripline: state store not ready: %w", err)
+		}
+	}
+	return nil
 }
 
 // BuildRuntime constructs the full application from configuration.
 // P0.1 fix: Every authority is instantiated exactly once and shared.
 func BuildRuntime(cfg *config.Config) (*Runtime, error) {
 	var closers []func() error
+	// failCleanup releases every descriptor opened so far if construction
+	// fails partway (P1.23).
+	failCleanup := func() {
+		for i := len(closers) - 1; i >= 0; i-- {
+			_ = closers[i]()
+		}
+	}
 
 	pepper := os.Getenv("GRIPLINE_PEPPER_V1")
 	if pepper == "" {
@@ -60,21 +96,41 @@ func BuildRuntime(cfg *config.Config) (*Runtime, error) {
 		}
 	}
 	if pepper == "" {
-		return nil, fmt.Errorf("gripline: GRIPLINE_PEPPER_V1 env var required")
+		return nil, fmt.Errorf("gripline: GRIPLINE_PEPPER_V1 env var required (base64-encoded, >=32 bytes of entropy)")
 	}
-	if len(pepper) < 16 {
-		return nil, fmt.Errorf("gripline: GRIPLINE_PEPPER_V1 must be at least 16 bytes")
+	pepperKey, err := decodeSecretKey("GRIPLINE_PEPPER_V1", pepper, 32)
+	if err != nil {
+		return nil, err
 	}
-	peppers := credential.MustPepperRing(&credential.PepperKey{Version: 1, Key: []byte(pepper)})
+	peppers := credential.MustPepperRing(&credential.PepperKey{Version: 1, Key: pepperKey})
 
-	// P0.10: when a state DB path is configured, back the credential registry
-	// (and operator audit + posture) on one transactional bbolt store instead of
-	// the in-memory registry. Every registry mutation is then transactional and
-	// durable across restart; bootstrap uses InsertIfAbsent so an env-provided
-	// credential never overwrites an operator-managed one.
+	// P0.18-fix: persistent state is the REQUIRED production path. paths.state
+	// and paths.signer_keyring must be configured unless the operator
+	// explicitly opts into ephemeral development mode
+	// (deployment.allow_ephemeral_state=true). The safe deployment is the path
+	// of least resistance.
+	if !cfg.Deployment.AllowEphemeralState {
+		if cfg.Paths.State == "" {
+			return nil, fmt.Errorf("gripline: paths.state is required (deployment.allow_ephemeral_state is false; set it only for development)")
+		}
+		if cfg.Paths.SignerKeyring == "" {
+			return nil, fmt.Errorf("gripline: paths.signer_keyring is required (deployment.allow_ephemeral_state is false; set it only for development)")
+		}
+	}
+
+	// P0.2-fix: when a state DB is configured it is the SINGLE security
+	// authority — credentials, lanes, evidence, operator audit, and posture
+	// all live behind one transactional write path. A second persistence
+	// authority (the legacy Gob evidence file) must not silently split
+	// security state across databases.
 	var reg credential.Registry
+	var lanes lane.Repository
+	var evStore evidence.Store
 	var state *statebolt.Store
 	if cfg.Paths.State != "" {
+		if cfg.Paths.Evidence != "" {
+			return nil, fmt.Errorf("gripline: paths.evidence must be empty when paths.state is configured: the Bolt state database is the single evidence authority (P0.2)")
+		}
 		s, err := statebolt.Open(cfg.Paths.State, statebolt.Options{})
 		if err != nil {
 			return nil, fmt.Errorf("gripline: state db: %w", err)
@@ -82,35 +138,25 @@ func BuildRuntime(cfg *config.Config) (*Runtime, error) {
 		state = s
 		closers = append(closers, func() error { return s.Close() })
 		reg = s
+		lanes = s   // durable lane.Repository (P0.10)
+		evStore = s // durable evidence.Store (P0.2-fix)
 	} else {
 		reg = credential.NewMemoryRegistry()
+		lanes = lane.NewStore(nil, time.Now)
+		evStore = evidence.NewMemoryStore()
 	}
-	if err := bootstrapCredentials(reg, pepper); err != nil {
+	if err := bootstrapCredentials(reg, pepperKey); err != nil {
+		failCleanup()
 		return nil, err
 	}
 
-	var evStore evidence.Store
-	if cfg.Paths.Evidence != "" {
-		durable, closeFn, err := evidence.NewDurableStore(evidence.DurableConfig{
-			Path:          cfg.Paths.Evidence,
-			FlushInterval: time.Second,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("gripline: durable evidence store: %w", err)
-		}
-		evStore = durable
-		closers = append(closers, closeFn)
-	} else {
-		evStore = evidence.NewMemoryStore()
-	}
-
-	signer, err := terminator.LoadKeyring(cfg.Paths.SignerKeyring)
+	signer, err := terminator.LoadOrCreateKeyring(cfg.Paths.SignerKeyring)
 	if err != nil {
+		failCleanup()
 		return nil, fmt.Errorf("gripline: signer: %w", err)
 	}
 
 	// P0.1 fix: Instantiate each authority exactly once
-	lanes := lane.NewStore(nil, time.Now)
 	governor := resource.NewGovernor(nil)
 	spray := anomaly.NewDetector(time.Now, anomaly.DefaultThresholds())
 	ctrl := control.New(0)
@@ -119,6 +165,7 @@ func BuildRuntime(cfg *config.Config) (*Runtime, error) {
 	if state != nil {
 		p, err := state.LoadPosture()
 		if err != nil {
+			failCleanup()
 			return nil, fmt.Errorf("gripline: load posture: %w", err)
 		}
 		ctrl.Restore(p)
@@ -129,7 +176,7 @@ func BuildRuntime(cfg *config.Config) (*Runtime, error) {
 	term, err := terminator.New(terminator.Dependencies{
 		Registry: reg,
 		Peppers:  peppers,
-		Lanes:    lanes, // Shared lane store
+		Lanes:    lanes, // Shared lane authority
 		Policy:   pol,
 		Signer:   signer,
 		Audience: cfg.Identity.Audience,
@@ -145,6 +192,7 @@ func BuildRuntime(cfg *config.Config) (*Runtime, error) {
 		},
 	})
 	if err != nil {
+		failCleanup()
 		return nil, fmt.Errorf("gripline: terminator: %w", err)
 	}
 
@@ -153,10 +201,25 @@ func BuildRuntime(cfg *config.Config) (*Runtime, error) {
 		return nil, err
 	}
 	transport := &http.Transport{
-		MaxIdleConnsPerHost:   cfg.Backend.MaxIdleConnsPerHost,
-		ResponseHeaderTimeout: cfg.Backend.Timeout.D(),
-		IdleConnTimeout:       cfg.Server.IdleTimeout.D(),
+		MaxIdleConnsPerHost: cfg.Backend.MaxIdleConnsPerHost,
+		IdleConnTimeout:     cfg.Server.IdleTimeout.D(),
 	}
+	// Split backend timeouts (P0.16): each phase defaults to backend.timeout.
+	dialTimeout := cfg.Backend.Timeout.D()
+	if cfg.Backend.DialTimeout.D() > 0 {
+		dialTimeout = cfg.Backend.DialTimeout.D()
+	}
+	tlsHandshakeTimeout := cfg.Backend.Timeout.D()
+	if cfg.Backend.TLSHandshakeTimeout.D() > 0 {
+		tlsHandshakeTimeout = cfg.Backend.TLSHandshakeTimeout.D()
+	}
+	respHeaderTimeout := cfg.Backend.Timeout.D()
+	if cfg.Backend.ResponseHeaderTimeout.D() > 0 {
+		respHeaderTimeout = cfg.Backend.ResponseHeaderTimeout.D()
+	}
+	transport.DialContext = (&net.Dialer{Timeout: dialTimeout}).DialContext
+	transport.TLSHandshakeTimeout = tlsHandshakeTimeout
+	transport.ResponseHeaderTimeout = respHeaderTimeout
 	if backend.Scheme == "https" {
 		transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
 	}
@@ -164,7 +227,17 @@ func BuildRuntime(cfg *config.Config) (*Runtime, error) {
 	// P0.6: Build the trusted ingress source resolver if configured.
 	var srcResolver *proxy.IngressSourceResolver
 	if cfg.Ingress != nil && cfg.Ingress.PseudonymKey != "" {
-		pseudonyms, err := pseudonymRingFromKey(cfg.Ingress.PseudonymKey)
+		pseudoKey, err := decodeSecretKey("ingress.pseudonym_key", cfg.Ingress.PseudonymKey, 32)
+		if err != nil {
+			return nil, err
+		}
+		// P0-17: key-separation — the pseudonymization HMAC key must differ
+		// from the credential verifier pepper; reusing one secret across two
+		// domains lets a value in either domain be replayed into the other.
+		if string(pseudoKey) == string(pepperKey) {
+			return nil, fmt.Errorf("gripline: ingress.pseudonym_key must differ from GRIPLINE_PEPPER_V1 (key separation)")
+		}
+		pseudonyms, err := pseudonymRingFromKey(pseudoKey)
 		if err != nil {
 			return nil, fmt.Errorf("gripline: ingress pseudonym key: %w", err)
 		}
@@ -189,6 +262,13 @@ func BuildRuntime(cfg *config.Config) (*Runtime, error) {
 		Transport:    transport,
 		Audience:     cfg.Identity.Audience,
 		MaxBodyBytes: cfg.Server.MaxBodyBytes,
+		// P0.16 streaming timeout scheme: when the idle bound is configured the
+		// data plane owns per-request write deadlines (initial full budget,
+		// re-armed per chunk); main.go must then run the server with
+		// WriteTimeout 0 so the per-request deadlines govern instead of the
+		// blanket one that would kill long-lived SSE streams.
+		WriteTimeout:           cfg.Server.WriteTimeout.D(),
+		StreamWriteIdleTimeout: cfg.Server.StreamWriteIdleTimeout.D(),
 	}
 	// P0.6: Only wire a source resolver when ingress is configured. Leaving
 	// Sources nil defaults to NoSource (source-scoped features inert).
@@ -197,21 +277,44 @@ func BuildRuntime(cfg *config.Config) (*Runtime, error) {
 	}
 	dp, err := proxy.New(proxyCfg)
 	if err != nil {
+		failCleanup()
 		return nil, fmt.Errorf("gripline: proxy: %w", err)
 	}
 
 	var adminSrv *http.Server
+	var adminSvc *control.Service
 	if cfg.Admin != nil {
-		audit, err := control.NewFileAuditRepository(cfg.Paths.AuditLog)
-		if err != nil {
-			return nil, err
+		// P0.5-fix: when state-backed, the Bolt store is the AUTHORITATIVE
+		// operator audit sink — every operator action appends into the same
+		// transactional database as the mutation it documents. The JSONL file
+		// is an optional post-commit mirror, never a second authority.
+		var audit control.AuditRepository
+		if state != nil {
+			audit = state
+			if cfg.Paths.AuditLog != "" {
+				log.Printf("gripline: paths.audit_log %q is an optional JSONL mirror; the state database is the authoritative operator audit", cfg.Paths.AuditLog)
+				mirror, err := control.NewFileAuditRepository(cfg.Paths.AuditLog)
+				if err != nil {
+					failCleanup()
+					return nil, err
+				}
+				closers = append(closers, func() error { return mirror.Close() })
+			}
+		} else {
+			fileAudit, err := control.NewFileAuditRepository(cfg.Paths.AuditLog)
+			if err != nil {
+				failCleanup()
+				return nil, err
+			}
+			audit = fileAudit
+			closers = append(closers, func() error { return fileAudit.Close() })
 		}
-		closers = append(closers, func() error { return audit.Close() })
 
 		tokens := make(map[string]*control.Identity, len(cfg.Admin.OperatorTokens))
 		for tok, spec := range cfg.Admin.OperatorTokens {
 			name, caps, err := parseSpec(spec)
 			if err != nil {
+				failCleanup()
 				return nil, fmt.Errorf("gripline: admin token: %w", err)
 			}
 			cs := make([]control.Capability, 0, len(caps))
@@ -222,31 +325,37 @@ func BuildRuntime(cfg *config.Config) (*Runtime, error) {
 		}
 		auth, err := control.NewTokenAuthenticator(tokens)
 		if err != nil {
+			failCleanup()
 			return nil, err
 		}
 
-		// P0.1 fix: Use the SAME lane store as the terminator
+		// P0.1 fix: use the SAME lane authority as the terminator.
 		opts := []control.ServiceOption{
 			control.WithCredentialOperator(reg),
-			control.WithLaneOperator(control.LaneUnblockAdapter{Unblock: func(credID, laneID, actor, reason string, now time.Time) error {
-				_, err := lanes.Unblock(credID, laneID, actor, reason, now)
-				return err
-			}}),
 		}
-		// P0.10: persist + audit emergency transitions atomically through the
-		// state store so lockdown survives restart.
+		// P0.18-fix: when state-backed, EVERY operator mutation (credential
+		// revoke, lane unblock, posture) commits with its audit row in one
+		// transaction via control.MutationStore. The lane-unblock path also
+		// commits its lane-side audit entry atomically inside the state store
+		// (P0.49).
 		if state != nil {
-			opts = append(opts, control.WithPosturePersister(func(ctx context.Context, target control.Posture, actor, reason string) error {
-				return state.SetPostureWithAudit(ctx, target, control.OperatorRecord{
-					At: time.Now().UTC(), Actor: actor, Action: "posture.set_emergency",
-					Target: "global", Reason: reason, Posture: target.String(), Committed: true,
-				})
-			}))
+			opts = append(opts, control.WithMutationStore(state))
+		} else {
+			opts = append(opts, control.WithLaneOperator(control.LaneUnblockAdapter{Unblock: func(credID, laneID, actor, reason string, now time.Time) error {
+				mem, ok := lanes.(*lane.Store)
+				if !ok {
+					return fmt.Errorf("gripline: lane unblock requires the resident lane store in ephemeral mode")
+				}
+				_, err := mem.Unblock(credID, laneID, actor, reason, now)
+				return err
+			}}))
 		}
 		svc, err := control.NewService(ctrl, auth, audit, opts...)
 		if err != nil {
+			failCleanup()
 			return nil, err
 		}
+		adminSvc = svc
 
 		mux := http.NewServeMux()
 		mux.HandleFunc("/admin/posture", adminPosture(svc))
@@ -261,33 +370,38 @@ func BuildRuntime(cfg *config.Config) (*Runtime, error) {
 	}
 
 	return &Runtime{
-		Registry:  reg,
-		Lanes:     lanes, // Shared lane store
-		Evidence:  evStore,
-		Resource:  governor, // Shared resource governor
-		Control:   ctrl,     // Shared control plane
-		Spray:     spray,    // Shared spray detector
-		Signer:    signer,
-		Policy:    pol,
-		State:     state,
-		Audience:  cfg.Identity.Audience,
-		DataPlane: dp,
-		Admin:     adminSrv,
-		closers:   closers,
+		Registry:     reg,
+		Lanes:        lanes, // Shared lane authority
+		AdminService: adminSvc,
+		Evidence:     evStore,
+		Resource:     governor, // Shared resource governor
+		Control:      ctrl,     // Shared control plane
+		Spray:        spray,    // Shared spray detector
+		Signer:       signer,
+		Policy:       pol,
+		State:        state,
+		Audience:     cfg.Identity.Audience,
+		DataPlane:    dp,
+		Admin:        adminSrv,
+		closers:      closers,
 	}, nil
 }
 
+// Close releases the runtime's resources exactly once (P1.23). Errors from
+// individual closers are aggregated.
 func (rt *Runtime) Close() error {
-	var errs []error
-	for _, fn := range rt.closers {
-		if err := fn(); err != nil {
-			errs = append(errs, err)
+	rt.closeOnce.Do(func() {
+		var errs []error
+		for _, fn := range rt.closers {
+			if err := fn(); err != nil {
+				errs = append(errs, err)
+			}
 		}
-	}
-	if len(errs) > 0 {
-		return fmt.Errorf("gripline: close errors: %v", errs)
-	}
-	return nil
+		if len(errs) > 0 {
+			rt.closeErr = fmt.Errorf("gripline: close errors: %v", errs)
+		}
+	})
+	return rt.closeErr
 }
 
 func adminPosture(svc *control.Service) http.HandlerFunc {
@@ -338,7 +452,7 @@ func parseSpec(spec string) (string, []string, error) {
 	return strings.TrimSpace(name), out, nil
 }
 
-func bootstrapCredentials(reg credential.Registry, pepper string) error {
+func bootstrapCredentials(reg credential.Registry, pepperKey []byte) error {
 	// Bootstrap prefers the Provisioner seam (InsertIfAbsent) so an env-provided
 	// credential never overwrites a durable, operator-managed one (P0.10). A
 	// registry that does not support provisioning (must be provisioned out of
@@ -372,7 +486,7 @@ func bootstrapCredentials(reg credential.Registry, pepper string) error {
 
 	if credSecret := os.Getenv("GRIPLINE_CREDENTIAL_SECRET"); credSecret != "" {
 		sealed := secret.NewFromBytes([]byte(credSecret))
-		verifier := credential.Verifier(sealed, &credential.PepperKey{Version: 1, Key: []byte(pepper)})
+		verifier := credential.Verifier(sealed, &credential.PepperKey{Version: 1, Key: pepperKey})
 		credID := os.Getenv("GRIPLINE_CREDENTIAL_ID")
 		if credID == "" {
 			credID = "cred_bootstrap"
@@ -401,12 +515,37 @@ func bootstrapCredentials(reg credential.Registry, pepper string) error {
 
 // pseudonymRingFromKey builds an ingress.PseudonymRing from a raw HMAC key
 // (P0.6). The pseudonym key MUST be distinct from the credential pepper.
-func pseudonymRingFromKey(key string) (ingress.PseudonymRing, error) {
-	ring, err := pseudonym.NewRing(&pseudonym.Key{Version: 1, Secret: []byte(key)})
+func pseudonymRingFromKey(key []byte) (ingress.PseudonymRing, error) {
+	ring, err := pseudonym.NewRing(&pseudonym.Key{Version: 1, Secret: key})
 	if err != nil {
 		return nil, err
 	}
 	return &pseudonymRingAdapter{ring: ring}, nil
+}
+
+// decodeSecretKey decodes a base64 (standard or URL-safe, padding optional)
+// secret-material configuration value and enforces a minimum DECODED length
+// (P0-17): a deployment key must carry real entropy, not an ASCII passphrase.
+// Raw (non-base64) values are rejected so short/low-entropy secrets cannot
+// sneak past the length check via encoding confusion.
+func decodeSecretKey(what, encoded string, minBytes int) ([]byte, error) {
+	enc := strings.TrimSpace(encoded)
+	trimmed := strings.TrimRight(enc, "=")
+	var key []byte
+	var err error
+	switch {
+	case strings.ContainsAny(trimmed, "-_"):
+		key, err = base64.RawURLEncoding.DecodeString(enc)
+	default:
+		key, err = base64.StdEncoding.DecodeString(enc)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("gripline: %s must be base64-encoded (got decode error: %v)", what, err)
+	}
+	if len(key) < minBytes {
+		return nil, fmt.Errorf("gripline: %s must decode to at least %d bytes of entropy, got %d", what, minBytes, len(key))
+	}
+	return key, nil
 }
 
 // pseudonymRingAdapter adapts a *pseudonym.Ring to ingress.PseudonymRing.

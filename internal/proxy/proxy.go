@@ -23,6 +23,7 @@ import (
 	"net/url"
 	"path"
 	"strings"
+	"time"
 
 	"github.com/B-A-M-N/gripline/internal/lane"
 	"github.com/B-A-M-N/gripline/internal/resource"
@@ -68,9 +69,17 @@ type FeatureResolver interface {
 // a sanitized Observation. It is the trusted-ingress seam: a production
 // deployment supplies one backed by its RealIP configuration and an ASN
 // database; the default trusts nothing and returns the zero TrustedSource
-// (source-scoped features inert for that request).
+// with a nil error (source-scoped features inert for that request).
+//
+// A NON-NIL error means the configured source identity could not be
+// established (malformed peer, pseudonymization failure, ...). The proxy fails
+// closed (503, backend never reached) rather than silently degrading to "no
+// source" — an explicitly configured source boundary must not disable itself
+// on resolver errors. Optional enrichment that is merely absent (no ASN
+// metadata configured) is not an error: it returns the identity it could
+// establish with a nil error.
 type SourceResolver interface {
-	ResolveSource(obs Observation) terminator.TrustedSource
+	ResolveSource(obs Observation) (terminator.TrustedSource, error)
 }
 
 // Peer is retained for adapter compatibility; resolvers should prefer the
@@ -146,11 +155,15 @@ func endpointFamily(path string) string {
 
 // NoSource is the default SourceResolver: it derives no trusted source
 // identity, so source-scoped features stay inert per request (P0.4 fail-closed
-// default — an unknown source is not attributed to any bucket).
+// default — an unknown source is not attributed to any bucket). No error: an
+// unconfigured source boundary is a deliberate posture, not a resolution
+// failure.
 type NoSource struct{}
 
-// ResolveSource returns the zero TrustedSource.
-func (NoSource) ResolveSource(Observation) terminator.TrustedSource { return terminator.TrustedSource{} }
+// ResolveSource returns the zero TrustedSource and a nil error.
+func (NoSource) ResolveSource(Observation) (terminator.TrustedSource, error) {
+	return terminator.TrustedSource{}, nil
+}
 
 // Config wires the data plane. Terminator, BackendURL, and Audience are
 // REQUIRED (P0.7); Transport is the upstream round tripper (defaults to
@@ -172,45 +185,109 @@ type Config struct {
 	// at the backend (INV-11 binding).
 	Audience string
 	// Usage (P0.3) supplies the typed per-dimension usage knowledge: the
-	// ESTIMATE admission reserves before execution, and the ACTUAL usage the
-	// reservation settles against after the backend responds. Nil uses the
-	// minimal {Requests: 1} both ways — correct for pure-request accounting;
-	// token/cost dimension enforcement requires a real provider adapter.
-	Usage UsageEstimator
+	// ESTIMATE admission reserves before execution, and the streaming METERING
+	// session whose Finish() is what settlement charges. Nil uses the minimal
+	// {Requests: 1} both ways — correct for pure-request accounting; token/cost
+	// dimension enforcement requires a real provider adapter.
+	Usage UsageProvider
+
+	// Observer, when set, receives non-secret operational completion events
+	// (P0.9): whether completion evidence persisted, and stream outcomes. It
+	// never receives request/response content. Nil means no observation.
+	Observer DecisionObserver
 
 	// MaxBodyBytes caps the request body (BETA-08). Inference prompts can be
 	// large but are not unbounded. Oversized bodies are rejected with 413
 	// BEFORE admission. Zero disables the limit (not recommended).
 	MaxBodyBytes int64
+
+	// WriteTimeout is the initial response budget, from WriteHeader until the
+	// first deadline expiry. Zero = no server-managed write deadline change
+	// (the http.Server's WriteTimeout applies as-is).
+	WriteTimeout time.Duration
+	// StreamWriteIdleTimeout re-arms the write deadline after EVERY forwarded
+	// chunk (P0.16): a streaming response may run arbitrarily long while
+	// tokens are flowing, but a stalled stream is cut after this much
+	// silence. Requires WriteTimeout > 0 to take effect (the server must run
+	// with WriteTimeout 0 so the per-request deadlines govern).
+	StreamWriteIdleTimeout time.Duration
 }
 
-// UsageEstimator is the provider-adapter seam for resource accounting (P0.3).
-// Estimate is what admission reserves (what is knowable before execution);
-// Actual is what settlement charges (collected from the backend's response —
-// usage headers or a metering API). Actual receives the response so a
-// provider adapter can read provider-specific usage headers.
-type UsageEstimator interface {
+// UsageProvider is the provider-adapter seam for resource accounting (P0.3,
+// P0.8): Estimate is what admission reserves (what is knowable before
+// execution); Begin opens the per-request METERING SESSION the moment the
+// backend response headers arrive. A session sees every streamed body chunk as
+// it is forwarded (ObserveChunk) and produces the settled usage at
+// end-of-stream (Finish) — so token/cost enforcement can read the final JSON/SSE
+// usage envelope without buffering the stream or retaining prompt/completion
+// content. A provider must parse only bounded usage metadata.
+type UsageProvider interface {
 	Estimate(obs Observation) resource.UsageEstimate
-	Actual(obs Observation, resp *http.Response) resource.UsageEstimate
+	Begin(obs Observation, resp *http.Response) UsageSession
 }
 
-// NoUsage is the default UsageEstimator: one request per admission, settled
-// at one request. Token/cost gauges stay inert (a zero estimate reserves
-// nothing, and the governor skips unenforced dimensions).
+// UsageSession meters ONE in-flight streamed response. ObserveChunk receives
+// each body chunk exactly once, in stream order, immediately before the same
+// bytes are forwarded to the client. Finish is called exactly once at stream
+// end; streamErr is nil for a clean EOF and non-nil when the stream failed
+// (upstream read error or client disconnect). The returned estimate is what
+// settlement charges. Implementations must not retain chunk contents beyond the
+// call.
+type UsageSession interface {
+	ObserveChunk(chunk []byte)
+	Finish(streamErr error) resource.UsageEstimate
+}
+
+// NoUsage is the default UsageProvider: one request per admission, settled at
+// one request. Token/cost gauges stay inert (a zero estimate reserves nothing,
+// and the governor skips unenforced dimensions).
 type NoUsage struct{}
 
-func (NoUsage) Estimate(Observation) resource.UsageEstimate { return resource.UsageEstimate{Requests: 1} }
-func (NoUsage) Actual(Observation, *http.Response) resource.UsageEstimate {
+func (NoUsage) Estimate(Observation) resource.UsageEstimate {
 	return resource.UsageEstimate{Requests: 1}
+}
+
+func (NoUsage) Begin(Observation, *http.Response) UsageSession { return noUsageSession{} }
+
+type noUsageSession struct{}
+
+func (noUsageSession) ObserveChunk([]byte) {}
+func (noUsageSession) Finish(error) resource.UsageEstimate {
+	return resource.UsageEstimate{Requests: 1}
+}
+
+// DecisionObserver receives non-secret operational completion events (P0.9).
+// The API surface of Outcome.Complete reports persistence failure, but only an
+// observer makes that visible in a shipping binary: the client response is
+// already delivered and must not change. Implementations receive metadata only
+// — never prompts, completions, or credentials.
+type DecisionObserver interface {
+	// ObserveCompletion is invoked once per completed request. persisted
+	// reports whether completion evidence (when any was produced) reached the
+	// durable store; err is the persistence/stream error, nil on full success.
+	ObserveCompletion(event CompletionEvent)
+}
+
+// CompletionEvent is the non-secret completion telemetry record.
+type CompletionEvent struct {
+	// EvidenceCodes lists completion-signal codes minted for this request.
+	EvidenceCodes []string
+	// Persisted reports whether minted evidence reached the store.
+	Persisted bool
+	// StreamOK reports whether the upstream stream ended cleanly.
+	StreamOK bool
+	// Err is the completion-persistence error, when persistence was attempted
+	// and failed.
+	Err error
 }
 
 // DataPlane is a single terminate-and-forward proxy hop. It is CONCURRENT-SAFE
 // (stateless besides the terminator), so a single instance can serve the whole
 // edge.
 type DataPlane struct {
-	cfg    Config
-	feat   FeatureResolver
-	srcs   SourceResolver
+	cfg     Config
+	feat    FeatureResolver
+	srcs    SourceResolver
 	backend *url.URL
 }
 
@@ -267,24 +344,26 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "payload_too_large", http.StatusRequestEntityTooLarge)
 			return
 		}
-		// P0.16: Bounded spooling for chunked/unknown-length bodies. Read
-		// the body with an absolute cap, spooling to a temp file if it
+		// P0.16/P0.6-fix: Bounded spooling for chunked/unknown-length bodies.
+		// Read the body with an absolute cap, spooling to a temp file if it
 		// exceeds a memory threshold. This prevents an unauthenticated
 		// attacker from causing large per-connection allocations (32
-		// simultaneous 32MB requests = ~1GB).
+		// simultaneous 32MB requests = ~1GB). maxBytes is the actual limit:
+		// the spooler sets tooLarge when input remains past it, so an
+		// oversized chunked body is rejected 413, never truncated-and-forwarded.
 		if r.ContentLength < 0 {
-			body, err := spoolBody(r.Body, d.cfg.MaxBodyBytes+1, spoolMemoryThreshold)
+			body, err := spoolBody(r.Body, d.cfg.MaxBodyBytes, spoolMemoryThreshold)
 			if err != nil {
 				http.Error(w, "bad_request", http.StatusBadRequest)
 				return
 			}
 			r.Body.Close()
 			if body.tooLarge {
-				cleanupBody(body)
+				_ = body.Close() // closes + removes any temp file
 				http.Error(w, "payload_too_large", http.StatusRequestEntityTooLarge)
 				return
 			}
-			r.Body = body
+			r.Body = body // body.Close() removes the temp file when the transport closes it
 			r.ContentLength = body.length
 		} else {
 			// Known Content-Length within limit: use MaxBytesReader for safety.
@@ -323,7 +402,17 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ProtoMajor: r.ProtoMajor,
 		URLPath:    r.URL.Path,
 	}
-	src := d.srcs.ResolveSource(obs)
+	// P0.11-fix: a configured source resolver that FAILS must fail the request
+	// closed, not silently degrade to "no source" (which would disable the
+	// source boundary exactly when resolution is broken). NoSource and healthy
+	// resolvers return a nil error; optional metadata (ASN/region) being absent
+	// is not an error.
+	src, srcErr := d.srcs.ResolveSource(obs)
+	if srcErr != nil {
+		w.Header().Set("X-Gripline-Reason", "source_resolution_failed")
+		http.Error(w, "source_resolution_failed", http.StatusServiceUnavailable)
+		return
+	}
 	feat := d.feat.Resolve(obs)
 	// P0.6B: Merge trusted source network provenance into features. Trusted
 	// ingress metadata is the authority; the generic feature resolver's values
@@ -390,18 +479,46 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// 6. Copy the backend response headers + status, stream the body back.
 	copyResponseHeaders(w.Header(), resp.Header)
+	// P0.16 streaming timeouts: when stream_write_idle_timeout is configured,
+	// the initial write deadline carries the full write budget; every
+	// forwarded chunk then re-arms it to the idle bound. A live SSE stream
+	// runs arbitrarily long; a stalled one is cut after the idle silence.
+	var rc *http.ResponseController
+	streamIdle := time.Duration(0)
+	if d.cfg.WriteTimeout > 0 && d.cfg.StreamWriteIdleTimeout > 0 {
+		rc = http.NewResponseController(w)
+		streamIdle = d.cfg.StreamWriteIdleTimeout
+		_ = rc.SetWriteDeadline(time.Now().Add(d.cfg.WriteTimeout))
+	}
 	w.WriteHeader(resp.StatusCode)
+	// P0.8: open the streaming metering session NOW — before any body byte
+	// moves — so the meter sees every chunk of the final response, including
+	// the SSE/JSON usage envelope that only exists at end-of-stream. The
+	// session sees bounded usage metadata only; chunk contents are never
+	// retained by the proxy's own flow.
+	meter := d.cfg.Usage.Begin(obs, resp)
 	// Stream the body, flushing eagerly so SSE/chunked semantics survive the
 	// hop (P0.40): a buffering proxy would still produce a correct final body,
 	// which is exactly the failure mode a final-concatenation check cannot
 	// distinguish from true streaming. Per-chunk Flush keeps chunk arrival
 	// times bounded by the backend's, not the response's end.
 	flusher, _ := w.(http.Flusher)
+	// P0.16: the write deadline alone cannot cut a STALLED stream — a write
+	// deadline only fires at write time, and a dead backend produces no
+	// writes. The body reader wraps the upstream body with the idle bound so
+	// a silent upstream unblocks the loop too.
+	var body io.Reader = resp.Body
+	if streamIdle > 0 && rc != nil {
+		body = newIdleTimeoutReader(resp.Body, streamIdle)
+	}
 	buf := make([]byte, 32<<10)
 	var streamErr error
 	for {
-		n, rerr := resp.Body.Read(buf)
+		n, rerr := body.Read(buf)
 		if n > 0 {
+			// Meter the chunk first, then forward the SAME bytes unchanged —
+			// the meter is a read-only observer of the stream.
+			meter.ObserveChunk(buf[:n])
 			if _, werr := w.Write(buf[:n]); werr != nil {
 				// Client went away; the deferred release runs.
 				streamErr = werr
@@ -409,6 +526,10 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			if flusher != nil {
 				flusher.Flush()
+			}
+			if streamIdle > 0 {
+				// P0.16: tokens are flowing — re-arm the idle bound.
+				_ = rc.SetWriteDeadline(time.Now().Add(streamIdle))
 			}
 		}
 		if rerr != nil {
@@ -420,12 +541,13 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 7. Settle + complete at ACTUAL end-of-stream (P0.3/P0.36/P0.4A). Resource
-	// settlement was deliberately NOT done on response headers: for LLM APIs the
-	// real usage (token/cost) is reported in the final JSON/SSE envelope, which
-	// only exists after the body is consumed. A provider's Actual() reads that
-	// final surface; a header-only implementation still settles correctly here.
-	actual := d.cfg.Usage.Actual(obs, resp)
+	// 7. Settle + complete at ACTUAL end-of-stream (P0.3/P0.36/P0.8/P0.4A).
+	// Resource settlement was deliberately NOT done on response headers: for
+	// LLM APIs the real usage (token/cost) is reported in the final JSON/SSE
+	// envelope, which the metering session has now observed chunk-by-chunk.
+	// Finish produces the settled usage from that final surface; a header-only
+	// provider implementation still settles correctly here.
+	actual := meter.Finish(streamErr)
 	// P0.36: only the reserved-but-unused remainder is refunded, and only to this
 	// reservation's own buckets. Runs BEFORE the deferred Release so unsettled
 	// holds are never cancelled-and-refunded in full. Concurrency is released by
@@ -436,7 +558,18 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// P0.4A: drive the completion producers with the ACTUAL usage. `success`
 	// is false when the upstream stream failed, so a corrupt/failed stream is
 	// not credited as clean velocity. This affects SUBSEQUENT admissions.
-	out.Complete(actual, streamErr == nil)
+	completion := out.Complete(actual, streamErr == nil)
+	// P0.9: surface completion-persistence failure through the observer seam —
+	// the client response is already delivered and must not change, but a
+	// shipping binary must not silently discard the Complete() result.
+	if d.cfg.Observer != nil {
+		d.cfg.Observer.ObserveCompletion(CompletionEvent{
+			EvidenceCodes: completion.EvidenceCodes,
+			Persisted:     completion.Persisted,
+			StreamOK:      streamErr == nil,
+			Err:           completion.Err,
+		})
+	}
 	// P0.27/P0.17: Finalize baseline trust ONLY after successful stream
 	// completion. A request whose backend stream corrupts/fails earns no clean
 	// trust.

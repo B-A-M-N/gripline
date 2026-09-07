@@ -17,14 +17,14 @@ import (
 // All thresholds must be strictly ordered: 0 < Watch < Constrained < Quarantine <= 100.
 // Down-thresholds govern automatic recovery from elevated states.
 type RiskThresholds struct {
-	Watch             int // escalate to WATCH if risk >= this
-	Constrained       int // escalate to CONSTRAINED if risk >= this
-	Quarantine        int // escalate to QUARANTINED if risk >= this
-	ConstrainedDownThresh int // CONSTRAINED→WATCH if risk < this
-	WatchDownThresh   int // WATCH→NORMAL if risk < this
-	ConstrainedDwell  time.Duration // dwell time for CONSTRAINED→WATCH recovery
-	WatchDwell        time.Duration // dwell time for WATCH→NORMAL recovery
-	WatchObs          int           // qualifying observations needed for WATCH entry
+	Watch                 int           // escalate to WATCH if risk >= this
+	Constrained           int           // escalate to CONSTRAINED if risk >= this
+	Quarantine            int           // escalate to QUARANTINED if risk >= this
+	ConstrainedDownThresh int           // CONSTRAINED→WATCH if risk < this
+	WatchDownThresh       int           // WATCH→NORMAL if risk < this
+	ConstrainedDwell      time.Duration // dwell time for CONSTRAINED→WATCH recovery
+	WatchDwell            time.Duration // dwell time for WATCH→NORMAL recovery
+	WatchObs              int           // qualifying observations needed for WATCH entry
 
 	// EnableAutomaticQuarantine gates the durable QUARANTINED status escalation
 	// (§102 phase 6, Gate H). Automatic quarantine MUST be disabled until shadow
@@ -91,8 +91,9 @@ type BucketConfig struct {
 }
 
 // Learning controls baseline seeding (§29, §42) and lane promotion criteria.
-type Learning struct {	MaximumRisk          int
-	AllowNewLanes        bool
+type Learning struct {
+	MaximumRisk   int
+	AllowNewLanes bool
 	// AllowSuspiciousLanes is DEPRECATED and has no effect. SUSPICIOUS/BLOCKED
 	// lanes NEVER promote (INV-8). This field is retained for wire compatibility
 	// but is ignored by PromoteIfEligible — it remains here so existing policy
@@ -144,13 +145,13 @@ type Policy struct {
 	ID       string
 	Revision int
 
-	Risk     RiskThresholds
-	Limits   ScopedLimits
+	Risk   RiskThresholds
+	Limits ScopedLimits
 	// Global carries the whole-plane (fleet) limits (P0.19). Global replaces
 	// the old magic Normal.ConcurrencyCap*1024 derivation; a zero
 	// Global.ConcurrencyCap disables the fleet gauge. Leaving Tokens/Cost zero
 	// keeps the fleet bound concurrency-only unless a deployment authors them.
-	Global Limits
+	Global   Limits
 	Learning Learning
 	Privacy  Privacy
 	Identity Identity
@@ -202,14 +203,14 @@ func Default() *Policy {
 		ID:       "fi-default-v1",
 		Revision: 1,
 		Risk: RiskThresholds{
-			Watch:                30,
-			Constrained:          55,
-			Quarantine:           80,
+			Watch:                 30,
+			Constrained:           55,
+			Quarantine:            80,
 			ConstrainedDownThresh: 40,
-			WatchDownThresh:      20,
-			ConstrainedDwell:     15 * time.Minute,
-			WatchDwell:           30 * time.Minute,
-			WatchObs:             2,
+			WatchDownThresh:       20,
+			ConstrainedDwell:      15 * time.Minute,
+			WatchDwell:            30 * time.Minute,
+			WatchObs:              2,
 			// P0.7: source blocking is shadow-only by default in the public
 			// beta. SourceBlockThresh is recorded so telemetry can truthfully
 			// report "would block under enforcement", but SourceMode stays
@@ -368,6 +369,17 @@ func (p *Policy) IsValid() bool {
 	if t.WatchObs < 1 {
 		return false
 	}
+	// P1-20: the source-scoped block threshold is a real enforcement gate, so
+	// it must be in range 1..100 in BOTH modes — an out-of-range value in
+	// SourceObserve would silently promise a block point telemetry can never
+	// observe, and in SourceEnforce it would either never fire (0 is
+	// unreachable below Watch) or always fire (>100).
+	if t.SourceBlockThresh < 1 || t.SourceBlockThresh > 100 {
+		return false
+	}
+	if t.SourceMode != SourceObserve && t.SourceMode != SourceEnforce {
+		return false
+	}
 	// Promotion criteria must be non-negative and within bounds.
 	if p.Learning.MaxEstablishmentRisk < 0 || p.Learning.MaxEstablishmentRisk > 100 {
 		return false
@@ -455,7 +467,6 @@ func (p *Policy) MaxIdentityTTLSeconds() int {
 	}
 	return p.Identity.MaxTTLSeconds
 }
-
 
 // ErrRevoked / ErrEmergency / ErrSourceBlocked / ErrHardLimit / ErrRisk are the
 // precedence outcomes (ordered highest → lowest). The evaluator returns the

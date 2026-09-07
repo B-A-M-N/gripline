@@ -110,7 +110,7 @@ func TestPromotionGate(t *testing.T) {
 	// New lane must not promote unless seeding allowed.
 	rec := &LaneRecord{
 		LaneID: "l", CredentialID: "c", State: StateNew,
-		FirstSeenAt: now.Add(-10 * 24 * time.Hour),
+		FirstSeenAt:  now.Add(-10 * 24 * time.Hour),
 		RequestCount: 500, RiskScore: 5,
 		AuthorizedCleanRequests: 500, // Meets MinCleanRequests
 		ActiveDays:              5,

@@ -57,9 +57,15 @@ func parseSubcommand(args []string) (string, []string) {
 // dispatchSubcommand runs a non-server subcommand. Supported:
 //
 //	gripline keys export --config path.json
+//	gripline credential list|revoke --config path.json [...]
+//	gripline lane list|unblock --config path.json [...]
+//	gripline status --config path.json
 //
-// prints the PUBLIC backend verification material (active kid + all retained
-// public keys) as JSON to stdout — never any private/signing material (P0.15).
+// keys export prints the PUBLIC backend verification material (active kid +
+// all retained public keys) as JSON to stdout — never any private/signing
+// material (P0.15). The lifecycle subcommands operate through the control
+// plane's authorization + atomic mutation/audit seams and never touch raw
+// credential secrets (P1-26).
 func dispatchSubcommand(sub string, args []string) error {
 	switch sub {
 	case "keys":
@@ -73,8 +79,19 @@ func dispatchSubcommand(sub string, args []string) error {
 			return err
 		}
 		return runKeysExport(*cfgPath)
+	case "credential":
+		return runCredentialCLI(args)
+	case "lane":
+		return runLaneCLI(args)
+	case "status":
+		fs := flag.NewFlagSet("status", flag.ExitOnError)
+		cfgPath := fs.String("config", "/etc/gripline/config.json", "path to the deployment configuration")
+		if err := fs.Parse(args); err != nil {
+			return err
+		}
+		return runStatusCLI(*cfgPath)
 	default:
-		return fmt.Errorf("unknown subcommand %q (expected: keys)", sub)
+		return fmt.Errorf("unknown subcommand %q (expected: keys, credential, lane, status)", sub)
 	}
 }
 
@@ -126,7 +143,14 @@ func run(cfgPath string) error {
 	if err != nil {
 		return err
 	}
-	defer rt.Close()
+	// P1-23: a failed Close (unflushed audit mirror, bbolt corruption on
+	// final sync) is an operational error, not something to discard — it must
+	// propagate after the (successful) shutdown path so supervision sees it.
+	defer func() {
+		if cerr := rt.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
 
 	// --- Public server -------------------------------------------------------
 	root := http.NewServeMux()
@@ -137,21 +161,38 @@ func run(cfgPath string) error {
 	})
 	var ready atomic.Bool
 	ready.Store(true)
+	// P1-24: readiness is a REAL check — the state authority must answer a
+	// probe read (when state-backed) and the process must not be draining. A
+	// failed probe is a 503 so the load balancer stops routing, not a 200
+	// that lies.
 	root.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
 		if !ready.Load() {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_, _ = w.Write([]byte("draining"))
 			return
 		}
+		if err := rt.Ready(); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("not_ready"))
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
 
+	writeTimeout := cfg.Server.WriteTimeout.D()
+	// P0.16: with stream_write_idle_timeout configured, per-request write
+	// deadlines govern (initial budget + per-chunk re-arm inside the data
+	// plane). A blanket server WriteTimeout here would kill legitimate
+	// long-lived SSE streams at the budget regardless of liveness.
+	if cfg.Server.StreamWriteIdleTimeout.D() > 0 {
+		writeTimeout = 0
+	}
 	srv := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           root,
 		ReadTimeout:       cfg.Server.ReadTimeout.D(),
-		WriteTimeout:      cfg.Server.WriteTimeout.D(),
+		WriteTimeout:      writeTimeout,
 		IdleTimeout:       cfg.Server.IdleTimeout.D(),
 		ReadHeaderTimeout: cfg.Server.ReadHeaderTimeout.D(),
 		MaxHeaderBytes:    cfg.Server.MaxHeaderBytes,

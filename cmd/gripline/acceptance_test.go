@@ -27,7 +27,7 @@ func TestAcceptanceBuildRuntime(t *testing.T) {
 	os.Setenv("GRIPLINE_CREDENTIAL_SECRET", externalSecret)
 	os.Setenv("GRIPLINE_CREDENTIAL_ID", "cred_test")
 	os.Setenv("GRIPLINE_ACCOUNT_ID", "acct_test")
-	os.Setenv("GRIPLINE_PEPPER_V1", "test-pepper-123456789012345678")
+	os.Setenv("GRIPLINE_PEPPER_V1", testPepperEnv)
 	defer func() {
 		os.Unsetenv("GRIPLINE_CREDENTIAL_SECRET")
 		os.Unsetenv("GRIPLINE_CREDENTIAL_ID")
@@ -52,6 +52,7 @@ func TestAcceptanceBuildRuntime(t *testing.T) {
 			"read_header_timeout": "5s"
 		},
 		"identity": {"audience": "test-audience"},
+		"deployment": {"allow_ephemeral_state": true},
 		"tls": {"terminate_tls_upstream": true},
 		"paths": {
 			"evidence": "` + filepath.Join(dir, "evidence.gob") + `"

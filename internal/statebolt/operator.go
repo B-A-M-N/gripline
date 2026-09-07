@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"time"
 
 	bolt "go.etcd.io/bbolt"
 
 	"github.com/B-A-M-N/gripline/internal/control"
 	"github.com/B-A-M-N/gripline/internal/credential"
+	"github.com/B-A-M-N/gripline/internal/lane"
 )
 
 // persistedOperatorRecord is the versioned operator-audit row. It reuses the
@@ -90,69 +92,90 @@ func appendOperatorTx(tx *bolt.Tx, rec control.OperatorRecord) error {
 	return audit.Put(keyAuditSequence, itob(uint64(seq)))
 }
 
-// MutationStore is the narrow, transactional operator-mutation seam (P0.18):
-// each action mutates state AND appends its operator-audit record in ONE
-// transaction. If either fails, nothing commits — a mutation is never durably
-// audited separately from, or in spite of, the state change it documents. This
-// is the authority the control plane should use for state-changing actions;
-// FileAuditRepository remains only an optional mirrored/external sink.
-//
-// The concrete *Store implements this surface via the methods below.
-type MutationStore interface {
-	// RevokeCredentialWithAudit revokes a credential and commits its audit row
-	// atomically. Provided for the transaction boundary used by the control
-	// plane's CredentialOperator seam.
-	RevokeCredentialWithAudit(ctx context.Context, credID string, audit control.OperatorRecord) error
-
-	// SetPostureWithAudit persists a new operator posture and commits its audit
-	// row atomically.
-	SetPostureWithAudit(ctx context.Context, posture control.Posture, audit control.OperatorRecord) error
-}
+// The transactional operator-mutation surface (P0.18) is defined by the
+// consumer package as control.MutationStore; the *Store implements it with the
+// three WithAudit methods below. Each performs the mutation AND its
+// operator-audit append in ONE write transaction — a failed audit write fails
+// the mutation and vice versa, so the audit trail and the authoritative state
+// can never disagree. FileAuditRepository remains only an optional
+// mirrored/external sink.
 
 // compile-time assertion that *Store satisfies the transactional seams.
 var (
 	_ control.AuditRepository = (*Store)(nil)
-	_ MutationStore           = (*Store)(nil)
+	_ control.MutationStore   = (*Store)(nil)
 )
+
+// UnblockLaneWithAudit clears a BLOCKED lane and appends the control plane's
+// audit row in a single write transaction (P0.18/P0.49): the lane mutation
+// (pure lane.ApplyUnblock semantics), the lane-side audit entry, and the
+// control-plane audit row commit together or not at all.
+func (s *Store) UnblockLaneWithAudit(ctx context.Context, credID, laneID string, audit control.OperatorRecord, now time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return ctx.Err()
+	}
+	key, err := laneKey(credID, laneID)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		v := tx.Bucket(bucketLanes).Get(key)
+		if v == nil {
+			return lane.ErrLaneNotFound
+		}
+		var p persistedLane
+		if err := json.Unmarshal(v, &p); err != nil || p.SchemaVersion > laneSchemaVersion {
+			return errCorruptLane
+		}
+		rec := p.Record
+		before, err := lane.ApplyUnblock(&rec, now)
+		if err != nil {
+			return err
+		}
+		if err := appendLaneAuditTx(tx, lane.AuditEntry{
+			LaneID: laneID, CredentialID: credID, Actor: audit.Actor,
+			Action: lane.ActionUnblock, Before: before, After: lane.LaneNormal,
+			At: now, Reason: audit.Reason, Revision: rec.Revision,
+		}); err != nil {
+			return err // rolls back the whole unblock
+		}
+		if err := putLaneTx(tx, &rec); err != nil {
+			return err
+		}
+		return appendOperatorTx(tx, audit) // control audit commits in the SAME transaction
+	})
+}
 
 // RevokeCredentialWithAudit revokes the credential and appends the audit row in
 // a single write transaction: a failed audit write fails the revocation and
-// vice versa — no mutation-then-audit gap.
+// vice versa — no mutation-then-audit gap. All failures return from the
+// callback so bbolt rolls back atomically (P0.3-fix).
 func (s *Store) RevokeCredentialWithAudit(ctx context.Context, credID string, audit control.OperatorRecord) error {
 	if err := ctx.Err(); err != nil {
 		return ctx.Err()
 	}
-	var outErr error
-	err := s.db.Update(func(tx *bolt.Tx) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
 		creds := tx.Bucket(bucketCredentials)
 		env := creds.Get([]byte(credID))
 		if env == nil {
-			outErr = credential.ErrNotFound
-			return nil
+			return credential.ErrNotFound
 		}
 		var p persistedCredential
 		if err := json.Unmarshal(env, &p); err != nil {
-			outErr = credential.ErrCorrupt
-			return nil
+			return credential.ErrCorrupt
 		}
 		p.Record.Status = credential.StatusRevoked
 		p.Record.Revision++
 		p.Record.RotatedAt = s.now()
 		b, err := json.Marshal(p)
 		if err != nil {
-			outErr = err
-			return nil
+			return err
 		}
 		if err := creds.Put([]byte(credID), b); err != nil {
-			outErr = err
-			return nil
+			return err
 		}
 		return appendOperatorTx(tx, audit) // audit commits in the SAME transaction
 	})
-	if err != nil {
-		return err
-	}
-	return outErr
 }
 
 // SetPostureWithAudit persists the posture and appends its audit row atomically.
@@ -160,18 +183,12 @@ func (s *Store) SetPostureWithAudit(ctx context.Context, posture control.Posture
 	if err := ctx.Err(); err != nil {
 		return ctx.Err()
 	}
-	var outErr error
-	err := s.db.Update(func(tx *bolt.Tx) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
 		if err := tx.Bucket(bucketOperatorState).Put(keyPosture, []byte(strconv.Itoa(int(posture)))); err != nil {
-			outErr = err
-			return nil
+			return err
 		}
 		return appendOperatorTx(tx, audit) // audit commits in the SAME transaction
 	})
-	if err != nil {
-		return err
-	}
-	return outErr
 }
 
 // CountAuditRecords returns how many operator audit rows are stored (test/diag).

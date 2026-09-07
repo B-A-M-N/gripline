@@ -10,10 +10,10 @@ import (
 // distinct ASNs/regions seen per credential within a sliding window and emits
 // a signal when a new one is observed after the baseline set is established.
 type SourceNoveltyProducer struct {
-	mu         sync.Mutex
-	now        func() time.Time
-	window     time.Duration
-	cooldown   time.Duration
+	mu          sync.Mutex
+	now         func() time.Time
+	window      time.Duration
+	cooldown    time.Duration
 	maxSubjects int
 
 	// credASN tracks distinct ASNs per credential.

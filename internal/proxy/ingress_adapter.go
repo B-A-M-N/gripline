@@ -22,18 +22,20 @@ func NewIngressSourceResolver(r *ingress.Resolver) *IngressSourceResolver {
 
 // ResolveSource implements proxy.SourceResolver. It returns the trusted source
 // identity from the ingress resolver, or the zero TrustedSource when no
-// pseudonym ring is configured.
-func (s *IngressSourceResolver) ResolveSource(obs Observation) terminator.TrustedSource {
+// pseudonym ring is configured (nil error). A resolution failure (malformed
+// peer, pseudonymization error) is returned as an error so the proxy can fail
+// closed instead of silently dropping source protection (P0.11).
+func (s *IngressSourceResolver) ResolveSource(obs Observation) (terminator.TrustedSource, error) {
 	src, err := s.inner.Resolve(obs.RemoteAddr, obs.Header)
 	if err != nil {
-		return terminator.TrustedSource{}
+		return terminator.TrustedSource{}, err
 	}
 	return terminator.TrustedSource{
 		Pseudonym:   src.Pseudonym,
 		ASN:         src.ASN,
 		NetworkType: src.NetworkType,
 		Region:      src.Region,
-	}
+	}, nil
 }
 
 // MergeSourceIntoFeatures overrides the feature resolver's network provenance

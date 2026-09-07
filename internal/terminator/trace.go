@@ -120,8 +120,6 @@ func trimStrings(in []string, max int) []string {
 	return out
 }
 
-
-
 var (
 	_ = credential.StatusWatch
 	_ = lane.LaneNormal

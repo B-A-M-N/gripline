@@ -19,9 +19,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
+
+	"github.com/B-A-M-N/gripline/internal/lane"
 )
 
 // Bucket names (§schema). meta holds a schema marker; each logical bucket holds
@@ -41,6 +44,13 @@ var (
 
 const currentSchemaVersion = 1
 
+// ErrMigrationRequired is returned when a database carries a schema version
+// other than the one this build understands (P1.22). Until real migration
+// machinery exists, an OLDER schema must fail closed too — silently accepting
+// it would make the "versioned/migratable" claim a lie the first time the
+// schema actually changes.
+var ErrMigrationRequired = errors.New("statebolt: database schema version requires migration (unsupported for this build)")
+
 // Options configures opening a state database.
 type Options struct {
 	// Now is the clock used for timestamps (tests).
@@ -48,10 +58,28 @@ type Options struct {
 }
 
 // Store is one bbolt-backed state authority. It is safe for concurrent use;
-// bbolt serializes writers. It satisfies credential.Registry and lane.Repository.
+// bbolt serializes writers. It satisfies credential.Registry, lane.Repository,
+// and evidence.Store.
 type Store struct {
 	db  *bolt.DB
 	now func() time.Time
+	// mu guards the small policy-side knobs below (they are written once at
+	// terminator construction, read on every lane admission).
+	mu sync.RWMutex
+	// securityOverride carries the compiled policy's lane security hysteresis
+	// (P0.13); zero means defaults.
+	securityOverride lane.SecurityHysteresis
+	// laneLimitsFn provides the lane explosion limits (policy-compiled). Nil
+	// uses lane.DefaultLimits.
+	laneLimitsFn func() lane.Limits
+}
+
+// SetLaneLimits wires the lane explosion-limits provider (the runtime compiles
+// it from policy). Must be called before serving traffic.
+func (s *Store) SetLaneLimits(fn func() lane.Limits) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.laneLimitsFn = fn
 }
 
 // Open opens (creating if needed) the database at path and guarantees the
@@ -98,11 +126,13 @@ func (s *Store) init() error {
 		if v == nil {
 			return meta.Put(keySchemaVersion, itob(currentSchemaVersion))
 		}
-		// A newer schema than we understand must fail closed rather than read
-		// incompatible rows.
+		// P1.22: until explicit migrations exist, ONLY the exact current schema
+		// is acceptable — an older database fails closed with
+		// ErrMigrationRequired rather than being silently read with semantics
+		// it was not written under.
 		got := btoi(v)
-		if got > currentSchemaVersion {
-			return fmt.Errorf("statebolt: database schema %d newer than supported %d (refusing to read)", got, currentSchemaVersion)
+		if got != currentSchemaVersion {
+			return fmt.Errorf("statebolt: database schema %d, supported %d: %w", got, currentSchemaVersion, ErrMigrationRequired)
 		}
 		return nil
 	})
@@ -111,6 +141,17 @@ func (s *Store) init() error {
 // Close closes the database.
 func (s *Store) Close() error {
 	return s.db.Close()
+}
+
+// Ping proves the database answers reads (P1-24 readiness probe). It performs
+// a trivial read transaction — cheap, lock-free against writers (bbolt MVCC).
+func (s *Store) Ping() error {
+	return s.db.View(func(tx *bolt.Tx) error {
+		if tx.Bucket(bucketMeta) == nil {
+			return errors.New("statebolt: meta bucket missing")
+		}
+		return nil
+	})
 }
 
 // DBPath returns the on-disk path (diagnostics).

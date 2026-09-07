@@ -110,7 +110,7 @@ type BucketSpec struct {
 // BucketConfig is one gauge's burst/rate policy (P0.35). A zero Capacity
 // disables the gauge at this scope.
 type BucketConfig struct {
-	Capacity float64
+	Capacity  float64
 	RefillPer float64
 	RefillIn  time.Duration
 }
@@ -143,9 +143,9 @@ func (bs BucketSpec) specFor(dim Dimension) BucketConfig {
 // request AND permanently consume capacity (a leak you can never refund
 // because the caller never learned an admission succeeded).
 type Governor struct {
-	mu     sync.Mutex
-	now    func() time.Time
-	pools  map[string]*ConcurrencyPool // scopeKey <Scope>:<id> -> pool
+	mu      sync.Mutex
+	now     func() time.Time
+	pools   map[string]*ConcurrencyPool // scopeKey <Scope>:<id> -> pool
 	buckets map[Dimension]map[string]*TokenBucket
 }
 
@@ -427,6 +427,7 @@ func (r *MultiReservation) Leases() []*LeaseHandle {
 	}
 	return out
 }
+
 // InUseAll reports the total concurrency currently held across every scope
 // pool (diagnostics/leak-detection in tests).
 func (g *Governor) InUseAll() int {

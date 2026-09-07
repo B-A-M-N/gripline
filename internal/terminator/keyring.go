@@ -19,10 +19,10 @@ import (
 // It carries the active private key AND all retained public keys so a
 // restart recovers signing authority without key rotation.
 type keyringPersist struct {
-	ActiveKid int               `json:"active_kid"` // P0.14: persist kid for rotation correctness
-	Active    string            `json:"active"`     // base64-encoded private key
-	Verifiers map[int]string    `json:"verifiers"`  // kid -> base64-encoded public key
-	Next      int               `json:"next"`
+	ActiveKid int            `json:"active_kid"` // P0.14: persist kid for rotation correctness
+	Active    string         `json:"active"`     // base64-encoded private key
+	Verifiers map[int]string `json:"verifiers"`  // kid -> base64-encoded public key
+	Next      int            `json:"next"`
 }
 
 // Save writes the keyring's active private key and all retained public keys
@@ -57,10 +57,17 @@ func (k *Keyring) Save(path string) error {
 	return os.Rename(tmp, path)
 }
 
-// LoadKeyring reads a keyring from a file. If the file exists, it recovers
-// the active private key and all retained public keys. If not, it generates
-// a fresh keyring and saves it.
+// LoadKeyring reads a keyring from a file with load-or-create semantics: a
+// missing file generates a fresh keyring and persists it. This is the RUNTIME
+// path. Read-only consumers (export, inspection, migration tools) must use
+// LoadExistingKeyring instead — a command named "export" must never mint a
+// new signing identity as a side effect (P0.17).
 func LoadKeyring(path string) (*Keyring, error) {
+	return LoadOrCreateKeyring(path)
+}
+
+// LoadOrCreateKeyring is the explicit load-or-create runtime loader.
+func LoadOrCreateKeyring(path string) (*Keyring, error) {
 	if path == "" {
 		return NewKeyring()
 	}
@@ -89,6 +96,30 @@ func LoadKeyring(path string) (*Keyring, error) {
 		return nil, err
 	}
 
+	return loadKeyringFile(path)
+}
+
+// LoadExistingKeyring loads a keyring that MUST already exist (P0.17): a
+// missing file is an error, never a new signing identity. Read-only consumers
+// — key export, inspection, operator tooling — must use this path so a typo'd
+// or unset signer path cannot silently mutate the trust root. "" is rejected
+// rather than falling back to an ephemeral identity.
+func LoadExistingKeyring(path string) (*Keyring, error) {
+	if path == "" {
+		return nil, errors.New("terminator: keyring path required for read-only load")
+	}
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("terminator: keyring %s does not exist (read-only load refuses to create a signing identity)", path)
+		}
+		return nil, err
+	}
+	return loadKeyringFile(path)
+}
+
+// loadKeyringFile reads and validates an existing keyring file without any
+// create/write behavior.
+func loadKeyringFile(path string) (*Keyring, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -97,7 +128,6 @@ func LoadKeyring(path string) (*Keyring, error) {
 	if err := json.Unmarshal(data, &p); err != nil {
 		return nil, err
 	}
-
 	k := &Keyring{st: &keyringState{
 		verifiers: make(map[int][]byte, len(p.Verifiers)),
 		next:      p.Next,
@@ -111,10 +141,6 @@ func LoadKeyring(path string) (*Keyring, error) {
 		return nil, fmt.Errorf("terminator: invalid persisted private key size %d, want %d", len(priv), ed25519.PrivateKeySize)
 	}
 	k.st.active = &Signer{priv: ed25519.PrivateKey(priv), Version: p.ActiveKid}
-	// Hardening (release): validate the packed keyring structurally BEFORE
-	// accepting it. A corrupt/truncated/hand-edited keyring must fail closed at
-	// load, not silently serve a wrong active key (which would mint assertions
-	// no backend can verify, or worse, reuse a mismatched signing pair).
 	if p.ActiveKid < 1 {
 		return nil, fmt.Errorf("terminator: persisted active_kid %d invalid (must be >= 1)", p.ActiveKid)
 	}

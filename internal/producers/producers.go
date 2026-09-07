@@ -70,9 +70,9 @@ type Producer interface {
 
 // Features carries the observable non-secret feature atoms of one request.
 type Features struct {
-	NetworkASN  string // e.g. "AS1234"
-	NetworkType string // residential/hosting/mobile
-	RegionClass string // coarse geographic region
+	NetworkASN   string // e.g. "AS1234"
+	NetworkType  string // residential/hosting/mobile
+	RegionClass  string // coarse geographic region
 	ClientFamily string // claude-code/python-sdk/curl
 }
 
@@ -177,8 +177,6 @@ type baseline struct {
 	lastEmit time.Time
 }
 
-
-
 func evictColdestBaseline(m map[string]*baseline) {
 	var coldest string
 	var coldestTime time.Time
@@ -198,4 +196,3 @@ const defaultMaxSubjects = 65536
 
 // defaultCooldown bounds re-emission of the same signal for the same subject.
 const defaultCooldown = time.Minute
-

@@ -84,9 +84,9 @@ func TestPromotionBlockedBySecurityStatus(t *testing.T) {
 	// A PROBATION lane with all clean criteria met but RISK status SUSPICIOUS.
 	rec := &LaneRecord{
 		LaneID: "l", State: StateProbation,
-		FirstSeenAt:            now.Add(-30 * 24 * time.Hour),
+		FirstSeenAt:             now.Add(-30 * 24 * time.Hour),
 		AuthorizedCleanRequests: 500, CleanActiveDays: 5,
-		RiskScore: 2,
+		RiskScore:  2,
 		CleanSince: now.Add(-20 * 24 * time.Hour),
 		Security:   SecurityState{Status: LaneSuspicious},
 	}
@@ -130,6 +130,7 @@ func TestCleanSinceResetOnElevation(t *testing.T) {
 		t.Fatalf("P0.7: lane must be BLOCKED after high risk, got %v", rec.Security.Status)
 	}
 }
+
 // P0.13: automatic lane BLOCK is policy-gated. With the gate disabled (the
 // default, shadow-first posture), a block-warranting score may elevate a lane
 // to SUSPICIOUS (restricted, non-promoting) but NEVER to BLOCKED — the old
