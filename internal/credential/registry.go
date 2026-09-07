@@ -104,9 +104,10 @@ var ErrVerifierOwned = errors.New("credential: verifier already owned by another
 // managed credential.
 var ErrAlreadyExists = errors.New("credential: credential id already exists")
 
-// Provisioner is the startup-provisioning seam (P0.10). Bootstrap uses
-// InsertIfAbsent so an env-provided GRIPLINE_CREDENTIAL_SECRET never overwrites
-// an operator-managed (e.g. CONSTRAINED/REVOKED) credential on restart.
+// Provisioner is the startup-provisioning seam (P0.10). Development bootstrap
+// may insert an already-derived verifier record, but production deployments
+// should provision through the authenticated operator lifecycle. InsertIfAbsent
+// never overwrites an operator-managed (e.g. CONSTRAINED/REVOKED) credential.
 // Rotation/replacement is the explicit lifecycle path (Insert / UpdateStatusCAS),
 // not bootstrap.
 type Provisioner interface {

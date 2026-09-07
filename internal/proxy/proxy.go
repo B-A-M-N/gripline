@@ -210,6 +210,11 @@ type Config struct {
 	// SpoolDir is the optional dedicated writable directory for unknown-length
 	// request bodies. Empty uses the process temp directory.
 	SpoolDir string
+	// SpoolMaxBytes and SpoolMaxFiles bound aggregate unknown-length request
+	// body work. A reservation is held from admission until the body is closed;
+	// zero disables that particular aggregate bound.
+	SpoolMaxBytes int64
+	SpoolMaxFiles int
 
 	// WriteTimeout is the initial response budget, from WriteHeader until the
 	// first deadline expiry. Zero = no server-managed write deadline change
@@ -288,15 +293,26 @@ type AdmissionObserver interface {
 
 // CompletionEvent is the non-secret completion telemetry record.
 type CompletionEvent struct {
+	// RequestID correlates completion telemetry with its admission decision.
+	RequestID string `json:"request_id"`
+	// CredentialID and LaneID are bounded internal identifiers used for
+	// investigation, never raw credentials or prompt content.
+	CredentialID string `json:"credential_id,omitempty"`
+	LaneID       string `json:"lane_id,omitempty"`
 	// EvidenceCodes lists completion-signal codes minted for this request.
 	EvidenceCodes []string `json:"evidence_codes"`
 	// Persisted reports whether minted evidence reached the store.
 	Persisted bool `json:"persisted"`
 	// StreamOK reports whether the upstream stream ended cleanly.
 	StreamOK bool `json:"stream_ok"`
-	// Err is the completion-persistence error, when persistence was attempted
-	// and failed.
-	Err error `json:"error,omitempty"`
+	// ErrorCode and ErrorMessage are the bounded JSON contract. ErrorMessage is
+	// intentionally a fixed safe phrase; implementation errors stay in process
+	// memory and are never serialized into telemetry.
+	ErrorCode    string `json:"error_code,omitempty"`
+	ErrorMessage string `json:"error_message,omitempty"`
+	// Err remains available to in-process observers for compatibility but is
+	// never serialized as Go's error interface commonly becomes `{}`.
+	Err error `json:"-"`
 }
 
 // DataPlane is a single terminate-and-forward proxy hop. It is CONCURRENT-SAFE
@@ -307,6 +323,7 @@ type DataPlane struct {
 	feat    FeatureResolver
 	srcs    SourceResolver
 	backend *url.URL
+	spool   *SpoolBudget
 }
 
 // New validates the required seams and returns a DataPlane. Fail-closed: a
@@ -345,7 +362,8 @@ func New(cfg Config) (*DataPlane, error) {
 	bu.RawQuery = ""
 	bu.Fragment = ""
 	bu.Path = strings.TrimSuffix(bu.Path, "/") // joined per-request below
-	return &DataPlane{cfg: cfg, feat: cfg.Features, srcs: cfg.Sources, backend: &bu}, nil
+	return &DataPlane{cfg: cfg, feat: cfg.Features, srcs: cfg.Sources, backend: &bu,
+		spool: NewSpoolBudget(cfg.SpoolMaxBytes, cfg.SpoolMaxFiles)}, nil
 }
 
 // ServeHTTP implements the data-plane admission. It is safe to use as an
@@ -376,60 +394,21 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// Copy headers before any body work. Unknown-length requests are preflighted
-	// against the credential before they can force disk spooling.
+	// Copy headers before any body work. Credential parsing and the full
+	// admission pipeline run before unknown-length request bodies can force disk
+	// spooling.
 	authHeaders := copyHeaders(r.Header)
-	if d.cfg.MaxBodyBytes > 0 && r.ContentLength < 0 {
-		preflightHeaders := copyHeaders(authHeaders)
-		if err := d.cfg.Terminator.Preflight(preflightHeaders); err != nil {
-			out := &terminator.Outcome{RequestID: requestID, Authorized: false, Reason: terminator.PublicReason(err), DenialErr: err}
-			observeAdmission(out)
-			d.writeDenial(w, out)
-			return
-		}
-	}
 
 	// BETA-08: Enforce MaxBodyBytes BEFORE admission. Reject oversized
-	// bodies with 413 before any credential extraction or forwarding.
+	// bodies with 413 before credential extraction or forwarding when the
+	// declared length already proves the request is too large. Unknown-length
+	// bodies are checked after full admission, before forwarding.
 	if d.cfg.MaxBodyBytes > 0 {
 		if r.ContentLength > d.cfg.MaxBodyBytes {
 			out := &terminator.Outcome{RequestID: requestID, Authorized: false, Reason: "payload_too_large"}
 			observeAdmission(out)
 			d.writeDenial(w, out)
 			return
-		}
-		// P0.16/P0.6-fix: Bounded spooling for chunked/unknown-length bodies.
-		// Read the body with an absolute cap, spooling to a temp file if it
-		// exceeds a memory threshold. This prevents an unauthenticated
-		// attacker from causing large per-connection allocations (32
-		// simultaneous 32MB requests = ~1GB). maxBytes is the actual limit:
-		// the spooler sets tooLarge when input remains past it, so an
-		// oversized chunked body is rejected 413, never truncated-and-forwarded.
-		if r.ContentLength < 0 {
-			tempDir := d.cfg.SpoolDir
-			if tempDir == "" {
-				tempDir = spoolTempDir
-			}
-			body, err := spoolBodyInDir(r.Body, d.cfg.MaxBodyBytes, spoolMemoryThreshold, tempDir)
-			if err != nil {
-				out := &terminator.Outcome{RequestID: requestID, Authorized: false, Reason: "bad_request", DenialErr: err}
-				observeAdmission(out)
-				d.writeDenial(w, out)
-				return
-			}
-			r.Body.Close()
-			if body.tooLarge {
-				_ = body.Close() // closes + removes any temp file
-				out := &terminator.Outcome{RequestID: requestID, Authorized: false, Reason: "payload_too_large"}
-				observeAdmission(out)
-				d.writeDenial(w, out)
-				return
-			}
-			r.Body = body // body.Close() removes the temp file when the transport closes it
-			r.ContentLength = body.length
-		} else {
-			// Known Content-Length within limit: use MaxBytesReader for safety.
-			r.Body = http.MaxBytesReader(w, r.Body, d.cfg.MaxBodyBytes)
 		}
 	}
 
@@ -440,7 +419,7 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// Even on extraction failure the terminator's safe-reason mapping is
 		// reused so no header detail leaks into the response.
-		out := &terminator.Outcome{RequestID: requestID, Authorized: false, Reason: terminator.PublicReason(err), DenialErr: err}
+		out := &terminator.Outcome{RequestID: requestID, Authorized: false, Reason: "invalid_authentication", DenialErr: err}
 		observeAdmission(out)
 		d.writeDenial(w, out)
 		return
@@ -481,9 +460,9 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	est := d.cfg.Usage.Estimate(obs)
 
 	out := d.cfg.Terminator.AdmitUsageWithRequestID(requestID, authHeaders, feat, src, est)
-	observeAdmission(out)
 
 	if !out.Authorized {
+		observeAdmission(out)
 		d.writeDenial(w, out)
 		return
 	}
@@ -496,6 +475,49 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	reservation := out.Reservation()
 	defer reservation.Release()
 
+	// P0-2: only an admitted request may incur body-spooling cost. This keeps
+	// valid-but-contained credentials from consuming one full spool per
+	// connection, while invalid credentials still reach AdmitUsage's spray
+	// detector instead of taking an auth-only shortcut. A body rejected here is
+	// a forward outcome, not a security authorization; emit one final decision
+	// record below and do not finalize baseline trust.
+	if d.cfg.MaxBodyBytes > 0 {
+		if r.ContentLength < 0 {
+			spoolReservation, err := d.spool.Acquire(d.cfg.MaxBodyBytes)
+			if err != nil {
+				out := &terminator.Outcome{RequestID: requestID, Authorized: false, Reason: "spool_capacity_exhausted", DenialErr: err}
+				observeAdmission(out)
+				d.writeDenial(w, out)
+				return
+			}
+			tempDir := d.cfg.SpoolDir
+			if tempDir == "" {
+				tempDir = spoolTempDir
+			}
+			body, err := spoolBodyInDirWithReservation(r.Body, d.cfg.MaxBodyBytes, spoolMemoryThreshold, tempDir, spoolReservation)
+			if err != nil {
+				out := &terminator.Outcome{RequestID: requestID, Authorized: false, Reason: "bad_request", DenialErr: err}
+				observeAdmission(out)
+				d.writeDenial(w, out)
+				return
+			}
+			r.Body.Close()
+			if body.tooLarge {
+				_ = body.Close() // closes + removes any temp file
+				out = &terminator.Outcome{RequestID: requestID, Authorized: false, Reason: "payload_too_large"}
+				observeAdmission(out)
+				d.writeDenial(w, out)
+				return
+			}
+			r.Body = body // body.Close() removes the temp file when the transport closes it
+			r.ContentLength = body.length
+		} else {
+			// Known Content-Length within limit: use MaxBytesReader for safety.
+			r.Body = http.MaxBytesReader(w, r.Body, d.cfg.MaxBodyBytes)
+		}
+	}
+	observeAdmission(out)
+
 	// 4. Resolve the (now stripped + re-injected) upstream headers: every secret
 	// carrier and any forged Gripline-* header is gone; the signed assertion is
 	// freshly minted. Hop-by-hop headers and untrusted provenance headers are
@@ -505,6 +527,7 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	terminator.StripSecretHeaders(upstreamHeaders)
 	stripHopByHopHeaders(upstreamHeaders)
 	stripUntrustedProvenanceHeaders(upstreamHeaders)
+	stripRequestTrailers(r.Trailer)
 	upstreamHeaders[assertionHeader] = []string{out.Assertion.Encode()}
 
 	// 5. Build and forward the upstream request, streaming the body. The
@@ -513,6 +536,8 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// preserved. The client cannot redirect the proxy at another host.
 	upr := r.Clone(r.Context())
 	upr.Header = upstreamHeaders
+	upr.Trailer = copyHeaders(r.Trailer)
+	stripRequestTrailers(upr.Trailer)
 	upr.URL = &url.URL{
 		Scheme:   d.backend.Scheme,
 		Host:     d.backend.Host,
@@ -634,12 +659,19 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// the client response is already delivered and must not change, but a
 	// shipping binary must not silently discard the Complete() result.
 	if d.cfg.Observer != nil {
-		d.cfg.Observer.ObserveCompletion(CompletionEvent{
-			EvidenceCodes: completion.EvidenceCodes,
-			Persisted:     completion.Persisted,
-			StreamOK:      streamErr == nil,
-			Err:           completion.Err,
-		})
+		event := CompletionEvent{
+			RequestID: out.RequestID, CredentialID: out.Principal.CredentialID,
+			LaneID: out.Context.LaneID, EvidenceCodes: completion.EvidenceCodes,
+			Persisted: completion.Persisted, StreamOK: streamErr == nil, Err: completion.Err,
+		}
+		if completion.Err != nil {
+			event.ErrorCode = "completion_observation_failed"
+			event.ErrorMessage = "completion observation failed"
+		} else if streamErr != nil {
+			event.ErrorCode = "stream_failed"
+			event.ErrorMessage = "upstream stream failed"
+		}
+		d.cfg.Observer.ObserveCompletion(event)
 	}
 	// P0.27/P0.17: Finalize baseline trust ONLY after successful stream
 	// completion. A request whose backend stream corrupts/fails earns no clean
@@ -653,38 +685,53 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // allowing traversal out of the base (P0.7). The result is always rooted and
 // cleaned.
 func joinPath(base, req string) string {
-	if base == "" {
-		return path.Clean("/" + req)
+	// Normalize the request as a rooted path first. This makes all traversal
+	// components relative to the request root before they can interact with the
+	// configured backend prefix; path.Clean(base + "/" + req) would let ../
+	// escape that prefix.
+	rel := path.Clean("/" + strings.TrimPrefix(req, "/"))
+	rel = strings.TrimPrefix(rel, "/")
+	if rel == "." {
+		rel = ""
 	}
-	return path.Clean(base + "/" + req)
+	base = path.Clean("/" + strings.TrimPrefix(base, "/"))
+	if base == "." {
+		base = "/"
+	}
+	return path.Join(base, rel)
 }
 
 // writeDenial maps an admission denial to an HTTP status + safe reason. Internal
 // error details never leak the secret or internal state.
 func (d *DataPlane) writeDenial(w http.ResponseWriter, out *terminator.Outcome) {
 	code := http.StatusForbidden
-	switch out.Reason {
-	case "concurrency_limit", "rate_limit", "temporarily_restricted":
+	var limitErr *resource.ScopeLimitError
+	// The typed governor cause is authoritative. Scope-specific reason strings
+	// are useful for internal telemetry, but must not turn a hard quota denial
+	// into a security-state 403 or hide its retry metadata.
+	if errors.As(out.DenialErr, &limitErr) {
 		code = http.StatusTooManyRequests
-	case "invalid_credential", "credential_expired", "bad", "invalid_authentication":
-		code = http.StatusUnauthorized
-	case "backend_error", "internal_identity_failure", "resource_unavailable", "source_resolution_failed", "internal_error":
-		code = http.StatusServiceUnavailable
-	case "bad_request":
-		code = http.StatusBadRequest
-	case "payload_too_large":
-		code = http.StatusRequestEntityTooLarge
+	} else {
+		switch out.Reason {
+		case "concurrency_limit", "rate_limit", "temporarily_restricted":
+			code = http.StatusTooManyRequests
+		case "invalid_credential", "credential_expired", "bad", "invalid_authentication":
+			code = http.StatusUnauthorized
+		case "backend_error", "internal_identity_failure", "resource_unavailable", "source_resolution_failed", "spool_capacity_exhausted", "internal_error":
+			code = http.StatusServiceUnavailable
+		case "bad_request":
+			code = http.StatusBadRequest
+		case "payload_too_large":
+			code = http.StatusRequestEntityTooLarge
+		}
 	}
 	if out.RequestID != "" {
 		w.Header().Set("X-Gripline-Request-ID", out.RequestID)
 	}
 	w.Header().Set("X-Gripline-Reason", out.Reason)
-	if out.Reason == "rate_limit" {
-		var limitErr *resource.ScopeLimitError
-		if errors.As(out.DenialErr, &limitErr) && limitErr.RetryAfter > 0 {
-			seconds := int64((limitErr.RetryAfter + time.Second - 1) / time.Second)
-			w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
-		}
+	if limitErr != nil && limitErr.RetryAfter > 0 {
+		seconds := int64((limitErr.RetryAfter + time.Second - 1) / time.Second)
+		w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
 	}
 	http.Error(w, out.Reason, code)
 }
@@ -730,9 +777,10 @@ var fixedHopByHopHeaders = map[string]struct{}{
 	"proxy-authenticate":  {},
 	"proxy-authorization": {},
 	"te":                  {},
-	"trailers":            {},
+	"trailer":             {},
 	"transfer-encoding":   {},
 	"upgrade":             {},
+	"proxy-connection":    {},
 }
 
 // stripHopByHopHeaders removes hop-by-hop headers from h in place: first every
@@ -750,6 +798,24 @@ func stripHopByHopHeaders(h http.Header) {
 	}
 	for name := range fixedHopByHopHeaders {
 		h.Del(name)
+	}
+}
+
+// stripRequestTrailers removes secret, reserved, and hop-by-hop trailers.
+// Trailer names are announced before the body is consumed but values arrive
+// only afterward, so header-only sanitation is insufficient for chunked
+// requests. The map is sanitized both before cloning and on the upstream copy.
+func stripRequestTrailers(h http.Header) {
+	if h == nil {
+		return
+	}
+	terminator.StripSecretHeaders(h)
+	stripHopByHopHeaders(h)
+	for k := range h {
+		lower := strings.ToLower(k)
+		if strings.HasPrefix(lower, "x-gripline-") || strings.HasPrefix(lower, "gripline-") {
+			h.Del(k)
+		}
 	}
 }
 

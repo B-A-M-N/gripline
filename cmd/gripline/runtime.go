@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,14 +24,12 @@ import (
 	"github.com/B-A-M-N/gripline/internal/credential"
 	"github.com/B-A-M-N/gripline/internal/evidence"
 	"github.com/B-A-M-N/gripline/internal/ingress"
-	"github.com/B-A-M-N/gripline/internal/keyexport"
 	"github.com/B-A-M-N/gripline/internal/lane"
 	"github.com/B-A-M-N/gripline/internal/policy"
 	"github.com/B-A-M-N/gripline/internal/producers"
 	"github.com/B-A-M-N/gripline/internal/proxy"
 	"github.com/B-A-M-N/gripline/internal/pseudonym"
 	"github.com/B-A-M-N/gripline/internal/resource"
-	"github.com/B-A-M-N/gripline/internal/secret"
 	"github.com/B-A-M-N/gripline/internal/statebolt"
 	"github.com/B-A-M-N/gripline/internal/terminator"
 )
@@ -101,21 +100,10 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		}
 	}
 
-	pepper := os.Getenv("GRIPLINE_PEPPER_V1")
-	if pepper == "" {
-		pepper = os.Getenv("GRILINE_PEPPER_V1")
-		if pepper != "" {
-			log.Printf("gripline: WARNING: using misspelled GRILINE_PEPPER_V1")
-		}
-	}
-	if pepper == "" {
-		return nil, fmt.Errorf("gripline: GRIPLINE_PEPPER_V1 env var required (base64-encoded, >=32 bytes of entropy)")
-	}
-	pepperKey, err := decodeSecretKey("GRIPLINE_PEPPER_V1", pepper, 32)
+	peppers, err := loadPepperRing(cfg)
 	if err != nil {
 		return nil, err
 	}
-	peppers := credential.MustPepperRing(&credential.PepperKey{Version: 1, Key: pepperKey})
 
 	// P0.18-fix: persistent state is the REQUIRED production path. paths.state
 	// and paths.signer_keyring must be configured unless the operator
@@ -158,8 +146,12 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		lanes = lane.NewStore(nil, time.Now)
 		evStore = evidence.NewMemoryStore()
 	}
-	if err := bootstrapCredentials(reg, pepperKey); err != nil {
-		return nil, err
+	if cfg.Deployment.AllowEphemeralState {
+		if err := bootstrapCredentials(reg); err != nil {
+			return nil, err
+		}
+	} else if os.Getenv("GRIPLINE_BOOTSTRAP_CREDENTIAL") != "" {
+		return nil, fmt.Errorf("gripline: GRIPLINE_BOOTSTRAP_CREDENTIAL is permitted only with deployment.allow_ephemeral_state=true; provision credentials before starting the persistent deployment")
 	}
 
 	signer, err := terminator.LoadOrCreateKeyring(cfg.Paths.SignerKeyring)
@@ -169,6 +161,9 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 
 	// P0.1 fix: Instantiate each authority exactly once
 	governor := resource.NewGovernor(nil)
+	if cfg.Server.MaxSourceScopes > 0 || cfg.Server.SourceScopeIdle.D() > 0 {
+		governor.SetSourceScopeLimits(cfg.Server.MaxSourceScopes, cfg.Server.SourceScopeIdle.D())
+	}
 	spray := anomaly.NewDetector(time.Now, anomaly.DefaultThresholds())
 	ctrl := control.New(0)
 	// P0.10: restore the persisted operator posture so a process restart in
@@ -181,7 +176,10 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		ctrl.Restore(p)
 	}
 
-	pol := policyFor(cfg)
+	pol, err := policyFor(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("gripline: policy: %w", err)
+	}
 
 	term, err := terminator.New(terminator.Dependencies{
 		Registry: reg,
@@ -212,6 +210,10 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 	transport := &http.Transport{
 		MaxIdleConnsPerHost: cfg.Backend.MaxIdleConnsPerHost,
 		IdleConnTimeout:     cfg.Server.IdleTimeout.D(),
+		// Preserve backend response bytes and negotiation semantics. Automatic
+		// gzip negotiation/decompression would make this proxy transform a
+		// supposedly pass-through response.
+		DisableCompression: true,
 	}
 	// Split backend timeouts (P0.16): each phase defaults to backend.timeout.
 	dialTimeout := cfg.Backend.Timeout.D()
@@ -244,11 +246,17 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		if err != nil {
 			return nil, err
 		}
+		defer zeroBytes(pseudoKey)
 		// P0-17: key-separation — the pseudonymization HMAC key must differ
 		// from the credential verifier pepper; reusing one secret across two
 		// domains lets a value in either domain be replayed into the other.
-		if string(pseudoKey) == string(pepperKey) {
-			return nil, fmt.Errorf("gripline: ingress.pseudonym_key must differ from GRIPLINE_PEPPER_V1 (key separation)")
+		for _, version := range peppers.Versions() {
+			pepperKey, ok := peppers.Get(version)
+			if ok && bytes.Equal(pseudoKey, pepperKey) {
+				zeroBytes(pepperKey)
+				return nil, fmt.Errorf("gripline: ingress.pseudonym_key must differ from every configured verifier pepper (key separation; version %d)", version)
+			}
+			zeroBytes(pepperKey)
 		}
 		pseudonyms, err := pseudonymRingFromKey(pseudoKey)
 		if err != nil {
@@ -283,6 +291,8 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		WriteTimeout:           cfg.Server.WriteTimeout.D(),
 		StreamWriteIdleTimeout: cfg.Server.StreamWriteIdleTimeout.D(),
 		SpoolDir:               cfg.Server.SpoolDir,
+		SpoolMaxBytes:          cfg.Server.SpoolMaxBytes,
+		SpoolMaxFiles:          cfg.Server.SpoolMaxFiles,
 	}
 	// Admission and completion decisions are shipped as bounded JSONL events
 	// on stderr. This is intentionally a real runtime sink, not only a library
@@ -377,7 +387,6 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		mux.HandleFunc("/admin/lanes/unblock", adminLaneUnblock(svc))
 		mux.HandleFunc("/admin/audit", adminAudit(svc, state))
 		mux.HandleFunc("/admin/security-events", adminSecurityEvents(svc, state))
-		mux.HandleFunc("/admin/identity/keys/rotate", adminIdentityKeyRotate(svc, signer, cfg.Paths.SignerKeyring))
 		adminSrv = &http.Server{
 			Addr:              cfg.Admin.Listen,
 			Handler:           mux,
@@ -404,6 +413,67 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		Admin:        adminSrv,
 		closers:      closers,
 	}, nil
+}
+
+// loadPepperRing loads all configured verifier peppers and returns a ring that
+// retains only its private copies. The legacy V1 environment variable remains
+// a compatibility fallback when no versioned config map is present. New
+// verifiers should always use ring.Latest(); older versions stay available for
+// authentication until their records are migrated.
+func loadPepperRing(cfg *config.Config) (*credential.PepperRing, error) {
+	values := cfg.Secrets.PepperVersions
+	legacyEnv := false
+	if len(values) == 0 {
+		legacyEnv = true
+		pepper := os.Getenv("GRIPLINE_PEPPER_V1")
+		if pepper == "" {
+			pepper = os.Getenv("GRILINE_PEPPER_V1")
+			if pepper != "" {
+				log.Printf("gripline: WARNING: using misspelled GRILINE_PEPPER_V1")
+			}
+		}
+		if pepper == "" {
+			return nil, fmt.Errorf("gripline: verifier pepper required: configure secrets.pepper_versions or GRIPLINE_PEPPER_V1 (base64-encoded, >=32 bytes of entropy)")
+		}
+		values = map[string]string{"1": pepper}
+	}
+	versions := make([]int, 0, len(values))
+	encoded := make(map[int]string, len(values))
+	for rawVersion, value := range values {
+		version, err := strconv.Atoi(rawVersion)
+		if err != nil || version < 1 {
+			return nil, fmt.Errorf("gripline: verifier pepper version %q must be a positive decimal", rawVersion)
+		}
+		if _, exists := encoded[version]; exists {
+			return nil, fmt.Errorf("gripline: duplicate verifier pepper version %d", version)
+		}
+		encoded[version] = value
+		versions = append(versions, version)
+	}
+	sort.Ints(versions)
+	keys := make([]*credential.PepperKey, 0, len(versions))
+	for _, version := range versions {
+		what := fmt.Sprintf("verifier pepper version %d", version)
+		if legacyEnv && version == 1 {
+			what = "GRIPLINE_PEPPER_V1"
+		}
+		key, err := decodeSecretKey(what, encoded[version], 32)
+		if err != nil {
+			for _, prior := range keys {
+				zeroBytes(prior.Key)
+			}
+			return nil, err
+		}
+		keys = append(keys, &credential.PepperKey{Version: version, Key: key})
+	}
+	ring, err := credential.NewPepperRing(keys...)
+	for _, key := range keys {
+		zeroBytes(key.Key)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("gripline: verifier pepper ring: %w", err)
+	}
+	return ring, nil
 }
 
 // Close releases the runtime's resources exactly once (P1.23). Errors from
@@ -665,6 +735,10 @@ func adminAudit(svc *control.Service, state *statebolt.Store) http.HandlerFunc {
 			http.Error(w, "audit authority unavailable", http.StatusServiceUnavailable)
 			return
 		}
+		if len(rows) > 0 {
+			w.Header().Set("X-Gripline-Next-Audit-After", strconv.FormatUint(rows[len(rows)-1].Sequence, 10))
+		}
+		w.Header().Set("X-Gripline-Audit-Has-More", strconv.FormatBool(len(rows) == limit))
 		writeAdminJSON(w, rows)
 	}
 }
@@ -693,43 +767,11 @@ func adminSecurityEvents(svc *control.Service, state *statebolt.Store) http.Hand
 			http.Error(w, "security audit authority unavailable", http.StatusServiceUnavailable)
 			return
 		}
+		if len(rows) > 0 {
+			w.Header().Set("X-Gripline-Next-Audit-After", strconv.FormatUint(rows[len(rows)-1].Sequence, 10))
+		}
+		w.Header().Set("X-Gripline-Audit-Has-More", strconv.FormatBool(len(rows) == limit))
 		writeAdminJSON(w, rows)
-	}
-}
-
-func adminIdentityKeyRotate(svc *control.Service, keyring *terminator.Keyring, path string) http.HandlerFunc {
-	type request struct {
-		Reason string `json:"reason"`
-	}
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			adminMethodNotAllowed(w)
-			return
-		}
-		var req request
-		if err := decodeAdminJSON(w, r, &req); err != nil {
-			return
-		}
-		kid, err := svc.RotateIdentityKeys(r.Context(), bearer(r.Header.Get("Authorization")), req.Reason, func() (int, error) {
-			return keyring.RotateAndSave(path)
-		})
-		if err != nil {
-			writeAdminError(w, err)
-			return
-		}
-		publicKeys := keyring.PublicKeys()
-		verifiers := make(map[int][]byte, len(publicKeys))
-		for publicKid, publicKey := range publicKeys {
-			verifiers[publicKid] = append([]byte(nil), publicKey...)
-		}
-		exp, err := keyexport.GenerateExport(kid, verifiers)
-		if err != nil {
-			// Rotation is already durably committed; report an operational error
-			// rather than returning incomplete verification material.
-			http.Error(w, "key export unavailable", http.StatusInternalServerError)
-			return
-		}
-		writeAdminJSON(w, exp)
 	}
 }
 
@@ -826,11 +868,11 @@ func parseSpec(spec string) (string, []string, error) {
 	return strings.TrimSpace(name), out, nil
 }
 
-func bootstrapCredentials(reg credential.Registry, pepperKey []byte) error {
-	// Bootstrap prefers the Provisioner seam (InsertIfAbsent) so an env-provided
-	// credential never overwrites a durable, operator-managed one (P0.10). A
-	// registry that does not support provisioning (must be provisioned out of
-	// band) is left alone.
+func bootstrapCredentials(reg credential.Registry) error {
+	// This is a development-only compatibility seam for an already-derived
+	// verifier record. Raw external credentials are deliberately not accepted
+	// here; production credentials are provisioned through the authenticated
+	// operator lifecycle before the persistent runtime starts.
 	prov, ok := reg.(credential.Provisioner)
 	if bootstrapJSON := os.Getenv("GRIPLINE_BOOTSTRAP_CREDENTIAL"); bootstrapJSON != "" {
 		var rec credential.CredentialRecord
@@ -856,33 +898,6 @@ func bootstrapCredentials(reg credential.Registry, pepperKey []byte) error {
 			log.Printf("gripline: bootstrap credential %s already present; left untouched", rec.CredentialID)
 		}
 		return nil
-	}
-
-	if credSecret := os.Getenv("GRIPLINE_CREDENTIAL_SECRET"); credSecret != "" {
-		sealed := secret.NewFromBytes([]byte(credSecret))
-		verifier := credential.Verifier(sealed, &credential.PepperKey{Version: 1, Key: pepperKey})
-		sealed.Zero()
-		credID := os.Getenv("GRIPLINE_CREDENTIAL_ID")
-		if credID == "" {
-			credID = "cred_bootstrap"
-		}
-		if !ok {
-			return fmt.Errorf("gripline: registry does not support provisioning; cannot derive credential %s", credID)
-		}
-		if _, err := prov.InsertIfAbsent(&credential.CredentialRecord{
-			CredentialID:  credID,
-			AccountID:     os.Getenv("GRIPLINE_ACCOUNT_ID"),
-			Verifier:      verifier,
-			PepperVersion: 1,
-			Status:        credential.StatusNormal,
-			PolicyID:      "fi-default-v1",
-			PlanID:        "plan-a",
-			CreatedAt:     time.Now().Add(-time.Hour),
-			Revision:      1,
-		}); err != nil {
-			return fmt.Errorf("gripline: insert derived credential: %w", err)
-		}
-		log.Printf("gripline: derived credential %s wired", credID)
 	}
 
 	return nil
@@ -915,12 +930,20 @@ func decodeSecretKey(what, encoded string, minBytes int) ([]byte, error) {
 		key, err = base64.StdEncoding.DecodeString(enc)
 	}
 	if err != nil {
+		zeroBytes(key)
 		return nil, fmt.Errorf("gripline: %s must be base64-encoded (got decode error: %v)", what, err)
 	}
 	if len(key) < minBytes {
+		zeroBytes(key)
 		return nil, fmt.Errorf("gripline: %s must decode to at least %d bytes of entropy, got %d", what, minBytes, len(key))
 	}
 	return key, nil
+}
+
+func zeroBytes(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
 }
 
 // pseudonymRingAdapter adapts a *pseudonym.Ring to ingress.PseudonymRing.

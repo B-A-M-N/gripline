@@ -1,21 +1,21 @@
 # Gripline — Hostile-Review P0 Verdict Audit (Full)
 
 Durable source of truth for the numbered P0 findings from the external hostile
-production review. Every row is a verdict grounded in committed code, confirmed
-by re-reading the actual implementation (not inferred from summaries). This is
-the on-repo ground truth for "All P0s now": a finding is only RESOLVED when the
-verdict links to the committed symbol that satisfies it, and only CLOSED once
-that code is committed on `main`.
+production review. Every row is a verdict grounded in the current release-
+candidate tree, confirmed by re-reading the actual implementation (not inferred
+from summaries). This is the on-repo ground truth for "All P0s now": a finding
+is only RESOLVED when the verdict links to the symbol and proof that satisfy it;
+the release commit should preserve this document unchanged.
 
 Legend:
-- RESOLVED — the invariant is implemented and enforced in committed code.
+- RESOLVED — the invariant is implemented and enforced in the current tree.
 - PARTIAL — the safety property holds but a named surface is known-incomplete;
   the missing piece is called out.
 - OPEN — a confirmed defect not yet closed.
 - NOT GROUNDED — no code/test/comment in the tree references this finding
-  number; i.e. the finding text has no committed representation to verify.
+  number; i.e. the finding text has no repository representation to verify.
 
-Last verified against the release-candidate worktree. The final commit hash and
+Last verified against the release-candidate worktree on 2026-09-07. The
 release-gate results are recorded at close-out below.
 
 ---
@@ -105,7 +105,7 @@ release-gate results are recorded at close-out below.
 | # | Verdict | Evidence |
 |---|---------|----------|
 | P0.58 | RESOLVED (single-node beta) | `internal/statebolt` is the durable credential authority. Multi-node replication remains deliberately out of scope. |
-| P0.59 | RESOLVED | Live signer rotation uses `Keyring.RotateAndSave`: the candidate generation is persisted before publish, old public keys overlap, the authenticated admin endpoint audits the action, and the endpoint returns the public export. |
+| P0.59 | PARTIAL (out of beta scope) | `Keyring.RotateAndSave` remains a library primitive with durable replace ordering and retained public-key overlap. The live admin rotation endpoint/capability is intentionally absent from public beta; operators must coordinate signer rotation and publish `gripline keys export` externally. |
 | P0.60 | PARTIAL | Assertion key overlap exists via Keyring, but no HSM/remote signer or automated key-management lifecycle. |
 | P0.61 | ABSENT | Multi-node / leader election: resource governor is a single-process `sync.Mutex`; no etcd/Consul/Raft. |
 | P0.62 | ABSENT | Shared leases with TTL across nodes: leases are in-process; no distributed store/TTL. |
@@ -144,8 +144,8 @@ release-gate results are recorded at close-out below.
 > true.
 
 **Single-node public-beta gateway.** The deterministic authorization engine,
-proxy trust boundary, durable bbolt authority, source-spray detector, live
-signer rotation, operator control plane, bounded runtime observer, and causal
+proxy trust boundary, durable bbolt authority, source-spray detector, operator
+control plane, bounded runtime observer, and causal
 demo are implemented and tested. Multi-node lease coordination, an external
 chaos/replay harness, metrics backends, KMS/HSM-backed keys, and a provider SDK
 matrix remain outside the beta claim.
@@ -174,9 +174,32 @@ matrix remain outside the beta claim.
 
 ## Public-beta re-review close-out (2026-09)
 
-The second external review ("Gripline Public-Beta Re-review", 35 findings,
-5-phase fix order) was implemented in full. Summary of what each phase changed
-and how it is proven:
+The current release-candidate tree addresses the second external review
+("Gripline Public-Beta Re-review", 35 findings, 5-phase fix order). The
+remaining partial/absent items are explicit beta limitations above, not hidden
+claims. The ten release blockers and their current status are:
+
+| Review item | Current status and evidence |
+|---|---|
+| P0-1 typed hard-resource denials | **RESOLVED.** `ScopeLimitError` survives `Terminator` into `Outcome.DenialErr`; HTTP maps typed hard-limit denials to 429 and preserves typed `Retry-After`. `TestM3TypedScopeDenialsPreserveHardLimitCause` covers SOURCE, ACCOUNT, CREDENTIAL, LANE, and GLOBAL. |
+| P0-2 body-spool ordering | **RESOLVED.** Full source/classification/evidence/state/resource admission runs before unknown-length spooling; denied traffic does not spool, oversized admitted bodies cancel without backend or baseline credit, and chunked bodies forward exactly. `internal/proxy/spool_test.go` plus acceptance coverage. |
+| P0-3 stock demo signal | **RESOLVED.** The demo uses only `SourceNovelty`, `ResourceVelocity`, and `Enumeration` producers and contains no `DEMO_*` signal, manual evidence append, or manual lane mutation. A real concurrent HTTP burst exposes stock `CONCURRENCY_OVER_4X_BASELINE`; the web and headless proofs require the real evidence and transition. |
+| P0-4/P0-5 credential provisioning | **RESOLVED.** `terminator.ValidateExternalCredential` is shared by ingress, bootstrap, and live CLI; live add validates the config but never stats/opens the server-owned state file. |
+| P0-6 admin bearer transport | **RESOLVED.** Plaintext admin binds accept numeric loopback only; LAN/private/public binds are rejected and remote access is documented through SSH or a TLS wrapper. |
+| P0-7 live signer rotation | **OUT OF BETA SCOPE.** The one-step live route and capability are absent. Persistent key export and library rotation primitives remain available until a prepare/activate protocol exists. |
+| P0-8 key durability | **RESOLVED.** Keyring replacement writes 0600 temporary state, fsyncs file, renames, fsyncs the parent directory, and cleans up failed temporary writes. |
+| P0-9 strict config | **RESOLVED.** Config decoding disallows unknown fields at every nesting level and rejects trailing JSON values. |
+| P0-10 cryptographic buffer hygiene | **RESOLVED (best effort).** Key comparisons use decoded bytes and temporary pepper, pseudonym, verifier, and secret buffers are wiped on owned exit paths; Go string/header copies remain outside the mutable-buffer guarantee. |
+| P0-11 release publication | **RESOLVED in workflow.** Release tags run the full vet/tidy/diff/staticcheck/build/test/race/gate/acceptance/gofmt/demo/container checks, publish human and SHA image tags with normalized GHCR naming, embed version metadata, ship demo binaries, and smoke-test the pushed human tag. |
+
+P1 close-out is also wired: `audit security list|export` exposes automatic
+transition history; transition rows carry request, policy, and evidence
+provenance; the bounded observer reports telemetry drops while running; the
+quick start starts only after config/secrets are prepared and readiness is
+verified; demo browser controls have `httptest` coverage; and the release
+workflow declares the demo binaries as assets.
+
+Summary of the implementation phases and their proof follows:
 
 **Phase 1 — immediate correctness defects**
 - Body spooler limit bypass/truncation + temp-file leak: `proxy.spoolBody` reads
@@ -236,6 +259,11 @@ and how it is proven:
   (distroless, explicit UID 65532, image build verified); `.dockerignore` is
   present and staticcheck is pinned to v0.7.0.
 
-**Verification at close-out:** `go vet ./...`, `staticcheck`, `go build ./...`,
-`go test -race ./...` (all packages) green; executable acceptance suite green;
-Docker image builds.
+**Verification at close-out (2026-09-07):** `go test ./...`, `go vet ./...`,
+`staticcheck ./...`, `go build ./...`, `go mod tidy -diff`, `git diff --check`,
+and the `gofmt` gate are green. `go test -race ./...` is green across all
+packages. Gate A–J component proofs, observability proofs, and the §112
+admission-latency proof are green (p95 ≈ 0.41ms, p99 ≈ 0.57ms); the
+executable acceptance suite and headless causal demo are green. The release
+container builds and `deploy/container-smoke.sh` passes persistence, readiness,
+SIGTERM, and restart checks.

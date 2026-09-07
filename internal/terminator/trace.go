@@ -82,6 +82,7 @@ type DecisionTrace struct {
 	ReservationScope     string                 `json:"reservation_scope,omitempty"`
 	ReservationDimension string                 `json:"reservation_dimension,omitempty"`
 	Estimate             resource.UsageEstimate `json:"usage_estimate"`
+	ObservedConcurrency  int                    `json:"observed_concurrency"`
 
 	// Adaptive posture + WHY it degraded (P0.1/P0.50): a degraded decision must
 	// be explainable as degraded, not silently read as clean.

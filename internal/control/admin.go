@@ -51,6 +51,7 @@ type AuditRecordReader interface {
 // justification, the posture at action time, and the OUTCOME — everything a
 // review needs, nothing secret (INV-3).
 type OperatorRecord struct {
+	Sequence  uint64    `json:"sequence,omitempty"` // durable cursor assigned by the store
 	At        time.Time `json:"at"`
 	Actor     string    `json:"actor"`            // authenticated operator identity
 	Action    string    `json:"action"`           // e.g. "credential.revoke"
@@ -141,8 +142,6 @@ const (
 	CapPolicyInstall Capability = "policy.install"
 	// CapAuditRead: read operator and automatic security audit history.
 	CapAuditRead Capability = "audit.read"
-	// CapIdentityKeysRotate: rotate the live assertion signing generation.
-	CapIdentityKeysRotate Capability = "identity.keys.rotate"
 )
 
 // ErrUnauthenticated is returned when credentials are absent or invalid.
@@ -195,7 +194,7 @@ func NewTokenAuthenticator(tokens map[string]*Identity) (*TokenAuthenticator, er
 func ParseCapability(s string) (Capability, error) {
 	capability := Capability(s)
 	switch capability {
-	case CapCredentialLifecycle, CapLaneLifecycle, CapPosture, CapEvidence, CapPolicyInstall, CapAuditRead, CapIdentityKeysRotate:
+	case CapCredentialLifecycle, CapLaneLifecycle, CapPosture, CapEvidence, CapPolicyInstall, CapAuditRead:
 		return capability, nil
 	default:
 		return "", fmt.Errorf("control: unknown capability %q", s)
@@ -493,31 +492,6 @@ func (s *Service) SetEmergency(ctx context.Context, token string, on bool, reaso
 	}
 	posture := s.plane.SetEmergency(on, id.Name, reason)
 	return posture, nil
-}
-
-// RotateIdentityKeys rotates a live signer through the supplied atomic
-// persist-and-publish callback. The callback must persist the candidate key
-// generation before making it active; a failed persistence therefore cannot
-// silently publish an identity that restart would forget.
-func (s *Service) RotateIdentityKeys(ctx context.Context, token, reason string, rotate func() (int, error)) (int, error) {
-	id, err := s.authorize(ctx, token, CapIdentityKeysRotate, reason)
-	if err != nil {
-		s.record("", "identity.keys.rotate", "signer", reason, false, err.Error())
-		return 0, err
-	}
-	if rotate == nil {
-		s.record(id.Name, "identity.keys.rotate", "signer", reason, false, "no signer rotation implementation")
-		return 0, errors.New("control: signer rotation unavailable")
-	}
-	kid, err := rotate()
-	if err != nil {
-		s.record(id.Name, "identity.keys.rotate", "signer", reason, false, err.Error())
-		return 0, err
-	}
-	if err := s.commitAudit(ctx, id.Name, "identity.keys.rotate", "signer", reason); err != nil {
-		return 0, fmt.Errorf("control: signer rotated but audit commit failed: %w", err)
-	}
-	return kid, nil
 }
 
 // RevokeCredential revokes a credential under full control-plane discipline.

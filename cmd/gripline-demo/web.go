@@ -28,8 +28,9 @@ type protectedSnapshot struct {
 	DirectRawRejected int `json:"direct_raw_rejected"`
 }
 type demoProof struct {
-	RealEvidence       bool `json:"real_evidence"`
-	SecurityTransition bool `json:"security_transition"`
+	RealEvidence        bool `json:"real_evidence"`
+	ConcurrencyEvidence bool `json:"concurrency_evidence"`
+	SecurityTransition  bool `json:"security_transition"`
 }
 
 type baselineSnapshot struct {
@@ -66,8 +67,11 @@ func (s *Scenario) Snapshot() demoSnapshot {
 				out.Protected.AttackerBlocked++
 			}
 			for _, code := range e.Evidence {
-				if code == "DEMO_ATTACK_SPIKE" || code == "NEW_HOSTING_ASN" {
+				if code == "NEW_ASN" || code == "NEW_HOSTING_ASN" || code == "NEW_COUNTRY" || code == "CONCURRENCY_OVER_4X_BASELINE" || code == "CONCURRENCY_OVER_10X_BASELINE" {
 					out.Proof.RealEvidence = true
+				}
+				if code == "CONCURRENCY_OVER_4X_BASELINE" || code == "CONCURRENCY_OVER_10X_BASELINE" {
+					out.Proof.ConcurrencyEvidence = true
 				}
 			}
 			if strings.Contains(e.Transition, "lane-security:") {

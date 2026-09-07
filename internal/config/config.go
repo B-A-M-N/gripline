@@ -16,6 +16,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"net/url"
@@ -87,12 +88,35 @@ type Config struct {
 	// Paths are the durable-state locations.
 	Paths PathsSection `json:"paths"`
 
+	// Secrets carries versioned verifier-pepper references. Values are expected
+	// to come from environment expansion or a secret-injection layer; they are
+	// never persisted in state.
+	Secrets SecretsSection `json:"secrets,omitempty"`
+
 	// Ingress configures trusted source identity resolution (P0.6).
 	Ingress *IngressSection `json:"ingress,omitempty"`
 
 	// Deployment carries the deployment-posture switches (P0.18). The safe
 	// production path is the DEFAULT: persistent state is required at boot.
 	Deployment DeploymentSection `json:"deployment,omitempty"`
+
+	// Policy optionally names the authenticated/versioned policy artifact. An
+	// empty path retains the beta default; a supplied path is loaded and passed
+	// through policy.Compile during runtime construction.
+	Policy PolicySection `json:"policy,omitempty"`
+}
+
+// PolicySection selects the versioned policy artifact for the deployment.
+type PolicySection struct {
+	File string `json:"file,omitempty"`
+}
+
+// SecretsSection configures the active verifier pepper versions. The map key
+// is a positive decimal version string and the value is base64 key material.
+// Keeping more than one version live allows existing credentials to migrate
+// without making the old verifier invalid before re-provisioning completes.
+type SecretsSection struct {
+	PepperVersions map[string]string `json:"pepper_versions,omitempty"`
 }
 
 // DeploymentSection carries the deployment-posture switches (P0.18).
@@ -188,6 +212,18 @@ type ServerSection struct {
 	// SpoolDir is an optional dedicated directory for chunked request bodies.
 	// In a read-only-root container, point this at a writable tmpfs mount.
 	SpoolDir string `json:"spool_dir,omitempty"`
+	// SpoolMaxBytes bounds aggregate unknown-length body reservations. Zero
+	// leaves the aggregate byte bound disabled (the per-request cap remains).
+	SpoolMaxBytes int64 `json:"spool_max_bytes,omitempty"`
+	// SpoolMaxFiles bounds concurrent unknown-length body reservations. Zero
+	// leaves the aggregate file/concurrency bound disabled.
+	SpoolMaxFiles int `json:"spool_max_files,omitempty"`
+	// MaxSourceScopes bounds source pseudonym state in the process-local
+	// governor. Zero uses the conservative runtime default.
+	MaxSourceScopes int `json:"max_source_scopes,omitempty"`
+	// SourceScopeIdle is the minimum idle horizon before a fully replenished
+	// source scope may be evicted.
+	SourceScopeIdle Duration `json:"source_scope_idle,omitempty"`
 }
 
 // AdminSection configures the operator control-plane listener (P0.47).
@@ -241,8 +277,20 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	var c Config
-	if err := json.Unmarshal([]byte(expanded), &c); err != nil {
+	dec := json.NewDecoder(strings.NewReader(expanded))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&c); err != nil {
 		return nil, fmt.Errorf("config: parse %s: %w", path, err)
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("config: parse %s: trailing JSON value", path)
+		}
+		return nil, fmt.Errorf("config: parse %s: trailing data: %w", path, err)
+	}
+	if c.Policy.File != "" && !filepath.IsAbs(c.Policy.File) {
+		c.Policy.File = filepath.Join(filepath.Dir(path), c.Policy.File)
 	}
 	if err := c.Validate(); err != nil {
 		return nil, fmt.Errorf("config: invalid: %w", err)
@@ -354,8 +402,23 @@ func (c *Config) Validate() error {
 	if c.Server.MaxHeaderBytes < 0 || c.Server.MaxBodyBytes < 0 {
 		return fmt.Errorf("server.max_header_bytes/max_body_bytes must be non-negative")
 	}
+	if c.Server.SpoolMaxBytes < 0 || c.Server.SpoolMaxFiles < 0 {
+		return fmt.Errorf("server.spool_max_bytes/spool_max_files must be non-negative")
+	}
+	if c.Server.MaxSourceScopes < 0 || c.Server.SourceScopeIdle.D() < 0 {
+		return fmt.Errorf("server.max_source_scopes/source_scope_idle must be non-negative")
+	}
 	if c.Server.StreamWriteIdleTimeout.D() < 0 {
 		return fmt.Errorf("server.stream_write_idle_timeout must be non-negative")
+	}
+	for version, value := range c.Secrets.PepperVersions {
+		n, err := strconv.Atoi(version)
+		if err != nil || n < 1 {
+			return fmt.Errorf("secrets.pepper_versions key %q must be a positive decimal version", version)
+		}
+		if strings.TrimSpace(value) == "" {
+			return fmt.Errorf("secrets.pepper_versions[%q] must not be empty", version)
+		}
 	}
 
 	// Identity boundary.
@@ -414,9 +477,9 @@ func (c *Config) Validate() error {
 }
 
 // requirePrivateBind enforces that a listener address binds loopback or a
-// private (RFC1918 / unique-local / link-local) interface. Used for listeners
-// whose traffic is only safe on a private network (the admin control plane;
-// the public listener when TLS is terminated upstream).
+// private (RFC1918 / unique-local / link-local) interface. It is used for the
+// public listener when TLS is terminated upstream; the admin control plane is
+// stricter and uses validateAdminBind below.
 func requirePrivateBind(listen, what string) error {
 	host := listen
 	if h, _, err := net.SplitHostPort(listen); err == nil {
@@ -438,12 +501,22 @@ func requirePrivateBind(listen, what string) error {
 	return fmt.Errorf("%s %q: public address is not allowed for this listener (traffic is unencrypted on this bind; use 127.0.0.1 or a private interface)", what, listen)
 }
 
-// validateAdminBind enforces that the admin listener binds loopback or a
-// private (RFC1918 / unique-local / link-local) interface address. An
-// unspecified/wildcard host (`:port`, `0.0.0.0`, `::`) or a public IP is
-// rejected unconditionally — the control plane must sit on a private network.
+// validateAdminBind enforces that the plaintext admin listener binds only to
+// loopback. Private LAN addresses are intentionally rejected: a bearer token
+// control plane must be reached through an explicit SSH/TLS tunnel.
 func validateAdminBind(a *AdminSection) error {
-	return requirePrivateBind(a.Listen, "admin.listen")
+	host := a.Listen
+	if h, _, err := net.SplitHostPort(a.Listen); err == nil {
+		host = h
+	}
+	if host == "" {
+		return fmt.Errorf("admin.listen %q: wildcard host is not allowed (bind loopback and use an SSH/TLS tunnel)", a.Listen)
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil || !addr.IsLoopback() {
+		return fmt.Errorf("admin.listen %q: only a numeric loopback address is allowed; use an SSH/TLS tunnel for remote access", a.Listen)
+	}
+	return nil
 }
 
 // parseOperatorSpec parses "name:cap1,cap2".

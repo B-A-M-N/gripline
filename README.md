@@ -22,6 +22,20 @@
 
 <p align="center"><strong>Credentials stop at the line · Authority continues across it · Legacy clients keep working</strong></p>
 
+<p align="center"><img src="docs/assets/gripline-value.svg" alt="Without Gripline, a stolen API key reaches the backend. With Gripline, the raw credential stops at the trust boundary and suspicious use is constrained while the legitimate lane continues."></p>
+
+## Why I built this
+
+I built Gripline after studying API credential theft and unauthorized access to
+hosted AI systems. Reusable API keys are convenient, but possession of a key
+should not grant unlimited authority behind the provider edge. Gripline is my
+response: terminate the reusable credential at the provider boundary,
+reconstruct narrowly scoped internal authority, and contain suspicious use
+without requiring legacy clients to change.
+
+Gripline does not stop a credential from being stolen; it reduces what
+possession of that credential can authorize after theft.
+
 Gripline is a provider-agnostic gateway that terminates reusable external
 credentials at the provider trust boundary, reconstructs authority from scoped
 internal identity and current security state, constrains suspicious contexts
@@ -69,10 +83,27 @@ Build and run against a private backend:
 ```bash
 go build -o gripline ./cmd/gripline
 
+cp deploy/config.example.json config.json
 export GRIPLINE_PEPPER_V1="$(openssl rand -base64 32)"   # verifier pepper (>=32 bytes entropy)
 export GRIPLINE_OPERATOR_TOKEN="$(openssl rand -base64 32)" # admin bearer token (>=32 bytes)
 export GRIPLINE_PSEUDONYM_KEY="$(openssl rand -base64 32)"  # trusted-ingress key (>=32 bytes)
-gripline -config deploy/config.example.json
+
+# Before starting, edit config.json for your backend and point its TLS and
+# persistent state/keyring paths at files/directories this deployment owns.
+mkdir -p tls state
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=localhost' \
+  -keyout tls/key.pem -out tls/cert.pem >/dev/null 2>&1
+printf '%s' "$GRIPLINE_OPERATOR_TOKEN" > operator-token
+chmod 600 operator-token
+./gripline -config config.json &
+curl --fail --silent --insecure https://127.0.0.1:8443/readyz
+
+# After readiness: publish backend verification keys, provision a credential,
+# configure the backend with verification-keys.json, then send inference traffic.
+./gripline keys export --config config.json > verification-keys.json
+openssl rand -base64 32 > provider-key
+chmod 600 provider-key
+./gripline credential add --config config.json --id <cred> --account <acct> --reason "provision" --secret-stdin --token-file operator-token < provider-key
 ```
 
 `deploy/config.example.json` is a complete, validated production-shaped
@@ -84,26 +115,30 @@ Operator lifecycle:
 
 ```bash
 gripline status     --config /etc/gripline/config.json   # what is durable / on / off, honestly
-gripline credential list   --config c.json --token "$GRIPLINE_OPERATOR_TOKEN"
-gripline credential add    --config c.json --id <cred> --account <acct> --reason "provision" --secret-stdin --token-file /run/secrets/gripline-operator <<< "$KEY"
+gripline credential list   --config c.json --token-file /run/secrets/gripline-operator
+gripline credential add   --config c.json --id <cred> --account <acct> --reason "provision" --secret-stdin --token-file /run/secrets/gripline-operator < /run/secrets/provider-key
 gripline credential revoke --config c.json --id <cred> --reason "..." --token "$GRIPLINE_OPERATOR_TOKEN"
 gripline lane list         --config c.json --credential <cred> --token-file /run/secrets/gripline-operator
 gripline lane unblock      --config c.json --credential <cred> --id <lane> --reason "..." --token-file /run/secrets/gripline-operator
 gripline audit list        --config c.json --token-file /run/secrets/gripline-operator
 gripline audit export      --config c.json --token-file /run/secrets/gripline-operator > audit.jsonl
+gripline audit security list   --config c.json --token-file /run/secrets/gripline-operator
+gripline audit security export --config c.json --token-file /run/secrets/gripline-operator > security.jsonl
 gripline keys export       --config c.json   # public backend verification material only
+gripline version
 
-# Live signer rotation is authenticated, audited, persisted-before-publish,
-# and returns the complete public verification export for backend reload.
-curl -X POST -H "Authorization: Bearer $GRIPLINE_OPERATOR_TOKEN" \
-  -H 'Content-Type: application/json' -d '{"reason":"scheduled rotation"}' \
-  http://127.0.0.1:9090/admin/identity/keys/rotate
+# Live signer rotation is intentionally not exposed in public beta. Coordinate
+# key lifecycle externally, then publish the public verification material:
+gripline keys export --config c.json > verification-keys.json
 ```
 
 Lifecycle and audit commands use the running private admin listener by default;
 `--offline` is an explicit stopped-database maintenance mode for credential and
 lane commands. Generate operator tokens with `openssl rand -base64 32` (or a
 stronger secret source); tokens shorter than 32 bytes are rejected at startup.
+The plaintext admin listener binds to loopback only. For remote operations,
+use an SSH local-forward or place a mutually authenticated TLS control-plane
+wrapper in front of it; do not expose the bearer-token listener to a LAN.
 
 Container:
 
@@ -127,10 +162,13 @@ container, use a bounded tmpfs mount such as
 `--tmpfs /tmp/gripline-spool:rw,noexec,nosuid,size=64m`; Gripline removes stale
 `gripline-body-*.tmp` files there at startup.
 
-The stock executable supports verifier pepper V1 at runtime. Pepper rotation
-is available as a library capability; a deployment changing pepper versions
-must provision a versioned runtime configuration and re-derive verifiers before
-switching traffic. It is not an automatic stock-binary operation.
+The stock executable supports versioned verifier peppers through
+`secrets.pepper_versions` (the example maps version `1` to
+`GRIPLINE_PEPPER_V1`). Keep the old version and add the new version during a
+migration; existing records continue to authenticate, while `credential add`
+derives new verifiers with the highest configured version. Re-provision records
+before retiring an old pepper. Pepper material belongs in the deployment's
+secret injector, not in the state database.
 
 ## Guarantees (and how they are proven)
 
@@ -195,6 +233,22 @@ from the Gripline specification (v0.1.0):
 - [`06-observability.md`](docs/design/06-observability.md) — telemetry, pseudonymization, retention, audit.
 - [`07-deployment.md`](docs/design/07-deployment.md) — modes, failure semantics, multi-node, FI integration.
 - [`08-testing.md`](docs/design/08-testing.md) — test strategy + acceptance gates.
+
+### Provider backend integration
+
+Protected Go services can import the public [`verify/`](verify/) package. It
+loads the public JSON produced by `gripline keys export`, verifies the exact
+audience and issuer, enforces the short TTL and revision claims, rejects
+duplicate carriers/claims, and removes the assertion after successful
+verification. It never receives signing keys or reusable credentials.
+
+The wire format is intentionally explicit: `base64url(payload).base64url(Ed25519
+signature)`, with the claim set documented in
+[`05-internal-identity.md`](docs/design/05-internal-identity.md). The public
+verifier's conformance tests cover valid, expired, wrong-audience,
+wrong-key-generation, stale-revision, tampered, duplicate, and malformed
+assertions. Providers using another language should implement those vectors
+before accepting production traffic.
 
 ## Status
 

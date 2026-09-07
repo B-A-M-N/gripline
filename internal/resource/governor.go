@@ -47,12 +47,21 @@ func (s Scope) String() string {
 // "rate limited" bucket.
 var ErrScopeLimit = errors.New("resource: scope hard limit exceeded")
 
+// ErrSourceScopeSaturated means a new attacker-controlled source scope could
+// not be admitted because every bounded-table entry still carries active or
+// recently spent state. The caller should treat this as resource unavailability
+// rather than silently growing memory.
+var ErrSourceScopeSaturated = errors.New("resource: source scope table saturated")
+
 // ScopeLimitError carries the scope and gauge dimension that denied. Both are
 // internal diagnostic data; callers should not expose the exact scope to an
 // untrusted client.
 type ScopeLimitError struct {
 	Scope     Scope
 	Dimension Dimension
+	// Cause carries an operational saturation reason when the scope table, not
+	// the gauge allowance, prevented admission.
+	Cause error
 	// RetryAfter is a best-effort lower bound for bucket-backed limits. A zero
 	// value means the denial was concurrency-only, burst-only, or otherwise has
 	// no meaningful automatic retry time.
@@ -61,6 +70,15 @@ type ScopeLimitError struct {
 
 func (e *ScopeLimitError) Error() string {
 	return "resource: " + e.Scope.String() + " hard limit exceeded"
+}
+
+// Unwrap preserves the sentinel classification for callers that do not need
+// the scope detail. The concrete error remains available through errors.As.
+func (e *ScopeLimitError) Unwrap() []error {
+	if e == nil || e.Cause == nil {
+		return []error{ErrScopeLimit}
+	}
+	return []error{ErrScopeLimit, e.Cause}
 }
 
 // Dimension is one resource gauge to enforce per scope. A provision request
@@ -158,7 +176,22 @@ type Governor struct {
 	now     func() time.Time
 	pools   map[string]*ConcurrencyPool // scopeKey <Scope>:<id> -> pool
 	buckets map[Dimension]map[string]*TokenBucket
+	// sourceScopes is the bounded metadata table for attacker-controlled SOURCE
+	// keys. Entries are removed only after an idle horizon and when every owned
+	// gauge is fully idle/replenished.
+	sourceScopes      map[string]sourceScopeMeta
+	maxSourceScopes   int
+	sourceIdle        time.Duration
+	sourceEvictions   uint64
+	sourceSaturations uint64
 }
+
+type sourceScopeMeta struct{ lastUsed time.Time }
+
+const (
+	defaultMaxSourceScopes = 4096
+	defaultSourceScopeIdle = 10 * time.Minute
+)
 
 // NewGovernor builds a Governor. now may be nil (defaults to time.Now).
 func NewGovernor(now func() time.Time) *Governor {
@@ -166,14 +199,92 @@ func NewGovernor(now func() time.Time) *Governor {
 		now = time.Now
 	}
 	g := &Governor{
-		now:     now,
-		pools:   make(map[string]*ConcurrencyPool),
-		buckets: make(map[Dimension]map[string]*TokenBucket),
+		now:             now,
+		pools:           make(map[string]*ConcurrencyPool),
+		buckets:         make(map[Dimension]map[string]*TokenBucket),
+		sourceScopes:    make(map[string]sourceScopeMeta),
+		maxSourceScopes: defaultMaxSourceScopes,
+		sourceIdle:      defaultSourceScopeIdle,
 	}
 	for i := 0; i < int(DimCost)+1; i++ {
 		g.buckets[Dimension(i)] = make(map[string]*TokenBucket)
 	}
 	return g
+}
+
+// SetSourceScopeLimits configures the bounded table for attacker-controlled
+// source pseudonyms. A zero max disables the cap; a non-positive idle horizon
+// uses the conservative default. Call before serving traffic.
+func (g *Governor) SetSourceScopeLimits(max int, idle time.Duration) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if max >= 0 {
+		g.maxSourceScopes = max
+	}
+	if idle > 0 {
+		g.sourceIdle = idle
+	}
+}
+
+// GovernorStats exposes bounded-state utilization without exposing scope IDs.
+type GovernorStats struct {
+	SourceScopes      int
+	MaxSourceScopes   int
+	SourceEvictions   uint64
+	SourceSaturations uint64
+}
+
+func (g *Governor) Stats() GovernorStats {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return GovernorStats{SourceScopes: len(g.sourceScopes), MaxSourceScopes: g.maxSourceScopes,
+		SourceEvictions: g.sourceEvictions, SourceSaturations: g.sourceSaturations}
+}
+
+func (g *Governor) ensureSourceScopeLocked(sp ScopeSpec) error {
+	if sp.Scope != ScopeSource || sp.ID == "" {
+		return nil
+	}
+	key := scopeKey(sp.Scope, sp.ID)
+	now := g.now()
+	if meta, ok := g.sourceScopes[key]; ok {
+		meta.lastUsed = now
+		g.sourceScopes[key] = meta
+		return nil
+	}
+	if g.maxSourceScopes > 0 && len(g.sourceScopes) >= g.maxSourceScopes {
+		if !g.evictSourceScopeLocked(now) {
+			g.sourceSaturations++
+			return ErrSourceScopeSaturated
+		}
+	}
+	g.sourceScopes[key] = sourceScopeMeta{lastUsed: now}
+	return nil
+}
+
+func (g *Governor) evictSourceScopeLocked(now time.Time) bool {
+	for key, meta := range g.sourceScopes {
+		if now.Sub(meta.lastUsed) < g.sourceIdle {
+			continue
+		}
+		if p := g.pools[key]; p != nil && p.InUse() != 0 {
+			continue
+		}
+		for _, byScope := range g.buckets {
+			if b := byScope[key]; b != nil && !b.Evictable() {
+				goto next
+			}
+		}
+		delete(g.pools, key)
+		for _, byScope := range g.buckets {
+			delete(byScope, key)
+		}
+		delete(g.sourceScopes, key)
+		g.sourceEvictions++
+		return true
+	next:
+	}
+	return false
 }
 
 func scopeKey(s Scope, id string) string {
@@ -280,6 +391,11 @@ func (g *Governor) ProvisionUsage(scopes []ScopeSpec, est UsageEstimate) (*Multi
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	for _, sp := range scopes {
+		if err := g.ensureSourceScopeLocked(sp); err != nil {
+			return nil, &ScopeLimitError{Scope: sp.Scope, Dimension: DimConcurrency, Cause: err}
+		}
+	}
 
 	var acquired []*singleAcquired
 	defer func() {

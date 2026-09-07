@@ -45,6 +45,7 @@ type Scenario struct {
 	obs               *demoObserver
 	baseStats         *baselineStats
 	backendStats      *backendStats
+	barrier           *demoBarrier
 	raw               string
 	fingerprint       string
 }
@@ -85,13 +86,11 @@ func (s *Scenario) build() error {
 	pol.Learning.AllowNewLanes = true
 	pol.LaneLimits = lane.DefaultLimits()
 	pol.LaneLimits.MaxActiveLanesPerCredential = 8
-	pol.LaneSecurity = lane.SecurityHysteresis{SuspectThresh: 20, BlockThresh: 60,
+	// Keep the first location novelty below the lane-suspicion threshold. The
+	// coordinated burst then contributes the stock 4x concurrency signal and
+	// crosses the block threshold from real producer evidence.
+	pol.LaneSecurity = lane.SecurityHysteresis{SuspectThresh: 40, BlockThresh: 40,
 		ClearThresh: 10, ClearDwell: time.Minute, SuspectObs: 1, EnableAutomaticBlock: true}
-	pol.EvidenceRules["DEMO_ATTACK_SPIKE"] = evidence.Rule{
-		Code: "DEMO_ATTACK_SPIKE", Family: evidence.FamilyOperatorIOC, Scope: evidence.ScopeLane,
-		Score: 80, Severity: 10, Confidence: 100, CorrelationGroup: "demo-attack",
-		TTL: 10 * time.Minute,
-	}
 
 	keyring, err := terminator.NewKeyring()
 	if err != nil {
@@ -103,14 +102,19 @@ func (s *Scenario) build() error {
 		Registry: reg, Peppers: credential.MustPepperRing(pepper), Lanes: laneStore,
 		Policy: pol, Signer: keyring, Audience: demoAudience, Evidence: evidenceStore,
 		Resource: resource.NewGovernor(nil), Mode: terminator.ModeEnforce,
-		Producers: []producers.Producer{producers.NewSourceNoveltyProducer(time.Now), newDemoAttackProducer()},
+		Producers: []producers.Producer{
+			producers.NewSourceNoveltyProducer(time.Now),
+			producers.NewResourceVelocityProducer(time.Now),
+			producers.NewEnumerationProducer(time.Now),
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("terminator: %w", err)
 	}
 
 	s.obs, s.baseStats, s.backendStats = newDemoObserver(), &baselineStats{}, &backendStats{}
-	s.backend = httptest.NewServer(newProtectedBackend(keyring.PublishVerifier(), demoAudience, s.backendStats))
+	s.barrier = newDemoBarrier()
+	s.backend = httptest.NewServer(newProtectedBackend(keyring.PublishVerifier(), demoAudience, s.backendStats, s.barrier))
 	backendURL, _ := url.Parse(s.backend.URL)
 	demoRing, err := pseudonym.NewRing(&pseudonym.Key{Version: 1, Secret: []byte("gripline-demo-ingress-key-material-32!!")})
 	if err != nil {
@@ -188,8 +192,10 @@ func (s *Scenario) StealKeyAndAttack() error {
 	if _, err := s.requestLocked("protected", "attacker"); err != nil {
 		return err
 	}
-	_, err := s.requestLocked("protected", "attacker")
-	return err
+	if _, err := s.requestLocked("protected", "attacker"); err != nil {
+		return err
+	}
+	return s.attackBurstLocked("attacker", 3)
 }
 func (s *Scenario) LegitAfterContainment() error {
 	s.mu.Lock()
@@ -268,6 +274,55 @@ func (s *Scenario) requestLocked(kind, actor string) (int, error) {
 	return resp.StatusCode, nil
 }
 
+// attackBurstLocked holds the scenario lifecycle lock while coordinating a
+// real concurrent request burst. The backend deliberately keeps admitted
+// requests in flight long enough for the resource-velocity producer to observe
+// live lane concurrency rather than a synthetic demo signal.
+func (s *Scenario) attackBurstLocked(actor string, count int) error {
+	if count < 1 {
+		return fmt.Errorf("attack burst: count must be positive")
+	}
+	s.barrier.begin(count)
+	defer s.barrier.releaseAll()
+	start := make(chan struct{})
+	errs := make(chan error, count)
+	var wg sync.WaitGroup
+	for i := 0; i < count; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := s.requestLocked("protected", actor)
+			errs <- err
+		}()
+	}
+	close(start)
+	if !s.barrier.waitFor(count, 3*time.Second) {
+		return fmt.Errorf("attack burst: only %d/%d real HTTP requests reached the backend barrier", s.barrier.count(), count)
+	}
+	// The follow-up request is also real HTTP traffic. It runs while the first
+	// three requests are held by the backend, so the stock producer observes a
+	// live concurrency ramp and crosses its 4x rule; no governor/evidence state
+	// is preloaded by the demo.
+	followup := make(chan error, 1)
+	go func() {
+		_, err := s.requestLocked("protected", actor)
+		followup <- err
+	}()
+	if err := <-followup; err != nil {
+		return err
+	}
+	s.barrier.releaseAll()
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Scenario) requestURL(base, actor string) *http.Request {
 	ua := "gripline-demo-legit"
 	if actor == "attacker" {
@@ -306,7 +361,7 @@ func (s *Scenario) assertions() error {
 	if snap.Protected.DirectRawRejected < 1 {
 		return fmt.Errorf("direct raw backend rejection proof is missing")
 	}
-	if !snap.Proof.RealEvidence || !snap.Proof.SecurityTransition {
+	if !snap.Proof.RealEvidence || !snap.Proof.ConcurrencyEvidence || !snap.Proof.SecurityTransition {
 		return fmt.Errorf("timeline does not show real evidence and security transitions")
 	}
 	return nil
@@ -329,30 +384,6 @@ func (demoNetworkMetadata) Resolve(ip netip.Addr) (string, string, string, bool)
 	default:
 		return "", "", "", false
 	}
-}
-
-type demoAttackProducer struct {
-	mu   sync.Mutex
-	seen map[string]int
-}
-
-func newDemoAttackProducer() *demoAttackProducer {
-	return &demoAttackProducer{seen: make(map[string]int)}
-}
-func (p *demoAttackProducer) ObserveAdmission(b producers.AdmissionBehavior) []producers.Signal {
-	if b.Features.NetworkType != "hosting" || b.Subjects.LaneID == "" {
-		return nil
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.seen[b.Subjects.LaneID]++
-	if p.seen[b.Subjects.LaneID] >= 2 {
-		return []producers.Signal{{Code: "DEMO_ATTACK_SPIKE"}}
-	}
-	return nil
-}
-func (*demoAttackProducer) ObserveCompletion(producers.CompletionBehavior) []producers.Signal {
-	return nil
 }
 
 func demoClient(ip string) *http.Client {

@@ -252,6 +252,26 @@ func TestDataPlaneDenialMapsStatus(t *testing.T) {
 	}
 }
 
+func TestWriteDenialTypedScopeLimitMapsTo429(t *testing.T) {
+	dp := &DataPlane{}
+	rec := httptest.NewRecorder()
+	dp.writeDenial(rec, &terminator.Outcome{
+		RequestID: "req_scope_limit",
+		Reason:    "source_restricted",
+		DenialErr: &resource.ScopeLimitError{
+			Scope:      resource.ScopeSource,
+			Dimension:  resource.DimRequests,
+			RetryAfter: 1500 * time.Millisecond,
+		},
+	})
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("typed hard resource denial status=%d, want 429", rec.Code)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "2" {
+		t.Fatalf("typed hard resource Retry-After=%q, want 2", got)
+	}
+}
+
 func TestDataPlaneRejectsBackendURLComponents(t *testing.T) {
 	signer, _ := terminator.GenerateSigner()
 	base := &url.URL{Scheme: "http", Host: "backend.internal", User: url.User("bad"), RawQuery: "token=secret", Fragment: "bad"}

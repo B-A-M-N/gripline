@@ -139,6 +139,12 @@ func (rec *CredentialRecord) Validate() error {
 	if rec.CredentialID == "" {
 		return errors.New("credential: empty credential id")
 	}
+	if rec.AccountID == "" {
+		return errors.New("credential: empty account id")
+	}
+	if rec.PolicyID == "" {
+		return errors.New("credential: empty policy id")
+	}
 	if len(rec.Verifier) == 0 {
 		return errors.New("credential: record has no verifier")
 	}

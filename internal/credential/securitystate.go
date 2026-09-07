@@ -25,6 +25,17 @@ import (
 
 type requestIDContextKey struct{}
 
+type transitionMetadataContextKey struct{}
+
+// TransitionMetadata is the request-causal metadata persisted with an
+// automatic security transition. It is intentionally limited to identifiers
+// and evidence codes; no request content or secret material belongs here.
+type TransitionMetadata struct {
+	RequestID      string
+	PolicyRevision int
+	EvidenceCodes  []string
+}
+
 // WithRequestID associates the outer ingress request id with an authoritative
 // security-state mutation. Stores use it only for correlation; it never affects
 // the transition result.
@@ -39,6 +50,26 @@ func RequestIDFromContext(ctx context.Context) string {
 	}
 	id, _ := ctx.Value(requestIDContextKey{}).(string)
 	return id
+}
+
+// WithTransitionMetadata associates policy/evidence provenance with an
+// authoritative security-state mutation.
+func WithTransitionMetadata(ctx context.Context, meta TransitionMetadata) context.Context {
+	meta.EvidenceCodes = append([]string(nil), meta.EvidenceCodes...)
+	return context.WithValue(ctx, transitionMetadataContextKey{}, meta)
+}
+
+// TransitionMetadataFromContext returns the optional causal metadata.
+func TransitionMetadataFromContext(ctx context.Context) TransitionMetadata {
+	if ctx == nil {
+		return TransitionMetadata{}
+	}
+	meta, _ := ctx.Value(transitionMetadataContextKey{}).(TransitionMetadata)
+	meta.EvidenceCodes = append([]string(nil), meta.EvidenceCodes...)
+	if meta.RequestID == "" {
+		meta.RequestID = RequestIDFromContext(ctx)
+	}
+	return meta
 }
 
 // SecurityState is the persisted hysteresis metadata needed to reproduce a

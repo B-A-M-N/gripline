@@ -34,6 +34,12 @@ The raw invalid credential is discarded immediately; only a short-lived
 pseudonymous fingerprint is retained for key-spray cardinality (§44–45).
 Retention measured in minutes/hours.
 
+The stock JSONL observer is bounded and best-effort: admission does not wait
+for stderr or a collector. If its queue overflows, it emits a
+`telemetry_overflow` count periodically while the process is running and once
+more during shutdown. Durable credential, lane, evidence, and security-audit
+state remains authoritative and is not represented by these telemetry records.
+
 ## 5. Data retention classes
 
 Separately configurable (§74): raw network address (hours/days); invalid-

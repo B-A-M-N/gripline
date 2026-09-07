@@ -85,10 +85,10 @@ func (s *Store) Insert(rec *credential.CredentialRecord) error {
 
 // InsertIfAbsent implements provisioning (P0.10/§6): it creates the credential
 // ONLY if one with that id does not already exist, returning created=false when
-// present. Startup bootstrap MUST use this so GRIPLINE_CREDENTIAL_SECRET never
+// present. Development bootstrap MUST use this so a verifier record never
 // overwrites an operator-managed (e.g. CONSTRAINED/REVOKED) credential on
-// every restart. Credential rotation/replacement is the explicit lifecycle path
-// (Insert / UpdateStatusCAS), not bootstrap.
+// every restart. Credential rotation/replacement is the explicit lifecycle
+// path (Insert / UpdateStatusCAS), not bootstrap.
 func (s *Store) InsertIfAbsent(rec *credential.CredentialRecord) (bool, error) {
 	if rec == nil {
 		return false, errors.New("credential: nil record")
@@ -245,6 +245,16 @@ func (s *Store) BumpRevision(credentialID string) error {
 
 // TouchLastSeen implements credential.Registry (analytics, best-effort).
 func (s *Store) TouchLastSeen(credentialID string, at time.Time) {
+	// LastSeenAt is analytics-grade, not authorization state. Avoid a bbolt
+	// write transaction on every successful inference request; the coarse
+	// interval keeps the DB out of the hot path while preserving useful recency.
+	s.lastSeenMu.Lock()
+	if previous, ok := s.lastSeen[credentialID]; ok && at.Sub(previous) < s.lastSeenInterval {
+		s.lastSeenMu.Unlock()
+		return
+	}
+	s.lastSeen[credentialID] = at
+	s.lastSeenMu.Unlock()
 	_ = s.updateInPlace(credentialID, func(rec *credential.CredentialRecord) error {
 		rec.LastSeenAt = at
 		return nil
@@ -373,10 +383,12 @@ func (s *Store) ObserveAndCommit(
 		if err := creds.Put([]byte(credentialID), b); err != nil {
 			return err
 		}
+		meta := credential.TransitionMetadataFromContext(ctx)
 		if err := appendSecurityTransitionTx(tx, control.SecurityTransitionRecord{
-			At: now.UTC(), Kind: "credential_status", RequestID: credential.RequestIDFromContext(ctx),
+			At: now.UTC(), Kind: "credential_status", RequestID: meta.RequestID,
 			CredentialID: credentialID, Before: before.Status.String(), After: rec.Status.String(),
-			RiskScore: score, Revision: rec.Revision,
+			RiskScore: score, Revision: rec.Revision, PolicyRevision: meta.PolicyRevision,
+			EvidenceCodes: append([]string(nil), meta.EvidenceCodes...),
 		}); err != nil {
 			return err
 		}

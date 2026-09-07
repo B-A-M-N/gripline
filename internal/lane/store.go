@@ -76,6 +76,22 @@ type RequestAwareRepository interface {
 	RecordCleanAuthorizedAndPromoteWithRequestID(credID, laneID string, riskScore int, criteria PromotionCriteria, now time.Time, requestID string) (*LaneRecord, bool, error)
 }
 
+// TransitionMetadata is the request-causal provenance attached to automatic
+// lane security transitions. It mirrors credential.TransitionMetadata without
+// creating a package dependency cycle.
+type TransitionMetadata struct {
+	RequestID      string
+	PolicyRevision int
+	EvidenceCodes  []string
+}
+
+// MetadataAwareRepository is an optional extension for durable lane stores.
+// Older embedders continue to work through RequestAwareRepository.
+type MetadataAwareRepository interface {
+	ObserveRiskWithMetadata(credID, laneID string, riskScore int, now time.Time, meta TransitionMetadata) (*LaneRecord, error)
+	RecordCleanAuthorizedAndPromoteWithMetadata(credID, laneID string, riskScore int, criteria PromotionCriteria, now time.Time, meta TransitionMetadata) (*LaneRecord, bool, error)
+}
+
 // Store is a per-credential, bounded, concurrency-safe lane store with idle
 // eviction (§28, §81 bounded memory). It is the RESIDENT implementation of
 // Repository; its every mutation is a pure reducer from reduce.go executed

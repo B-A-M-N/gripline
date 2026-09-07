@@ -328,7 +328,7 @@ func TestCredentialReplacementInvalidatesOldVerifier(t *testing.T) {
 	rec1 := &CredentialRecord{
 		CredentialID: "cred_rot", AccountID: "acct_1",
 		Verifier: Verifier(raw1, pep), PepperVersion: pep.Version,
-		Status: StatusNormal, Revision: 1,
+		Status: StatusNormal, PolicyID: "policy_1", PlanID: "plan_1", Revision: 1,
 	}
 	if err := reg.Insert(rec1); err != nil {
 		t.Fatal(err)
@@ -370,7 +370,7 @@ func TestFindByVerifierDefensivelyRechecks(t *testing.T) {
 	if err := reg.Insert(&CredentialRecord{
 		CredentialID: "cred_d", AccountID: "a",
 		Verifier: Verifier(raw, pep), PepperVersion: pep.Version,
-		VerifierVersion: 1, Status: StatusNormal, Revision: 1,
+		VerifierVersion: 1, Status: StatusNormal, PolicyID: "policy_d", PlanID: "plan_d", Revision: 1,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -400,13 +400,13 @@ func TestConflictingVerifierOwnershipRejected(t *testing.T) {
 	ver := Verifier(raw, pep)
 	reg := NewMemoryRegistry()
 	if err := reg.Insert(&CredentialRecord{
-		CredentialID: "cred_a", Verifier: ver, PepperVersion: 1,
+		CredentialID: "cred_a", AccountID: "acct_a", PolicyID: "policy_a", PlanID: "plan_a", Verifier: ver, PepperVersion: 1,
 		VerifierVersion: 1, Status: StatusNormal, Revision: 1,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := reg.Insert(&CredentialRecord{
-		CredentialID: "cred_b", Verifier: ver, PepperVersion: 1,
+		CredentialID: "cred_b", AccountID: "acct_b", PolicyID: "policy_b", PlanID: "plan_b", Verifier: ver, PepperVersion: 1,
 		VerifierVersion: 1, Status: StatusNormal, Revision: 1,
 	}); err != ErrVerifierOwned {
 		t.Fatalf("want ErrVerifierOwned, got %v", err)

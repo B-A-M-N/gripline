@@ -14,10 +14,20 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/gripline ./cmd/gripline
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG BUILD_DATE=unknown
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION} -X main.buildCommit=${COMMIT} -X main.buildDate=${BUILD_DATE}" -o /out/gripline ./cmd/gripline
 RUN mkdir -p /out/state
 
 FROM gcr.io/distroless/static-debian12:nonroot
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG BUILD_DATE=unknown
+LABEL org.opencontainers.image.title="gripline" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${COMMIT}" \
+      org.opencontainers.image.created="${BUILD_DATE}"
 COPY --from=build /out/gripline /usr/local/bin/gripline
 COPY --from=build --chown=65532:65532 /out/state/ /var/lib/gripline/
 USER 65532:65532

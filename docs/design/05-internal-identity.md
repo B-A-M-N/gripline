@@ -45,6 +45,14 @@ configured public key(s), `exp`/`iat` window, `aud`, `iss`, and enables stale
 `cred_rev` rejection by sensitive services. Expired and wrong-audience
 assertions never validate (spec §104 property list).
 
+Provider backends should use the public [`verify`](../../verify/) package rather
+than importing `internal/terminator`. It consumes only the JSON public-key
+publication emitted by `gripline keys export`, rejects duplicate claim/header
+carriers, requires `kid`, and strips the assertion after verification. The
+custom wire format is versioned by this contract and remains deliberately
+small; changing it requires a protocol revision and updated conformance
+vectors.
+
 ## 5. Sender-constrained mode (HARDENED, future)
 
 Optional DPoP-style proof of possession (RFC 9449) / mTLS certificate-bound

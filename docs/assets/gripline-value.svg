@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 520" role="img" aria-labelledby="title desc">
+  <title id="title">Gripline reduces the blast radius of a stolen API key</title>
+  <desc id="desc">Without Gripline, possession of a reusable key reaches the backend. With Gripline, the key stops at the trust boundary and suspicious use is constrained while the legitimate lane continues.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1"><stop stop-color="#101827"/><stop offset="1" stop-color="#182b43"/></linearGradient>
+    <linearGradient id="good" x1="0" x2="1"><stop stop-color="#5eead4"/><stop offset="1" stop-color="#38bdf8"/></linearGradient>
+    <linearGradient id="warn" x1="0" x2="1"><stop stop-color="#fbbf24"/><stop offset="1" stop-color="#fb7185"/></linearGradient>
+    <style>
+      .title{font:700 22px ui-sans-serif,system-ui,sans-serif;letter-spacing:.08em;fill:#f8fafc}
+      .label{font:600 16px ui-sans-serif,system-ui,sans-serif;fill:#dbeafe}
+      .small{font:14px ui-sans-serif,system-ui,sans-serif;fill:#cbd5e1}
+      .tiny{font:700 12px ui-sans-serif,system-ui,sans-serif;letter-spacing:.08em;fill:#0f172a}
+    </style>
+  </defs>
+  <rect width="1200" height="520" rx="24" fill="url(#bg)"/>
+  <text x="48" y="48" class="title">THE CREDENTIAL BLAST RADIUS</text>
+  <line x1="600" y1="76" x2="600" y2="440" stroke="#334155" stroke-width="2"/>
+  <text x="52" y="92" class="label">WITHOUT GRIPLINE</text>
+  <text x="648" y="92" class="label">WITH GRIPLINE</text>
+  <g transform="translate(50 122)">
+    <circle cx="24" cy="32" r="18" fill="#64748b"/><path d="M17 32h14M24 25v14" stroke="#0f172a" stroke-width="4"/>
+    <text x="58" y="38" class="label">Legitimate client + API key</text>
+    <path d="M260 32H395" stroke="#94a3b8" stroke-width="4"/>
+    <rect x="412" y="8" width="110" height="48" rx="12" fill="#334155"/><text x="438" y="38" class="small">BACKEND</text>
+    <circle cx="24" cy="130" r="18" fill="#fb7185"/><path d="M15 121l18 18M33 121l-18 18" stroke="#0f172a" stroke-width="4"/>
+    <text x="58" y="136" class="label">Stolen same API key</text>
+    <path d="M260 130H395" stroke="#fb7185" stroke-width="4"/>
+    <rect x="412" y="106" width="110" height="48" rx="12" fill="#7f1d1d"/><text x="438" y="136" class="small">BACKEND</text>
+    <text x="30" y="236" class="small">Possession of the reusable key = backend authority.</text>
+  </g>
+  <g transform="translate(648 122)">
+    <circle cx="20" cy="32" r="16" fill="#5eead4"/><path d="M13 32h14M20 25v14" stroke="#0f172a" stroke-width="4"/>
+    <text x="48" y="38" class="label">Client + API key</text>
+    <path d="M175 32H260" stroke="url(#good)" stroke-width="4"/>
+    <rect x="270" y="0" width="145" height="66" rx="12" fill="#0e7490" stroke="#5eead4" stroke-width="2"/>
+    <text x="293" y="27" class="tiny">GRIPLINE</text><text x="286" y="46" class="tiny">TRUST BOUNDARY</text>
+    <path d="M415 32H485" stroke="url(#good)" stroke-width="4"/>
+    <rect x="495" y="8" width="125" height="48" rx="12" fill="#164e63"/><text x="508" y="38" class="small">ASSERTION →</text>
+    <rect x="495" y="84" width="125" height="48" rx="12" fill="#334155"/><text x="514" y="114" class="small">PRIVATE API</text>
+    <path d="M20 116H250" stroke="url(#warn)" stroke-width="4"/>
+    <circle cx="20" cy="116" r="16" fill="#fb7185"/><path d="M12 108l16 16M28 108l-16 16" stroke="#0f172a" stroke-width="4"/>
+    <text x="48" y="122" class="label">Same stolen key</text>
+    <path d="M250 116H450" stroke="url(#warn)" stroke-width="4" stroke-dasharray="8 7"/>
+    <rect x="458" y="90" width="162" height="52" rx="12" fill="#7f1d1d"/><text x="480" y="122" class="small">CONSTRAIN / DENY</text>
+    <line x1="428" y1="-18" x2="428" y2="278" stroke="#fef08a" stroke-width="3" stroke-dasharray="5 5"/>
+    <text x="438" y="174" class="tiny" transform="rotate(90 438 174)">RAW CREDENTIAL STOPS HERE</text>
+    <text x="30" y="236" class="small">The legitimate lane continues; suspicious use gets policy limits.</text>
+  </g>
+  <text x="48" y="482" class="label">Same legacy client. Smaller credential blast radius.</text>
+</svg>

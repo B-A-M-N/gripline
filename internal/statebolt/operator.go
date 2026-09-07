@@ -82,6 +82,7 @@ func appendOperatorTx(tx *bolt.Tx, rec control.OperatorRecord) error {
 	audit := tx.Bucket(bucketOperatorAudit)
 	seq := btoi(audit.Get(keyAuditSequence))
 	seq++
+	rec.Sequence = uint64(seq)
 	env, err := json.Marshal(persistedOperatorRecord{SchemaVersion: operatorRecordSchemaVersion, Record: rec})
 	if err != nil {
 		return err
@@ -264,6 +265,7 @@ func (s *Store) ListOperatorAudit(after uint64, limit int) ([]control.OperatorRe
 			if err := json.Unmarshal(v, &p); err != nil || p.SchemaVersion != operatorRecordSchemaVersion {
 				return fmt.Errorf("statebolt: corrupt operator audit record: %w", ErrMigrationRequired)
 			}
+			p.Record.Sequence = uint64(seq)
 			out = append(out, p.Record)
 		}
 		return nil

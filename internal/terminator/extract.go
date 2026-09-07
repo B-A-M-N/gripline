@@ -1,6 +1,7 @@
 package terminator
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"strings"
@@ -18,8 +19,24 @@ const (
 	carrierProvider
 )
 
-// maxCredentialLen bounds the accepted raw credential size (§15 oversized).
-const maxCredentialLen = 1024
+// MaxExternalCredentialBytes is the maximum raw credential size accepted at
+// an external ingress boundary. It is shared by HTTP extraction, bootstrap,
+// and operator tooling so every credential-add path has the same contract.
+const MaxExternalCredentialBytes = 1024
+
+// ErrInvalidExternalCredential identifies a credential that violates the
+// external boundary contract before it reaches hashing or authentication.
+var ErrInvalidExternalCredential = errors.New("terminator: invalid external credential")
+
+// ValidateExternalCredential enforces the raw external credential contract:
+// non-empty, bounded, and free of transport whitespace. Callers should run it
+// before deriving a verifier and should zero the supplied bytes afterward.
+func ValidateExternalCredential(raw []byte) error {
+	if len(raw) == 0 || len(raw) > MaxExternalCredentialBytes || bytes.ContainsAny(raw, " \t\r\n") {
+		return ErrInvalidExternalCredential
+	}
+	return nil
+}
 
 // extractionError is returned for ambiguous or malformed auth (§15: ambiguity
 // must fail).
@@ -85,12 +102,8 @@ func ExtractExternalCredential(headers map[string][]string) (*secret.SealedSecre
 			return nil, carrierNone, &extractionError{msg: "duplicate api-key headers"}
 		}
 		raw := keyCandidates[0]
-		raw = strings.TrimSpace(raw)
-		if len(raw) == 0 || len(raw) > maxCredentialLen {
-			return nil, carrierNone, &extractionError{msg: "invalid api-key length"}
-		}
-		if strings.ContainsAny(raw, " \t\r\n") {
-			return nil, carrierNone, &extractionError{msg: "api-key must not contain whitespace"}
+		if err := ValidateExternalCredential([]byte(raw)); err != nil {
+			return nil, carrierNone, &extractionError{msg: "invalid api-key credential"}
 		}
 		return secret.NewFromBytes([]byte(raw)), carrierAPIKey, nil
 	default:
@@ -109,8 +122,8 @@ func parseBearer(v string) (*secret.SealedSecret, error) {
 		return nil, &extractionError{msg: "unsupported authorization scheme"}
 	}
 	raw := parts[1]
-	if len(raw) == 0 || len(raw) > maxCredentialLen {
-		return nil, &extractionError{msg: "invalid bearer credential length"}
+	if err := ValidateExternalCredential([]byte(raw)); err != nil {
+		return nil, &extractionError{msg: "invalid bearer credential"}
 	}
 	return secret.NewFromBytes([]byte(raw)), nil
 }

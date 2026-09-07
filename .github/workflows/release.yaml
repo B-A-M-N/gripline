@@ -17,17 +17,47 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Set build metadata
+        id: buildmeta
+        run: |
+          echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          echo "commit=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+      - name: Install staticcheck
+        run: go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
       - name: Verify release tree
         run: |
+          go vet ./...
           go mod tidy -diff
           git diff --check
+          staticcheck ./...
+          go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+          go build ./...
           go test ./...
+          go test -race ./...
+          go test -run TestGate -v ./internal/gates/
+          go test -v ./internal/observability/
+          go test -run TestAdmissionLatencyBudget -v ./internal/terminator/
+          go test -run "TestAcceptance" -v ./cmd/gripline/
+          test -z "$(gofmt -l internal cmd verify)"
           go run ./cmd/gripline-demo --headless
+      - name: Build and smoke-test release container
+        run: |
+          docker build \
+            --build-arg VERSION="${{ steps.buildmeta.outputs.version }}" \
+            --build-arg COMMIT="${{ steps.buildmeta.outputs.commit }}" \
+            --build-arg BUILD_DATE="${{ steps.buildmeta.outputs.date }}" \
+            -t gripline-release:${GITHUB_SHA} -f deploy/Dockerfile .
+          docker run --rm gripline-release:${GITHUB_SHA} --version | grep -F "gripline ${GITHUB_REF_NAME}"
+          bash deploy/container-smoke.sh gripline-release:${GITHUB_SHA}
       - name: Build Linux binaries
         run: |
           mkdir -p dist
-          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o dist/gripline-linux-amd64 ./cmd/gripline
-          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o dist/gripline-linux-arm64 ./cmd/gripline
+          ldflags="-s -w -X main.version=${{ steps.buildmeta.outputs.version }} -X main.buildCommit=${{ steps.buildmeta.outputs.commit }} -X main.buildDate=${{ steps.buildmeta.outputs.date }}"
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="${ldflags}" -o dist/gripline-linux-amd64 ./cmd/gripline
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="${ldflags}" -o dist/gripline-linux-arm64 ./cmd/gripline
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -o dist/gripline-demo-linux-amd64 ./cmd/gripline-demo
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -o dist/gripline-demo-linux-arm64 ./cmd/gripline-demo
           sha256sum dist/* > dist/SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
@@ -38,15 +68,28 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Normalize image name
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
       - uses: docker/build-push-action@v6
         with:
           context: .
           file: deploy/Dockerfile
           push: true
-          tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
+          tags: |
+            ${{ steps.image.outputs.name }}:${{ github.ref_name }}
+            ${{ steps.image.outputs.name }}:${{ github.sha }}
           platforms: linux/amd64,linux/arm64
+          build-args: |
+            VERSION=${{ steps.buildmeta.outputs.version }}
+            COMMIT=${{ steps.buildmeta.outputs.commit }}
+            BUILD_DATE=${{ steps.buildmeta.outputs.date }}
           sbom: true
           provenance: true
+      - name: Smoke-test pushed tagged image
+        run: |
+          docker pull "${{ steps.image.outputs.name }}:${GITHUB_REF_NAME}"
+          bash deploy/container-smoke.sh "${{ steps.image.outputs.name }}:${GITHUB_REF_NAME}"
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*

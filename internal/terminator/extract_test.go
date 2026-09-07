@@ -90,6 +90,31 @@ func TestExtractMalformedFails(t *testing.T) {
 	}
 }
 
+func TestValidateExternalCredential(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  []byte
+		ok   bool
+	}{
+		{"empty", nil, false},
+		{"one-byte", []byte("x"), true},
+		{"maximum", []byte(strings.Repeat("x", MaxExternalCredentialBytes)), true},
+		{"over-maximum", []byte(strings.Repeat("x", MaxExternalCredentialBytes+1)), false},
+		{"space", []byte("x y"), false},
+		{"tab", []byte("x\ty"), false},
+		{"carriage-return", []byte("x\ry"), false},
+		{"line-feed", []byte("x\ny"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateExternalCredential(tc.raw)
+			if (err == nil) != tc.ok {
+				t.Fatalf("ValidateExternalCredential(%q) error = %v, want ok=%t", tc.raw, err, tc.ok)
+			}
+		})
+	}
+}
+
 func TestExtractProxyAuthorizationIsACarrier(t *testing.T) {
 	h := map[string][]string{"Proxy-Authorization": {"Bearer sk-pa"}}
 	s, carrier, err := ExtractExternalCredential(h)

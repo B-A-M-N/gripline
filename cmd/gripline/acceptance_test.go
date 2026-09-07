@@ -24,14 +24,9 @@ func TestAcceptanceBuildRuntime(t *testing.T) {
 	rand.Read(rawCred)
 	externalSecret := "sk-live-" + fmt.Sprintf("%x", rawCred)
 
-	os.Setenv("GRIPLINE_CREDENTIAL_SECRET", externalSecret)
-	os.Setenv("GRIPLINE_CREDENTIAL_ID", "cred_test")
-	os.Setenv("GRIPLINE_ACCOUNT_ID", "acct_test")
+	setBootstrapCredential(t, "cred_test", "acct_test", externalSecret)
 	os.Setenv("GRIPLINE_PEPPER_V1", testPepperEnv)
 	defer func() {
-		os.Unsetenv("GRIPLINE_CREDENTIAL_SECRET")
-		os.Unsetenv("GRIPLINE_CREDENTIAL_ID")
-		os.Unsetenv("GRIPLINE_ACCOUNT_ID")
 		os.Unsetenv("GRIPLINE_PEPPER_V1")
 	}()
 

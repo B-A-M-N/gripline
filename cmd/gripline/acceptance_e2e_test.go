@@ -76,14 +76,9 @@ func TestAcceptanceEndToEnd(t *testing.T) {
 	rawCred := make([]byte, 32)
 	rand.Read(rawCred)
 	externalSecret := "sk-live-" + fmt.Sprintf("%x", rawCred)
-	os.Setenv("GRIPLINE_CREDENTIAL_SECRET", externalSecret)
-	os.Setenv("GRIPLINE_CREDENTIAL_ID", "cred_e2e")
-	os.Setenv("GRIPLINE_ACCOUNT_ID", "acct_e2e")
+	setBootstrapCredential(t, "cred_e2e", "acct_e2e", externalSecret)
 	os.Setenv("GRIPLINE_PEPPER_V1", testPepperEnv)
 	defer func() {
-		os.Unsetenv("GRIPLINE_CREDENTIAL_SECRET")
-		os.Unsetenv("GRIPLINE_CREDENTIAL_ID")
-		os.Unsetenv("GRIPLINE_ACCOUNT_ID")
 		os.Unsetenv("GRIPLINE_PEPPER_V1")
 	}()
 	kr, err := terminator.NewKeyring()
@@ -136,14 +131,14 @@ func TestAcceptanceEndToEnd(t *testing.T) {
 	if be.authorized.Load() != 1 {
 		t.Fatalf("backend authorized = %d, want 1", be.authorized.Load())
 	}
-	// GRIPLINE_CREDENTIAL_ID must be honored end-to-end: the claimed credential
-	// id delivered to the protected backend must match the configured env var.
+	// The provisioned credential id must be honored end-to-end: the claimed
+	// credential id delivered to the protected backend must match the record.
 	claimsVal := be.lastClaims.Load()
 	if claimsVal == nil {
 		t.Fatal("backend did not record claims")
 	}
 	if c := claimsVal.(*terminator.Claims); c.CredID != "cred_e2e" {
-		t.Fatalf("expected claimed CredID cred_e2e (from GRIPLINE_CREDENTIAL_ID), got %s", c.CredID)
+		t.Fatalf("expected claimed CredID cred_e2e (from the provisioned record), got %s", c.CredID)
 	}
 	req2, _ := http.NewRequest("POST", baseURL+"/v1/messages", strings.NewReader(`{"text":"x"}`))
 	req2.Header.Set("Authorization", "Bearer sk-invalid-credential")
@@ -178,14 +173,9 @@ func TestAcceptanceOversizedBody(t *testing.T) {
 	rawCred := make([]byte, 32)
 	rand.Read(rawCred)
 	externalSecret := "sk-live-" + fmt.Sprintf("%x", rawCred)
-	os.Setenv("GRIPLINE_CREDENTIAL_SECRET", externalSecret)
-	os.Setenv("GRIPLINE_CREDENTIAL_ID", "cred_size")
-	os.Setenv("GRIPLINE_ACCOUNT_ID", "acct_size")
+	setBootstrapCredential(t, "cred_size", "acct_size", externalSecret)
 	os.Setenv("GRIPLINE_PEPPER_V1", testPepperEnv)
 	defer func() {
-		os.Unsetenv("GRIPLINE_CREDENTIAL_SECRET")
-		os.Unsetenv("GRIPLINE_CREDENTIAL_ID")
-		os.Unsetenv("GRIPLINE_ACCOUNT_ID")
 		os.Unsetenv("GRIPLINE_PEPPER_V1")
 	}()
 	kr, err := terminator.NewKeyring()
@@ -241,14 +231,9 @@ func TestAcceptanceOversizedBody(t *testing.T) {
 
 func TestAcceptanceSharedAuthorities(t *testing.T) {
 	dir := t.TempDir()
-	os.Setenv("GRIPLINE_CREDENTIAL_SECRET", "sk-test-shared-auth-1234567890")
-	os.Setenv("GRIPLINE_CREDENTIAL_ID", "cred_shared")
-	os.Setenv("GRIPLINE_ACCOUNT_ID", "acct_shared")
+	setBootstrapCredential(t, "cred_shared", "acct_shared", "sk-test-shared-auth-1234567890")
 	os.Setenv("GRIPLINE_PEPPER_V1", testPepperEnv)
 	defer func() {
-		os.Unsetenv("GRIPLINE_CREDENTIAL_SECRET")
-		os.Unsetenv("GRIPLINE_CREDENTIAL_ID")
-		os.Unsetenv("GRIPLINE_ACCOUNT_ID")
 		os.Unsetenv("GRIPLINE_PEPPER_V1")
 	}()
 	kr, err := terminator.NewKeyring()
@@ -358,14 +343,9 @@ func doProbe(t *testing.T, baseURL, secretStr string) (int, string) {
 // backing it out must restore normal behavior.
 func TestAcceptanceSharedControlBehavioral(t *testing.T) {
 	dir := t.TempDir()
-	os.Setenv("GRIPLINE_CREDENTIAL_SECRET", "sk-behavioral-base-123456789012345678")
-	os.Setenv("GRIPLINE_CREDENTIAL_ID", "cred_behavioral")
-	os.Setenv("GRIPLINE_ACCOUNT_ID", "acct_behavioral")
+	setBootstrapCredential(t, "cred_behavioral", "acct_behavioral", "sk-behavioral-base-123456789012345678")
 	os.Setenv("GRIPLINE_PEPPER_V1", testPepperEnv)
 	defer func() {
-		os.Unsetenv("GRIPLINE_CREDENTIAL_SECRET")
-		os.Unsetenv("GRIPLINE_CREDENTIAL_ID")
-		os.Unsetenv("GRIPLINE_ACCOUNT_ID")
 		os.Unsetenv("GRIPLINE_PEPPER_V1")
 	}()
 	kr, err := terminator.NewKeyring()
@@ -450,14 +430,9 @@ func TestAcceptanceSharedControlBehavioral(t *testing.T) {
 // admin surface rejects unauthenticated requests.
 func TestAcceptanceAdminPostureLockdown(t *testing.T) {
 	dir := t.TempDir()
-	os.Setenv("GRIPLINE_CREDENTIAL_SECRET", "sk-admin-base-12345678901234567890")
-	os.Setenv("GRIPLINE_CREDENTIAL_ID", "cred_admin")
-	os.Setenv("GRIPLINE_ACCOUNT_ID", "acct_admin")
+	setBootstrapCredential(t, "cred_admin", "acct_admin", "sk-admin-base-12345678901234567890")
 	os.Setenv("GRIPLINE_PEPPER_V1", testPepperEnv)
 	defer func() {
-		os.Unsetenv("GRIPLINE_CREDENTIAL_SECRET")
-		os.Unsetenv("GRIPLINE_CREDENTIAL_ID")
-		os.Unsetenv("GRIPLINE_ACCOUNT_ID")
 		os.Unsetenv("GRIPLINE_PEPPER_V1")
 	}()
 	kr, err := terminator.NewKeyring()

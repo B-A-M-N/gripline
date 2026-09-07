@@ -187,12 +187,18 @@ func (s *Store) Get(credID, laneID string) (*lane.LaneRecord, bool) {
 // ObserveRisk implements lane.Repository: risk observation + security-status
 // reduction in one write transaction (P0.7).
 func (s *Store) ObserveRisk(credID, laneID string, riskScore int, now time.Time) (*lane.LaneRecord, error) {
-	return s.ObserveRiskWithRequestID(credID, laneID, riskScore, now, "")
+	return s.ObserveRiskWithMetadata(credID, laneID, riskScore, now, lane.TransitionMetadata{})
 }
 
 // ObserveRiskWithRequestID is the request-correlated durable variant used by
 // the terminator when the ingress boundary supplied an id.
 func (s *Store) ObserveRiskWithRequestID(credID, laneID string, riskScore int, now time.Time, requestID string) (*lane.LaneRecord, error) {
+	return s.ObserveRiskWithMetadata(credID, laneID, riskScore, now, lane.TransitionMetadata{RequestID: requestID})
+}
+
+// ObserveRiskWithMetadata persists request, policy, and evidence provenance
+// alongside a resulting lane security transition in the same Bolt transaction.
+func (s *Store) ObserveRiskWithMetadata(credID, laneID string, riskScore int, now time.Time, meta lane.TransitionMetadata) (*lane.LaneRecord, error) {
 	key, err := laneKey(credID, laneID)
 	if err != nil {
 		return nil, err
@@ -215,9 +221,10 @@ func (s *Store) ObserveRiskWithRequestID(credID, laneID string, riskScore int, n
 		}
 		if before != rec.Security.Status {
 			if err := appendSecurityTransitionTx(tx, control.SecurityTransitionRecord{
-				At: now.UTC(), Kind: "lane_security", RequestID: requestID,
+				At: now.UTC(), Kind: "lane_security", RequestID: meta.RequestID,
 				CredentialID: credID, LaneID: laneID, Before: before.String(), After: rec.Security.Status.String(),
-				RiskScore: riskScore, Revision: rec.Revision,
+				RiskScore: riskScore, Revision: rec.Revision, PolicyRevision: meta.PolicyRevision,
+				EvidenceCodes: append([]string(nil), meta.EvidenceCodes...),
 			}); err != nil {
 				return err
 			}
@@ -240,6 +247,12 @@ func (s *Store) RecordCleanAuthorizedAndPromote(credID, laneID string, riskScore
 // RecordCleanAuthorizedAndPromoteWithRequestID persists automatic trust
 // promotions and correlates a resulting trust transition with its request.
 func (s *Store) RecordCleanAuthorizedAndPromoteWithRequestID(credID, laneID string, riskScore int, crit lane.PromotionCriteria, now time.Time, requestID string) (*lane.LaneRecord, bool, error) {
+	return s.RecordCleanAuthorizedAndPromoteWithMetadata(credID, laneID, riskScore, crit, now, lane.TransitionMetadata{RequestID: requestID})
+}
+
+// RecordCleanAuthorizedAndPromoteWithMetadata persists trust-promotion
+// provenance atomically with the lane mutation.
+func (s *Store) RecordCleanAuthorizedAndPromoteWithMetadata(credID, laneID string, riskScore int, crit lane.PromotionCriteria, now time.Time, meta lane.TransitionMetadata) (*lane.LaneRecord, bool, error) {
 	var promoted bool
 	key, err := laneKey(credID, laneID)
 	if err != nil {
@@ -263,8 +276,9 @@ func (s *Store) RecordCleanAuthorizedAndPromoteWithRequestID(credID, laneID stri
 		}
 		if before != r.State {
 			if err := appendSecurityTransitionTx(tx, control.SecurityTransitionRecord{
-				At: now.UTC(), Kind: "lane_trust", RequestID: requestID,
+				At: now.UTC(), Kind: "lane_trust", RequestID: meta.RequestID,
 				CredentialID: credID, LaneID: laneID, Before: before.String(), After: r.State.String(), Revision: r.Revision,
+				PolicyRevision: meta.PolicyRevision, EvidenceCodes: append([]string(nil), meta.EvidenceCodes...),
 			}); err != nil {
 				return err
 			}

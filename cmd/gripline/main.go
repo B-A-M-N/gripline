@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"runtime"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -30,7 +31,17 @@ import (
 // non-server subcommand that was handled.
 var errSubcommand = errors.New("gripline: subcommand handled")
 
+var (
+	version     = "dev"
+	buildCommit = "unknown"
+	buildDate   = "unknown"
+)
+
 func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-version") {
+		fmt.Println(versionString())
+		return
+	}
 	sub, rest := parseSubcommand(os.Args[1:])
 	if sub != "" {
 		if err := dispatchSubcommand(sub, rest); err != nil && !errors.Is(err, errSubcommand) {
@@ -60,7 +71,9 @@ func parseSubcommand(args []string) (string, []string) {
 //	gripline credential list|revoke --config path.json [...]
 //	gripline lane list|unblock --config path.json [...]
 //	gripline audit list|export --config path.json
+//	gripline state check|backup|restore --config path.json
 //	gripline status --config path.json
+//	gripline version
 //
 // keys export prints the PUBLIC backend verification material (active kid +
 // all retained public keys) as JSON to stdout — never any private/signing
@@ -86,6 +99,8 @@ func dispatchSubcommand(sub string, args []string) error {
 		return runLaneCLI(args)
 	case "audit":
 		return runAuditCLI(args)
+	case "state":
+		return runStateCLI(args)
 	case "status":
 		fs := flag.NewFlagSet("status", flag.ExitOnError)
 		cfgPath := fs.String("config", "/etc/gripline/config.json", "path to the deployment configuration")
@@ -93,9 +108,19 @@ func dispatchSubcommand(sub string, args []string) error {
 			return err
 		}
 		return runStatusCLI(*cfgPath)
+	case "version":
+		if len(args) != 0 {
+			return fmt.Errorf("version: does not accept arguments")
+		}
+		fmt.Println(versionString())
+		return errSubcommand
 	default:
-		return fmt.Errorf("unknown subcommand %q (expected: keys, credential, lane, audit, status)", sub)
+		return fmt.Errorf("unknown subcommand %q (expected: keys, credential, lane, audit, state, status, version)", sub)
 	}
+}
+
+func versionString() string {
+	return fmt.Sprintf("gripline %s (commit %s, built %s, %s)", version, buildCommit, buildDate, runtime.Version())
 }
 
 // runKeysExport loads the persistent signing keyring from the configured path
@@ -288,11 +313,20 @@ func run(cfgPath string) (retErr error) {
 	return nil
 }
 
-// policyFor builds the policy revision this deployment enforces.
-func policyFor(cfg *config.Config) *policy.Policy {
+// policyFor builds the policy revision this deployment enforces. A configured
+// artifact is parsed and compiled at startup; invalid policy is a boot error,
+// never a partially initialized data plane.
+func policyFor(cfg *config.Config) (*policy.Policy, error) {
+	if cfg.Policy.File != "" {
+		compiled, err := policy.LoadFile(cfg.Policy.File)
+		if err != nil {
+			return nil, err
+		}
+		return &compiled.Policy, nil
+	}
 	pol := policy.Default()
 	pol.Identity.MaxTTLSeconds = 30
-	return pol
+	return pol, nil
 }
 
 // urlFrom parses the fixed backend origin.

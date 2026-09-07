@@ -268,7 +268,7 @@ func TestAdmitExpiredCredentialDenied(t *testing.T) {
 	if err := reg.Insert(&credential.CredentialRecord{
 		CredentialID: "cred_e", AccountID: "acct_1",
 		Verifier: credential.Verifier(sealed, pep), PepperVersion: 1,
-		Status:    credential.StatusNormal,
+		Status: credential.StatusNormal, PolicyID: "fi-default-v1", PlanID: "plan-a",
 		ExpiresAt: time.Now().Add(-time.Minute), // already expired
 		Revision:  1,
 	}); err != nil {
@@ -589,7 +589,7 @@ func TestCredentialUnderWrongPolicyDenied(t *testing.T) {
 	if err := reg.Insert(&credential.CredentialRecord{
 		CredentialID: "cred_wp", AccountID: "acct_1",
 		Verifier: credential.Verifier(sealed, pep), PepperVersion: pep.Version,
-		Status: credential.StatusNormal, PolicyID: "some-OTHER-policy", Revision: 1,
+		Status: credential.StatusNormal, PolicyID: "some-OTHER-policy", PlanID: "plan-a", Revision: 1,
 	}); err != nil {
 		t.Fatal(err)
 	}

@@ -30,12 +30,13 @@ var spoolTempDir = ""
 // are never valid request bodies: the caller must reject them and Close them,
 // never forward the (truncated) content.
 type spooledBody struct {
-	reader   io.Reader
-	closer   io.Closer
-	length   int64
-	tooLarge bool
-	fileName string // nonempty when backed by a temp file
-	once     sync.Once
+	reader      io.Reader
+	closer      io.Closer
+	length      int64
+	tooLarge    bool
+	fileName    string // nonempty when backed by a temp file
+	reservation *SpoolReservation
+	once        sync.Once
 }
 
 func (b *spooledBody) Read(p []byte) (int, error) {
@@ -59,6 +60,9 @@ func (b *spooledBody) Close() error {
 				result = err
 			}
 		}
+		if b.reservation != nil {
+			b.reservation.Release()
+		}
 	})
 	return result
 }
@@ -74,9 +78,19 @@ func spoolBody(rc io.ReadCloser, maxBytes int64, memThreshold int64) (*spooledBo
 }
 
 func spoolBodyInDir(rc io.ReadCloser, maxBytes int64, memThreshold int64, tempDir string) (*spooledBody, error) {
+	return spoolBodyInDirWithReservation(rc, maxBytes, memThreshold, tempDir, nil)
+}
+
+func spoolBodyInDirWithReservation(rc io.ReadCloser, maxBytes int64, memThreshold int64, tempDir string, reservation *SpoolReservation) (*spooledBody, error) {
 	if maxBytes < 0 {
 		maxBytes = 0
 	}
+	releaseOnError := true
+	defer func() {
+		if releaseOnError && reservation != nil {
+			reservation.Release()
+		}
+	}()
 	// readCap = maxBytes+1, clamped for maxBytes == MaxInt64.
 	readCap := maxBytes + 1
 	if readCap <= 0 {
@@ -101,14 +115,15 @@ func spoolBodyInDir(rc io.ReadCloser, maxBytes int64, memThreshold int64, tempDi
 			// Consumed maxBytes+1 bytes with no EOF: the body exceeds the
 			// limit. Never expose the truncated content as a valid body.
 			_ = rc.Close()
-			return &spooledBody{reader: buf, tooLarge: true, length: int64(buf.Len())}, nil
+			releaseOnError = false
+			return &spooledBody{reader: buf, tooLarge: true, length: int64(buf.Len()), reservation: reservation}, nil
 		}
 		tmp, err := os.CreateTemp(tempDir, "gripline-body-*.tmp")
 		if err != nil {
 			_ = rc.Close()
 			return nil, err
 		}
-		b := &spooledBody{reader: tmp, closer: tmp, fileName: tmp.Name()}
+		b := &spooledBody{reader: tmp, closer: tmp, fileName: tmp.Name(), reservation: reservation}
 		if _, err := tmp.Write(buf.Bytes()); err != nil {
 			_ = b.Close() // closes + removes the temp file
 			_ = rc.Close()
@@ -130,16 +145,19 @@ func spoolBodyInDir(rc io.ReadCloser, maxBytes int64, memThreshold int64, tempDi
 			_ = b.Close()
 			return nil, err
 		}
+		releaseOnError = false
 		return b, nil
 	}
 
 	// EOF: the whole body is in memory (possibly still over maxBytes when the
 	// read cap equals the memory limit — tooLarge is computed, not assumed).
 	_ = rc.Close()
+	releaseOnError = false
 	return &spooledBody{
-		reader:   buf,
-		length:   int64(buf.Len()),
-		tooLarge: int64(buf.Len()) > maxBytes,
+		reader:      buf,
+		length:      int64(buf.Len()),
+		tooLarge:    int64(buf.Len()) > maxBytes,
+		reservation: reservation,
 	}, nil
 }
 

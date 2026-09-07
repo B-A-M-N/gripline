@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Gripline causal demo</title>
   <link rel="stylesheet" href="/static/app.css">
+  <style>.badges{display:flex;flex-wrap:wrap;gap:8px;margin-top:15px}.badge{color:#9ba9b8;border:1px solid #273444;border-radius:99px;padding:5px 9px;font-size:11px}.badge.pass{color:#5ee0a0;border-color:#5ee0a0;background:rgba(94,224,160,.08)}.small{color:#9ba9b8;font-size:12px;margin:14px 0 0}td.signal{color:#f3b562;font-weight:700}tr.denied td{background:rgba(255,119,119,.06)}</style>
 </head>
 <body>
   <main>
@@ -38,9 +39,9 @@
     </section>
     <section class="proof-grid">
       <article><h2>Private backend boundary</h2><div class="metric-line"><span>valid assertions</span><strong id="valid-assertions">0</strong></div><div class="metric-line"><span>invalid / forged</span><strong id="invalid-assertions">0</strong></div><div class="metric-line"><span>raw Authorization seen</span><strong id="raw-auth">0</strong></div><div class="metric-line"><span>direct raw rejected</span><strong id="direct-rejected">0</strong></div></article>
-      <article><h2>Causal timeline</h2><div id="proof" class="proof">Waiting for the first run…</div></article>
+      <article><h2>Causal proof</h2><div id="proof" class="proof">Waiting for the first run…</div><p class="small">Real HTTP, the same reusable credential, and the stock runtime producers drive this trace. The demo injects no evidence and calls no manual block.</p><div class="badges"><span class="badge pass">real HTTP</span><span class="badge pass">same raw credential</span><span class="badge pass">stock producers</span><span id="badge-evidence" class="badge">production evidence</span><span class="badge pass">no evidence injection</span><span class="badge pass">no manual block</span><span id="badge-raw" class="badge">raw key stripped</span><span id="badge-transition" class="badge">lane transition</span><span id="badge-containment" class="badge">attacker backend prevented</span><span id="badge-legit" class="badge">legitimate lane continues</span><span id="badge-assertion" class="badge">assertion verified</span></div></article>
     </section>
-    <section><div class="timeline-head"><h2>Authoritative admission events</h2><span id="status">idle</span></div><div class="table-wrap"><table><thead><tr><th>time</th><th>request</th><th>actor</th><th>source</th><th>lane</th><th>evidence</th><th>risk</th><th>transition</th><th>limits</th><th>decision</th><th>backend</th></tr></thead><tbody id="timeline"></tbody></table></div></section>
+    <section><div class="timeline-head"><h2>Authoritative admission events</h2><span id="status">idle</span></div><div class="table-wrap"><table><thead><tr><th>time</th><th>request</th><th>actor</th><th>source</th><th>lane</th><th>evidence</th><th>risk</th><th>observed concurrency</th><th>transition</th><th>limits</th><th>decision</th><th>backend</th></tr></thead><tbody id="timeline"></tbody></table></div></section>
   </main>
   <script src="/static/app.js"></script>
 </body>

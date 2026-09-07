@@ -100,9 +100,7 @@ func TestAcceptanceRealStreaming(t *testing.T) {
 	rawCred := make([]byte, 32)
 	rand.Read(rawCred)
 	externalSecret := "sk-live-" + fmt.Sprintf("%x", rawCred)
-	t.Setenv("GRIPLINE_CREDENTIAL_SECRET", externalSecret)
-	t.Setenv("GRIPLINE_CREDENTIAL_ID", "cred_stream")
-	t.Setenv("GRIPLINE_ACCOUNT_ID", "acct_stream")
+	setBootstrapCredential(t, "cred_stream", "acct_stream", externalSecret)
 	t.Setenv("GRIPLINE_PEPPER_V1", testPepperEnv)
 
 	kr, err := terminator.NewKeyring()
@@ -311,9 +309,7 @@ func TestAcceptanceStalledStreamCut(t *testing.T) {
 	rawCred := make([]byte, 32)
 	rand.Read(rawCred)
 	externalSecret := "sk-live-" + fmt.Sprintf("%x", rawCred)
-	t.Setenv("GRIPLINE_CREDENTIAL_SECRET", externalSecret)
-	t.Setenv("GRIPLINE_CREDENTIAL_ID", "cred_stall")
-	t.Setenv("GRIPLINE_ACCOUNT_ID", "acct_stall")
+	setBootstrapCredential(t, "cred_stall", "acct_stall", externalSecret)
 	t.Setenv("GRIPLINE_PEPPER_V1", testPepperEnv)
 
 	kr, err := terminator.NewKeyring()

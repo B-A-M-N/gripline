@@ -5,6 +5,7 @@ import (
 	"io"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/B-A-M-N/gripline/internal/observability"
 	"github.com/B-A-M-N/gripline/internal/proxy"
@@ -12,14 +13,15 @@ import (
 
 // jsonlObserver is the stock executable's bounded, single-writer telemetry
 // sink. Admission never waits on stderr or a slow collector: overflow is
-// counted and reported after the queue drains.
+// counted and reported periodically while the process is running.
 type jsonlObserver struct {
-	writer io.Writer
-	queue  chan any
-	done   chan struct{}
-	wg     sync.WaitGroup
-	drops  atomic.Uint64
-	once   sync.Once
+	writer       io.Writer
+	queue        chan any
+	done         chan struct{}
+	wg           sync.WaitGroup
+	drops        atomic.Uint64
+	sinkFailures atomic.Uint64
+	once         sync.Once
 }
 
 type completionLog struct {
@@ -42,19 +44,56 @@ func newJSONLObserver(w io.Writer) *jsonlObserver {
 func (o *jsonlObserver) run() {
 	defer o.wg.Done()
 	enc := json.NewEncoder(o.writer)
-	for ev := range o.queue {
-		_ = enc.Encode(ev)
+	write := func(value any) {
+		if err := enc.Encode(value); err != nil {
+			o.sinkFailures.Add(1)
+		}
 	}
-	if dropped := o.drops.Load(); dropped > 0 {
-		_ = enc.Encode(struct {
-			Type    string `json:"type"`
-			Dropped uint64 `json:"dropped"`
-		}{Type: "telemetry_overflow", Dropped: dropped})
+	reportDrops := func() {
+		if dropped := o.drops.Swap(0); dropped > 0 {
+			write(struct {
+				Type    string `json:"type"`
+				Dropped uint64 `json:"dropped"`
+			}{Type: "telemetry_overflow", Dropped: dropped})
+		}
 	}
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case ev := <-o.queue:
+			write(ev)
+		case <-ticker.C:
+			reportDrops()
+		case <-o.done:
+			for {
+				select {
+				case ev := <-o.queue:
+					write(ev)
+				default:
+					reportDrops()
+					return
+				}
+			}
+		}
+	}
+}
+
+// TelemetryStats reports sink health without making authorization depend on
+// the best-effort JSONL channel.
+type TelemetryStats struct {
+	Dropped      uint64 `json:"dropped"`
+	SinkFailures uint64 `json:"sink_failures"`
+}
+
+func (o *jsonlObserver) Stats() TelemetryStats {
+	return TelemetryStats{Dropped: o.drops.Load(), SinkFailures: o.sinkFailures.Load()}
 }
 
 func (o *jsonlObserver) enqueue(ev any) {
 	select {
+	case <-o.done:
+		o.drops.Add(1)
 	case o.queue <- ev:
 	default:
 		o.drops.Add(1)
@@ -73,7 +112,7 @@ func (o *jsonlObserver) ObserveCompletion(event proxy.CompletionEvent) {
 
 func (o *jsonlObserver) Close() error {
 	o.once.Do(func() {
-		close(o.queue)
+		close(o.done)
 		o.wg.Wait()
 	})
 	return nil

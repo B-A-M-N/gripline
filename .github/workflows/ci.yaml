@@ -25,6 +25,9 @@ jobs:
       - name: Install staticcheck
         run: go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
 
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+
       - name: go vet
         run: go vet ./...
 
@@ -65,4 +68,4 @@ jobs:
         run: go test -run "TestAcceptance" -v ./cmd/gripline/
 
       - name: gofmt check (touched files must be formatted)
-        run: test -z "$(gofmt -l internal cmd)"
+        run: test -z "$(gofmt -l internal cmd verify)"

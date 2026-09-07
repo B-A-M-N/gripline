@@ -37,8 +37,9 @@ func TestObserveAndCommitSecondNodeConverges(t *testing.T) {
 	base := time.Unix(1_600_000_000, 0)
 
 	if err := reg.Insert(&CredentialRecord{
-		CredentialID: "cred_node", Verifier: []byte("v"), PepperVersion: 1,
+		CredentialID: "cred_node", AccountID: "acct_node", Verifier: []byte("v"), PepperVersion: 1,
 		VerifierVersion: 1, Status: StatusNormal,
+		PolicyID: "policy_node", PlanID: "plan_node",
 		CreatedAt: base.Add(-time.Hour), Revision: 1,
 	}); err != nil {
 		t.Fatal(err)

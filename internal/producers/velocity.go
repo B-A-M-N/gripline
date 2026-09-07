@@ -81,12 +81,59 @@ func (p *ResourceVelocityProducer) ObserveAdmission(behavior AdmissionBehavior) 
 	now := p.now()
 
 	if behavior.Concurrency > 0 {
-		if sig := p.checkVelocity(p.concurrencyBaseline, subject+":conc", float64(behavior.Concurrency), now, "CONCURRENCY_OVER_4X_BASELINE", "CONCURRENCY_OVER_10X_BASELINE"); sig != "" {
+		if sig := p.checkConcurrencyVelocity(subject+":conc", float64(behavior.Concurrency), now); sig != "" {
 			signals = append(signals, Signal{Code: sig})
 		}
 	}
 
 	return signals
+}
+
+// checkConcurrencyVelocity deliberately learns only from observations that
+// remain near the established baseline. A real concurrent burst is observed
+// as a ramp (1, 2, 3, ...), and feeding each in-flight value into the EMA can
+// otherwise make the detector normalize the attack before it reaches a
+// threshold. Token and cost baselines continue to use checkVelocity because
+// their completion values have different learning characteristics.
+func (p *ResourceVelocityProducer) checkConcurrencyVelocity(key string, value float64, now time.Time) string {
+	b := p.concurrencyBaseline[key]
+	if b == nil {
+		if len(p.concurrencyBaseline) >= p.maxSubjects {
+			evictColdestBaseline(p.concurrencyBaseline)
+		}
+		b = &baseline{}
+		p.concurrencyBaseline[key] = b
+	}
+	b.count++
+	b.lastSeen = now
+	if b.count < 3 || b.ema <= 0 {
+		if b.count == 1 {
+			b.ema = value
+		} else {
+			b.ema = p.alpha*value + (1-p.alpha)*b.ema
+		}
+		return ""
+	}
+
+	emitted := ""
+	if value >= b.ema*10 {
+		if b.lastEmit.IsZero() || now.Sub(b.lastEmit) >= p.cooldown {
+			b.lastEmit = now
+			emitted = "CONCURRENCY_OVER_10X_BASELINE"
+		}
+	} else if value >= b.ema*4 {
+		if b.lastEmit.IsZero() || now.Sub(b.lastEmit) >= p.cooldown {
+			b.lastEmit = now
+			emitted = "CONCURRENCY_OVER_4X_BASELINE"
+		}
+	}
+
+	// Do not let an elevated in-flight ramp redefine the normal level. A
+	// return to near-baseline traffic resumes ordinary EMA learning.
+	if value < b.ema*2 {
+		b.ema = p.alpha*value + (1-p.alpha)*b.ema
+	}
+	return emitted
 }
 
 // ObserveCompletion checks token and cost velocity against the baseline.

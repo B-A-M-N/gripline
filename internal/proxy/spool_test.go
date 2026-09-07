@@ -147,6 +147,26 @@ func TestSpoolBodyTempFileCleanedOnNormalClose(t *testing.T) {
 	}
 }
 
+func TestSpoolBudgetBoundsAggregateReservations(t *testing.T) {
+	budget := NewSpoolBudget(100, 1)
+	first, err := budget.Acquire(100)
+	if err != nil {
+		t.Fatalf("first spool reservation: %v", err)
+	}
+	if _, err := budget.Acquire(1); err != ErrSpoolBudgetExhausted {
+		t.Fatalf("second reservation error=%v, want aggregate exhaustion", err)
+	}
+	stats := budget.Stats()
+	if stats.Bytes != 100 || stats.Files != 1 {
+		t.Fatalf("active spool stats=%+v, want 100 bytes/1 file", stats)
+	}
+	first.Release()
+	first.Release()
+	if stats := budget.Stats(); stats.Bytes != 0 || stats.Files != 0 {
+		t.Fatalf("released spool stats=%+v, want empty", stats)
+	}
+}
+
 // TestSpoolBodyChunkedEndToEnd drives the full DataPlane with a chunked
 // (unknown-length) body for every boundary case: max-1/exactly-max forward,
 // max+1/10x-max reject 413 with the backend never reached.
@@ -207,7 +227,7 @@ func TestSpoolBodyChunkedEndToEnd(t *testing.T) {
 	}
 }
 
-func TestChunkedInvalidCredentialPreflightDoesNotReadBody(t *testing.T) {
+func TestChunkedInvalidCredentialDoesNotReadBody(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("invalid credential must not reach backend")
 	}))
@@ -223,10 +243,10 @@ func TestChunkedInvalidCredentialPreflightDoesNotReadBody(t *testing.T) {
 	rec := httptest.NewRecorder()
 	dp.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("invalid preflight status=%d body=%s", rec.Code, rec.Body.String())
+		t.Fatalf("invalid credential status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	if body.read {
-		t.Fatal("invalid credential preflight must reject before reading/spooling the body")
+		t.Fatal("invalid credential must reject before reading/spooling the body")
 	}
 	if rec.Header().Get("X-Gripline-Request-ID") == "" {
 		t.Fatal("early denial must carry request id")

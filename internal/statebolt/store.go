@@ -63,8 +63,11 @@ type Options struct {
 // bbolt serializes writers. It satisfies credential.Registry, lane.Repository,
 // and evidence.Store.
 type Store struct {
-	db  *bolt.DB
-	now func() time.Time
+	db               *bolt.DB
+	now              func() time.Time
+	lastSeenMu       sync.Mutex
+	lastSeen         map[string]time.Time
+	lastSeenInterval time.Duration
 	// mu guards the small policy-side knobs below (they are written once at
 	// terminator construction, read on every lane admission).
 	mu sync.RWMutex
@@ -104,7 +107,7 @@ func Open(path string, opts Options) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("statebolt: open %s: %w", path, err)
 	}
-	s := &Store{db: db, now: opts.Now}
+	s := &Store{db: db, now: opts.Now, lastSeen: make(map[string]time.Time), lastSeenInterval: time.Minute}
 	if err := s.init(); err != nil {
 		db.Close()
 		return nil, err

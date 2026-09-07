@@ -27,6 +27,8 @@ import (
 	"github.com/B-A-M-N/gripline/internal/credential"
 	"github.com/B-A-M-N/gripline/internal/policy"
 	"github.com/B-A-M-N/gripline/internal/secret"
+	"github.com/B-A-M-N/gripline/internal/statebolt"
+	"github.com/B-A-M-N/gripline/internal/terminator"
 )
 
 // runCredentialCLI dispatches `gripline credential <list|revoke>`.
@@ -247,23 +249,15 @@ func runCredentialAddLive(cfgPath, credID, accountID, policyID, planID, reason, 
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(cfg.Paths.State); err != nil {
-		return fmt.Errorf("credential add: persistent paths.state is required: %w", err)
+	if cfg.Paths.State == "" {
+		return fmt.Errorf("credential add: live mode requires a configured persistent paths.state")
 	}
-	pepperRaw := os.Getenv("GRIPLINE_PEPPER_V1")
-	if pepperRaw == "" {
-		return fmt.Errorf("credential add: GRIPLINE_PEPPER_V1 is required to derive the verifier locally")
-	}
-	pepper, err := decodeSecretKey("GRIPLINE_PEPPER_V1", pepperRaw, 32)
+	peppers, err := loadPepperRing(cfg)
 	if err != nil {
 		return err
 	}
-	defer func() {
-		for i := range pepper {
-			pepper[i] = 0
-		}
-	}()
-	raw, err := io.ReadAll(io.LimitReader(os.Stdin, 4097))
+	pepperVersion := peppers.Latest()
+	raw, err := io.ReadAll(io.LimitReader(os.Stdin, terminator.MaxExternalCredentialBytes+1))
 	if err != nil {
 		return fmt.Errorf("credential add: read --secret-stdin: %w", err)
 	}
@@ -272,8 +266,8 @@ func runCredentialAddLive(cfgPath, credID, accountID, policyID, planID, reason, 
 			raw[i] = 0
 		}
 	}()
-	if len(raw) == 4097 {
-		return fmt.Errorf("credential add: secret exceeds 4096 bytes")
+	if len(raw) == terminator.MaxExternalCredentialBytes+1 {
+		return fmt.Errorf("credential add: secret exceeds %d bytes", terminator.MaxExternalCredentialBytes)
 	}
 	if len(raw) > 0 && raw[len(raw)-1] == '\n' {
 		raw = raw[:len(raw)-1]
@@ -281,11 +275,11 @@ func runCredentialAddLive(cfgPath, credID, accountID, policyID, planID, reason, 
 			raw = raw[:len(raw)-1]
 		}
 	}
-	if len(raw) == 0 {
-		return fmt.Errorf("credential add: stdin secret is empty")
+	if err := terminator.ValidateExternalCredential(raw); err != nil {
+		return fmt.Errorf("credential add: invalid external credential: %w", err)
 	}
 	sealed := secret.NewFromBytes(raw)
-	verifier := credential.Verifier(sealed, &credential.PepperKey{Version: 1, Key: pepper})
+	verifier := peppers.DeriveVerifier(sealed, pepperVersion)
 	defer func() {
 		for i := range verifier {
 			verifier[i] = 0
@@ -299,7 +293,7 @@ func runCredentialAddLive(cfgPath, credID, accountID, policyID, planID, reason, 
 	if err := client.request(http.MethodPost, "/admin/credentials/add", token, map[string]any{
 		"credential_id": credID, "account_id": accountID, "policy_id": policyID, "plan_id": planID,
 		"verifier_b64": base64.StdEncoding.EncodeToString(verifier), "verifier_version": 1,
-		"pepper_version": 1, "reason": reason,
+		"pepper_version": pepperVersion, "reason": reason,
 	}, nil); err != nil {
 		return fmt.Errorf("credential add: %w", err)
 	}
@@ -360,8 +354,11 @@ func runLaneUnblockLive(cfgPath, credID, laneID, reason, token string) error {
 }
 
 func runAuditCLI(args []string) error {
+	if len(args) > 0 && args[0] == "security" {
+		return runSecurityAuditCLI(args[1:])
+	}
 	if len(args) == 0 || (args[0] != "list" && args[0] != "export") {
-		return fmt.Errorf("audit: expected list or export")
+		return fmt.Errorf("audit: expected list, export, or security list|export")
 	}
 	fs := flag.NewFlagSet("audit", flag.ExitOnError)
 	cfgPath := fs.String("config", "/etc/gripline/config.json", "path to deployment configuration")
@@ -381,8 +378,8 @@ func runAuditCLI(args []string) error {
 	if err != nil {
 		return err
 	}
-	var rows []control.OperatorRecord
-	if err := c.request(http.MethodGet, "/admin/audit?limit=1000", tok, nil, &rows); err != nil {
+	rows, err := fetchOperatorAudit(c, tok)
+	if err != nil {
 		return fmt.Errorf("audit: %w", err)
 	}
 	if args[0] == "export" {
@@ -402,6 +399,146 @@ func runAuditCLI(args []string) error {
 	return w.Flush()
 }
 
+func runSecurityAuditCLI(args []string) error {
+	if len(args) == 0 || (args[0] != "list" && args[0] != "export") {
+		return fmt.Errorf("audit security: expected list or export")
+	}
+	fs := flag.NewFlagSet("audit security", flag.ExitOnError)
+	cfgPath := fs.String("config", "/etc/gripline/config.json", "path to deployment configuration")
+	token := fs.String("token", "", "operator token (env GRIPLINE_OPERATOR_TOKEN)")
+	tokenFile := fs.String("token-file", "", "read the operator token from this file")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	tok, err := operatorTokenFromFile(*token, *tokenFile)
+	if err != nil {
+		return err
+	}
+	if tok == "" {
+		return fmt.Errorf("audit security: --token (or GRIPLINE_OPERATOR_TOKEN) is required")
+	}
+	c, err := newAdminClient(*cfgPath)
+	if err != nil {
+		return err
+	}
+	rows, err := fetchSecurityAudit(c, tok)
+	if err != nil {
+		return fmt.Errorf("audit security: %w", err)
+	}
+	if args[0] == "export" {
+		enc := json.NewEncoder(os.Stdout)
+		for _, row := range rows {
+			if err := enc.Encode(row); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "SEQ\tAT\tKIND\tCREDENTIAL\tLANE\tBEFORE\tAFTER\tRISK\tREV\tPOLICY_REV\tREQUEST_ID\tEVIDENCE")
+	for _, row := range rows {
+		fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%s\t%s\n",
+			row.Sequence, row.At.UTC().Format(time.RFC3339), row.Kind, row.CredentialID, row.LaneID,
+			row.Before, row.After, row.RiskScore, row.Revision, row.PolicyRevision, row.RequestID,
+			strings.Join(row.EvidenceCodes, ","))
+	}
+	return w.Flush()
+}
+
+// runStateCLI provides stopped-deployment maintenance without constructing
+// the data plane or loading runtime secrets.
+func runStateCLI(args []string) error {
+	if len(args) == 0 || (args[0] != "check" && args[0] != "backup" && args[0] != "restore") {
+		return fmt.Errorf("state: expected check, backup, or restore")
+	}
+	fs := flag.NewFlagSet("state", flag.ExitOnError)
+	cfgPath := fs.String("config", "/etc/gripline/config.json", "path to deployment configuration")
+	outPath := fs.String("out", "", "backup output path")
+	fromPath := fs.String("from", "", "backup input path")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return err
+	}
+	if cfg.Paths.State == "" {
+		return fmt.Errorf("state: paths.state is required")
+	}
+	switch args[0] {
+	case "check":
+		if err := statebolt.CheckFile(cfg.Paths.State); err != nil {
+			return err
+		}
+		fmt.Printf("state healthy: %s\n", cfg.Paths.State)
+		return nil
+	case "backup":
+		if *outPath == "" {
+			return fmt.Errorf("state backup: --out is required")
+		}
+		state, err := statebolt.Open(cfg.Paths.State, statebolt.Options{})
+		if err != nil {
+			return err
+		}
+		defer state.Close()
+		if err := state.Backup(*outPath); err != nil {
+			return err
+		}
+		fmt.Printf("state backup verified: %s\n", *outPath)
+		return nil
+	case "restore":
+		if *fromPath == "" {
+			return fmt.Errorf("state restore: --from is required")
+		}
+		if err := statebolt.RestoreBackup(*fromPath, cfg.Paths.State); err != nil {
+			return err
+		}
+		fmt.Printf("state restored and verified: %s\n", cfg.Paths.State)
+		return nil
+	}
+	return nil
+}
+
+func fetchOperatorAudit(c *adminClient, token string) ([]control.OperatorRecord, error) {
+	var all []control.OperatorRecord
+	after := uint64(0)
+	for {
+		var page []control.OperatorRecord
+		if err := c.request(http.MethodGet, fmt.Sprintf("/admin/audit?after=%d&limit=1000", after), token, nil, &page); err != nil {
+			return nil, err
+		}
+		all = append(all, page...)
+		if len(page) < 1000 {
+			return all, nil
+		}
+		next := page[len(page)-1].Sequence
+		if next <= after {
+			return nil, fmt.Errorf("audit cursor did not advance")
+		}
+		after = next
+	}
+}
+
+func fetchSecurityAudit(c *adminClient, token string) ([]control.SecurityTransitionRecord, error) {
+	var all []control.SecurityTransitionRecord
+	after := uint64(0)
+	for {
+		var page []control.SecurityTransitionRecord
+		if err := c.request(http.MethodGet, fmt.Sprintf("/admin/security-events?after=%d&limit=1000", after), token, nil, &page); err != nil {
+			return nil, err
+		}
+		all = append(all, page...)
+		if len(page) < 1000 {
+			return all, nil
+		}
+		next := page[len(page)-1].Sequence
+		if next <= after {
+			return nil, fmt.Errorf("security audit cursor did not advance")
+		}
+		after = next
+	}
+}
+
 // openStateForCLI is the explicit offline maintenance seam. Normal lifecycle
 // commands use the running admin HTTP service and never open the state DB.
 // It returns the durable state store plus the control service it backs (or nil
@@ -415,18 +552,62 @@ func openStateForCLI(cfgPath string) (*config.Config, *runtimeCLI, error) {
 	if cfg.Paths.State == "" {
 		return nil, nil, fmt.Errorf("this command requires a persistent deployment (paths.state); ephemeral mode has no lifecycle state to inspect")
 	}
-	rt, err := BuildRuntime(cfg)
+	state, err := statebolt.Open(cfg.Paths.State, statebolt.Options{})
 	if err != nil {
 		return nil, nil, err
 	}
-	return cfg, &runtimeCLI{rt: rt}, nil
+	return cfg, &runtimeCLI{state: state}, nil
 }
 
 type runtimeCLI struct {
-	rt *Runtime
+	state   *statebolt.Store
+	service *control.Service
 }
 
-func (c *runtimeCLI) close() error { return c.rt.Close() }
+func (c *runtimeCLI) close() error {
+	if c == nil || c.state == nil {
+		return nil
+	}
+	return c.state.Close()
+}
+
+// offlineService builds only the minimum authenticated mutation surface. It
+// intentionally does not load pepper material, construct a signer, start the
+// data plane, or process bootstrap credentials.
+func (c *runtimeCLI) offlineService(cfg *config.Config) (*control.Service, error) {
+	if c.service != nil {
+		return c.service, nil
+	}
+	if cfg.Admin == nil {
+		return nil, fmt.Errorf("deployment configures no admin section; offline mutation has no operator identity")
+	}
+	tokens := make(map[string]*control.Identity, len(cfg.Admin.OperatorTokens))
+	for rawToken, spec := range cfg.Admin.OperatorTokens {
+		name, rawCaps, err := parseSpec(spec)
+		if err != nil {
+			return nil, err
+		}
+		caps := make([]control.Capability, 0, len(rawCaps))
+		for _, rawCap := range rawCaps {
+			capability, err := control.ParseCapability(rawCap)
+			if err != nil {
+				return nil, err
+			}
+			caps = append(caps, capability)
+		}
+		tokens[rawToken] = &control.Identity{Name: name, Capabilities: caps}
+	}
+	auth, err := control.NewTokenAuthenticator(tokens)
+	if err != nil {
+		return nil, err
+	}
+	service, err := control.NewService(control.New(0), auth, c.state, control.WithMutationStore(c.state))
+	if err != nil {
+		return nil, err
+	}
+	c.service = service
+	return service, nil
+}
 
 func runCredentialList(cfgPath string) error {
 	_, h, err := openStateForCLI(cfgPath)
@@ -434,7 +615,7 @@ func runCredentialList(cfgPath string) error {
 		return err
 	}
 	defer h.close()
-	sums, err := h.rt.State.ListCredentials()
+	sums, err := h.state.ListCredentials()
 	if err != nil {
 		return err
 	}
@@ -456,17 +637,18 @@ func runCredentialRevoke(cfgPath, credID, reason, token string) error {
 	if token == "" {
 		return fmt.Errorf("credential revoke: --token (or GRIPLINE_OPERATOR_TOKEN) is required")
 	}
-	_, h, err := openStateForCLI(cfgPath)
+	cfg, h, err := openStateForCLI(cfgPath)
 	if err != nil {
 		return err
 	}
 	defer h.close()
-	if h.rt.AdminService == nil {
-		return fmt.Errorf("credential revoke: the deployment configures no admin section (admin.operator_tokens); there is no operator identity to authorize")
+	svc, err := h.offlineService(cfg)
+	if err != nil {
+		return fmt.Errorf("credential revoke: %w", err)
 	}
 	// NOTE: the CLI holds the runtime exclusively (the data plane is not
 	// serving here), so the mutation is safe without runtime coordination.
-	if err := h.rt.controlService().RevokeCredential(context.Background(), token, credID, reason); err != nil {
+	if err := svc.RevokeCredential(context.Background(), token, credID, reason); err != nil {
 		return fmt.Errorf("credential revoke: %w", err)
 	}
 	fmt.Printf("revoked %s (mutation + audit committed atomically)\n", credID)
@@ -479,7 +661,7 @@ func runLaneList(cfgPath, credID string) error {
 		return err
 	}
 	defer h.close()
-	rows, err := h.rt.State.ListLaneRecords(credID)
+	rows, err := h.state.ListLaneRecords(credID)
 	if err != nil {
 		return fmt.Errorf("lane list: %w", err)
 	}
@@ -508,15 +690,16 @@ func runLaneUnblock(cfgPath, credID, laneID, reason, token string) error {
 	if token == "" {
 		return fmt.Errorf("lane unblock: --token (or GRIPLINE_OPERATOR_TOKEN) is required")
 	}
-	_, h, err := openStateForCLI(cfgPath)
+	cfg, h, err := openStateForCLI(cfgPath)
 	if err != nil {
 		return err
 	}
 	defer h.close()
-	if h.rt.AdminService == nil {
-		return fmt.Errorf("lane unblock: the deployment configures no admin section (admin.operator_tokens); there is no operator identity to authorize")
+	svc, err := h.offlineService(cfg)
+	if err != nil {
+		return fmt.Errorf("lane unblock: %w", err)
 	}
-	if err := h.rt.controlService().UnblockLane(context.Background(), token, credID, laneID, reason); err != nil {
+	if err := svc.UnblockLane(context.Background(), token, credID, laneID, reason); err != nil {
 		return fmt.Errorf("lane unblock: %w", err)
 	}
 	fmt.Printf("unblocked %s/%s (mutation + audit committed atomically)\n", credID, laneID)
@@ -531,7 +714,10 @@ func runStatusCLI(cfgPath string) error {
 	if err != nil {
 		return err
 	}
-	pol := policyFor(cfg)
+	pol, err := policyFor(cfg)
+	if err != nil {
+		return err
+	}
 	stateBacked := cfg.Paths.State != ""
 	providerSource := cfg.Ingress != nil && cfg.Ingress.PseudonymKey != ""
 	type row struct {

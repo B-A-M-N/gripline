@@ -809,10 +809,10 @@ func TestGateD_ChunksArriveIncrementally(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		for i := 0; i < 4; i++ {
 			w.Write([]byte(chunk))
-			f.Flush()
 			mu.Lock()
 			backendEmits = append(backendEmits, time.Now())
 			mu.Unlock()
+			f.Flush()
 			time.Sleep(60 * time.Millisecond) // give the client time to observe
 		}
 	}))

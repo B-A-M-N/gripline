@@ -218,6 +218,38 @@ func TestLoadBadJSON(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsUnknownFieldsAtEveryNesting(t *testing.T) {
+	base := validConfigJSON()
+	cases := map[string]string{
+		"top":         strings.Replace(base, "{\n", "{\n\t\t\"unknown\": true,\n", 1),
+		"tls":         strings.Replace(base, `"tls": {`, `"tls": {"unknown": true,`, 1),
+		"backend":     strings.Replace(base, `"backend": {`, `"backend": {"unknown": true,`, 1),
+		"backend_tls": strings.Replace(base, `"backend": {`, `"backend": {"tls":{"unknown":true},`, 1),
+		"server":      strings.Replace(base, `"server": {`, `"server": {"unknown": true,`, 1),
+		"identity":    strings.Replace(base, `"identity": {`, `"identity": {"unknown": true,`, 1),
+		"paths":       strings.Replace(base, `"paths": {`, `"paths": {"unknown": true,`, 1),
+		"deployment": strings.TrimSuffix(base, "\n}") + `,"deployment":{"unknown":true}
+}`,
+		"ingress": strings.TrimSuffix(base, "\n}") + `,"ingress":{"unknown":true}
+}`,
+		"admin": strings.TrimSuffix(base, "\n}") + `,"admin":{"listen":"127.0.0.1:9090","unknown":true,"operator_tokens":{"test-token-0123456789abcdef0123456789abcdef":"op:posture.control"}}
+}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(writeCfg(t, body)); err == nil {
+				t.Fatal("unknown config field must be rejected")
+			}
+		})
+	}
+}
+
+func TestLoadRejectsTrailingJSONValue(t *testing.T) {
+	if _, err := Load(writeCfg(t, validConfigJSON()+"{}")); err == nil {
+		t.Fatal("trailing second JSON value must be rejected")
+	}
+}
+
 // Operator token specs parse as name:caps.
 func TestParseOperatorSpec(t *testing.T) {
 	name, caps, err := parseOperatorSpec("alice:posture.control,credential.lifecycle")
@@ -229,9 +261,7 @@ func TestParseOperatorSpec(t *testing.T) {
 	}
 }
 
-// TestAdminBindValidation (P0.7) enforces the "private interface only" contract
-// for the admin control plane: loopback and private/unique-local addresses pass;
-// wildcard/unspecified and public addresses are rejected unless allow_public.
+// TestAdminBindValidation (P0.7) enforces loopback-only plaintext admin binds.
 func TestAdminBindValidation(t *testing.T) {
 	adminBody := func(listen string, allowPublic bool) string {
 		ap := ""
@@ -241,14 +271,14 @@ func TestAdminBindValidation(t *testing.T) {
 		return `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"https://b","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"},"admin":{"listen":"` + listen + `","operator_tokens":{"test-token-0123456789abcdef0123456789abcdef":"op:posture.control"}` + ap + `},"paths":{"audit_log":"a.jsonl"}}`
 	}
 
-	// Valid: loopback, RFC1918 private, IPv6 loopback.
-	for _, l := range []string{"127.0.0.1:9090", "10.0.0.5:9090", "192.168.1.2:9090", "[::1]:9090", "172.16.0.1:9090", "169.254.1.1:9090"} {
+	// Valid: IPv4 and IPv6 loopback only.
+	for _, l := range []string{"127.0.0.1:9090", "127.0.0.2:9090", "[::1]:9090"} {
 		if _, err := Load(writeCfg(t, adminBody(l, false))); err != nil {
 			t.Errorf("admin listen %q must be valid, got %v", l, err)
 		}
 	}
-	// Invalid unconditionally: wildcard (empty host), 0.0.0.0, [::], public.
-	for _, l := range []string{":9090", "0.0.0.0:9090", "[::]:9090", "8.8.8.8:9090", "52.0.0.1:9090"} {
+	// Invalid: wildcard, unspecified, private LAN, link-local, and public.
+	for _, l := range []string{":9090", "0.0.0.0:9090", "[::]:9090", "10.0.0.5:9090", "192.168.1.2:9090", "169.254.1.1:9090", "8.8.8.8:9090", "52.0.0.1:9090"} {
 		if _, err := Load(writeCfg(t, adminBody(l, false))); err == nil {
 			t.Errorf("admin listen %q must be rejected (private bind required)", l)
 		}

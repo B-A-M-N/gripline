@@ -146,6 +146,19 @@ func (b *TokenBucket) Balance() float64 {
 	return b.balance
 }
 
+// Evictable reports whether this bucket has no outstanding reservation/debt
+// and is fully replenished. It is deliberately stricter than merely being
+// idle: evicting a partially spent bucket would reset an attacker's allowance.
+func (b *TokenBucket) Evictable() bool {
+	if b == nil {
+		return true
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.refillLocked()
+	return b.balance == 0
+}
+
 // Reconfigure swaps a bucket's policy parameters (capacity, refill rate) in
 // place (P0.2). A scope's bucket is created on first use; without this, the
 // burst/rate in effect at creation time would be frozen forever — a constrained

@@ -6,12 +6,54 @@
 package policy
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/B-A-M-N/gripline/internal/evidence"
 	"github.com/B-A-M-N/gripline/internal/lane"
 )
+
+// LoadFile reads a policy artifact, rejects unknown/trailing JSON, and compiles
+// it before returning. The artifact is immutable for the lifetime of the
+// runtime; callers must replace it through an explicit operator lifecycle.
+// Duration fields use JSON nanoseconds when encoded numerically, matching
+// Go's time.Duration representation.
+func LoadFile(path string) (*CompiledPolicy, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, errors.New("policy: artifact path required")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("policy: open artifact: %w", err)
+	}
+	defer f.Close()
+	const maxPolicyBytes = 4 << 20
+	if info, err := f.Stat(); err != nil {
+		return nil, fmt.Errorf("policy: stat artifact: %w", err)
+	} else if info.Size() > maxPolicyBytes {
+		return nil, fmt.Errorf("policy: artifact exceeds %d bytes", maxPolicyBytes)
+	}
+	dec := json.NewDecoder(io.LimitReader(f, maxPolicyBytes))
+	dec.DisallowUnknownFields()
+	var p Policy
+	if err := dec.Decode(&p); err != nil {
+		return nil, fmt.Errorf("policy: parse artifact: %w", err)
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return nil, errors.New("policy: artifact contains trailing JSON")
+	}
+	compiled, err := Compile(&p)
+	if err != nil {
+		return nil, fmt.Errorf("policy: compile artifact: %w", err)
+	}
+	return compiled, nil
+}
 
 // RiskThresholds are the credential/lane risk-state boundaries (§31).
 // All thresholds must be strictly ordered: 0 < Watch < Constrained < Quarantine <= 100.

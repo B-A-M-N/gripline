@@ -39,6 +39,27 @@ func TestResourceVelocityProducerLearnsSubFloorBaseline(t *testing.T) {
 	}
 }
 
+func TestResourceVelocityConcurrencyRampDoesNotNormalizeBurst(t *testing.T) {
+	base := time.Now()
+	p := NewResourceVelocityProducer(func() time.Time { return base })
+	const subject = "cred_ramp"
+	for i := 0; i < 3; i++ {
+		p.ObserveAdmission(AdmissionBehavior{Subjects: SubjectContext{CredentialID: subject}, Concurrency: 1})
+	}
+	// A real in-flight burst is observed as a ramp because each admission sees
+	// the reservations that won the race before it. Elevated values must not
+	// rewrite the normal baseline before the ramp reaches the 4x rule.
+	for _, concurrency := range []int{1, 2, 3} {
+		if sigs := p.ObserveAdmission(AdmissionBehavior{Subjects: SubjectContext{CredentialID: subject}, Concurrency: concurrency}); len(sigs) != 0 {
+			t.Fatalf("ramp value %d emitted early: %v", concurrency, sigs)
+		}
+	}
+	sigs := p.ObserveAdmission(AdmissionBehavior{Subjects: SubjectContext{CredentialID: subject}, Concurrency: 4})
+	if len(sigs) != 1 || sigs[0].Code != "CONCURRENCY_OVER_4X_BASELINE" {
+		t.Fatalf("ramp must expose 4x concurrency signal, got %v", sigs)
+	}
+}
+
 // TestResourceVelocityProducerFloorStillGatesEmission keeps the original
 // guarantee: a sub-floor spike (4x the baseline but tiny in absolute terms)
 // must NOT emit — both predicates in the evidence name must hold.

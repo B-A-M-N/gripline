@@ -1,6 +1,7 @@
 package terminator
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -96,6 +97,57 @@ func TestM3MultiscopeDeniesWhenScopeSaturated(t *testing.T) {
 		t.Fatal("denial must carry a typed error")
 	}
 	_ = term
+}
+
+func TestM3TypedScopeDenialsPreserveHardLimitCause(t *testing.T) {
+	for _, scope := range []resource.Scope{
+		resource.ScopeSource, resource.ScopeAccount, resource.ScopeCredential,
+		resource.ScopeLane, resource.ScopeGlobal,
+	} {
+		t.Run(scope.String(), func(t *testing.T) {
+			reg := credential.NewMemoryRegistry()
+			term, gov, raw := m3Terminator(t, reg, "cred_typed_"+scope.String())
+			term.pol.Limits.Normal.ConcurrencyCap = 1
+			if scope == resource.ScopeGlobal {
+				term.pol.Global = policy.Limits{ConcurrencyCap: 1}
+			}
+			src := TrustedSource{Pseudonym: "src-typed"}
+			laneID := ""
+			if scope == resource.ScopeLane {
+				seed := term.Admit(bearerHeaders(raw), lane.Features{NetworkASN: "AS-typed"})
+				if !seed.Authorized {
+					t.Fatalf("seed admission: %s", seed.Reason)
+				}
+				laneID = seed.Context.LaneID
+				seed.Reservation().Release()
+			}
+			id := map[resource.Scope]string{
+				resource.ScopeSource: "src-typed", resource.ScopeAccount: "acct_1",
+				resource.ScopeCredential: "cred_typed_" + scope.String(), resource.ScopeLane: laneID,
+				resource.ScopeGlobal: "fleet",
+			}[scope]
+			fill, err := gov.ProvisionUsage([]resource.ScopeSpec{{
+				Scope: scope, ID: id, Buckets: resource.BucketSpec{ConcurrencyCap: 1},
+			}}, resource.UsageEstimate{Requests: 1})
+			if err != nil {
+				t.Fatalf("fill %s: %v", scope, err)
+			}
+			defer fill.Release()
+			var out *Outcome
+			if scope == resource.ScopeSource {
+				out = term.AdmitSource(bearerHeaders(raw), lane.Features{NetworkASN: "AS-typed"}, src)
+			} else {
+				out = term.Admit(bearerHeaders(raw), lane.Features{NetworkASN: "AS-typed"})
+			}
+			if out.Authorized || out.Reason != "rate_limit" {
+				t.Fatalf("outcome=%+v, want typed rate_limit denial", out)
+			}
+			var limitErr *resource.ScopeLimitError
+			if !errors.As(out.DenialErr, &limitErr) || limitErr.Scope != scope || !errors.Is(out.DenialErr, resource.ErrScopeLimit) {
+				t.Fatalf("denial error=%T %v, want ScopeLimitError for %s", out.DenialErr, out.DenialErr, scope)
+			}
+		})
+	}
 }
 
 func TestM3GlobalRequestTokenAndCostGauges(t *testing.T) {

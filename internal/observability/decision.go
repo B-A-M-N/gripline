@@ -52,6 +52,7 @@ type DecisionRecord struct {
 	LaneNew                bool        `json:"lane_new"`
 	EvidenceCodes          []string    `json:"evidence"` // evidence codes that contributed
 	PolicyRevision         int         `json:"policy_revision"`
+	ObservedConcurrency    int         `json:"observed_concurrency"`
 }
 
 // drPrincipal is the minimal, credential-safe principal projection.
@@ -126,6 +127,7 @@ func newFromTrace(out *terminator.Outcome) *DecisionRecord {
 		SourcePseudonym:        tr.SourcePseudonym,
 		CredentialRisk:         tr.CredentialRisk,
 		LaneRisk:               tr.LaneRisk,
+		ObservedConcurrency:    tr.ObservedConcurrency,
 		CredentialStatusBefore: tr.CredentialStatusBefore,
 		CredentialStatusAfter:  tr.CredentialStatusAfter,
 		LaneSecurityBefore:     tr.LaneSecBefore,

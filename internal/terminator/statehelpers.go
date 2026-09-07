@@ -9,13 +9,18 @@ import (
 )
 
 func ctxForRequest(now time.Time, requestID string) context.Context {
+	return ctxForRequestWithMetadata(now, credential.TransitionMetadata{RequestID: requestID})
+}
+
+func ctxForRequestWithMetadata(now time.Time, meta credential.TransitionMetadata) context.Context {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	// Self-releasing: the cancel is invoked once the deadline passes so the
 	// goroutine/context is reclaimed even though callers never hold a ref to it.
 	time.AfterFunc(5*time.Second, cancel)
-	if requestID != "" {
-		ctx = credential.WithRequestID(ctx, requestID)
+	if meta.RequestID != "" {
+		ctx = credential.WithRequestID(ctx, meta.RequestID)
 	}
+	ctx = credential.WithTransitionMetadata(ctx, meta)
 	return ctx
 }
 

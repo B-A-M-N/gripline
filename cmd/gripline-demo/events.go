@@ -10,19 +10,20 @@ import (
 )
 
 type demoEvent struct {
-	At                time.Time `json:"at"`
-	RequestID         string    `json:"request_id"`
-	Actor             string    `json:"actor"`
-	SourcePseudonym   string    `json:"source_pseudonym,omitempty"`
-	LaneID            string    `json:"lane_id,omitempty"`
-	Evidence          []string  `json:"evidence"`
-	CredentialRisk    int       `json:"credential_risk"`
-	LaneRisk          int       `json:"lane_risk"`
-	Transition        string    `json:"transition"`
-	LimitClass        string    `json:"limit_class"`
-	Decision          string    `json:"decision"`
-	BackendReached    bool      `json:"backend_reached"`
-	AssertionVerified bool      `json:"assertion_verified"`
+	At                  time.Time `json:"at"`
+	RequestID           string    `json:"request_id"`
+	Actor               string    `json:"actor"`
+	SourcePseudonym     string    `json:"source_pseudonym,omitempty"`
+	LaneID              string    `json:"lane_id,omitempty"`
+	Evidence            []string  `json:"evidence"`
+	CredentialRisk      int       `json:"credential_risk"`
+	LaneRisk            int       `json:"lane_risk"`
+	ObservedConcurrency int       `json:"observed_concurrency"`
+	Transition          string    `json:"transition"`
+	LimitClass          string    `json:"limit_class"`
+	Decision            string    `json:"decision"`
+	BackendReached      bool      `json:"backend_reached"`
+	AssertionVerified   bool      `json:"assertion_verified"`
 }
 
 type demoObserver struct {
@@ -52,7 +53,8 @@ func (o *demoObserver) ObserveAdmission(record *observability.DecisionRecord) {
 	o.events = append(o.events, &demoEvent{At: record.At, RequestID: record.RequestID,
 		SourcePseudonym: record.SourcePseudonym, LaneID: record.LaneID,
 		Evidence: append([]string(nil), record.EvidenceCodes...), CredentialRisk: record.CredentialRisk,
-		LaneRisk: record.LaneRisk, Transition: strings.Join(transitions, "; "), LimitClass: limit,
+		LaneRisk: record.LaneRisk, ObservedConcurrency: record.ObservedConcurrency,
+		Transition: strings.Join(transitions, "; "), LimitClass: limit,
 		Decision: record.Action + ":" + record.Reason})
 }
 func (o *demoObserver) ObserveCompletion(proxy.CompletionEvent) {}

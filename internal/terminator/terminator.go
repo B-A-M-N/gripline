@@ -80,10 +80,12 @@ type Outcome struct {
 // the proxy cannot forge extra counts, only present or not-present the one it
 // was given. Finalize is idempotent.
 type BaselineToken struct {
-	CredentialID string
-	LaneID       string
-	LaneRisk     int
-	RequestID    string
+	CredentialID   string
+	LaneID         string
+	LaneRisk       int
+	RequestID      string
+	PolicyRevision int
+	EvidenceCodes  []string
 	// Eligible reports whether the admission ran in AdaptiveAvailable posture
 	// — a degraded admission never builds baseline trust (P0.1).
 	Eligible bool
@@ -664,6 +666,7 @@ func (t *Terminator) AdmitUsageWithRequestID(reqID string, headers map[string][]
 		}
 	}
 	if len(t.dep.Producers) > 0 {
+		tr.ObservedConcurrency = t.currentConcurrency(laneID)
 		admissionBehavior := producers.AdmissionBehavior{
 			Subjects: subjects,
 			Features: producers.Features{
@@ -676,7 +679,7 @@ func (t *Terminator) AdmitUsageWithRequestID(reqID string, headers map[string][]
 			// P0.4B: live concurrency from the resource governor. Measures lane
 			// concurrency (the scope for CONCURRENCY_OVER_* rules) plus this
 			// attempted request. Falls back to 0 if no governor is configured.
-			Concurrency: t.currentConcurrency(laneID),
+			Concurrency: tr.ObservedConcurrency,
 		}
 		for _, prod := range t.dep.Producers {
 			if sigs := prod.ObserveAdmission(admissionBehavior); len(sigs) > 0 {
@@ -849,8 +852,9 @@ func (t *Terminator) AdmitUsageWithRequestID(reqID string, headers map[string][]
 		// ObserveAndCommit via the registry-as-repository. Double-source the
 		// remaining risk into the machine only when we have authoritative
 		// history.
+		transitionMeta := credential.TransitionMetadata{RequestID: out.RequestID, PolicyRevision: t.pol.Revision, EvidenceCodes: evidenceCodes}
 		tr, oerr := t.dep.Registry.ObserveAndCommit(
-			ctxForRequest(now, out.RequestID), cred.CredentialID,
+			ctxForRequestWithMetadata(now, transitionMeta), cred.CredentialID,
 			credentialRisk, hy, now,
 		)
 		if oerr != nil {
@@ -884,7 +888,7 @@ func (t *Terminator) AdmitUsageWithRequestID(reqID string, headers map[string][]
 					// P0.20: Re-commit once against the authoritative record.
 					// If this also conflicts, preserve the stricter state (the
 					// concurrent writer's) rather than discarding our observation.
-					retry, rerr := t.dep.Registry.ObserveAndCommit(ctxForRequest(now, out.RequestID), cred.CredentialID, credentialRisk, hy, now)
+					retry, rerr := t.dep.Registry.ObserveAndCommit(ctxForRequestWithMetadata(now, transitionMeta), cred.CredentialID, credentialRisk, hy, now)
 					switch {
 					case rerr == nil:
 						after = retry.Record.Status
@@ -970,7 +974,10 @@ func (t *Terminator) AdmitUsageWithRequestID(reqID string, headers map[string][]
 	if t.dep.Lanes != nil {
 		var rec *lane.LaneRecord
 		var rerr error
-		if aware, ok := t.dep.Lanes.(lane.RequestAwareRepository); ok {
+		laneMeta := lane.TransitionMetadata{RequestID: out.RequestID, PolicyRevision: t.pol.Revision, EvidenceCodes: evidenceCodes}
+		if aware, ok := t.dep.Lanes.(lane.MetadataAwareRepository); ok {
+			rec, rerr = aware.ObserveRiskWithMetadata(cred.CredentialID, laneID, laneRisk, now, laneMeta)
+		} else if aware, ok := t.dep.Lanes.(lane.RequestAwareRepository); ok {
 			rec, rerr = aware.ObserveRiskWithRequestID(cred.CredentialID, laneID, laneRisk, now, out.RequestID)
 		} else {
 			rec, rerr = t.dep.Lanes.ObserveRisk(cred.CredentialID, laneID, laneRisk, now)
@@ -1177,10 +1184,12 @@ func (t *Terminator) AdmitUsageWithRequestID(reqID string, headers map[string][]
 	// Nothing here mutates lane clean counters.
 	if t.dep.Lanes != nil {
 		out.Baseline = &BaselineToken{
-			CredentialID: cred.CredentialID,
-			LaneID:       laneID,
-			LaneRisk:     laneRisk,
-			RequestID:    out.RequestID,
+			CredentialID:   cred.CredentialID,
+			LaneID:         laneID,
+			LaneRisk:       laneRisk,
+			RequestID:      out.RequestID,
+			PolicyRevision: t.pol.Revision,
+			EvidenceCodes:  append([]string(nil), evidenceCodes...),
 			// Baseline finalization requires AVAILABLE adaptive posture (P0.1):
 			// unreliable history must not build trust upward, so a degraded
 			// admission's token is issued but the proxy-side finalize is a
@@ -1228,22 +1237,6 @@ func (t *Terminator) AdmitUsageWithRequestID(reqID string, headers map[string][]
 	out.Adaptive = adaptiveForObservation
 	out.Degraded = adaptiveForObservation == AdaptiveDegraded
 	return out
-}
-
-// Preflight authenticates the external credential without touching lane,
-// evidence, resource, or assertion state. The proxy uses it before spooling
-// an unknown-length body so an invalid credential cannot force disk I/O.
-// Callers should pass a disposable header copy; extraction strips carriers
-// from the supplied map as part of the secret-boundary contract.
-func (t *Terminator) Preflight(headers map[string][]string) error {
-	presented, _, err := ExtractExternalCredential(headers)
-	StripSecretHeaders(headers)
-	if err != nil {
-		return err
-	}
-	defer presented.Zero()
-	_, err = t.authenticate(presented)
-	return err
 }
 
 // provisionMultiscope is the hard multi-scope resource gate (P0.23-P0.27). It
@@ -1313,6 +1306,9 @@ func (t *Terminator) provisionMultiscope(cred *credential.Credential, laneID str
 	res, err := t.dep.Resource.ProvisionUsage(specs, est)
 	if err != nil {
 		tr.ReservationResult = "denied"
+		if errors.Is(err, resource.ErrSourceScopeSaturated) {
+			return deny("resource_unavailable", err)
+		}
 		var sle *resource.ScopeLimitError
 		if errors.As(err, &sle) {
 			tr.ReservationScope = sle.Scope.String()
@@ -1388,7 +1384,10 @@ func (t *Terminator) finalizeBaseline(b *BaselineToken) {
 		AllowSuspicious:          t.pol.Learning.AllowSuspiciousLanes,
 		HasDisqualifyingEvidence: t.hasActiveDisqualifyingEvidence(b.CredentialID, b.LaneID, now),
 	}
-	if aware, ok := t.dep.Lanes.(lane.RequestAwareRepository); ok {
+	meta := lane.TransitionMetadata{RequestID: b.RequestID, PolicyRevision: b.PolicyRevision, EvidenceCodes: b.EvidenceCodes}
+	if aware, ok := t.dep.Lanes.(lane.MetadataAwareRepository); ok {
+		_, _, _ = aware.RecordCleanAuthorizedAndPromoteWithMetadata(b.CredentialID, b.LaneID, b.LaneRisk, promCrit, now, meta)
+	} else if aware, ok := t.dep.Lanes.(lane.RequestAwareRepository); ok {
 		_, _, _ = aware.RecordCleanAuthorizedAndPromoteWithRequestID(b.CredentialID, b.LaneID, b.LaneRisk, promCrit, now, b.RequestID)
 	} else {
 		_, _, _ = t.dep.Lanes.RecordCleanAuthorizedAndPromote(b.CredentialID, b.LaneID, b.LaneRisk, promCrit, now)
@@ -1771,10 +1770,6 @@ func safeReason(err error) string {
 		return "denied"
 	}
 }
-
-// PublicReason maps an authentication/preflight error to the same safe reason
-// vocabulary used by the data plane. It intentionally omits internal causes.
-func PublicReason(err error) string { return safeReason(err) }
 
 // issueAssertion mints and signs the internal identity for the context.
 func (t *Terminator) issueAssertion(ctx principal.AuthorizedContext, reqID string, cred *credential.Credential) (*Assertion, error) {

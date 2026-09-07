@@ -20,6 +20,8 @@ func mustRecord(id, raw string) *credential.CredentialRecord {
 		VerifierVersion: 1,
 		PepperVersion:   1,
 		Status:          credential.StatusNormal,
+		PolicyID:        "policy-test",
+		PlanID:          "plan-test",
 		CreatedAt:       time.Now().Add(-time.Hour),
 		Revision:        1,
 	}
