@@ -125,7 +125,7 @@ func (s *Store) BorrowOrCreate(credID, newLaneID string, cand lane.Features, ctx
 	var out *lane.LaneRecord
 	var created bool
 	var domainErr error
-	err := s.db.Update(func(tx *bolt.Tx) error {
+	err := s.update(func(tx *bolt.Tx) error {
 		records, err := loadLanesTx(tx, credID)
 		if err != nil {
 			return err
@@ -168,7 +168,7 @@ func (s *Store) Get(credID, laneID string) (*lane.LaneRecord, bool) {
 		return nil, false
 	}
 	var rec *lane.LaneRecord
-	_ = s.db.View(func(tx *bolt.Tx) error {
+	_ = s.view(func(tx *bolt.Tx) error {
 		v := tx.Bucket(bucketLanes).Get(key)
 		if v == nil {
 			return nil
@@ -204,7 +204,7 @@ func (s *Store) ObserveRiskWithMetadata(credID, laneID string, riskScore int, no
 		return nil, err
 	}
 	var out *lane.LaneRecord
-	err = s.db.Update(func(tx *bolt.Tx) error {
+	err = s.update(func(tx *bolt.Tx) error {
 		v := tx.Bucket(bucketLanes).Get(key)
 		if v == nil {
 			return lane.ErrLaneNotFound
@@ -259,7 +259,7 @@ func (s *Store) RecordCleanAuthorizedAndPromoteWithMetadata(credID, laneID strin
 		return nil, false, err
 	}
 	var rec *lane.LaneRecord
-	err = s.db.Update(func(tx *bolt.Tx) error {
+	err = s.update(func(tx *bolt.Tx) error {
 		v := tx.Bucket(bucketLanes).Get(key)
 		if v == nil {
 			return lane.ErrLaneNotFound
@@ -300,7 +300,7 @@ func (s *Store) ListLaneIDs(credID string) []string {
 		return nil
 	}
 	var ids []string
-	_ = s.db.View(func(tx *bolt.Tx) error {
+	_ = s.view(func(tx *bolt.Tx) error {
 		c := tx.Bucket(bucketLanes).Cursor()
 		for k, _ := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, _ = c.Next() {
 			laneID := string(k[len(prefix):])
@@ -317,7 +317,7 @@ func (s *Store) ListLaneIDs(credID string) []string {
 // like an empty lane set.
 func (s *Store) ListLaneRecords(credID string) ([]*lane.LaneRecord, error) {
 	var records []*lane.LaneRecord
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *bolt.Tx) error {
 		var err error
 		records, err = loadLanesTx(tx, credID)
 		return err
@@ -333,7 +333,7 @@ func (s *Store) LookupLane(credID, laneID string) (*lane.LaneRecord, bool, error
 		return nil, false, err
 	}
 	var rec *lane.LaneRecord
-	err = s.db.View(func(tx *bolt.Tx) error {
+	err = s.view(func(tx *bolt.Tx) error {
 		v := tx.Bucket(bucketLanes).Get(key)
 		if v == nil {
 			return nil
@@ -396,7 +396,7 @@ func (s *Store) Unblock(credID, laneID, actor, reason string, now time.Time) err
 	if err != nil {
 		return err
 	}
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
 		v := tx.Bucket(bucketLanes).Get(key)
 		if v == nil {
 			return lane.ErrLaneNotFound

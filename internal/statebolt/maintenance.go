@@ -84,7 +84,7 @@ func (s *Store) Backup(path string) error {
 			return err
 		}
 	}
-	if err := s.db.View(func(tx *bolt.Tx) error { return tx.CopyFile(path, 0o600) }); err != nil {
+	if err := s.view(func(tx *bolt.Tx) error { return tx.CopyFile(path, 0o600) }); err != nil {
 		return fmt.Errorf("statebolt: consistent backup: %w", err)
 	}
 	return CheckFile(path)
@@ -94,13 +94,16 @@ func (s *Store) Backup(path string) error {
 // containing its schema and content hash. The sidecar is written only after
 // the backup passes CheckFile.
 func (s *Store) BackupWithManifest(path, manifestPath string) error {
-	return s.BackupWithRecoveryManifest(path, manifestPath, RecoveryMetadata{})
+	return errors.New("statebolt: recovery metadata is required; use BackupWithRecoveryManifest")
 }
 
 // BackupWithRecoveryManifest creates a consistent backup plus a manifest that
 // binds the database to the policy and public signing/key-version metadata the
 // deployment must restore alongside it.
 func (s *Store) BackupWithRecoveryManifest(path, manifestPath string, metadata RecoveryMetadata) error {
+	if err := validateRecoveryMetadata(metadata); err != nil {
+		return err
+	}
 	if err := s.Backup(path); err != nil {
 		return err
 	}
@@ -128,9 +131,8 @@ func (s *Store) BackupWithRecoveryManifest(path, manifestPath string, metadata R
 	return atomicWriteRestricted(manifestPath, append(manifest, '\n'))
 }
 
-// ValidateRecoveryManifest verifies the sidecar hash and schema before a
-// restore. The sidecar is optional for backward-compatible offline restore;
-// production recovery tooling should always supply it.
+// ValidateRecoveryManifest verifies the mandatory sidecar hash, schema, and
+// authority bindings before a restore.
 func ValidateRecoveryManifest(backup, manifestPath string) error {
 	if backup == "" || manifestPath == "" {
 		return errors.New("statebolt: backup and recovery manifest paths required")
@@ -147,12 +149,22 @@ func ValidateRecoveryManifest(backup, manifestPath string) error {
 	if err := json.Unmarshal(manifestData, &manifest); err != nil {
 		return fmt.Errorf("statebolt: parse recovery manifest: %w", err)
 	}
-	if manifest.FormatVersion != 1 || manifest.SchemaVersion != currentSchemaVersion {
+	if manifest.FormatVersion != 1 || manifest.SchemaVersion != currentSchemaVersion || manifest.PolicyID == "" || manifest.PolicyRevision < 1 || manifest.PolicyDigest == "" || len(manifest.SignerPublicFingerprints) == 0 || len(manifest.RequiredPepperVersions) == 0 {
 		return fmt.Errorf("statebolt: unsupported recovery manifest format/schema: %w", ErrMigrationRequired)
 	}
 	sum := sha256.Sum256(data)
 	if manifest.DatabaseBytes != int64(len(data)) || manifest.DatabaseSHA256 != hex.EncodeToString(sum[:]) {
 		return errors.New("statebolt: recovery manifest does not match backup")
+	}
+	return nil
+}
+
+func validateRecoveryMetadata(metadata RecoveryMetadata) error {
+	if metadata.PolicyID == "" || metadata.PolicyRevision < 1 || metadata.PolicyDigest == "" {
+		return errors.New("statebolt: recovery metadata requires policy id, positive revision, and digest")
+	}
+	if len(metadata.SignerPublicFingerprints) == 0 || len(metadata.RequiredPepperVersions) == 0 {
+		return errors.New("statebolt: recovery metadata requires signer fingerprints and pepper versions")
 	}
 	return nil
 }
@@ -203,16 +215,17 @@ func atomicWriteRestricted(path string, data []byte) (err error) {
 	return err
 }
 
-// RestoreBackup validates a snapshot, copies it to the target atomically, and
-// validates the installed file. The target must be stopped by the operator;
-// this command deliberately cannot coordinate with another running process.
+// RestoreBackup validates the companion recovery manifest, copies a snapshot
+// to the target atomically, and validates the installed file. The manifest is
+// mandatory for recovery so a database cannot be restored without the policy,
+// signer, and secret-version binding recorded beside it.
 func RestoreBackup(backup, target string) (err error) {
-	return restoreBackup(backup, target)
+	return RestoreBackupWithManifest(backup, backup+".manifest.json", target)
 }
 
 // RestoreBackupWithManifest validates the recovery sidecar before installing a
-// snapshot. It retains the existing RestoreBackup API for older tooling while
-// making complete, metadata-bound recovery explicit.
+// snapshot. The target must be stopped; the writer-lock probe refuses a live
+// database path before the atomic install.
 func RestoreBackupWithManifest(backup, manifestPath, target string) error {
 	if err := ValidateRecoveryManifest(backup, manifestPath); err != nil {
 		return err

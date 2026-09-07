@@ -336,28 +336,57 @@ type DataPlane struct {
 // It intentionally contains counts and outcome classes only; request IDs,
 // credentials, paths, and provider content do not belong in a metrics label.
 type MetricsSnapshot struct {
-	Admissions         uint64
-	Authorizations     uint64
-	Denials            uint64
-	AuthenticationFail uint64
-	SpoolRejects       uint64
-	CompletionFailures uint64
+	Admissions                 uint64
+	Authorizations             uint64
+	Denials                    uint64
+	AuthenticationFail         uint64
+	Degraded                   uint64
+	ResourceDenials            uint64
+	PolicyDenials              uint64
+	PayloadTooLarge            uint64
+	SpoolRejects               uint64
+	CompletionFailures         uint64
+	BackendFailures            uint64
+	Backend4xx                 uint64
+	Backend5xx                 uint64
+	ActiveStreams              uint64
+	EvidenceEvents             uint64
+	ResourceDenialsByScope     [5]uint64
+	ResourceDenialsByDimension [6]uint64
+	Spool                      SpoolStats
 }
 
 type proxyMetrics struct {
-	admissions, authorizations, denials, authenticationFail atomic.Uint64
-	spoolRejects, completionFailures                        atomic.Uint64
+	admissions, authorizations, denials, authenticationFail   atomic.Uint64
+	degraded, resourceDenials, policyDenials, payloadTooLarge atomic.Uint64
+	spoolRejects, completionFailures, backendFailures         atomic.Uint64
+	backend4xx, backend5xx, activeStreams, evidenceEvents     atomic.Uint64
+	resourceByScope                                           [5]atomic.Uint64
+	resourceByDim                                             [6]atomic.Uint64
 }
 
 func (d *DataPlane) Metrics() MetricsSnapshot {
 	if d == nil {
 		return MetricsSnapshot{}
 	}
-	return MetricsSnapshot{
+	snapshot := MetricsSnapshot{
 		Admissions: d.metrics.admissions.Load(), Authorizations: d.metrics.authorizations.Load(),
 		Denials: d.metrics.denials.Load(), AuthenticationFail: d.metrics.authenticationFail.Load(),
+		Degraded: d.metrics.degraded.Load(), ResourceDenials: d.metrics.resourceDenials.Load(),
+		PolicyDenials: d.metrics.policyDenials.Load(), PayloadTooLarge: d.metrics.payloadTooLarge.Load(),
 		SpoolRejects: d.metrics.spoolRejects.Load(), CompletionFailures: d.metrics.completionFailures.Load(),
+		BackendFailures: d.metrics.backendFailures.Load(), Backend4xx: d.metrics.backend4xx.Load(),
+		Backend5xx: d.metrics.backend5xx.Load(), ActiveStreams: d.metrics.activeStreams.Load(),
+		EvidenceEvents: d.metrics.evidenceEvents.Load(),
+		Spool:          d.spool.Stats(),
 	}
+	for i := range snapshot.ResourceDenialsByScope {
+		snapshot.ResourceDenialsByScope[i] = d.metrics.resourceByScope[i].Load()
+	}
+	for i := range snapshot.ResourceDenialsByDimension {
+		snapshot.ResourceDenialsByDimension[i] = d.metrics.resourceByDim[i].Load()
+	}
+	return snapshot
 }
 
 // New validates the required seams and returns a DataPlane. Fail-closed: a
@@ -414,7 +443,7 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Gripline-Request-ID", requestID)
 	var observed bool
 	observeAdmission := func(out *terminator.Outcome) {
-		if observed || d.cfg.Admission == nil {
+		if observed {
 			return
 		}
 		observed = true
@@ -424,15 +453,35 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		} else {
 			d.metrics.denials.Add(1)
 			if out != nil {
+				var limitErr *resource.ScopeLimitError
+				if errors.As(out.DenialErr, &limitErr) {
+					if int(limitErr.Scope) >= 0 && int(limitErr.Scope) < len(d.metrics.resourceByScope) {
+						d.metrics.resourceByScope[limitErr.Scope].Add(1)
+					}
+					if int(limitErr.Dimension) >= 0 && int(limitErr.Dimension) < len(d.metrics.resourceByDim) {
+						d.metrics.resourceByDim[limitErr.Dimension].Add(1)
+					}
+				}
 				switch out.Reason {
 				case "invalid_authentication", "invalid_credential", "credential_revoked", "credential_restricted", "credential_expired":
 					d.metrics.authenticationFail.Add(1)
 				case "spool_capacity_exhausted":
 					d.metrics.spoolRejects.Add(1)
+				case "rate_limit", "resource_unavailable":
+					d.metrics.resourceDenials.Add(1)
+				case "temporarily_restricted", "policy_denied":
+					d.metrics.policyDenials.Add(1)
+				case "payload_too_large":
+					d.metrics.payloadTooLarge.Add(1)
 				}
 			}
+			if out != nil && out.Degraded {
+				d.metrics.degraded.Add(1)
+			}
 		}
-		d.cfg.Admission.ObserveAdmission(observability.New(out))
+		if d.cfg.Admission != nil {
+			d.cfg.Admission.ObserveAdmission(observability.New(out))
+		}
 	}
 	// Any guard that returns before the normal admission call still produces
 	// one correlated denial record.
@@ -610,6 +659,7 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := d.cfg.Transport.RoundTrip(upr)
 	if err != nil {
+		d.metrics.backendFailures.Add(1)
 		// Upstream never accepted the request: no baseline credit (P0.27 — an
 		// admitted request that fails before any useful workload is not clean
 		// trust-building activity). The deferred Release cancels the unsettled
@@ -618,6 +668,13 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
+	d.metrics.activeStreams.Add(1)
+	defer d.metrics.activeStreams.Add(^uint64(0))
+	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+		d.metrics.backend4xx.Add(1)
+	} else if resp.StatusCode >= 500 {
+		d.metrics.backend5xx.Add(1)
+	}
 
 	// 6. Copy the backend response headers + status, stream the body back.
 	copyResponseHeaders(w.Header(), resp.Header)
@@ -711,6 +768,9 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// is false when the upstream stream failed, so a corrupt/failed stream is
 	// not credited as clean velocity. This affects SUBSEQUENT admissions.
 	completion := out.Complete(actual, streamErr == nil)
+	if len(completion.EvidenceCodes) > 0 {
+		d.metrics.evidenceEvents.Add(uint64(len(completion.EvidenceCodes)))
+	}
 	if completion.Err != nil {
 		d.metrics.completionFailures.Add(1)
 	}

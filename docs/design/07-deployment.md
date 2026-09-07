@@ -20,10 +20,13 @@ Phase 6 Auto quarantine  only after validated shadow results
 Phase 7 Hardened auth  sender-constrained (DPoP / mTLS / platform keys)
 ```
 
-## 2. Consistency requirements
+## 2. Consistency requirements (supported v1 versus target)
 
-- **Strong:** credential revocation, hard concurrency admission, hard spend
-  admission where promised, emergency block state.
+- **Strong in one authority:** credential revocation, hard concurrency
+  admission, configured request/token/cost reservations, and emergency block
+  state. Token/cost budgets require a configured usage adapter and are settled
+  after execution unless the provider supplies a conservative pre-execution
+  maximum.
 - **Eventual OK:** analytics, baseline updates, historical investigation,
   low-severity evidence propagation.
 - Never treat eventually-consistent state as authoritative for a hard limit
@@ -40,14 +43,18 @@ proves per-object atomicity, but it is not a cross-node lease service.
 
 ## 4. Dependency failure semantics
 
+The table below is the target multi-service contract. Entries marked **target**
+are not silently claimed by the stock single-node binary; the executable
+behavior is the final sentence in each row.
+
 | Dependency down | Behavior |
 |---|---|
-| Credential registry | short authenticated local cache (≤60s) for recently verified; unknown fail closed |
+| Credential registry | **target:** short authenticated local cache (≤60s); v1 fails closed on registry errors |
 | Risk store | `DEGRADED_STATIC`; never disable hard limits |
-| Resource state | bounded local emergency limits; never unlimited |
-| Policy service | last validated policy |
-| Analytics | proxy continues; buffer events within strict bounds |
-| Internal signer | **fail closed** for new upstream authorization (alternate hot signer → HA) |
+| Resource state | **target:** bounded distributed fallback; v1 governor is process-local and never unlimited |
+| Policy service | **target:** last validated policy; v1 uses the durable local manifest and signed artifact |
+| Analytics | proxy continues; bounded queue drops are counted |
+| Internal signer | **target:** alternate hot signer; v1 fails closed for new upstream authorization |
 
 Control-plane dependency degradation must not silently weaken the data plane
 (§61): data-plane admission remains fail-closed and loads only
@@ -57,10 +64,12 @@ reported and the supervisor drains both servers.
 
 The private admin listener exposes authenticated low-cardinality metrics at
 `GET /admin/metrics` (`audit.read`). It reports admission/denial classes,
-authentication failures, spool rejections, completion-observation failures,
-source-table saturation/overflow, detector drops, telemetry sink failures, and
-global evidence-sweep counters. No request or credential value is a metric
-label.
+degraded decisions, resource/policy denials, bounded spool utilization,
+backend failures/status classes, active streams, bbolt transaction counts and
+latency, source-table saturation/overflow, detector drops, telemetry sink
+failures, global evidence-sweep counters, and active policy revision/signer
+identity. No request, credential, policy ID, signer KID, or source value is a
+metric label.
 
 ## 5. Single-node boundary
 
@@ -89,7 +98,8 @@ Integration levels: L1 separable auth middleware
 (`authenticate()`→`validate_gripline_identity()`); L2 small internal-auth
 adapter; L3 one-time refactor where FI distributes original-key validation. In
 every case the fundamental change is `backend trusts user key` →
-`backend trusts Gripline`.
+`backend trusts Gripline`. A deployment gate must also deny direct raw-key
+requests at the backend; proxy configuration alone is not that gate.
 
 ## 7. Cloudflare
 

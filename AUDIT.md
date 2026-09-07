@@ -3,9 +3,10 @@
 Durable source of truth for the numbered P0 findings from the external hostile
 production review. Every row is a verdict grounded in the current release-
 candidate tree, confirmed by re-reading the actual implementation (not inferred
-from summaries). This is the on-repo ground truth for "All P0s now": a finding
-is only RESOLVED when the verdict links to the symbol and proof that satisfy it;
-the release commit should preserve this document unchanged.
+from summaries). This is the on-repo ground truth for the review close-out: a
+finding is only RESOLVED when the verdict links to the symbol and proof that
+satisfy it. Known beta boundaries are recorded as scope decisions, not hidden
+capability claims.
 
 Legend:
 - RESOLVED — the invariant is implemented and enforced in the current tree.
@@ -105,7 +106,7 @@ release-gate results are recorded at close-out below.
 | # | Verdict | Evidence |
 |---|---------|----------|
 | P0.58 | RESOLVED (single-node beta) | `internal/statebolt` is the durable credential authority. Multi-node replication remains deliberately out of scope. |
-| P0.59 | PARTIAL (out of beta scope) | `Keyring.RotateAndSave` remains a library primitive with durable replace ordering and retained public-key overlap. The live admin rotation endpoint/capability is intentionally absent from public beta; operators must coordinate signer rotation and publish `gripline keys export` externally. |
+| P0.59 | RESOLVED (lifecycle seam; live route out of beta) | `PrepareRotationWithAudit` persists a candidate phase, `ActivatePreparedWithAudit` requires backend public-key acceptance before durable activation, and `RetireAfterWithAudit` enforces the TTL/skew horizon. The public admin rotation route remains intentionally absent from beta; the lifecycle is an explicit integration seam. |
 | P0.60 | PARTIAL | Assertion key overlap exists via Keyring, but no HSM/remote signer or automated key-management lifecycle. |
 | P0.61 | ABSENT | Multi-node / leader election: resource governor is a single-process `sync.Mutex`; no etcd/Consul/Raft. |
 | P0.62 | ABSENT | Shared leases with TTL across nodes: leases are in-process; no distributed store/TTL. |
@@ -114,8 +115,8 @@ release-gate results are recorded at close-out below.
 | P0.65 | PARTIAL | Credential `SecurityState` and its authoritative transitions are durable in `statebolt`; process-local governor buckets and adapters remain volatile by design. |
 | P0.66 | RESOLVED (single-node beta) | bbolt supplies the transactional append path for the beta authority; external WAL/replication and multi-node recovery remain out of scope. |
 | P0.67 | RESOLVED | Source-spray anomaly detector: `anomaly.Detector` wired via `Dependencies.Spray`; `internal/anomaly/spray.go` + `m6_test.go`. |
-| P0.68 | ABSENT | Dependency chaos / failure-injection harness: docs mention it (`docs/design/08-testing.md`) but no implementation; Gate F hand-codes one `failingStore`, not a harness. |
-| P0.69 | PARTIAL (honest scope) | `internal/gates` contains component proofs for A–J and the latency test covers §112; the external release harness, network isolation, cross-process replay, and multi-node proofs remain pending. |
+| P0.68 | RESOLVED (bounded single-node harness) | `scripts/chaos-smoke.sh` runs targeted state, signer, proxy, spool, telemetry, backend, and restart failure seams plus the compiled release harness. Environment-specific ENOSPC, read-only mounts, network namespaces, and multi-node faults remain deployment gates. |
+| P0.69 | RESOLVED (single-node release proof; deployment gates explicit) | `scripts/release-harness.sh` is a compiled black-box gateway/public-verifier proof with cross-process negative assertions, protocol cases, canary scan, backend restart, and gateway restart. Network isolation, third-party SDKs, and multi-node resource proofs remain explicitly outside this repository's single-node claim. |
 
 ---
 
@@ -146,9 +147,10 @@ release-gate results are recorded at close-out below.
 **Single-node public-beta gateway.** The deterministic authorization engine,
 proxy trust boundary, durable bbolt authority, source-spray detector, operator
 control plane, bounded runtime observer, and causal
-demo are implemented and tested. Multi-node lease coordination, an external
-chaos/replay harness, metrics backends, KMS/HSM-backed keys, and a provider SDK
-matrix remain outside the beta claim.
+demo are implemented and tested. A bounded single-node chaos/release harness
+is included; multi-node lease coordination, network-isolation proof, metrics
+backends, KMS/HSM-backed keys, and a provider SDK matrix remain outside the
+beta claim.
 
 ## Production gaps (not P0 defects; architecture recommendations)
 
@@ -157,16 +159,17 @@ matrix remain outside the beta claim.
 > (2) LARGELY RESOLVED — credentials, lanes, evidence, operator audit, and
 > posture are durable in one transactional bbolt database
 > (`internal/statebolt`); restart containment is acceptance-proven. (3) STILL
-> OPEN (deliberately out of beta scope) — multi-node coordination/TTL leases,
-> chaos harness, metrics pipeline, KMS/HSM. (4) PARTIAL — source-identity
+> OUT OF BETA SCOPE — multi-node coordination/TTL leases, network-isolation
+> proof, SDK matrix, metrics export integration, and KMS/HSM. (4) PARTIAL —
+> source-identity
 > attribution remains the provider-adapter seam.
 
 ## Open / partial work queue (ordered by what blocks the e2e goal)
 
 1. P0.61/P0.62 — distributed resource leases, leader election, and shared
    multi-node hard-limit state remain out of beta scope.
-2. P0.68/P0.69 — external chaos, network-isolation, cross-process replay, and
-   SDK-matrix harnesses remain release-follow-up work.
+2. Deployment evidence — network-isolation, external telemetry, SDK-matrix,
+   and multi-node resource proofs remain hosting/deployment gates.
 3. Provider adapters — stock binary exposes safe seams and request-only
    accounting; production integrations must supply ASN/region and token/cost
    adapters explicitly.
@@ -186,7 +189,7 @@ claims. The ten release blockers and their current status are:
 | P0-3 stock demo signal | **RESOLVED.** The demo uses only `SourceNovelty`, `ResourceVelocity`, and `Enumeration` producers and contains no `DEMO_*` signal, manual evidence append, or manual lane mutation. A real concurrent HTTP burst exposes stock `CONCURRENCY_OVER_4X_BASELINE`; the web and headless proofs require the real evidence and transition. |
 | P0-4/P0-5 credential provisioning | **RESOLVED.** `terminator.ValidateExternalCredential` is shared by ingress, bootstrap, and live CLI; live add validates the config but never stats/opens the server-owned state file. |
 | P0-6 admin bearer transport | **RESOLVED.** Plaintext admin binds accept numeric loopback only; LAN/private/public binds are rejected and remote access is documented through SSH or a TLS wrapper. |
-| P0-7 live signer rotation | **OUT OF BETA SCOPE.** The one-step live route and capability are absent. Persistent key export and library rotation primitives remain available until a prepare/activate protocol exists. |
+| P0-7 live signer rotation | **RESOLVED at the lifecycle seam; route out of beta.** `PrepareRotationWithAudit` persists a prepared candidate, public publication is explicit, `ActivatePreparedWithAudit` requires backend acceptance before activation, and `RetireAfterWithAudit` enforces the TTL/skew horizon. The admin route remains out of beta and is not claimed as shipped. |
 | P0-8 key durability | **RESOLVED.** Keyring replacement writes 0600 temporary state, fsyncs file, renames, fsyncs the parent directory, and cleans up failed temporary writes. |
 | P0-9 strict config | **RESOLVED.** Config decoding disallows unknown fields at every nesting level and rejects trailing JSON values. |
 | P0-10 cryptographic buffer hygiene | **RESOLVED (best effort).** Key comparisons use decoded bytes and temporary pepper, pseudonym, verifier, and secret buffers are wiped on owned exit paths; Go string/header copies remain outside the mutable-buffer guarantee. |
@@ -267,3 +270,60 @@ admission-latency proof are green (p95 ≈ 0.41ms, p99 ≈ 0.57ms); the
 executable acceptance suite and headless causal demo are green. The release
 container builds and `deploy/container-smoke.sh` passes persistence, readiness,
 SIGTERM, and restart checks.
+
+Final re-verification after the numbered audit changes also passed
+govulncheck (No vulnerabilities found), bash syntax checks, scripts/chaos-smoke.sh,
+the compiled release-harness.sh including backend capture canary, read-only
+state/signer/spool probes and SIGKILL restart, and the durable state-backed
+proxy percentile test (p50 41.8ms, p95 48.2ms, p99 67.8ms, 1,434 req/s on
+this host). The explicit admission-latency gate measured p95 397.6µs and p99
+738.1µs; the container smoke passed with a nonroot UID, TLS, persistence, and
+restart.
+
+## Numbered production-review completion audit (1–38)
+
+This matrix is the requirement-by-requirement close-out for the production
+review supplied on 2026-09-07. “Scope-closed” means the review requirement is
+handled by an explicit single-node or beta boundary and the repository does
+not claim the excluded deployment capability.
+
+| # | Verdict | Evidence |
+|---|---|---|
+| 1 | VERIFIED | go.mod requires Go 1.25.13; CI/release assert the exact toolchain and run govulncheck. |
+| 2 | VERIFIED | Public adapter/usage and adapter/ingress contracts plus external compile tests. |
+| 3 | VERIFIED | Stock ingress resolves trusted canonical source metadata through the configured ASN/network/region CIDR adapter. |
+| 4 | VERIFIED | Source novelty emits independent NEW_SOURCE evidence; it does not derive continuity solely from ASN. |
+| 5 | VERIFIED | Producer, anomaly, credential, lane, evidence, posture, and audit state are persistent; restart tests prove detector baseline restoration. |
+| 6 | VERIFIED | policy.Manager validates, prepares, persists, activates, restores crash-phase candidates, and performs explicit audited rollback. |
+| 7 | SCOPE-CLOSED | One immutable policy snapshot is selected per process; PlanID is required metadata and multi-plan resolution is explicitly not shipped. |
+| 8 | VERIFIED | Bounded OpenAI/Anthropic usage adapters are wired; request reservation precedes execution and actual usage settles after completion. |
+| 9 | SCOPE-CLOSED | Resource buckets are explicitly process-lifetime/volatile in single-node v1; status and deployment docs say so. |
+| 10 | VERIFIED | Governor uses metadata locking only; independent pools/buckets are acquired without a process-wide admission mutex. |
+| 11 | VERIFIED | Zero MaxSourceScopes resolves to a conservative bound and is covered by runtime status and governor tests. |
+| 12 | VERIFIED | Idle source scopes are evicted; non-evictable saturation folds identities into bounded hashed overflow scopes with metrics. |
+| 13 | VERIFIED | Idle lane/resource state has explicit removal and refuses eviction while leases, reservations, or debt remain. |
+| 14 | VERIFIED | Global evidence sweep, expiry metrics, bounded compaction, and durable sweep cursor are implemented in statebolt. |
+| 15 | VERIFIED | Persistent runtime config resolves zero spool limits to bounded 64 MiB/64-file defaults. |
+| 16 | VERIFIED | External secret carriers are stripped before source, feature, usage, or backend processing; owned mutable copies are zeroed. |
+| 17 | VERIFIED | Pepper keys are copied only inside the ring, never persisted, versioned records support overlap/migration, and old versions remain explicit. |
+| 18 | VERIFIED | Pseudonym keys are versioned with overlap and highest-version issuance; key material is distinct from verifier peppers. |
+| 19 | VERIFIED at lifecycle seam | Signer prepare/persist/public-publish/backend-accept/activate/TTL-skew-retire phases are durable, audited, and crash-tested; a live admin rotation route is intentionally outside beta and not claimed. |
+| 20 | VERIFIED | Keyring, policy, lifecycle, manifest, and state files reject links/special files/broad permissions; writes use restricted temp files, fsync, rename, and directory sync. |
+| 21 | VERIFIED | Recovery manifests bind database hash/schema to policy ID/revision/digest, signer public fingerprints, and required pepper/pseudonym versions; restore refuses an active target. |
+| 22 | VERIFIED | Ordered statebolt migrations create pre-migration backups, run transactionally, validate schema post-open, and expose backup/restore tooling. |
+| 23 | VERIFIED | The compiled backend fixture and demo use the public verify key-set acceptance path, not the private signer. |
+| 24 | VERIFIED | Wire format is versioned v1 with immutable payload/signature vectors in verify/testdata. |
+| 25 | VERIFIED for claimed surface | Compiled release harness uses separate gateway/backend processes and real TCP HTTP cases for direct denial, forged claims, revision freshness, query/gzip/chunked/SSE/oversized/cancel/restart/status behavior; third-party SDKs remain hosting-side evidence. |
+| 26 | VERIFIED | Exact harness credential is scanned across generated config, provision output, logs, backend captures, telemetry, audit, and artifacts before release proof passes. |
+| 27 | VERIFIED for single-node fault matrix | Chaos smoke covers lock/corruption/migration, signer unreadability/corruption, read-only state/spool, backend dial/idle/mid-stream/client disconnect, telemetry, admin, and SIGKILL restart; ENOSPC/network-namespace/multi-node faults remain host deployment gates. |
+| 28 | VERIFIED | Durable state-backed proxy benchmark reports p50/p95/p99 and throughput under concurrent request pressure. |
+| 29 | VERIFIED | Admin metrics expose low-cardinality admission, denial, degraded, resource scope/dimension, source saturation/eviction, spool, evidence, bbolt, stream, backend, telemetry, policy, and signer counters. |
+| 30 | VERIFIED | status reports active durable policy ID/revision/digest, actual signer KID state, resource persistence boundary, source bound, spool limits, and pepper/pseudonym versions. |
+| 31 | VERIFIED | CredentialRecord validation requires PlanID; CLI help and live provisioning use the same contract. |
+| 32 | VERIFIED | Generic policy naming is the default and the legacy provider alias remains accepted for compatibility. |
+| 33 | VERIFIED | CI/release pin action SHAs and tool versions, fail on toolchain/vulnerability/static checks, publish checksums, cosign signatures, SBOM/provenance, and attestations. |
+| 34 | VERIFIED | README and design docs reconcile executable policy auth, local lifecycle state, adapter seams, single-node resources, and deployment boundaries. |
+| 35 | VERIFIED | README and value visual qualify beta/single-node claims and avoid presenting target multi-node/SDK capabilities as shipped. |
+| 36 | VERIFIED | The causal demo uses the configured ingress/network adapter and a separate public verify-backed protected backend; headless proof is executable. |
+| 37 | VERIFIED as deployment gate | Backend integration docs require private reachability/mTLS and raw-key denial; the release harness directly proves the backend rejects raw credentials. |
+| 38 | VERIFIED | README, design docs, status, benchmark, and audit all state the single-node authority/resource boundary explicitly. |

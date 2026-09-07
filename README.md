@@ -76,6 +76,12 @@ short-lived signed assertion bound to a principal, a lane, and the current
 policy revision — so a stolen upstream secret is not a stolen backend
 identity, and misuse is constrained before it becomes exhaustion.
 
+The backend is part of the trust boundary: deploy it on a private network
+segment or enforce an equivalent mTLS/network-policy gate, configure it to
+accept only Gripline assertions, and prove that direct raw-credential access
+returns `403`. The compiled release harness exercises the verifier and direct
+access proof locally; it cannot prove a production network perimeter.
+
 ## Quick start
 
 Build and run against a private backend:
@@ -125,6 +131,7 @@ gripline audit export      --config c.json --token-file /run/secrets/gripline-op
 gripline audit security list   --config c.json --token-file /run/secrets/gripline-operator
 gripline audit security export --config c.json --token-file /run/secrets/gripline-operator > security.jsonl
 gripline keys export       --config c.json   # public backend verification material only
+gripline policy verify     --config c.json   # verify the configured signed policy artifact
 gripline version
 
 # Live signer rotation is intentionally not exposed in public beta. Coordinate
@@ -198,6 +205,10 @@ separate public-verifier backend and proves a real request/response path. The
 networked executable acceptance suite still requires a host network namespace.
 The current in-process benchmark is a development signal, not a production
 latency SLO; deployers must measure p95/p99 on their hardware.
+
+Tagged releases publish SHA-256 checksums with a keyless Sigstore bundle and
+sign the pushed container manifest with the same OIDC-backed release identity;
+GitHub build-provenance attestations are published for both artifact classes.
 
 ## Definitive causal demo
 
@@ -339,7 +350,7 @@ internal/anomaly       source-spray signal detector (ASN/credential/invalid-key 
 internal/observability DecisionRecord per admission (§97) projected from the internal DecisionTrace
                        (P0.50): denied decisions carry principal, lane, and policy revision (P0.51)
 internal/gates         component invariant tests for the §111 gate properties (honestly named
-                       `...Component`) — NOT the acceptance gates; external release harness pending
+                       `...Component`) — NOT the acceptance gates; compiled release/chaos harness shipped
 ```
 
 ### Known gaps (audit honesty)
@@ -349,9 +360,9 @@ claimed beyond what the implementation establishes:
 
 - **Policy immutability:** the terminator enforces a compiled deep-copy
   snapshot and `policy.Manager` provides monotonic prepare/activate,
-  last-known-good rollback, durable-manifest and audit seams. Artifact
-  signature/KMS integration remains deployment-specific and must be supplied
-  before accepting untrusted policy files.
+  last-known-good rollback, durable-manifest/artifact retention, and audit
+  transitions. Configured policy files use the version-1 Ed25519 envelope;
+  deployments may replace its verifier with a KMS/HSM integration.
 - **One policy per process:** the shipped runtime selects one compiled policy
   snapshot for each process. `PlanID` is required credential metadata, but a
   multi-plan provider policy resolver is not shipped; deployments that need

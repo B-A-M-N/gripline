@@ -33,13 +33,13 @@ func TestManagerPrepareActivateRollback(t *testing.T) {
 	if err := m.Activate("scheduled rollout"); err != nil {
 		t.Fatal(err)
 	}
-	if m.Current().Revision != 2 || len(manifests) != 1 || len(events) != 1 {
+	if m.Current().Revision != 2 || len(manifests) != 2 || len(events) != 2 {
 		t.Fatalf("activation state: rev=%d manifests=%d events=%d", m.Current().Revision, len(manifests), len(events))
 	}
 	if err := m.Rollback(1, "failed canary"); err != nil {
 		t.Fatal(err)
 	}
-	if m.Current().Revision != 1 || events[1].Action != "rollback" {
+	if m.Current().Revision != 1 || events[2].Action != "rollback" {
 		t.Fatalf("rollback state: rev=%d events=%+v", m.Current().Revision, events)
 	}
 }
@@ -51,14 +51,11 @@ func TestManagerFailedPersistenceDoesNotActivate(t *testing.T) {
 	}
 	next := Default()
 	next.Revision = 2
-	if _, err := m.Prepare(next); err != nil {
-		t.Fatal(err)
+	if _, err := m.Prepare(next); err == nil {
+		t.Fatal("candidate preparation must fail when the durable manifest cannot be persisted")
 	}
-	if err := m.Activate(""); err == nil {
-		t.Fatal("activation must fail when the manifest cannot be persisted")
-	}
-	if m.Current().Revision != 1 || m.Candidate() == nil {
-		t.Fatal("failed activation changed lifecycle state")
+	if m.Current().Revision != 1 || m.Candidate() != nil {
+		t.Fatal("failed preparation changed lifecycle state")
 	}
 }
 

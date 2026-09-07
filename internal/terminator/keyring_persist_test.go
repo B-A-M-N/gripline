@@ -146,6 +146,67 @@ func TestKeyringRotationPersistence(t *testing.T) {
 	}
 }
 
+func TestPreparedRotationPersistsPhaseAndRetirementHorizon(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "keyring.json")
+	kr, err := NewKeyring()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := kr.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	var phases []string
+	candidate, err := kr.PrepareRotationWithAudit(path, func(event RotationEvent) error {
+		phases = append(phases, event.Phase)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := LoadExistingKeyring(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.ActiveKid() != 1 || len(reloaded.PublicKeys()) != 2 {
+		t.Fatalf("prepared candidate changed active publication: kid=%d keys=%d", reloaded.ActiveKid(), len(reloaded.PublicKeys()))
+	}
+	if err := reloaded.RetireAfter(path, 1, time.Now().Add(time.Hour)); err == nil {
+		t.Fatal("retirement before assertion TTL/skew horizon must be rejected")
+	}
+	if err := reloaded.ActivatePreparedWithAudit(path, candidate.KID, func(public []byte) error {
+		if len(public) != ed25519.PublicKeySize {
+			return fmt.Errorf("bad public key")
+		}
+		return nil
+	}, func(event RotationEvent) error {
+		phases = append(phases, event.Phase)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := reloaded.RetireAfterWithAudit(path, 1, time.Now().Add(-time.Second), func(event RotationEvent) error {
+		phases = append(phases, event.Phase)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := fmt.Sprint(phases); got != "[prepared activated retired]" {
+		t.Fatalf("rotation phases=%s", got)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted keyringPersist
+	if err := json.Unmarshal(raw, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if len(persisted.RotationHistory) != 3 || persisted.RotationHistory[0].Phase != "prepared" || persisted.RotationHistory[1].Phase != "activated" || persisted.RotationHistory[2].Phase != "retired" {
+		t.Fatalf("durable rotation history=%+v", persisted.RotationHistory)
+	}
+}
+
 // TestKeyringLoadRejectsCorruptPack fails closed on a hand-edited or truncated
 // persisted keyring (release hardening): a mismatched active key / verifier
 // table, a non-monotonic next kid, or a zero active kid must refuse to load

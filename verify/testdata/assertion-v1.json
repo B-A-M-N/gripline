@@ -1,0 +1,8 @@
+{
+  "version": "v1",
+  "audience": "provider-vector",
+  "now": 1700000005,
+  "public_key": "ebVWLo/mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ=",
+  "payload": "{\"iss\":\"gripline\",\"sub\":\"acct-vector\",\"cid\":\"cred-vector\",\"ctx\":\"\",\"aud\":\"provider-vector\",\"iat\":1700000000,\"exp\":1700000020,\"jti\":\"jti-vector\",\"policy_rev\":7,\"cred_rev\":11,\"scope\":[\"inference\"],\"kid\":3}",
+  "token": "v1.eyJpc3MiOiJncmlwbGluZSIsInN1YiI6ImFjY3QtdmVjdG9yIiwiY2lkIjoiY3JlZC12ZWN0b3IiLCJjdHgiOiIiLCJhdWQiOiJwcm92aWRlci12ZWN0b3IiLCJpYXQiOjE3MDAwMDAwMDAsImV4cCI6MTcwMDAwMDAyMCwianRpIjoianRpLXZlY3RvciIsInBvbGljeV9yZXYiOjcsImNyZWRfcmV2IjoxMSwic2NvcGUiOlsiaW5mZXJlbmNlIl0sImtpZCI6M30.YdJTkEcGO35SMeZynggPhAX3HV9WUSh5WVH0I5w2_wS978SHCUY4JSI5W-VST3MAJbmYfE3BIrZm2P-qApc8Dg"
+}

@@ -6,9 +6,14 @@
 package policy
 
 import (
+	"bytes"
+	"crypto/ed25519"
 	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -50,23 +55,13 @@ func Digest(p *Policy) (string, error) {
 // Duration fields use JSON nanoseconds when encoded numerically, matching
 // Go's time.Duration representation.
 func LoadFile(path string) (*CompiledPolicy, error) {
-	if strings.TrimSpace(path) == "" {
-		return nil, errors.New("policy: artifact path required")
-	}
-	f, err := os.Open(path)
+	data, err := readArtifact(path)
 	if err != nil {
-		return nil, fmt.Errorf("policy: open artifact: %w", err)
+		return nil, err
 	}
-	defer f.Close()
-	const maxPolicyBytes = 4 << 20
-	if info, err := f.Stat(); err != nil {
-		return nil, fmt.Errorf("policy: stat artifact: %w", err)
-	} else if info.Size() > maxPolicyBytes {
-		return nil, fmt.Errorf("policy: artifact exceeds %d bytes", maxPolicyBytes)
-	}
-	dec := json.NewDecoder(io.LimitReader(f, maxPolicyBytes))
-	dec.DisallowUnknownFields()
 	var p Policy
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
 	if err := dec.Decode(&p); err != nil {
 		return nil, fmt.Errorf("policy: parse artifact: %w", err)
 	}
@@ -79,6 +74,139 @@ func LoadFile(path string) (*CompiledPolicy, error) {
 		return nil, fmt.Errorf("policy: compile artifact: %w", err)
 	}
 	return compiled, nil
+}
+
+// SignedArtifact is the authenticated policy wire format. The signature is
+// Ed25519 over the canonical JSON encoding of Policy. Keeping the envelope
+// versioned makes policy verification a protocol boundary, not an implicit
+// convention between operators and the binary.
+type SignedArtifact struct {
+	Version   int             `json:"version"`
+	Policy    json.RawMessage `json:"policy"`
+	Signature string          `json:"signature"`
+}
+
+// LoadAuthenticatedFile loads the only policy-file form accepted by the
+// production composition root: a versioned Ed25519-signed envelope. The
+// unsigned LoadFile helper remains available for local policy unit tests and
+// explicitly trusted in-process defaults; callers accepting an operator file
+// must use this function.
+func LoadAuthenticatedFile(path string, verifier ed25519.PublicKey) (*CompiledPolicy, error) {
+	data, err := readArtifact(path)
+	if err != nil {
+		return nil, err
+	}
+	if len(verifier) != ed25519.PublicKeySize {
+		return nil, errors.New("policy: Ed25519 verifier key required")
+	}
+	var envelope SignedArtifact
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&envelope); err != nil {
+		return nil, fmt.Errorf("policy: parse signed artifact: %w", err)
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return nil, errors.New("policy: signed artifact contains trailing JSON")
+	}
+	if envelope.Version != 1 || len(envelope.Policy) == 0 || strings.TrimSpace(envelope.Signature) == "" {
+		return nil, errors.New("policy: signed artifact requires version 1, policy, and signature")
+	}
+	var p Policy
+	policyDecoder := json.NewDecoder(bytes.NewReader(envelope.Policy))
+	policyDecoder.DisallowUnknownFields()
+	if err := policyDecoder.Decode(&p); err != nil {
+		return nil, fmt.Errorf("policy: parse signed policy: %w", err)
+	}
+	var policyExtra any
+	if err := policyDecoder.Decode(&policyExtra); err != io.EOF {
+		return nil, errors.New("policy: signed policy contains trailing JSON")
+	}
+	canonical, err := json.Marshal(&p)
+	if err != nil {
+		return nil, fmt.Errorf("policy: canonicalize signed policy: %w", err)
+	}
+	sig, err := base64.RawURLEncoding.DecodeString(envelope.Signature)
+	if err != nil {
+		sig, err = base64.StdEncoding.DecodeString(envelope.Signature)
+	}
+	if err != nil || len(sig) != ed25519.SignatureSize || !ed25519.Verify(verifier, canonical, sig) {
+		return nil, errors.New("policy: policy signature verification failed")
+	}
+	compiled, err := Compile(&p)
+	if err != nil {
+		return nil, fmt.Errorf("policy: compile signed artifact: %w", err)
+	}
+	return compiled, nil
+}
+
+// LoadVerifierKeyFile loads a raw, base64, or PEM-encoded Ed25519 public key.
+// It rejects links, special files, and writable policy trust roots.
+func LoadVerifierKeyFile(path string) (ed25519.PublicKey, error) {
+	if err := validatePolicyFile(path); err != nil {
+		return nil, fmt.Errorf("policy: verifier key: %w", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("policy: read verifier key: %w", err)
+	}
+	data = bytes.TrimSpace(data)
+	if block, _ := pem.Decode(data); block != nil {
+		pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("policy: parse verifier key PEM: %w", err)
+		}
+		key, ok := pub.(ed25519.PublicKey)
+		if !ok {
+			return nil, errors.New("policy: verifier PEM is not Ed25519")
+		}
+		return append(ed25519.PublicKey(nil), key...), nil
+	}
+	if decoded, decodeErr := base64.StdEncoding.DecodeString(string(data)); decodeErr == nil {
+		data = decoded
+	}
+	if len(data) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("policy: verifier key size %d, want %d", len(data), ed25519.PublicKeySize)
+	}
+	return append(ed25519.PublicKey(nil), data...), nil
+}
+
+func readArtifact(path string) ([]byte, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, errors.New("policy: artifact path required")
+	}
+	if err := validatePolicyFile(path); err != nil {
+		return nil, err
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("policy: open artifact: %w", err)
+	}
+	defer f.Close()
+	const maxPolicyBytes = 4 << 20
+	if info, err := f.Stat(); err != nil {
+		return nil, fmt.Errorf("policy: stat artifact: %w", err)
+	} else if info.Size() > maxPolicyBytes {
+		return nil, fmt.Errorf("policy: artifact exceeds %d bytes", maxPolicyBytes)
+	}
+	return io.ReadAll(io.LimitReader(f, maxPolicyBytes))
+}
+
+func validatePolicyFile(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("policy: inspect artifact: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("policy: artifact must not be a symlink")
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("policy: artifact must be a regular file")
+	}
+	if info.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("policy: artifact permissions %04o are writable by group/other", info.Mode().Perm())
+	}
+	return nil
 }
 
 // RiskThresholds are the credential/lane risk-state boundaries (§31).

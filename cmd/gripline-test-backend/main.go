@@ -5,13 +5,17 @@
 package main
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"flag"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -22,6 +26,8 @@ func main() {
 	listen := flag.String("listen", "127.0.0.1:18081", "private backend listen address")
 	keysPath := flag.String("keys", "", "public Gripline key-set JSON path")
 	audience := flag.String("audience", "", "expected assertion audience")
+	minPolicyRev := flag.Int("min-policy-rev", 0, "minimum accepted policy revision for test freshness checks")
+	capturePath := flag.String("capture", "", "optional accepted-request header capture path")
 	flag.Parse()
 	if *keysPath == "" || *audience == "" {
 		log.Fatal("-keys and -audience are required")
@@ -40,6 +46,21 @@ func main() {
 		log.Fatalf("construct verifier: %v", err)
 	}
 
+	var captureMu sync.Mutex
+	capture := func(r *http.Request) {
+		if *capturePath == "" {
+			return
+		}
+		captureMu.Lock()
+		defer captureMu.Unlock()
+		f, err := os.OpenFile(*capturePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			log.Printf("capture: %v", err)
+			return
+		}
+		_, _ = fmt.Fprintf(f, "%s %s headers=%v\n", r.Method, r.URL.RequestURI(), r.Header)
+		_ = f.Close()
+	}
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// A protected backend must never accept a raw external credential, even
 		// if a caller reaches this private listener directly.
@@ -47,9 +68,71 @@ func main() {
 			http.Error(w, "raw credential rejected", http.StatusForbidden)
 			return
 		}
+		capture(r)
 		claims, err := verifier.VerifyAndStrip(r)
 		if err != nil {
 			http.Error(w, "assertion required", http.StatusUnauthorized)
+			return
+		}
+		if *minPolicyRev > 0 && claims.PolicyRev < *minPolicyRev {
+			http.Error(w, "stale policy revision", http.StatusUnauthorized)
+			return
+		}
+		if r.URL.Path == "/v1/status/429" {
+			w.Header().Set("Retry-After", "3")
+			http.Error(w, "backend throttled", http.StatusTooManyRequests)
+			return
+		}
+		if r.URL.Path == "/v1/status/500" {
+			http.Error(w, "backend failed", http.StatusBadGateway)
+			return
+		}
+		if r.URL.Path == "/v1/gzip" {
+			w.Header().Set("Content-Encoding", "gzip")
+			w.Header().Set("Content-Type", "application/octet-stream")
+			gz := gzip.NewWriter(w)
+			_, _ = gz.Write([]byte("compressed-body-fidelity"))
+			_ = gz.Close()
+			return
+		}
+		if r.URL.Path == "/v1/echo" {
+			body, _ := io.ReadAll(io.LimitReader(r.Body, 2<<20))
+			encoder := json.NewEncoder(w)
+			encoder.SetEscapeHTML(false)
+			_ = encoder.Encode(map[string]any{"path": r.URL.Path, "query": r.URL.RawQuery, "body": string(body)})
+			return
+		}
+		if r.URL.Path == "/v1/stream" {
+			w.Header().Set("Content-Type", "text/event-stream")
+			flusher, _ := w.(http.Flusher)
+			for _, chunk := range []string{"data: one\n\n", "data: two\n\n", "data: [DONE]\n\n"} {
+				if _, err := io.WriteString(w, chunk); err != nil {
+					return
+				}
+				if flusher != nil {
+					flusher.Flush()
+				}
+			}
+			return
+		}
+		if r.URL.Path == "/v1/slow" {
+			// The fixed content length makes an idle-stream cut observable to a
+			// black-box client as a truncated response rather than a clean empty
+			// response. Context cancellation also proves the upstream is released
+			// when the client disconnects.
+			w.Header().Set("Content-Type", "text/plain")
+			w.Header().Set("Content-Length", "5")
+			w.WriteHeader(http.StatusOK)
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			timer := time.NewTimer(2 * time.Second)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+				_, _ = io.WriteString(w, "slow\n")
+			case <-r.Context().Done():
+			}
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")

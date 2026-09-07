@@ -72,6 +72,7 @@ func parseSubcommand(args []string) (string, []string) {
 //	gripline lane list|unblock --config path.json [...]
 //	gripline audit list|export --config path.json
 //	gripline state check|backup|restore|compact --config path.json
+//	gripline policy verify --config path.json
 //	gripline status --config path.json
 //	gripline version
 //
@@ -101,6 +102,8 @@ func dispatchSubcommand(sub string, args []string) error {
 		return runAuditCLI(args)
 	case "state":
 		return runStateCLI(args)
+	case "policy":
+		return runPolicyCLI(args)
 	case "status":
 		fs := flag.NewFlagSet("status", flag.ExitOnError)
 		cfgPath := fs.String("config", "/etc/gripline/config.json", "path to the deployment configuration")
@@ -115,7 +118,7 @@ func dispatchSubcommand(sub string, args []string) error {
 		fmt.Println(versionString())
 		return errSubcommand
 	default:
-		return fmt.Errorf("unknown subcommand %q (expected: keys, credential, lane, audit, state, status, version)", sub)
+		return fmt.Errorf("unknown subcommand %q (expected: keys, credential, lane, audit, state, policy, status, version)", sub)
 	}
 }
 
@@ -318,7 +321,11 @@ func run(cfgPath string) (retErr error) {
 // never a partially initialized data plane.
 func policyFor(cfg *config.Config) (*policy.Policy, error) {
 	if cfg.Policy.File != "" {
-		compiled, err := policy.LoadFile(cfg.Policy.File)
+		verifier, err := policy.LoadVerifierKeyFile(cfg.Policy.VerifierKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("policy verifier: %w", err)
+		}
+		compiled, err := policy.LoadAuthenticatedFile(cfg.Policy.File, verifier)
 		if err != nil {
 			return nil, err
 		}

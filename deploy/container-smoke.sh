@@ -6,6 +6,8 @@ container_name="gripline-smoke-$$"
 smoke_dir="$(mktemp -d)"
 cleanup() {
   docker rm -f "$container_name" >/dev/null 2>&1 || true
+  docker run --rm -v "$smoke_dir:/smoke" golang:1.25.13-alpine \
+    chown -R "$(id -u):$(id -g)" /smoke >/dev/null 2>&1 || true
   rm -rf "$smoke_dir"
 }
 trap cleanup EXIT
@@ -15,7 +17,13 @@ chmod 0777 "$smoke_dir/state"
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
   -subj '/CN=localhost' -keyout "$smoke_dir/tls/key.pem" \
   -out "$smoke_dir/tls/cert.pem" >/dev/null 2>&1
-chmod 0644 "$smoke_dir/tls/key.pem" "$smoke_dir/tls/cert.pem"
+chmod 0600 "$smoke_dir/tls/key.pem"
+chmod 0644 "$smoke_dir/tls/cert.pem"
+# The container runs as UID 65532. Transfer ownership inside a disposable
+# helper container so the private key can remain 0600 while the nonroot smoke
+# process can read it from the bind mount.
+docker run --rm -v "$smoke_dir/tls:/tls" golang:1.25.13-alpine \
+  chown 65532:65532 /tls/key.pem /tls/cert.pem >/dev/null
 pepper_value="$(openssl rand -base64 32 | tr -d '\n')"
 cat > "$smoke_dir/config.json" <<EOF
 {

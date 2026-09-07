@@ -40,7 +40,7 @@ func (s *Store) ListSecurityTransitions(after uint64, limit int) ([]control.Secu
 		limit = 1000
 	}
 	var out []control.SecurityTransitionRecord
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *bolt.Tx) error {
 		c := tx.Bucket(bucketSecurityAudit).Cursor()
 		for k, v := c.First(); k != nil && len(out) < limit; k, v = c.Next() {
 			if string(k) == string(keySecuritySequence) {
@@ -67,7 +67,7 @@ func (s *Store) ListSecurityTransitions(after uint64, limit int) ([]control.Secu
 // CountSecurityTransitions is a diagnostic/test helper.
 func (s *Store) CountSecurityTransitions() (int, error) {
 	var n int
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketSecurityAudit).ForEach(func(k, _ []byte) error {
 			if string(k) != string(keySecuritySequence) {
 				n++

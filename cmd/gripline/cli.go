@@ -14,6 +14,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -35,6 +36,34 @@ import (
 	"github.com/B-A-M-N/gripline/internal/statebolt"
 	"github.com/B-A-M-N/gripline/internal/terminator"
 )
+
+// runPolicyCLI dispatches policy artifact inspection commands. Verification
+// deliberately shares policyFor with the server composition root, so an
+// operator can prove the exact authenticated artifact that startup will use.
+func runPolicyCLI(args []string) error {
+	if len(args) == 0 || args[0] != "verify" {
+		return fmt.Errorf("policy: expected 'verify --config path.json'")
+	}
+	fs := flag.NewFlagSet("policy verify", flag.ExitOnError)
+	cfgPath := fs.String("config", "/etc/gripline/config.json", "path to the deployment configuration")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return fmt.Errorf("policy verify: %w", err)
+	}
+	pol, err := policyFor(cfg)
+	if err != nil {
+		return fmt.Errorf("policy verify: %w", err)
+	}
+	digest, err := policy.Digest(pol)
+	if err != nil {
+		return fmt.Errorf("policy verify: %w", err)
+	}
+	fmt.Printf("policy verified: %s revision=%d digest=%s\n", pol.ID, pol.Revision, digest)
+	return errSubcommand
+}
 
 // runCredentialCLI dispatches `gripline credential <list|revoke>`.
 func runCredentialCLI(args []string) error {
@@ -247,7 +276,7 @@ func runCredentialRevokeLive(cfgPath, credID, reason, token string) error {
 }
 
 func runCredentialAddLive(cfgPath, credID, accountID, policyID, planID, reason, token string) error {
-	if credID == "" || accountID == "" || policyID == "" || planID == "" || reason == "" || token == "" {
+	if credID == "" || accountID == "" || planID == "" || reason == "" || token == "" {
 		return fmt.Errorf("credential add: --id, --account, --reason, and --token (or --token-file/GRIPLINE_OPERATOR_TOKEN) are required")
 	}
 	cfg, err := config.Load(cfgPath)
@@ -511,12 +540,11 @@ func runStateCLI(args []string) error {
 		if *fromPath == "" {
 			return fmt.Errorf("state restore: --from is required")
 		}
-		var err error
-		if *manifestPath != "" {
-			err = statebolt.RestoreBackupWithManifest(*fromPath, *manifestPath, cfg.Paths.State)
-		} else {
-			err = statebolt.RestoreBackup(*fromPath, cfg.Paths.State)
+		manifest := *manifestPath
+		if manifest == "" {
+			manifest = *fromPath + ".manifest.json"
 		}
+		err := statebolt.RestoreBackupWithManifest(*fromPath, manifest, cfg.Paths.State)
 		if err != nil {
 			return err
 		}
@@ -798,7 +826,7 @@ func runStatusCLI(cfgPath string) error {
 	if err != nil {
 		return err
 	}
-	pol, err := policyFor(cfg)
+	pol, err := statusPolicyFor(cfg)
 	if err != nil {
 		return err
 	}
@@ -806,13 +834,24 @@ func runStatusCLI(cfgPath string) error {
 	providerSource := cfg.Ingress != nil && (cfg.Ingress.PseudonymKey != "" || len(cfg.Ingress.PseudonymKeys) > 0)
 	networkMetadata := cfg.Ingress != nil && len(cfg.Ingress.Networks) > 0
 	policyDigest, _ := policy.Digest(pol)
+	policyState := "configured"
+	if cfg.Paths.State != "" {
+		if lifecycle, lifecycleErr := policy.OpenFileStore(cfg.Paths.State + ".policy"); lifecycleErr == nil {
+			if manifest, manifestErr := lifecycle.LoadManifest(); manifestErr == nil && manifest.Active.Revision > 0 {
+				policyState = "durable"
+			}
+		}
+	}
 	usageConfigured := cfg.Usage.Mode == "openai" || cfg.Usage.Mode == "anthropic"
 	activeKID := "unknown"
+	signerState := "ephemeral"
 	if cfg.Paths.SignerKeyring != "" {
 		if keyring, loadErr := terminator.LoadExistingKeyring(cfg.Paths.SignerKeyring); loadErr == nil {
 			activeKID = fmt.Sprintf("%d", keyring.ActiveKid())
+			signerState = "durable"
 		} else {
 			activeKID = "unavailable"
+			signerState = "unavailable"
 		}
 	}
 	pepperVersions := "none"
@@ -829,6 +868,26 @@ func runStatusCLI(cfgPath string) error {
 			parts = append(parts, strconv.Itoa(version))
 		}
 		pepperVersions = strings.Join(parts, ",")
+	}
+	pseudonymVersions := "none"
+	if cfg.Ingress != nil {
+		versions := make([]int, 0, len(cfg.Ingress.PseudonymKeys))
+		for raw := range cfg.Ingress.PseudonymKeys {
+			if n, parseErr := strconv.Atoi(raw); parseErr == nil {
+				versions = append(versions, n)
+			}
+		}
+		if len(versions) == 0 && cfg.Ingress.PseudonymKey != "" {
+			versions = []int{1}
+		}
+		sort.Ints(versions)
+		parts := make([]string, 0, len(versions))
+		for _, version := range versions {
+			parts = append(parts, strconv.Itoa(version))
+		}
+		if len(parts) > 0 {
+			pseudonymVersions = strings.Join(parts, ",")
+		}
 	}
 	type row struct {
 		capability string
@@ -852,23 +911,24 @@ func runStatusCLI(cfgPath string) error {
 		{"credential authority", durab(stateBacked), authorityNote(stateBacked)},
 		{"lane authority", durab(stateBacked), authorityNote(stateBacked)},
 		{"evidence authority", durab(stateBacked), authorityNote(stateBacked)},
-		{"signer identity", durab(cfg.Paths.SignerKeyring != ""), signerNote(cfg)},
+		{"signer identity", signerState, signerNote(cfg)},
 		{"operator audit", durab(stateBacked || cfg.Paths.AuditLog != ""), auditNote(cfg)},
 		{"operator control plane", onoff(cfg.Admin != nil), adminNote(cfg)},
 		{"source attribution", onoff(providerSource), sourceNote(cfg)},
 		{"network metadata", onoff(networkMetadata), networkNote(cfg)},
-		{"source blocking", onoff(pol.Risk.SourceMode == policy.SourceEnforce), "shadow-only default: sourceWouldBlock recorded, never denies (P0.7)"},
+		{"source blocking", onoff(pol.Risk.SourceMode == policy.SourceEnforce), sourceBlockingNote(pol)},
 		{"automatic credential quarantine", onoff(pol.Risk.EnableAutomaticQuarantine), "policy-controlled; operator-set only while disabled"},
 		{"automatic lane block", onoff(pol.LaneSecurity.EnableAutomaticBlock), "policy-controlled (INV hysteresis)"},
 		{"request accounting", on(), "NoUsage provider counts one admitted request"},
 		{"token accounting", onoff(usageConfigured), usageNote(cfg, "tokens")},
 		{"cost accounting", onoff(usageConfigured && (cfg.Usage.InputMicrounitsPerToken > 0 || cfg.Usage.OutputMicrounitsPerToken > 0)), usageNote(cfg, "cost")},
-		{"active policy", "configured", fmt.Sprintf("%s revision=%d digest=%s", pol.ID, pol.Revision, policyDigest)},
+		{"active policy", policyState, fmt.Sprintf("%s revision=%d digest=%s", pol.ID, pol.Revision, policyDigest)},
 		{"resource persistence", "process-lifetime", "governor windows are volatile; restart-safe credential/lane/evidence state remains durable"},
 		{"source-table bound", fmt.Sprintf("%d", maxSourceScopes), "zero resolves to the conservative runtime default; overflow identities are hashed into bounded shared scopes"},
 		{"spool bounds", fmt.Sprintf("%d bytes/%d files", spoolBytes, spoolFiles), "aggregate unknown-length request budget"},
 		{"active signer KID", activeKID, "public key generations are exported separately"},
 		{"pepper versions", pepperVersions, "version identifiers only; key material is never displayed"},
+		{"pseudonym versions", pseudonymVersions, "active and overlap versions; key material is never displayed"},
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(w, "CAPABILITY\tSTATE\tNOTE")
@@ -876,6 +936,35 @@ func runStatusCLI(cfgPath string) error {
 		fmt.Fprintf(w, "%s\t%s\t%s\n", r.capability, r.state, r.note)
 	}
 	return w.Flush()
+}
+
+func statusPolicyFor(cfg *config.Config) (*policy.Policy, error) {
+	pol, err := policyFor(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.Paths.State == "" {
+		return pol, nil
+	}
+	store, err := policy.OpenFileStore(cfg.Paths.State + ".policy")
+	if errors.Is(err, os.ErrNotExist) {
+		return pol, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("policy lifecycle status: %w", err)
+	}
+	manifest, err := store.LoadManifest()
+	if err != nil {
+		return nil, fmt.Errorf("policy lifecycle status: %w", err)
+	}
+	if manifest.Active.Revision == 0 {
+		return pol, nil
+	}
+	active, err := store.LoadArtifact(manifest.Active)
+	if err != nil {
+		return nil, fmt.Errorf("policy lifecycle status artifact: %w", err)
+	}
+	return &active.Policy, nil
 }
 
 func durab(yes bool) string {
@@ -891,6 +980,13 @@ func onoff(yes bool) string {
 	return "off"
 }
 func on() string { return "on" }
+
+func sourceBlockingNote(pol *policy.Policy) string {
+	if pol != nil && pol.Risk.SourceMode == policy.SourceEnforce {
+		return "enforcing source risk threshold; validate shared-NAT impact before rollout"
+	}
+	return "shadow-only default: sourceWouldBlock recorded, never denies (P0.7)"
+}
 
 func authorityNote(stateBacked bool) string {
 	if stateBacked {
@@ -917,10 +1013,13 @@ func auditNote(cfg *config.Config) string {
 }
 
 func sourceNote(cfg *config.Config) string {
-	if cfg.Ingress == nil || cfg.Ingress.PseudonymKey == "" {
+	if cfg.Ingress == nil || (cfg.Ingress.PseudonymKey == "" && len(cfg.Ingress.PseudonymKeys) == 0) {
 		return "no trusted ingress source resolver configured"
 	}
-	return "trusted ingress pseudonyms; network attribution still unavailable"
+	if len(cfg.Ingress.Networks) > 0 {
+		return fmt.Sprintf("trusted ingress pseudonym adapter + %d-entry network metadata adapter", len(cfg.Ingress.Networks))
+	}
+	return "trusted ingress pseudonym adapter; network metadata unavailable"
 }
 
 func networkNote(cfg *config.Config) string {

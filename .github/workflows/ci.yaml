@@ -52,6 +52,9 @@ jobs:
       - name: compiled release harness
         run: bash scripts/release-harness.sh
 
+      - name: failure-semantics chaos smoke
+        run: bash scripts/chaos-smoke.sh
+
       - name: container build
         run: docker build -t gripline-ci -f deploy/Dockerfile .
 

@@ -21,8 +21,9 @@ type SpoolBudget struct {
 	files    int
 }
 
-// NewSpoolBudget creates an aggregate spool budget. A zero bound is unlimited
-// for that dimension; the per-request body limit remains independently active.
+// NewSpoolBudget creates an aggregate spool budget. Runtime configuration
+// resolves production zeroes before construction; zero remains an explicit
+// unlimited value for low-level library callers and tests.
 func NewSpoolBudget(maxBytes int64, maxFiles int) *SpoolBudget {
 	if maxBytes < 0 {
 		maxBytes = 0

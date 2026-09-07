@@ -199,7 +199,21 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 	if err != nil {
 		return nil, fmt.Errorf("gripline: policy: %w", err)
 	}
-	policyManager, err := policy.NewManager(pol, policy.Options{})
+	policyOptions := policy.Options{}
+	if state != nil {
+		policyStore, storeErr := policy.NewFileStore(cfg.Paths.State + ".policy")
+		if storeErr != nil {
+			return nil, fmt.Errorf("gripline: policy lifecycle store: %w", storeErr)
+		}
+		policyOptions = policy.Options{
+			Persist:           policyStore.Persist,
+			PersistArtifact:   policyStore.PersistArtifact,
+			PersistTransition: policyStore.PersistTransition,
+			LoadManifest:      policyStore.LoadManifest,
+			LoadArtifact:      policyStore.LoadArtifact,
+		}
+	}
+	policyManager, err := policy.NewManager(pol, policyOptions)
 	if err != nil {
 		return nil, fmt.Errorf("gripline: policy manager: %w", err)
 	}
@@ -439,7 +453,7 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		mux.HandleFunc("/admin/lanes/unblock", adminLaneUnblock(svc))
 		mux.HandleFunc("/admin/audit", adminAudit(svc, state))
 		mux.HandleFunc("/admin/security-events", adminSecurityEvents(svc, state))
-		mux.HandleFunc("/admin/metrics", adminMetrics(svc, dp, governor, state, spray, decisionObserver))
+		mux.HandleFunc("/admin/metrics", adminMetrics(svc, dp, governor, state, spray, decisionObserver, policyManager, signer))
 		adminSrv = &http.Server{
 			Addr:              cfg.Admin.Listen,
 			Handler:           mux,
@@ -829,7 +843,7 @@ func adminSecurityEvents(svc *control.Service, state *statebolt.Store) http.Hand
 	}
 }
 
-func adminMetrics(svc *control.Service, dp *proxy.DataPlane, governor *resource.Governor, state *statebolt.Store, spray *anomaly.Detector, observer *jsonlObserver) http.HandlerFunc {
+func adminMetrics(svc *control.Service, dp *proxy.DataPlane, governor *resource.Governor, state *statebolt.Store, spray *anomaly.Detector, observer *jsonlObserver, policyManager *policy.Manager, signer *terminator.Keyring) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			adminMethodNotAllowed(w)
@@ -847,8 +861,27 @@ func adminMetrics(svc *control.Service, dp *proxy.DataPlane, governor *resource.
 			writeMetric("authorizations_total", m.Authorizations)
 			writeMetric("denials_total", m.Denials)
 			writeMetric("authentication_failures_total", m.AuthenticationFail)
+			writeMetric("degraded_decisions_total", m.Degraded)
+			writeMetric("resource_denials_total", m.ResourceDenials)
+			writeMetric("policy_denials_total", m.PolicyDenials)
+			writeMetric("payload_too_large_total", m.PayloadTooLarge)
 			writeMetric("spool_rejects_total", m.SpoolRejects)
 			writeMetric("completion_failures_total", m.CompletionFailures)
+			writeMetric("backend_failures_total", m.BackendFailures)
+			writeMetric("backend_4xx_total", m.Backend4xx)
+			writeMetric("backend_5xx_total", m.Backend5xx)
+			writeMetric("active_streams", m.ActiveStreams)
+			writeMetric("evidence_events_total", m.EvidenceEvents)
+			for i, count := range m.ResourceDenialsByScope {
+				writeMetric("resource_denials_scope_"+strings.ToLower(resource.Scope(i).String())+"_total", count)
+			}
+			for i, count := range m.ResourceDenialsByDimension {
+				writeMetric("resource_denials_dimension_"+resource.Dimension(i).String()+"_total", count)
+			}
+			writeMetric("spool_bytes", m.Spool.Bytes)
+			writeMetric("spool_files", m.Spool.Files)
+			writeMetric("spool_max_bytes", m.Spool.MaxBytes)
+			writeMetric("spool_max_files", m.Spool.MaxFiles)
 		}
 		if governor != nil {
 			m := governor.Stats()
@@ -857,10 +890,22 @@ func adminMetrics(svc *control.Service, dp *proxy.DataPlane, governor *resource.
 			writeMetric("source_scope_overflows_total", m.SourceOverflows)
 			writeMetric("source_scope_evictions_total", m.SourceEvictions)
 		}
+		if policyManager != nil {
+			if current := policyManager.Current(); current != nil {
+				writeMetric("active_policy_revision", current.Revision)
+			}
+		}
+		if signer != nil {
+			writeMetric("active_signer_kid", signer.ActiveKid())
+		}
 		if state != nil {
 			m := state.EvidenceSweepStats()
 			writeMetric("evidence_sweep_scanned_total", m.Scanned)
 			writeMetric("evidence_sweep_deleted_total", m.Deleted)
+			tx := state.TransactionStats()
+			writeMetric("bbolt_transactions_total", tx.Transactions)
+			writeMetric("bbolt_transaction_errors_total", tx.TransactionErrors)
+			writeMetric("bbolt_transaction_nanos_total", tx.TransactionNanos)
 		}
 		if spray != nil {
 			writeMetric("detector_drops_total", spray.Stats().Dropped)

@@ -42,7 +42,7 @@ func (s *Store) Insert(rec *credential.CredentialRecord) error {
 	if err := rec.Validate(); err != nil {
 		return err
 	}
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
 		creds := tx.Bucket(bucketCredentials)
 		byVer := tx.Bucket(bucketCredVerifier)
 
@@ -97,7 +97,7 @@ func (s *Store) InsertIfAbsent(rec *credential.CredentialRecord) (bool, error) {
 		return false, err
 	}
 	created := false
-	err := s.db.Update(func(tx *bolt.Tx) error {
+	err := s.update(func(tx *bolt.Tx) error {
 		creds := tx.Bucket(bucketCredentials)
 		byVer := tx.Bucket(bucketCredVerifier)
 		if creds.Get([]byte(rec.CredentialID)) != nil {
@@ -134,7 +134,7 @@ func (s *Store) RotateVerifierCAS(credentialID string, expectedRevision int, pep
 		return nil, errors.New("credential: invalid rotated verifier")
 	}
 	var out *credential.CredentialRecord
-	err := s.db.Update(func(tx *bolt.Tx) error {
+	err := s.update(func(tx *bolt.Tx) error {
 		creds, byVer := tx.Bucket(bucketCredentials), tx.Bucket(bucketCredVerifier)
 		raw := creds.Get([]byte(credentialID))
 		if raw == nil {
@@ -208,7 +208,7 @@ func (s *Store) LookupAuthoritative(ctx context.Context, credentialID string) (*
 
 func (s *Store) lookup(credentialID string) (*credential.CredentialRecord, error) {
 	var rec *credential.CredentialRecord
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *bolt.Tx) error {
 		env := tx.Bucket(bucketCredentials).Get([]byte(credentialID))
 		if env == nil {
 			return nil
@@ -254,7 +254,7 @@ func (s *Store) FindByVerifierContext(ctx context.Context, verifier []byte, pepp
 
 func (s *Store) lookupByVerifier(verifier []byte, pepperVersion int) (*credential.CredentialRecord, error) {
 	var rec *credential.CredentialRecord
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *bolt.Tx) error {
 		key := verKeyFor(pepperVersion, verifier)
 		id := tx.Bucket(bucketCredVerifier).Get([]byte(key))
 		if id == nil {
@@ -321,7 +321,7 @@ func (s *Store) TouchLastSeen(credentialID string, at time.Time) {
 // revision increments by exactly 1 — all in one transaction.
 func (s *Store) UpdateStatusCAS(credentialID string, expectedRevision int, fromStatus, toStatus credential.Status) (*credential.CredentialRecord, error) {
 	var result *credential.CredentialRecord
-	err := s.db.Update(func(tx *bolt.Tx) error {
+	err := s.update(func(tx *bolt.Tx) error {
 		env := tx.Bucket(bucketCredentials).Get([]byte(credentialID))
 		if env == nil {
 			return credential.ErrNotFound
@@ -384,7 +384,7 @@ func (s *Store) ObserveAndCommit(
 		return credential.TransitionResult{}, credential.ErrLookupTimeout
 	}
 	var result credential.TransitionResult
-	err := s.db.Update(func(tx *bolt.Tx) error {
+	err := s.update(func(tx *bolt.Tx) error {
 		creds := tx.Bucket(bucketCredentials)
 		env := creds.Get([]byte(credentialID))
 		if env == nil {
@@ -462,7 +462,7 @@ func (s *Store) ObserveAndCommit(
 // updateInPlace mutates a credential's row inside one write transaction. Every
 // failure is returned from the callback so bbolt rolls back (P0.3-fix).
 func (s *Store) updateInPlace(credentialID string, mutate func(*credential.CredentialRecord) error) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
 		creds := tx.Bucket(bucketCredentials)
 		env := creds.Get([]byte(credentialID))
 		if env == nil {
@@ -502,7 +502,7 @@ type CredentialSummary = credential.Summary
 
 func (s *Store) ListCredentials() ([]credential.Summary, error) {
 	var out []credential.Summary
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *bolt.Tx) error {
 		c := tx.Bucket(bucketCredentials).Cursor()
 		for k, v := c.First(); k != nil; k, v = c.Next() {
 			var p persistedCredential

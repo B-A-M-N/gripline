@@ -19,11 +19,14 @@ import (
 // It carries the active private key AND all retained public keys so a
 // restart recovers signing authority without key rotation.
 type keyringPersist struct {
-	ActiveKid int                      `json:"active_kid"` // P0.14: persist kid for rotation correctness
-	Active    string                   `json:"active"`     // base64-encoded private key
-	Verifiers map[int]string           `json:"verifiers"`  // kid -> base64-encoded public key
-	Next      int                      `json:"next"`
-	Candidate *keyringCandidatePersist `json:"candidate,omitempty"`
+	ActiveKid       int                      `json:"active_kid"` // P0.14: persist kid for rotation correctness
+	Active          string                   `json:"active"`     // base64-encoded private key
+	Verifiers       map[int]string           `json:"verifiers"`  // kid -> base64-encoded public key
+	Next            int                      `json:"next"`
+	Candidate       *keyringCandidatePersist `json:"candidate,omitempty"`
+	RotationPhase   string                   `json:"rotation_phase"`
+	RotationAt      time.Time                `json:"rotation_at,omitempty"`
+	RotationHistory []RotationEvent          `json:"rotation_history,omitempty"`
 }
 
 type keyringCandidatePersist struct {
@@ -44,15 +47,21 @@ func (k *Keyring) Save(path string) error {
 	}
 	k.st.mu.Lock()
 	defer k.st.mu.Unlock()
-	return saveKeyringLocked(path, k.st.active, k.st.next, k.st.verifiers, k.st.pending)
+	return saveKeyringLocked(path, k.st.active, k.st.next, k.st.verifiers, k.st.pending, k.st.rotationHistory)
 }
 
-func saveKeyringLocked(path string, active *Signer, next int, verifiers map[int][]byte, pending *Signer) error {
+func saveKeyringLocked(path string, active *Signer, next int, verifiers map[int][]byte, pending *Signer, history []RotationEvent) error {
 	persist := keyringPersist{
-		ActiveKid: active.Kid(),
-		Active:    base64.StdEncoding.EncodeToString([]byte(active.Private())),
-		Next:      next,
-		Verifiers: make(map[int]string, len(verifiers)),
+		ActiveKid:       active.Kid(),
+		Active:          base64.StdEncoding.EncodeToString([]byte(active.Private())),
+		Next:            next,
+		Verifiers:       make(map[int]string, len(verifiers)),
+		RotationHistory: append([]RotationEvent(nil), history...),
+	}
+	persist.RotationPhase = "active"
+	if pending != nil {
+		persist.RotationPhase = "prepared"
+		persist.RotationAt = time.Now().UTC()
 	}
 	for kid, pub := range verifiers {
 		persist.Verifiers[kid] = base64.StdEncoding.EncodeToString(pub)
@@ -137,10 +146,12 @@ func (k *Keyring) RotateAndSave(path string) (int, error) {
 		verifiers[oldKid] = append([]byte(nil), pub...)
 	}
 	verifiers[kid] = []byte(candidate.Public())
-	if err := saveKeyringLocked(path, candidate, kid+1, verifiers, nil); err != nil {
+	event := RotationEvent{Phase: "activated", KID: kid, At: k.st.now().UTC()}
+	history := appendRotationHistory(k.st.rotationHistory, event)
+	if err := saveKeyringLocked(path, candidate, kid+1, verifiers, nil, history); err != nil {
 		return 0, fmt.Errorf("terminator: persist rotated keyring: %w", err)
 	}
-	k.st.verifiers, k.st.active, k.st.next = verifiers, candidate, kid+1
+	k.st.verifiers, k.st.active, k.st.next, k.st.rotationHistory = verifiers, candidate, kid+1, history
 	return kid, nil
 }
 
@@ -152,10 +163,30 @@ type RotationCandidate struct {
 	PublicKey []byte
 }
 
+// RotationEvent is the auditable lifecycle record emitted by the safe live
+// rotation methods. The event contains no private key material.
+type RotationEvent struct {
+	Phase string    `json:"phase"` // prepared, activated, retired
+	KID   int       `json:"kid"`
+	At    time.Time `json:"at"`
+}
+
+// RotationAudit is called after each durable lifecycle transition. A provider
+// should connect it to the same append-only operator audit authority used for
+// policy changes; a failed audit leaves the durable key phase intact and must
+// be investigated before proceeding.
+type RotationAudit func(RotationEvent) error
+
 // PrepareRotation creates and durably records a candidate while leaving the
 // current signer active. The candidate public key is included by PublicKeys,
 // so a subsequent keys export can publish it during the overlap phase.
 func (k *Keyring) PrepareRotation(path string) (*RotationCandidate, error) {
+	return k.PrepareRotationWithAudit(path, nil)
+}
+
+// PrepareRotationWithAudit is PrepareRotation with an explicit lifecycle
+// audit hook.
+func (k *Keyring) PrepareRotationWithAudit(path string, audit RotationAudit) (*RotationCandidate, error) {
 	if path == "" {
 		return nil, errors.New("terminator: keyring path required for rotation preparation")
 	}
@@ -175,10 +206,17 @@ func (k *Keyring) PrepareRotation(path string) (*RotationCandidate, error) {
 	candidate := &Signer{priv: priv, Version: kid}
 	verifiers := clonePublicKeys(k.st.verifiers)
 	verifiers[kid] = []byte(candidate.Public())
-	if err := saveKeyringLocked(path, k.st.active, kid+1, verifiers, candidate); err != nil {
+	event := RotationEvent{Phase: "prepared", KID: kid, At: k.st.now().UTC()}
+	history := appendRotationHistory(k.st.rotationHistory, event)
+	if err := saveKeyringLocked(path, k.st.active, kid+1, verifiers, candidate, history); err != nil {
 		return nil, fmt.Errorf("terminator: persist prepared key rotation: %w", err)
 	}
-	k.st.verifiers, k.st.next, k.st.pending = verifiers, kid+1, candidate
+	k.st.verifiers, k.st.next, k.st.pending, k.st.rotationHistory = verifiers, kid+1, candidate, history
+	if audit != nil {
+		if err := audit(event); err != nil {
+			return nil, fmt.Errorf("terminator: audit prepared signing key %d: %w", kid, err)
+		}
+	}
 	return &RotationCandidate{KID: kid, PublicKey: append([]byte(nil), verifiers[kid]...)}, nil
 }
 
@@ -187,6 +225,12 @@ func (k *Keyring) PrepareRotation(path string) (*RotationCandidate, error) {
 // the prepared candidate available for retry. The callback runs without the
 // keyring lock and receives only a copy of the public key.
 func (k *Keyring) ActivatePrepared(path string, kid int, backendAccepted func([]byte) error) error {
+	return k.ActivatePreparedWithAudit(path, kid, backendAccepted, nil)
+}
+
+// ActivatePreparedWithAudit requires backend acceptance before activation and
+// records the transition through an explicit audit hook.
+func (k *Keyring) ActivatePreparedWithAudit(path string, kid int, backendAccepted func([]byte) error, audit RotationAudit) error {
 	if path == "" {
 		return errors.New("terminator: keyring path required for rotation activation")
 	}
@@ -213,10 +257,17 @@ func (k *Keyring) ActivatePrepared(path string, kid int, backendAccepted func([]
 	if k.st.pending == nil || k.st.pending.Kid() != kid {
 		return fmt.Errorf("terminator: prepared signing key %d changed during activation", kid)
 	}
-	if err := saveKeyringLocked(path, k.st.pending, k.st.next, k.st.verifiers, nil); err != nil {
+	event := RotationEvent{Phase: "activated", KID: kid, At: k.st.now().UTC()}
+	history := appendRotationHistory(k.st.rotationHistory, event)
+	if err := saveKeyringLocked(path, k.st.pending, k.st.next, k.st.verifiers, nil, history); err != nil {
 		return fmt.Errorf("terminator: persist activated key %d: %w", kid, err)
 	}
-	k.st.active, k.st.pending = k.st.pending, nil
+	k.st.active, k.st.pending, k.st.rotationHistory = k.st.pending, nil, history
+	if audit != nil {
+		if err := audit(event); err != nil {
+			return fmt.Errorf("terminator: audit activated signing key %d: %w", kid, err)
+		}
+	}
 	return nil
 }
 
@@ -224,6 +275,23 @@ func (k *Keyring) ActivatePrepared(path string, kid int, backendAccepted func([]
 // longer than the maximum assertion TTL plus clock-skew allowance. It cannot
 // remove the active or prepared generation and persists the change atomically.
 func (k *Keyring) Retire(path string, kid int) error {
+	return k.RetireAfter(path, kid, time.Time{})
+}
+
+// RetireAfter removes an old generation only after notBefore. Callers should
+// set notBefore to now + max assertion TTL + allowed clock skew. The zero time
+// keeps Retire source-compatible for low-level maintenance tools; providers'
+// live rotation code should always use this method with an explicit horizon.
+func (k *Keyring) RetireAfter(path string, kid int, notBefore time.Time) error {
+	return k.retireAfter(path, kid, notBefore, nil)
+}
+
+// RetireAfterWithAudit is RetireAfter with an explicit lifecycle audit hook.
+func (k *Keyring) RetireAfterWithAudit(path string, kid int, notBefore time.Time, audit RotationAudit) error {
+	return k.retireAfter(path, kid, notBefore, audit)
+}
+
+func (k *Keyring) retireAfter(path string, kid int, notBefore time.Time, audit RotationAudit) error {
 	if path == "" {
 		return errors.New("terminator: keyring path required for key retirement")
 	}
@@ -232,6 +300,9 @@ func (k *Keyring) Retire(path string, kid int) error {
 	}
 	k.st.mu.Lock()
 	defer k.st.mu.Unlock()
+	if !notBefore.IsZero() && k.st.now().Before(notBefore) {
+		return fmt.Errorf("terminator: cannot retire signing key %d before %s", kid, notBefore.UTC().Format(time.RFC3339))
+	}
 	if kid == k.st.active.Kid() || (k.st.pending != nil && kid == k.st.pending.Kid()) {
 		return fmt.Errorf("terminator: cannot retire active or prepared key %d", kid)
 	}
@@ -240,10 +311,17 @@ func (k *Keyring) Retire(path string, kid int) error {
 	}
 	verifiers := clonePublicKeys(k.st.verifiers)
 	delete(verifiers, kid)
-	if err := saveKeyringLocked(path, k.st.active, k.st.next, verifiers, k.st.pending); err != nil {
+	event := RotationEvent{Phase: "retired", KID: kid, At: k.st.now().UTC()}
+	history := appendRotationHistory(k.st.rotationHistory, event)
+	if err := saveKeyringLocked(path, k.st.active, k.st.next, verifiers, k.st.pending, history); err != nil {
 		return fmt.Errorf("terminator: persist retired key %d: %w", kid, err)
 	}
-	k.st.verifiers = verifiers
+	k.st.verifiers, k.st.rotationHistory = verifiers, history
+	if audit != nil {
+		if err := audit(event); err != nil {
+			return fmt.Errorf("terminator: audit retired signing key %d: %w", kid, err)
+		}
+	}
 	return nil
 }
 
@@ -253,6 +331,11 @@ func clonePublicKeys(src map[int][]byte) map[int][]byte {
 		out[kid] = append([]byte(nil), pub...)
 	}
 	return out
+}
+
+func appendRotationHistory(history []RotationEvent, event RotationEvent) []RotationEvent {
+	out := append([]RotationEvent(nil), history...)
+	return append(out, event)
 }
 
 // LoadKeyring reads a keyring from a file with load-or-create semantics: a
@@ -330,9 +413,10 @@ func loadKeyringFile(path string) (*Keyring, error) {
 		return nil, err
 	}
 	k := &Keyring{st: &keyringState{
-		verifiers: make(map[int][]byte, len(p.Verifiers)),
-		next:      p.Next,
-		now:       time.Now,
+		verifiers:       make(map[int][]byte, len(p.Verifiers)),
+		next:            p.Next,
+		now:             time.Now,
+		rotationHistory: append([]RotationEvent(nil), p.RotationHistory...),
 	}}
 	priv, err := base64.StdEncoding.DecodeString(p.Active)
 	if err != nil {
@@ -378,6 +462,9 @@ func loadKeyringFile(path string) (*Keyring, error) {
 		k.st.verifiers[kid] = pub
 	}
 	if p.Candidate != nil {
+		if p.RotationPhase != "prepared" {
+			return nil, fmt.Errorf("terminator: persisted candidate requires prepared rotation phase")
+		}
 		if p.Candidate.Kid <= p.ActiveKid {
 			return nil, fmt.Errorf("terminator: persisted candidate kid %d is not newer than active kid %d", p.Candidate.Kid, p.ActiveKid)
 		}
@@ -395,6 +482,13 @@ func loadKeyringFile(path string) (*Keyring, error) {
 			return nil, fmt.Errorf("terminator: persisted next kid %d must exceed candidate kid %d", p.Next, p.Candidate.Kid)
 		}
 		k.st.pending = candidate
+	} else if p.RotationPhase != "" && p.RotationPhase != "active" {
+		return nil, fmt.Errorf("terminator: unknown persisted rotation phase %q", p.RotationPhase)
+	}
+	for _, event := range p.RotationHistory {
+		if event.KID < 1 || (event.Phase != "prepared" && event.Phase != "activated" && event.Phase != "retired") || event.At.IsZero() {
+			return nil, fmt.Errorf("terminator: invalid persisted rotation history event")
+		}
 	}
 	return k, nil
 }
@@ -446,12 +540,13 @@ type Keyring struct {
 // a thin handle, and copy := *kr yields another handle over the same state —
 // same behavior as before for use, redacting correctly for formatting.
 type keyringState struct {
-	mu        sync.Mutex
-	active    *Signer          // current signing generation (highest kid)
-	pending   *Signer          // prepared generation awaiting backend acceptance
-	verifiers map[int][]byte   // kid -> public key (all retained generations)
-	next      int              // next kid to assign
-	now       func() time.Time // clock (tests)
+	mu              sync.Mutex
+	active          *Signer          // current signing generation (highest kid)
+	pending         *Signer          // prepared generation awaiting backend acceptance
+	verifiers       map[int][]byte   // kid -> public key (all retained generations)
+	next            int              // next kid to assign
+	now             func() time.Time // clock (tests)
+	rotationHistory []RotationEvent
 }
 
 // Format implements fmt.Formatter and always redacts (P0.16 defense in

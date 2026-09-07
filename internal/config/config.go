@@ -112,7 +112,8 @@ type Config struct {
 
 // PolicySection selects the versioned policy artifact for the deployment.
 type PolicySection struct {
-	File string `json:"file,omitempty"`
+	File            string `json:"file,omitempty"`
+	VerifierKeyFile string `json:"verifier_key_file,omitempty"`
 }
 
 // SecretsSection configures the active verifier pepper versions. The map key
@@ -321,6 +322,9 @@ func Load(path string) (*Config, error) {
 	if c.Policy.File != "" && !filepath.IsAbs(c.Policy.File) {
 		c.Policy.File = filepath.Join(filepath.Dir(path), c.Policy.File)
 	}
+	if c.Policy.VerifierKeyFile != "" && !filepath.IsAbs(c.Policy.VerifierKeyFile) {
+		c.Policy.VerifierKeyFile = filepath.Join(filepath.Dir(path), c.Policy.VerifierKeyFile)
+	}
 	if err := c.Validate(); err != nil {
 		return nil, fmt.Errorf("config: invalid: %w", err)
 	}
@@ -499,6 +503,12 @@ func (c *Config) Validate() error {
 	// currently disabled, so enabling it later cannot introduce split history.
 	if c.Paths.State != "" && c.Paths.AuditLog != "" {
 		return fmt.Errorf("paths.audit_log must be empty when paths.state is configured: Bolt is the sole operator-audit authority")
+	}
+	if c.Policy.File != "" && c.Policy.VerifierKeyFile == "" {
+		return fmt.Errorf("policy.verifier_key_file is required when policy.file is configured: unsigned policy artifacts are not accepted")
+	}
+	if c.Policy.File == "" && c.Policy.VerifierKeyFile != "" {
+		return fmt.Errorf("policy.verifier_key_file requires policy.file")
 	}
 
 	// Admin: if exposed, it must be fully configured (P0.47).

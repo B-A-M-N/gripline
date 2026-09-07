@@ -91,6 +91,52 @@ type Store struct {
 	// laneLimitsFn provides the lane explosion limits (policy-compiled). Nil
 	// uses lane.DefaultLimits.
 	laneLimitsFn func() lane.Limits
+	txMu         sync.Mutex
+	txCount      uint64
+	txErrors     uint64
+	txNanos      uint64
+}
+
+// TransactionStats is a low-cardinality view of bbolt activity. Latency is
+// aggregate nanoseconds, not a per-request or per-credential label.
+type TransactionStats struct {
+	Transactions      uint64
+	TransactionErrors uint64
+	TransactionNanos  uint64
+}
+
+func (s *Store) recordTransaction(start time.Time, err error) {
+	s.txMu.Lock()
+	s.txCount++
+	s.txNanos += uint64(time.Since(start))
+	if err != nil {
+		s.txErrors++
+	}
+	s.txMu.Unlock()
+}
+
+func (s *Store) update(fn func(*bolt.Tx) error) error {
+	start := time.Now()
+	err := s.db.Update(fn)
+	s.recordTransaction(start, err)
+	return err
+}
+
+func (s *Store) view(fn func(*bolt.Tx) error) error {
+	start := time.Now()
+	err := s.db.View(fn)
+	s.recordTransaction(start, err)
+	return err
+}
+
+// TransactionStats reports aggregate durable-state transaction activity.
+func (s *Store) TransactionStats() TransactionStats {
+	if s == nil {
+		return TransactionStats{}
+	}
+	s.txMu.Lock()
+	defer s.txMu.Unlock()
+	return TransactionStats{Transactions: s.txCount, TransactionErrors: s.txErrors, TransactionNanos: s.txNanos}
 }
 
 // SetLaneLimits wires the lane explosion-limits provider (the runtime compiles
@@ -155,7 +201,7 @@ func validateStateFile(path string, allowMissing bool) error {
 // init creates the schema buckets and stamps/validates the schema version.
 func (s *Store) init() error {
 	var existingVersion int
-	if err := s.db.View(func(tx *bolt.Tx) error {
+	if err := s.view(func(tx *bolt.Tx) error {
 		if meta := tx.Bucket(bucketMeta); meta != nil && meta.Get(keySchemaVersion) != nil {
 			existingVersion = btoi(meta.Get(keySchemaVersion))
 		}
@@ -165,11 +211,11 @@ func (s *Store) init() error {
 	}
 	if existingVersion > 0 && existingVersion < currentSchemaVersion {
 		backupPath := fmt.Sprintf("%s.pre-migration-v%d", s.db.Path(), existingVersion)
-		if err := s.db.View(func(tx *bolt.Tx) error { return tx.CopyFile(backupPath, 0o600) }); err != nil {
+		if err := s.view(func(tx *bolt.Tx) error { return tx.CopyFile(backupPath, 0o600) }); err != nil {
 			return fmt.Errorf("statebolt: pre-migration backup: %w", err)
 		}
 	}
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
 		for _, b := range [][]byte{
 			bucketMeta, bucketCredentials, bucketCredVerifier, bucketLanes,
 			bucketEvidence, bucketOperatorAudit, bucketSecurityAudit, bucketOperatorState, bucketDetectorState,
@@ -216,7 +262,7 @@ func (s *Store) Close() error {
 // Ping proves the database answers reads (P1-24 readiness probe). It performs
 // a trivial read transaction — cheap, lock-free against writers (bbolt MVCC).
 func (s *Store) Ping() error {
-	return s.db.View(func(tx *bolt.Tx) error {
+	return s.view(func(tx *bolt.Tx) error {
 		if tx.Bucket(bucketMeta) == nil {
 			return errors.New("statebolt: meta bucket missing")
 		}

@@ -27,7 +27,7 @@ func (s *Store) LoadDetectorState(name string) ([]byte, bool, error) {
 	}
 	var out []byte
 	var found bool
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *bolt.Tx) error {
 		value := tx.Bucket(bucketDetectorState).Get([]byte(name))
 		if value == nil {
 			return nil
@@ -55,7 +55,7 @@ func (s *Store) SaveDetectorState(name string, data []byte) error {
 	if err != nil {
 		return err
 	}
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketDetectorState).Put([]byte(name), env)
 	})
 }

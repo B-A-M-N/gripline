@@ -46,6 +46,7 @@ jobs:
           test -z "$(gofmt -l internal cmd verify adapter)"
           go run ./cmd/gripline-demo --headless
           bash scripts/release-harness.sh
+          bash scripts/chaos-smoke.sh
       - name: Build and smoke-test release container
         run: |
           docker build \
@@ -64,6 +65,12 @@ jobs:
           GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -o dist/gripline-demo-linux-amd64 ./cmd/gripline-demo
           GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -o dist/gripline-demo-linux-arm64 ./cmd/gripline-demo
           sha256sum dist/* > dist/SHA256SUMS
+      - name: Install cosign
+        run: go install github.com/sigstore/cosign/v2/cmd/cosign@v2.4.1
+      - name: Sign release checksum manifest
+        env:
+          COSIGN_YES: "true"
+        run: "$(go env GOPATH)/bin/cosign sign-blob --yes --bundle dist/SHA256SUMS.sigstore.json dist/SHA256SUMS"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: gripline-${{ github.ref_name }}-binaries
@@ -102,6 +109,10 @@ jobs:
           subject-name: ${{ steps.image.outputs.name }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
+      - name: Sign pushed image manifest
+        env:
+          COSIGN_YES: "true"
+        run: "$(go env GOPATH)/bin/cosign sign --yes '${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}'"
       - name: Smoke-test pushed tagged image
         run: |
           docker pull "${{ steps.image.outputs.name }}:${GITHUB_REF_NAME}"

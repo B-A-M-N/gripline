@@ -58,7 +58,7 @@ func (s *Store) Append(items ...evidence.Evidence) error {
 			return err
 		}
 	}
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketEvidence)
 		// Group by subject so compaction runs once per subject after its batch
 		// items are appended.
@@ -111,7 +111,7 @@ func (s *Store) Append(items ...evidence.Evidence) error {
 // subjects, with the shared inclusive-expiry rule.
 func (s *Store) Snapshot(subjects []evidence.SubjectKey, now time.Time) ([]evidence.Evidence, error) {
 	var out []evidence.Evidence
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *bolt.Tx) error {
 		for _, sk := range subjects {
 			items, err := loadSubjectTx(tx, subjectKeyString(sk))
 			if err != nil {
@@ -133,7 +133,7 @@ func (s *Store) Snapshot(subjects []evidence.SubjectKey, now time.Time) ([]evide
 // do not accumulate (P0.13).
 func (s *Store) Prune(subjects []evidence.SubjectKey, now time.Time) (int, error) {
 	pruned := 0
-	err := s.db.Update(func(tx *bolt.Tx) error {
+	err := s.update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketEvidence)
 		for _, sk := range subjects {
 			prefix, err := evidencePrefix(sk)
@@ -212,7 +212,7 @@ func (errEvidenceCorrupt) Error() string { return "statebolt: corrupt evidence r
 // CountEvidence returns the total number of stored evidence rows (diagnostics).
 func (s *Store) CountEvidence() (int, error) {
 	n := 0
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketEvidence).ForEach(func(_, _ []byte) error {
 			n++
 			return nil
@@ -240,7 +240,7 @@ func (s *Store) SweepExpiredEvidence(now time.Time, batch int) (int, error) {
 	s.evidenceSweepMu.Lock()
 	defer s.evidenceSweepMu.Unlock()
 	var deleted int
-	err := s.db.Update(func(tx *bolt.Tx) error {
+	err := s.update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketEvidence)
 		c := b.Cursor()
 		var k, v []byte

@@ -2,7 +2,7 @@
 
 ## 1. Versioned policy
 
-Resource windows are process-local and volatile in the beta. They reset when
+Resource windows are process-local and volatile in single-node v1. They reset when
 the process restarts; durable credential, lane, evidence, audit, and posture
 state do not. Multi-node shared leases and window persistence are target
 architecture and are not claimed by this implementation.
@@ -10,9 +10,11 @@ architecture and are not claimed by this implementation.
 All policy is versioned (`id` + monotonically increasing `revision`). The
 `policy.Manager` prepare/activate lifecycle validates candidates, persists an
 active manifest before swapping the immutable snapshot, retains known-good
-revisions for explicit audited rollback, and rejects replayed revisions. The
-data plane still requires the deployment to authenticate policy artifacts
-(signature/KMS verification is an integration seam) before loading them.
+revisions for explicit audited rollback, and rejects replayed revisions.
+The stock composition root authenticates configured policy artifacts with a
+version-1 Ed25519 signature and rejects unsigned files. A KMS/HSM-backed
+verifier may replace that local public-key seam without changing the data
+plane contract.
 
 ```go
 type Policy struct {
@@ -53,11 +55,12 @@ MUST NOT override a higher-priority denial (§58):
   expensive models, reduce concurrency, disable source classes, quarantine
   credentials, restrict admin APIs.
 
-Failure semantics (§60): credential-registry outage → short authenticated local
-cache (≤60s) for recently verified, unknown fail closed; risk-store outage →
-`DEGRADED_STATIC`, never disable hard limits; resource-state outage → bounded
-local emergency limits, never unlimited; analytics outage → proxy continues,
-buffer events within strict bounds; **internal-signer outage → fail closed**.
+Failure semantics (§60) for the supported single-node runtime are: credential
+or adaptive-state failure fails closed or enters `DEGRADED_STATIC` without
+disabling hard limits; analytics failure continues through a bounded queue;
+and signer failure fails closed for new upstream authorization. The
+authenticated local credential cache, distributed resource-state fallback, and
+policy-service outage behavior are target integrations, not stock v1 behavior.
 INV-9: analytics failure never disables hard quotas.
 
 ## 4. Resource dimensions & scopes
@@ -73,7 +76,7 @@ credential-cost, account-cost) carry `capacity, refill_rate, balance,
 revision`. Updates are **atomic** where concurrent authorizations could
 oversubscribe limits.
 
-## 6. Concurrency leases
+## 6. Concurrency leases (single-node v1)
 
 Concurrency is represented with atomic leases carrying TTLs:
 
@@ -82,11 +85,10 @@ admission → lease acquired → upstream active → {completion | client-cancel
 upstream-error | lease-timeout} → lease released
 ```
 
-Lease TTL exceeds expected request duration or supports safe renewal tied to a
-valid active request; orphaned leases expire so a crash never permanently
-consumes concurrency (§48–49). **INV-15: concurrency accounting never becomes
-negative** — the lease holder owns a slot and releases at most once
-(idempotent release).
+The in-process lease holder owns a slot and releases at most once; a process
+crash releases all in-memory leases as the process exits. Cross-node lease TTL,
+renewal, and orphan reclamation remain target architecture. **INV-15:
+concurrency accounting never becomes negative**.
 
 ## 7. Reservation accounting
 

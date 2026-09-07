@@ -28,7 +28,7 @@ const operatorRecordSchemaVersion = 1
 // EMERGENCY_LOCKDOWN does not silently boot into NORMAL (P0.10). The posture is
 // stored under operator_state/posture.
 func (s *Store) SavePosture(p control.Posture) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketOperatorState).Put(keyPosture, []byte(strconv.Itoa(int(p))))
 	})
 }
@@ -38,7 +38,7 @@ func (s *Store) SavePosture(p control.Posture) error {
 // fails closed to an error rather than guessing.
 func (s *Store) LoadPosture() (control.Posture, error) {
 	var out control.Posture
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *bolt.Tx) error {
 		v := tx.Bucket(bucketOperatorState).Get(keyPosture)
 		if v == nil {
 			out = control.Normal
@@ -73,7 +73,7 @@ func (s *Store) AppendOperator(_ context.Context, rec control.OperatorRecord) er
 // (big-endian key → chronological order). Called inside an already-open write
 // transaction by transactional mutations, or on its own for standalone records.
 func (s *Store) appendOperator(rec control.OperatorRecord) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
 		return appendOperatorTx(tx, rec)
 	})
 }
@@ -117,7 +117,7 @@ func (s *Store) ProvisionCredentialWithAudit(ctx context.Context, rec credential
 	if err := rec.Validate(); err != nil {
 		return err
 	}
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
 		creds := tx.Bucket(bucketCredentials)
 		byVer := tx.Bucket(bucketCredVerifier)
 		if creds.Get([]byte(rec.CredentialID)) != nil {
@@ -153,7 +153,7 @@ func (s *Store) UnblockLaneWithAudit(ctx context.Context, credID, laneID string,
 	if err != nil {
 		return err
 	}
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
 		v := tx.Bucket(bucketLanes).Get(key)
 		if v == nil {
 			return lane.ErrLaneNotFound
@@ -189,7 +189,7 @@ func (s *Store) RevokeCredentialWithAudit(ctx context.Context, credID string, au
 	if err := ctx.Err(); err != nil {
 		return ctx.Err()
 	}
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
 		creds := tx.Bucket(bucketCredentials)
 		env := creds.Get([]byte(credID))
 		if env == nil {
@@ -218,7 +218,7 @@ func (s *Store) SetPostureWithAudit(ctx context.Context, posture control.Posture
 	if err := ctx.Err(); err != nil {
 		return ctx.Err()
 	}
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
 		if err := tx.Bucket(bucketOperatorState).Put(keyPosture, []byte(strconv.Itoa(int(posture)))); err != nil {
 			return err
 		}
@@ -229,7 +229,7 @@ func (s *Store) SetPostureWithAudit(ctx context.Context, posture control.Posture
 // CountAuditRecords returns how many operator audit rows are stored (test/diag).
 func (s *Store) CountAuditRecords() (int, error) {
 	n := 0
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketOperatorAudit).ForEach(func(k, _ []byte) error {
 			if string(k) != string(keyAuditSequence) {
 				n++
@@ -248,7 +248,7 @@ func (s *Store) ListOperatorAudit(after uint64, limit int) ([]control.OperatorRe
 		limit = 1000
 	}
 	var out []control.OperatorRecord
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *bolt.Tx) error {
 		c := tx.Bucket(bucketOperatorAudit).Cursor()
 		for k, v := c.First(); k != nil && len(out) < limit; k, v = c.Next() {
 			if string(k) == string(keyAuditSequence) {
