@@ -217,9 +217,15 @@ type Service struct {
 	audit AuditRepository
 	now   func() time.Time
 
-	mu    sync.Mutex
 	lanes LaneOperator       // optional lane lifecycle seam
 	creds CredentialOperator // optional credential lifecycle seam
+
+	// posturePersist is an optional transactional posture persist + audit seam
+	// (P0.10/P0.18). When wired, SetEmergency persists the posture and its audit
+	// row atomically (state store: SetPostureWithAudit) instead of the separate
+	// audit-append + in-memory plane flip. A restart then restores the same
+	// posture — locking down does not silently vanish on reboot.
+	posturePersist func(ctx context.Context, target Posture, actor, reason string) error
 }
 
 // Authenticator is the operator authentication seam.
@@ -250,6 +256,13 @@ func WithLaneOperator(op LaneOperator) ServiceOption { return func(s *Service) {
 // WithCredentialOperator wires the credential lifecycle seam.
 func WithCredentialOperator(op CredentialOperator) ServiceOption {
 	return func(s *Service) { s.creds = op }
+}
+
+// WithPosturePersister wires the transactional posture persist + audit seam
+// (P0.10). fn must commit the posture AND its operator-audit row atomically
+// (or reject both) — a failed persist aborts the emergency transition.
+func WithPosturePersister(fn func(ctx context.Context, target Posture, actor, reason string) error) ServiceOption {
+	return func(s *Service) { s.posturePersist = fn }
 }
 
 // NewService builds the production control-plane service. plane, auth, and
@@ -308,6 +321,8 @@ func (s *Service) record(actor, action, target, reason string, committed bool, d
 
 // commitAudit durably commits the record for a COMPLETED action; a failure
 // here fails the action contract — callers return err to the operator.
+// BETA-11: The mutation MUST succeed before this is called — the audit
+// records only facts, never intentions.
 func (s *Service) commitAudit(ctx context.Context, actor, action, target, reason string) error {
 	return s.audit.AppendOperator(ctx, OperatorRecord{
 		At: s.now().UTC(), Actor: actor, Action: action, Target: target,
@@ -328,6 +343,17 @@ func (s *Service) SetEmergency(ctx context.Context, token string, on bool, reaso
 	if on {
 		target = EmergencyLockdown
 	}
+	// P0.10/P0.18: when the transactional posture seam is wired, the posture
+	// AND its audit row commit atomically — a failed persist aborts the
+	// transition. Otherwise fall back to the audit-first commit, which remains
+	// correct for a restart that then re-flips the plane (no persistence).
+	if s.posturePersist != nil {
+		if err := s.posturePersist(ctx, target, id.Name, reason); err != nil {
+			return s.plane.Posture(), fmt.Errorf("control: posture persist + audit failed, action aborted: %w", err)
+		}
+		posture := s.plane.SetEmergency(on, id.Name, reason)
+		return posture, nil
+	}
 	// The audit row carries the TARGET posture: it documents the action being
 	// authorized, and is committed before the plane flips (atomicity rule).
 	if err := s.audit.AppendOperator(ctx, OperatorRecord{
@@ -341,6 +367,10 @@ func (s *Service) SetEmergency(ctx context.Context, token string, on bool, reaso
 }
 
 // RevokeCredential revokes a credential under full control-plane discipline.
+// BETA-11: The mutation runs FIRST; the durable audit records the fact of
+// the successful mutation. A failed mutation never produces a committed audit
+// row. A failed audit after a successful mutation returns an error but the
+// credential IS revoked — the operator sees the failure and can re-audit.
 func (s *Service) RevokeCredential(ctx context.Context, token, credID, reason string) error {
 	id, err := s.authorize(ctx, token, CapCredentialLifecycle, reason)
 	if err != nil {
@@ -351,13 +381,14 @@ func (s *Service) RevokeCredential(ctx context.Context, token, credID, reason st
 		s.record(id.Name, "credential.revoke", credID, reason, false, "no credential operator wired")
 		return errors.New("control: no credential operator wired")
 	}
-	// Atomicity rule: durable audit BEFORE the mutation returns; a failed
-	// audit aborts (the operator re-runs; revoke is idempotent in effect).
-	if err := s.commitAudit(ctx, id.Name, "credential.revoke", credID, reason); err != nil {
-		return fmt.Errorf("control: audit commit failed, action aborted: %w", err)
-	}
+	// BETA-11: Mutation FIRST, then audit. The audit records what HAPPENED,
+	// not what was attempted.
 	if err := s.creds.Revoke(credID); err != nil {
+		s.record(id.Name, "credential.revoke", credID, reason, false, err.Error())
 		return err
+	}
+	if err := s.commitAudit(ctx, id.Name, "credential.revoke", credID, reason); err != nil {
+		return fmt.Errorf("control: audit commit failed after revoke: %w", err)
 	}
 	return nil
 }
@@ -365,6 +396,8 @@ func (s *Service) RevokeCredential(ctx context.Context, token, credID, reason st
 // UnblockLane clears a BLOCKED lane through the wired LaneOperator, which
 // commits the lane audit entry itself (P0.49 atomicity), plus the control
 // plane's own durable row.
+// BETA-11: Mutation FIRST, then audit — same transactional truthfulness as
+// RevokeCredential.
 func (s *Service) UnblockLane(ctx context.Context, token, credID, laneID, reason string) error {
 	id, err := s.authorize(ctx, token, CapLaneLifecycle, reason)
 	if err != nil {
@@ -375,11 +408,13 @@ func (s *Service) UnblockLane(ctx context.Context, token, credID, laneID, reason
 		s.record(id.Name, "lane.unblock", laneID, reason, false, "no lane operator wired")
 		return errors.New("control: no lane operator wired")
 	}
-	if err := s.commitAudit(ctx, id.Name, "lane.unblock", laneID, reason); err != nil {
-		return fmt.Errorf("control: audit commit failed, action aborted: %w", err)
-	}
+	// BETA-11: Mutation FIRST.
 	if err := s.lanes.UnblockOperator(credID, laneID, id.Name, reason, s.now()); err != nil {
+		s.record(id.Name, "lane.unblock", laneID, reason, false, err.Error())
 		return err
+	}
+	if err := s.commitAudit(ctx, id.Name, "lane.unblock", laneID, reason); err != nil {
+		return fmt.Errorf("control: audit commit failed after unblock: %w", err)
 	}
 	return nil
 }

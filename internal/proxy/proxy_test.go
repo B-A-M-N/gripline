@@ -357,3 +357,131 @@ func TestDataPlaneReservationReleasedOnSuccessAndTransportError(t *testing.T) {
 		t.Fatalf("P0.8: reservation leaked on transport error: %d slots in use", inUse)
 	}
 }
+
+
+// TestDataPlaneCredentialLeakIntoResolvers (BETA-01) verifies that resolvers
+// (FeatureResolver, SourceResolver, UsageEstimator) never receive secret
+// carriers or the reserved Gripline-* namespace. Each resolver is hostile:
+// it fails the test if it sees a carrier in the Observation.Header.
+func TestDataPlaneCredentialLeakIntoResolvers(t *testing.T) {
+	signer, _ := terminator.GenerateSigner()
+
+	dp, err := New(Config{
+		Terminator: buildTerminator(t, signer),
+		BackendURL: &url.URL{Scheme: "http", Host: "127.0.0.1:0"},
+		Audience:   testAudience,
+		Features:   hostileFeatures{t: t},
+		Sources:    hostileSource{t: t},
+		Usage:      hostileUsage{t: t},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("POST", "http://gripline.local/v1/messages", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer "+dpRaw())
+	req.Header.Set("X-Api-Key", "secondary-secret")
+	req.Header.Set("X-Gripline-Principal", "forged")
+	rec := httptest.NewRecorder()
+	dp.ServeHTTP(rec, req)
+}
+
+// hostileFeatures is a FeatureResolver that fails the test if it sees secret carriers.
+type hostileFeatures struct {
+	t *testing.T
+}
+
+func (h hostileFeatures) Resolve(obs Observation) lane.Features {
+	assertSanitized(h.t, obs.Header, "FeatureResolver")
+	return HeaderFeatures{}.Resolve(obs)
+}
+
+// hostileSource is a SourceResolver that fails the test if it sees secret carriers.
+type hostileSource struct {
+	t *testing.T
+}
+
+func (h hostileSource) ResolveSource(obs Observation) terminator.TrustedSource {
+	assertSanitized(h.t, obs.Header, "SourceResolver")
+	return terminator.TrustedSource{}
+}
+
+// hostileUsage is a UsageEstimator that fails the test if it sees secret carriers.
+type hostileUsage struct {
+	t *testing.T
+}
+
+func (h hostileUsage) Estimate(obs Observation) resource.UsageEstimate {
+	assertSanitized(h.t, obs.Header, "UsageEstimator.Estimate")
+	return resource.UsageEstimate{Requests: 1}
+}
+
+func (h hostileUsage) Actual(obs Observation, _ *http.Response) resource.UsageEstimate {
+	assertSanitized(h.t, obs.Header, "UsageEstimator.Actual")
+	return resource.UsageEstimate{Requests: 1}
+}
+
+// assertSanitized verifies that the given header map carries no secret carriers
+// and no reserved Gripline-* headers.
+func assertSanitized(t *testing.T, h http.Header, name string) {
+	for _, k := range []string{"Authorization", "Proxy-Authorization", "X-Api-Key", "Api-Key"} {
+		if len(h.Values(k)) > 0 {
+			t.Fatalf("BETA-01: %s saw secret carrier %s=%v", name, k, h.Values(k))
+		}
+	}
+	for kk := range h {
+		lk := strings.ToLower(kk)
+		if strings.HasPrefix(lk, "gripline-") || strings.HasPrefix(lk, "x-gripline-") {
+			t.Fatalf("BETA-01: %s saw reserved header %s", name, kk)
+		}
+	}
+}
+
+// TestMaxBodyBytesEnforced (BETA-08) verifies that oversized request bodies
+// are rejected with 413 before admission.
+func TestMaxBodyBytesEnforced(t *testing.T) {
+	signer, _ := terminator.GenerateSigner()
+	term := buildTerminatorWithSigner(t, signer)
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("accepted:" + r.Header.Get("X-Gripline-Principal")))
+	}))
+	defer backend.Close()
+	bu, _ := url.Parse(backend.URL)
+
+	// Proxy with a 100-byte body limit.
+	dp, err := New(Config{
+		Terminator:   term,
+		BackendURL:   bu,
+		Audience:     testAudience,
+		MaxBodyBytes: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	raw := dpRaw()
+
+	// Oversized body (200 bytes) — Content-Length exceeds limit.
+	bigBody := strings.Repeat("x", 200)
+	req := httptest.NewRequest("POST", "http://gripline.local/v1/messages", strings.NewReader(bigBody))
+	req.Header.Set("Authorization", "Bearer "+raw)
+	rec := httptest.NewRecorder()
+	dp.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413 for oversized body, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Small body should succeed.
+	smallBody := `{"text":"hi"}`
+	req2 := httptest.NewRequest("POST", "http://gripline.local/v1/messages", strings.NewReader(smallBody))
+	req2.Header.Set("Authorization", "Bearer "+raw)
+	rec2 := httptest.NewRecorder()
+	dp.ServeHTTP(rec2, req2)
+
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("expected 200 for small body, got %d: %s", rec2.Code, rec2.Body.String())
+	}
+}

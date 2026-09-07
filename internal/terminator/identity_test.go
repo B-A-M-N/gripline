@@ -129,9 +129,6 @@ func TestDetectorInvalidCredentialSpray(t *testing.T) {
 	if len(got) == 0 || got[len(got)-1].Code != "SOURCE_ATTEMPTING_MANY_INVALID_CREDENTIALS" {
 		t.Fatalf("P0.30: invalid-credential spray must emit its signal, got %+v", got)
 	}
-	if got[len(got)-1].SubjectID != "src-1" {
-		t.Fatalf("subject must be the source, got %q", got[len(got)-1].SubjectID)
-	}
 }
 
 // TestSprayPseudonymProperties proves the pseudonym is deterministic per key,
@@ -189,4 +186,3 @@ func TestDetectorEmitCooldown(t *testing.T) {
 		t.Fatalf("after cooldown exactly one re-emission expected, got %d", n)
 	}
 }
-

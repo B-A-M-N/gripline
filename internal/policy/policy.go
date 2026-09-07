@@ -34,27 +34,51 @@ type RiskThresholds struct {
 	// the risk state machine caps auto-escalation at CONSTRAINED; quarantine is
 	// operator-set only.
 	EnableAutomaticQuarantine bool
+
+	// SourceBlockThresh is the source-scoped risk threshold above which a
+	// source is considered blocked (BETA-06). Source risk is computed
+	// independently from credential/lane risk. A source at or above this
+	// threshold produces sourceWouldBlock=true in telemetry. Whether that
+	// actually denies admission depends on SourceMode: in SourceObserve (the
+	// default) it is shadow-only (recorded, not enforced); in SourceEnforce it
+	// is evaluated as a denial (P0.7). A zero threshold with SourceEnforce
+	// denies nothing (nothing is "at or above" an unset bound).
+	SourceBlockThresh int
+	// SourceMode selects shadow-only vs. enforcing source blocking (P0.7).
+	// Default SourceObserve: a public beta must not silently block a shared
+	// NAT / corporate / mobile-carrier / VPN egress behind a source heuristic
+	// until an operator has validated it.
+	SourceMode SourceEnforcementMode
 }
 
-// Limits captures hard resource limits per scope as policy.
-type Limits struct {
-	ConcurrencyCap    int
-	RequestBurstCap   int
-	TokenVelocityMult float64
-	CostVelocityMult  float64
-	RequestRate       int // requests / minute
+// SourceEnforcementMode controls whether source-risk blocking is enforced or
+// shadow-recorded (P0.7). The default is SourceObserve so a shared upstream IP
+// (home/corporate/mobile NAT, VPN exit, CDN edge) is never blocked silently on
+// a heuristic the operator has not yet validated.
+type SourceEnforcementMode int
 
-	// RequestsPerWindow is the hard REQUEST gauge (P0.35): burst capacity and
-	// refill for the per-scope request bucket. Zero disables the gauge (not
-	// enforced) — velocity enforcement remains with ConcurrencyCap until a
-	// deployment populates it.
-	RequestsPerWindow BucketConfig
-	// TokensPerWindow is the hard TOKEN gauge across input/output/combined
-	// dimensions (P0.35). Zero disables.
-	TokensPerWindow BucketConfig
-	// CostPerWindow is the hard SPEND gauge in microunits (P0.35). Zero
-	// disables.
-	CostPerWindow BucketConfig
+const (
+	// SourceObserve records sourceWouldBlock in telemetry but never denies
+	// admission on source risk alone. Safe default for a public beta.
+	SourceObserve SourceEnforcementMode = iota
+	// SourceEnforce denies admission when a source crosses SourceBlockThresh.
+	SourceEnforce
+)
+
+// Limits captures hard resource limits per scope as policy (P0.19).
+//
+// The per-scope gauges are the ONLY limit representation. The legacy burst/rate
+// and velocity-multiplier fields (RequestBurstCap, RequestRate,
+// TokenVelocityMult, CostVelocityMult) had zero live consumers and were removed
+// (P0.19 collapse); actual enforcement uses the Requests/Tokens/Cost windowed
+// gauges plus ConcurrencyCap. Tokens and Cost are left disabled (zero capacity)
+// until provider-specific per-dimension budgets are authored.
+type Limits struct {
+	ConcurrencyCap int
+
+	Requests BucketConfig // hard REQUEST gauge (P0.35): burst + refill per scope. Zero disables (velocity left to ConcurrencyCap).
+	Tokens   BucketConfig // hard TOKEN gauge across input/output/combined dims (P0.35). Zero disables.
+	Cost     BucketConfig // hard SPEND gauge in microunits (P0.35). Zero disables.
 }
 
 // BucketConfig is one gauge's burst/rate policy (P0.35). Capacity is the
@@ -122,6 +146,11 @@ type Policy struct {
 
 	Risk     RiskThresholds
 	Limits   ScopedLimits
+	// Global carries the whole-plane (fleet) limits (P0.19). Global replaces
+	// the old magic Normal.ConcurrencyCap*1024 derivation; a zero
+	// Global.ConcurrencyCap disables the fleet gauge. Leaving Tokens/Cost zero
+	// keeps the fleet bound concurrency-only unless a deployment authors them.
+	Global Limits
 	Learning Learning
 	Privacy  Privacy
 	Identity Identity
@@ -149,6 +178,20 @@ type Policy struct {
 	// artifact without a code edit.
 	Classification lane.ClassificationThresholds
 
+	// ClassificationRevision is a lane-universe revision, distinct from Policy.
+	//Revision (P0.21). It must be bumped ONLY when lane classification
+	// semantics change in a way that should re-key lanes:
+	//
+	//	feature schema, feature weighting, classification thresholds,
+	//	comparable-mass rules, lane matching semantics.
+	//
+	// It is hashed into the deterministic lane ID (alongside the feature vector)
+	// and persisted on each LaneRecord, so BorrowOrCreate only crosses revisions
+	// when both the feature schema AND this revision match. A change that merely
+	// tunes an unrelated limit (e.g. a request-rate window) must NOT bump this —
+	// it would needlessly fragment the lane universe.
+	ClassificationRevision int
+
 	// CreatedAt and signature hooks reserved for authenticated+validated load.
 	CreatedAt time.Time
 }
@@ -167,14 +210,38 @@ func Default() *Policy {
 			ConstrainedDwell:     15 * time.Minute,
 			WatchDwell:           30 * time.Minute,
 			WatchObs:             2,
+			// P0.7: source blocking is shadow-only by default in the public
+			// beta. SourceBlockThresh is recorded so telemetry can truthfully
+			// report "would block under enforcement", but SourceMode stays
+			// SourceObserve (no automatic source denial) until an operator opts
+			// into SourceEnforce for its validated environment.
+			SourceBlockThresh: 60,
+			SourceMode:        SourceObserve,
 		},
+		// P0.19: the request gauges translate the old burst/rate representation
+		// (burst=Capacity, rate=RefillPer per minute). Tokens/Cost Explicitly
+		// left disabled (zero capacity) until provider-specific windows are
+		// authored — we do not invent token/spend budgets from the deleted
+		// velocity multipliers.
 		Limits: ScopedLimits{
-			Normal:      Limits{ConcurrencyCap: 32, RequestBurstCap: 64, TokenVelocityMult: 1.0, CostVelocityMult: 1.0, RequestRate: 300},
-			Constrained: Limits{ConcurrencyCap: 2, RequestBurstCap: 8, TokenVelocityMult: 1.25, CostVelocityMult: 1.25, RequestRate: 20},
+			Normal: Limits{
+				ConcurrencyCap: 32,
+				Requests:       BucketConfig{Capacity: 64, RefillPer: 300, RefillIn: time.Minute},
+			},
+			Constrained: Limits{
+				ConcurrencyCap: 2,
+				Requests:       BucketConfig{Capacity: 8, RefillPer: 20, RefillIn: time.Minute},
+			},
 			// P0.48: incident posture — deliberately tighter than constrained.
 			// A credential holds at most ONE in-flight request under lockdown.
-			Emergency: Limits{ConcurrencyCap: 1, RequestBurstCap: 1, TokenVelocityMult: 2.0, CostVelocityMult: 2.0, RequestRate: 5},
+			Emergency: Limits{
+				ConcurrencyCap: 1,
+				Requests:       BucketConfig{Capacity: 1, RefillPer: 5, RefillIn: time.Minute},
+			},
 		},
+		// P0.19: Global replaces the old magic Normal.ConcurrencyCap*1024 fleet
+		// derivation. A modest explicit fleet bound, concurrency-only.
+		Global: Limits{ConcurrencyCap: 32 * 1024},
 		Learning: Learning{
 			MaximumRisk:          20,
 			AllowNewLanes:        false,
@@ -199,6 +266,10 @@ func Default() *Policy {
 		},
 		Privacy:  Privacy{PromptRetention: false, CompletionRetention: false},
 		Identity: Identity{MaxTTLSeconds: 30},
+		// P0.21: initial classification universe. Bump only on a classification
+		// semantics change (feature schema/weights, thresholds, comparable-mass,
+		// match rules), never on unrelated limit tuning.
+		ClassificationRevision: 1,
 		// P0.13: lane security hysteresis is policy-owned. Automatic lane BLOCK
 		// ships DISABLED (shadow-first default, matching
 		// Risk.EnableAutomaticQuarantine); an operator must enable it explicitly
@@ -312,9 +383,26 @@ func (p *Policy) IsValid() bool {
 			return false
 		}
 	}
-	// Hard caps must not go negative.
+	// Concurrency caps must not go negative (global included, P0.19).
 	if p.Limits.Normal.ConcurrencyCap < 0 || p.Limits.Constrained.ConcurrencyCap < 0 ||
-		p.Limits.Emergency.ConcurrencyCap < 0 {
+		p.Limits.Emergency.ConcurrencyCap < 0 || p.Global.ConcurrencyCap < 0 {
+		return false
+	}
+	// P0.19: validate every windowed gauge across scopes and the global plane.
+	// Capacity/RefillPer/RefillIn must be >= 0; a non-zero refill rate requires
+	// a positive interval (zero interval would be a divide-by-zero / mint-every
+	// instant). Burst-only (Capacity > 0, RefillPer == 0) remains legal.
+	for _, lim := range []Limits{
+		p.Limits.Normal, p.Limits.Constrained, p.Limits.Emergency, p.Global,
+	} {
+		if !validBucket(lim.Requests) || !validBucket(lim.Tokens) || !validBucket(lim.Cost) {
+			return false
+		}
+	}
+	// P0.21: classification universe must be a positive, explicit revision; the
+	// default (zero) is rejected so a mis-configured policy cannot silently
+	// create an empty lane universe and borrow nothing.
+	if p.ClassificationRevision < 1 {
 		return false
 	}
 	// P0.11: the compiled policy must carry a usable evidence rule table and
@@ -330,6 +418,27 @@ func (p *Policy) IsValid() bool {
 	}
 	if p.Classification.Related < 0 || p.Classification.Match > 1 ||
 		p.Classification.MinComparableWeight < 0 {
+		return false
+	}
+	// P0.7: an explicit enforcement mode must be one of the known values. A
+	// negative/garbage value is rejected rather than silently treating an
+	// intended SourceEnforce as observe.
+	switch p.Risk.SourceMode {
+	case SourceObserve, SourceEnforce:
+	default:
+		return false
+	}
+	return true
+}
+
+// validBucket reports whether a BucketConfig is structurally legal (P0.19).
+func validBucket(b BucketConfig) bool {
+	if b.Capacity < 0 || b.RefillPer < 0 || b.RefillIn < 0 {
+		return false
+	}
+	// A refill rate with no positive interval is a divide-by-zero / instant
+	// mint. Burst-only (Capacity > 0, RefillPer == 0) is fine.
+	if b.RefillPer > 0 && b.RefillIn <= 0 {
 		return false
 	}
 	return true

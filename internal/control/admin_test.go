@@ -137,19 +137,44 @@ func TestServiceAuditAtomicity(t *testing.T) {
 		t.Fatalf("audit actor must be the authenticated identity, got %q", audit.rows[0].Actor)
 	}
 
-	// Audit repository failure → action refused, even though auth would pass.
+	// Audit repository failure → action returns error (BETA-11: mutation
+	// already succeeded; the operator sees the failure and can re-audit).
 	audit.fail = errors.New("disk full")
 	if err := svc.RevokeCredential(ctx, "tok", "cred_y", "second incident"); err == nil {
-		t.Fatal("P0.47: failed durable audit must abort the action")
+		t.Fatal("P0.47: failed durable audit must return error")
 	}
 	audit.fail = nil
-	// cred_y was never revoked.
+	// cred_y WAS revoked (mutation precedes audit); the operator sees the
+	// audit failure and can re-run to persist the record.
+	foundY := false
 	for _, id := range svc.creds.(*stubCreds).revoked {
 		if id == "cred_y" {
-			t.Fatal("action with failed audit must not have mutated state")
+			foundY = true
 		}
 	}
+	if !foundY {
+		t.Fatal("BETA-11: mutation must succeed even if audit fails")
+	}
 	_ = lanes
+}
+
+// BETA-11: A failed mutation must NOT produce a committed audit row.
+func TestServiceMutationFailureNoAudit(t *testing.T) {
+	svc, audit, _, _ := newTestService(t)
+	ctx := context.Background()
+
+	// Make the credential operator fail.
+	svc.creds = &stubCreds{err: errors.New("db write failed")}
+
+	if err := svc.RevokeCredential(ctx, "tok", "cred_z", "test"); err == nil {
+		t.Fatal("expected error when mutation fails")
+	}
+	// No committed audit row for a failed mutation.
+	for _, r := range audit.rows {
+		if r.Target == "cred_z" && r.Committed {
+			t.Fatal("BETA-11: failed mutation must not produce committed audit row")
+		}
+	}
 }
 
 // P0.47: the lane unblock rides the wired LaneOperator (which commits the

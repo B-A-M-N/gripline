@@ -275,7 +275,14 @@ func TestRandomStagingHygiene(t *testing.T) {
 func TestJSONMarshalLeaksNothing(t *testing.T) {
 	s := NewFromBytes([]byte("sk-json-secret-value"))
 	defer s.Zero()
-	b, err := json.Marshal(s)
+	// A *SealedSecret has no exported fields and no MarshalJSON (INV-2), so a
+	// bare json.Marshal(s) is a staticcheck-flagged empty-struct no-op. Marshal
+	// it nested inside a one-exported-field wrapper instead; this still proves
+	// the JSON path never ships the raw bytes.
+	wrapped := struct {
+		Secret *SealedSecret `json:"secret"`
+	}{Secret: s}
+	b, err := json.Marshal(wrapped)
 	if err != nil {
 		t.Fatalf("json.Marshal errored: %v", err)
 	}

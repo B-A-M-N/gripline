@@ -14,6 +14,8 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -78,6 +80,19 @@ type Config struct {
 
 	// Paths are the durable-state locations.
 	Paths PathsSection `json:"paths"`
+
+	// Ingress configures trusted source identity resolution (P0.6).
+	Ingress *IngressSection `json:"ingress,omitempty"`
+}
+
+// IngressSection configures trusted source identity resolution (P0.6).
+type IngressSection struct {
+	// PseudonymKey is the HMAC key for source pseudonymization. Must be
+	// distinct from the credential verifier pepper. Env-injected.
+	PseudonymKey string `json:"pseudonym_key"`
+	// TrustedProxies is the set of CIDR prefixes that may supply forwarding
+	// headers. Empty means no trusted proxies (direct peer is canonical).
+	TrustedProxies []string `json:"trusted_proxies,omitempty"`
 }
 
 // TLSSection configures the public listener's TLS.
@@ -131,6 +146,10 @@ type AdminSection struct {
 	// only here (env-injected); the control plane stores digests. At least
 	// one token with each needed capability must be configured.
 	OperatorTokens map[string]string `json:"operator_tokens"` // token -> "name:cap1,cap2"
+	// AllowPublic opts out of the private-only admin bind check (P0.7). The
+	// operator explicitly accepts an internet-facing control plane. Never set
+	// this in the default posture.
+	AllowPublic bool `json:"allow_public,omitempty"`
 }
 
 // IdentitySection is the internal assertion boundary.
@@ -145,6 +164,19 @@ type PathsSection struct {
 	// AuditLog is the append-only operator audit JSONL (P0.47). Required when
 	// Admin is configured.
 	AuditLog string `json:"audit_log"`
+	// Evidence is the file path for the durable evidence store (BETA-09).
+	// Empty means in-memory only (evidence lost on restart).
+	Evidence string `json:"evidence"`
+	// SignerKeyring is the file path for the persistent signing keyring (BETA-10).
+	// Empty means ephemeral: a fresh keyring is generated at every restart,
+	// so previously issued assertions will not verify after a restart.
+	SignerKeyring string `json:"signer_keyring"`
+	// State is the file path for the single transactional state database
+	// (P0.10): credentials + verifier index + security state, lanes, operator
+	// audit, and operator posture all in one bbolt file. Empty means the
+	// in-memory registry + file-based audit sink (beta default, not durable
+	// for credentials across restart).
+	State string `json:"state"`
 }
 
 // Load reads, expands, and validates a configuration file.
@@ -272,8 +304,47 @@ func (c *Config) Validate() error {
 		if c.Paths.AuditLog == "" {
 			return fmt.Errorf("paths.audit_log required when the admin section is present (P0.47: durable operator audit)")
 		}
+		// P0.7 hardening: reject a public/unspecified admin bind. The admin
+		// listener is the operator control plane (posture + lifecycle actions);
+		// binding it to a wildcard or public interface contradicts the
+		// "private interface only" contract unless an operator explicitly opts
+		// into a non-loopback/private bind (admin.allow_public).
+		if err := validateAdminBind(c.Admin); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+// validateAdminBind enforces that the admin listener binds loopback or a
+// private (RFC1918 / unique-local / link-local) interface address. An
+// unspecified/wildcard host (`:port`, `0.0.0.0`, `::`) or a public IP is
+// rejected unless the operator set admin.allow_public = true (a deliberate,
+// externally-visible control-plane override — which also forces TLS).
+func validateAdminBind(a *AdminSection) error {
+	if a.AllowPublic {
+		return nil
+	}
+	host := a.Listen
+	if h, _, err := net.SplitHostPort(a.Listen); err == nil {
+		host = h
+	}
+	if host == "" {
+		return fmt.Errorf("admin.listen %q: unspecified/wildcard host requires an explicit loopback or private interface (or admin.allow_public=true)", a.Listen)
+	}
+	// A bare non-numeric hostname is not an address we can classify; require a
+	// numeric address for the private-only check.
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return fmt.Errorf("admin.listen %q: must be a numeric loopback or private address (or admin.allow_public=true)", a.Listen)
+	}
+	if addr.IsLoopback() || addr.IsPrivate() || addr.IsLinkLocalUnicast() {
+		return nil
+	}
+	if addr.IsUnspecified() {
+		return fmt.Errorf("admin.listen %q: unspecified address requires an explicit loopback or private interface (or admin.allow_public=true)", a.Listen)
+	}
+	return fmt.Errorf("admin.listen %q: public address is not allowed for the admin control plane (use 127.0.0.1 or a private interface, or set admin.allow_public=true)", a.Listen)
 }
 
 // parseOperatorSpec parses "name:cap1,cap2".

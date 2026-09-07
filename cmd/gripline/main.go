@@ -1,23 +1,13 @@
 // Command gripline is the deployable inference gateway (P0.54): a
 // production entry point that wires the terminator data plane behind a
-// hardened HTTP server — fixed backend, required TLS posture, bounded
-// timeouts/headers/bodies, graceful shutdown, readiness/liveness endpoints,
-// and (optionally) the authenticated operator control plane on a private
-// listener.
-//
-// A misconfigured deployment must fail at BOOT, never degrade silently: the
-// config loader rejects missing TLS decisions, unbounded timeouts, a missing
-// backend, or an incompletely specified admin surface before anything binds.
-//
-// Usage:
-//
-//	gripline -config /etc/gripline/config.json
+// hardened HTTP server.
 package main
 
 import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -26,25 +16,100 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/B-A-M-N/gripline/internal/config"
-	"github.com/B-A-M-N/gripline/internal/control"
-	"github.com/B-A-M-N/gripline/internal/credential"
+	"github.com/B-A-M-N/gripline/internal/keyexport"
 	"github.com/B-A-M-N/gripline/internal/policy"
-	"github.com/B-A-M-N/gripline/internal/proxy"
 	"github.com/B-A-M-N/gripline/internal/terminator"
 )
 
+// errSubcommand is a sentinel signaling that the invocation requested a
+// non-server subcommand that was handled.
+var errSubcommand = errors.New("gripline: subcommand handled")
+
 func main() {
+	sub, rest := parseSubcommand(os.Args[1:])
+	if sub != "" {
+		if err := dispatchSubcommand(sub, rest); err != nil && !errors.Is(err, errSubcommand) {
+			log.Fatalf("gripline: %v", err)
+		}
+		return
+	}
 	cfgPath := flag.String("config", "/etc/gripline/config.json", "path to the deployment configuration")
 	flag.Parse()
 	if err := run(*cfgPath); err != nil {
 		log.Fatalf("gripline: %v", err)
 	}
+}
+
+// parseSubcommand peeks os.Args for a leading non-flag subcommand token.
+// args is os.Args[1:].
+func parseSubcommand(args []string) (string, []string) {
+	if len(args) == 0 || len(args[0]) == 0 || args[0][0] == '-' {
+		return "", nil
+	}
+	return args[0], args[1:]
+}
+
+// dispatchSubcommand runs a non-server subcommand. Supported:
+//
+//	gripline keys export --config path.json
+//
+// prints the PUBLIC backend verification material (active kid + all retained
+// public keys) as JSON to stdout — never any private/signing material (P0.15).
+func dispatchSubcommand(sub string, args []string) error {
+	switch sub {
+	case "keys":
+		// gripline keys export --config path.json
+		if len(args) == 0 || args[0] != "export" {
+			return fmt.Errorf("keys: expected 'gripline keys export --config path.json'")
+		}
+		fs := flag.NewFlagSet("keys export", flag.ExitOnError)
+		cfgPath := fs.String("config", "/etc/gripline/config.json", "path to the deployment configuration")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		return runKeysExport(*cfgPath)
+	default:
+		return fmt.Errorf("unknown subcommand %q (expected: keys)", sub)
+	}
+}
+
+// runKeysExport loads the persistent signing keyring from the configured path
+// and prints its PUBLIC verification material to stdout as JSON. It is the
+// supported delivery surface for acquiring backend verification keys (P0.15):
+// a restricted deployment node runs this once and hands the output to the
+// protected backend's configuration.
+func runKeysExport(cfgPath string) error {
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return fmt.Errorf("keys export: %w", err)
+	}
+	if cfg.Paths.SignerKeyring == "" {
+		return fmt.Errorf("keys export: config.paths.signer_keyring is not set")
+	}
+	kr, err := terminator.LoadKeyring(cfg.Paths.SignerKeyring)
+	if err != nil {
+		return fmt.Errorf("keys export: load keyring: %w", err)
+	}
+	verifiers := make(map[int][]byte, 0)
+	for kid, pub := range kr.PublicKeys() {
+		verifiers[kid] = append([]byte(nil), pub...)
+	}
+	exp, err := keyexport.GenerateExport(kr.ActiveKid(), verifiers)
+	if err != nil {
+		return fmt.Errorf("keys export: %w", err)
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(exp); err != nil {
+		return fmt.Errorf("keys export: write: %w", err)
+	}
+	return errSubcommand // success — do not fall through to the server
 }
 
 func run(cfgPath string) error {
@@ -56,28 +121,23 @@ func run(cfgPath string) error {
 		return err
 	}
 
-	// --- Wire the data plane ------------------------------------------------
-	//
-	// The bootstrap here builds the in-process credential registry, pepper
-	// ring, and signer. Durable backends (PostgreSQL registry, remote signer)
-	// substitute behind the same seams; the wiring point is buildDataPlane.
-	plane, err := buildDataPlane(cfg)
+	// P0.1/P0.2: Build the shared runtime (single composition root).
+	rt, err := BuildRuntime(cfg)
 	if err != nil {
 		return err
 	}
+	defer rt.Close()
 
 	// --- Public server -------------------------------------------------------
 	root := http.NewServeMux()
-	root.Handle("/v1/", plane) // the inference data plane
+	root.Handle("/v1/", rt.DataPlane)
 	root.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		// Liveness: the process is up. Never checks dependencies.
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
 	var ready atomic.Bool
 	ready.Store(true)
 	root.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
-		// Readiness: serving traffic. Draining flips this before shutdown.
 		if !ready.Load() {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_, _ = w.Write([]byte("draining"))
@@ -108,18 +168,14 @@ func run(cfgPath string) error {
 		cfg.Listen, srv.TLSConfig != nil, cfg.Backend.URL)
 
 	// --- Optional admin/control-plane listener (P0.47) ----------------------
-	adminSrv, err := buildAdmin(cfg)
-	if err != nil {
-		return err
-	}
-	if adminSrv != nil {
+	if rt.Admin != nil {
 		ln, err := net.Listen("tcp", cfg.Admin.Listen)
 		if err != nil {
 			return fmt.Errorf("gripline: admin listen %s: %w", cfg.Admin.Listen, err)
 		}
 		go func() {
 			log.Printf("gripline: admin control plane listening on %s", cfg.Admin.Listen)
-			if err := adminSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			if err := rt.Admin.Serve(ln); err != nil && err != http.ErrServerClosed {
 				log.Printf("gripline: admin server: %v", err)
 			}
 		}()
@@ -148,13 +204,11 @@ func run(cfgPath string) error {
 		log.Printf("gripline: %v received — draining", s)
 	}
 
-	// Drain: stop accepting, mark not-ready so load balancers pull us first,
-	// give in-flight requests the configured grace period.
 	ready.Store(false)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if adminSrv != nil {
-		_ = adminSrv.Shutdown(ctx)
+	if rt.Admin != nil {
+		_ = rt.Admin.Shutdown(ctx)
 	}
 	if err := srv.Shutdown(ctx); err != nil {
 		return fmt.Errorf("gripline: drain: %w", err)
@@ -163,151 +217,7 @@ func run(cfgPath string) error {
 	return nil
 }
 
-// buildDataPlane assembles the terminator + proxy from configuration. The
-// in-process stores make the binary self-contained for evaluation; production
-// deployments substitute durable implementations behind the same seams.
-func buildDataPlane(cfg *config.Config) (http.Handler, error) {
-	reg := credential.NewMemoryRegistry()
-
-	pepper := os.Getenv("GRILINE_PEPPER_V1")
-	if pepper == "" {
-		return nil, fmt.Errorf("gripline: environment variable GRILINE_PEPPER_V1 is required (credential pepper key; injected, never on disk)")
-	}
-	peppers := credential.MustPepperRing(&credential.PepperKey{Version: 1, Key: []byte(pepper)})
-
-	signer, err := terminator.NewKeyring()
-	if err != nil {
-		return nil, fmt.Errorf("gripline: assertion signer: %w", err)
-	}
-
-	pol := policyFor(cfg)
-	term, err := terminator.New(terminator.Dependencies{
-		Registry: reg,
-		Peppers:  peppers,
-		Policy:   pol,
-		Signer:   signer,
-		Audience: cfg.Identity.Audience,
-		Mode:     terminator.ModeTerminate,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("gripline: terminator: %w", err)
-	}
-
-	backend, err := urlFrom(cfg.Backend.URL)
-	if err != nil {
-		return nil, err
-	}
-	transport := &http.Transport{
-		MaxIdleConnsPerHost:   cfg.Backend.MaxIdleConnsPerHost,
-		ResponseHeaderTimeout: cfg.Backend.Timeout.D(),
-		IdleConnTimeout:       cfg.Server.IdleTimeout.D(),
-	}
-	if backend.Scheme == "https" {
-		transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
-	}
-	return proxy.New(proxy.Config{
-		Terminator: term,
-		BackendURL: backend,
-		Transport:  transport,
-		Audience:   cfg.Identity.Audience,
-	})
-}
-
-// buildAdmin assembles the authenticated control-plane listener from config,
-// or returns nil when no admin section is configured.
-func buildAdmin(cfg *config.Config) (*http.Server, error) {
-	if cfg.Admin == nil {
-		return nil, nil
-	}
-	audit, err := control.NewFileAuditRepository(cfg.Paths.AuditLog)
-	if err != nil {
-		return nil, err
-	}
-	tokens := make(map[string]*control.Identity, len(cfg.Admin.OperatorTokens))
-	for tok, spec := range cfg.Admin.OperatorTokens {
-		name, caps, err := parseSpec(spec)
-		if err != nil {
-			return nil, fmt.Errorf("gripline: admin token: %w", err)
-		}
-		cs := make([]control.Capability, 0, len(caps))
-		for _, c := range caps {
-			cs = append(cs, control.Capability(c))
-		}
-		tokens[tok] = &control.Identity{Name: name, Capabilities: cs}
-	}
-	auth, err := control.NewTokenAuthenticator(tokens)
-	if err != nil {
-		return nil, err
-	}
-	svc, err := control.NewService(control.New(0), auth, audit)
-	if err != nil {
-		return nil, err
-	}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/admin/posture", adminPosture(svc))
-	return &http.Server{
-		Addr:              cfg.Admin.Listen,
-		Handler:           mux,
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       120 * time.Second,
-	}, nil
-}
-
-// adminPosture serves POST /admin/posture {"on":bool,"reason":"..."} with the
-// operator's bearer token.
-func adminPosture(svc *control.Service) http.HandlerFunc {
-	type body struct {
-		On     bool   `json:"on"`
-		Reason string `json:"reason"`
-	}
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		var b body
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&b); err != nil {
-			http.Error(w, "bad request", http.StatusBadRequest)
-			return
-		}
-		token := bearer(r.Header.Get("Authorization"))
-		posture, err := svc.SetEmergency(r.Context(), token, b.On, b.Reason)
-		if err != nil {
-			http.Error(w, "forbidden", http.StatusForbidden)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"posture": posture.String()})
-	}
-}
-
-func bearer(h string) string {
-	rest, ok := strings.CutPrefix(h, "Bearer ")
-	if !ok {
-		return ""
-	}
-	return strings.TrimSpace(rest)
-}
-
-func parseSpec(spec string) (string, []string, error) {
-	name, caps, ok := strings.Cut(spec, ":")
-	if !ok {
-		return "", nil, fmt.Errorf("spec must be \"name:cap1,cap2\"")
-	}
-	var out []string
-	for _, c := range strings.Split(caps, ",") {
-		if c = strings.TrimSpace(c); c != "" {
-			out = append(out, c)
-		}
-	}
-	return strings.TrimSpace(name), out, nil
-}
-
-// policyFor builds the policy revision this deployment enforces. The default
-// policy is the compiled baseline; production installs versioned policy
-// artifacts through the control plane (P0.51 policy manager seam).
+// policyFor builds the policy revision this deployment enforces.
 func policyFor(cfg *config.Config) *policy.Policy {
 	pol := policy.Default()
 	pol.Identity.MaxTTLSeconds = 30

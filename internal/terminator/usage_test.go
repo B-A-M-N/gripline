@@ -19,7 +19,7 @@ func usageTerminator(t *testing.T, cp *control.ControlPlane) (*Terminator, *reso
 	t.Helper()
 	pol := policy.Default()
 	// Burst-only token gauge (no continuous refill) so float comparisons are exact.
-	pol.Limits.Normal.TokensPerWindow = policy.BucketConfig{Capacity: 100}
+	pol.Limits.Normal.Tokens = policy.BucketConfig{Capacity: 100}
 
 	pep := &credential.PepperKey{Version: 1, Key: []byte("usage-pepper")}
 	rawBytes := make([]byte, 32)

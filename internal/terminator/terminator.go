@@ -22,6 +22,7 @@ import (
 	"github.com/B-A-M-N/gripline/internal/lane"
 	"github.com/B-A-M-N/gripline/internal/policy"
 	"github.com/B-A-M-N/gripline/internal/principal"
+	"github.com/B-A-M-N/gripline/internal/producers"
 	"github.com/B-A-M-N/gripline/internal/resource"
 	"github.com/B-A-M-N/gripline/internal/risk"
 	"github.com/B-A-M-N/gripline/internal/secret"
@@ -61,6 +62,11 @@ type Outcome struct {
 	// (backend accepted / response complete). An admitted-but-never-completed
 	// request earns no baseline trust.
 	Baseline *BaselineToken
+	// Completion (P0.4A) is non-nil on an authorized outcome when completion-time
+	// producers are wired. It carries the deferred completion observation: the
+	// proxy calls Complete(actual, success) at end-of-stream so token/cost
+	// velocity producers fire against the ACTUAL usage, not the estimate.
+	Completion *CompletionToken
 	// Trace (P0.50) is the INTERNAL decision record: full state transitions,
 	// evidence ids, selected limits, and the policy revision (P0.51 — stamped
 	// for denied requests too, from the compiled policy rather than the
@@ -83,23 +89,23 @@ type BaselineToken struct {
 
 	// done guards idempotent finalization: a request completed and then
 	// double-released (error path + defer) must count once.
-	done bool
+	// P0.13 fix: atomic.Bool for concurrent safety.
+	done atomic.Bool
 
 	// term is the issuing terminator (back-pointer, set at issuance) — the
 	// completion event lands on the same authority that admitted the request.
 	term *Terminator
 }
 
-// Finalize records ONE clean successful observation against the lane baseline
-// (counters + promotion evaluation) at the moment the proxy has proof the
-// upstream request succeeded. It is a no-op when the token was already spent,
-// when the admission ran degraded, or when no lane store is configured.
-// Returns whether a baseline credit was applied.
+// Finalize records ONE clean successful observation against the lane baseline.
 func (b *BaselineToken) Finalize() bool {
-	if b == nil || !b.Eligible || b.done || b.term == nil || b.term.dep.Lanes == nil {
+	if b == nil || !b.Eligible || b.term == nil || b.term.dep.Lanes == nil {
 		return false
 	}
-	b.done = true
+	// CAS ensures idempotent finalization even under concurrent calls.
+	if !b.done.CompareAndSwap(false, true) {
+		return false
+	}
 	b.term.finalizeBaseline(b)
 	return true
 }
@@ -112,6 +118,56 @@ func (o *Outcome) FinalizeBaseline() bool {
 		return false
 	}
 	return o.Baseline.Finalize()
+}
+
+// CompletionResult is the outcome of spending a CompletionToken. Completion
+// signals affect SUBSEQUENT admissions, never the request that just finished.
+type CompletionResult struct {
+	// EvidenceCodes are the scoped evidence codes persisted for this completion.
+	EvidenceCodes []string
+	// Persisted reports whether at least one completion signal was durably
+	// appended to the evidence store (a store may be nil/persist-failed).
+	Persisted bool
+	// Err is a non-nil if the completion observation itself failed hard (e.g.
+	// the terminating authority was unavailable). Producer best-effort skips are
+	// not errors.
+	Err error
+}
+
+// CompletionToken (P0.4A) carries the deferred completion observation from an
+// authorized admission to the proxy-side end-of-stream event. It mirrors
+// BaselineToken: a value token the proxy can only present or omit — it cannot
+// fabricate completion evidence for a request it was never given the token for.
+// Complete is idempotent.
+type CompletionToken struct {
+	subjects producers.SubjectContext
+	done     atomic.Bool
+	term     *Terminator
+}
+
+// Complete records the ACTUAL resource consumption and outcome of a finished
+// request, driving completion-time producers (token/cost velocity) and
+// persisting their scoped evidence. It is safe to call on nil and idempotent.
+// `actual` uses the resource governor's settlement units; `success` reports
+// whether the upstream stream finished cleanly.
+func (c *CompletionToken) Complete(actual resource.UsageEstimate, success bool) CompletionResult {
+	if c == nil || c.term == nil {
+		return CompletionResult{}
+	}
+	if !c.done.CompareAndSwap(false, true) {
+		return CompletionResult{} // already observed
+	}
+	return c.term.observeCompletion(c.subjects, actual, success)
+}
+
+// Complete is the Outcome convenience for the proxy lifecycle (P0.4A): spend the
+// completion token with the finished request's actual usage. Safe on a denied
+// outcome (nil token → empty result) and idempotent.
+func (o *Outcome) Complete(actual resource.UsageEstimate, success bool) CompletionResult {
+	if o == nil {
+		return CompletionResult{}
+	}
+	return o.Completion.Complete(actual, success)
 }
 
 // Reservation returns the ONE lifecycle handle for whatever this admission is
@@ -155,7 +211,7 @@ const (
 type Dependencies struct {
 	Registry credential.Registry
 	Peppers  *credential.PepperRing
-	Lanes    *lane.Store
+	Lanes    lane.Repository
 	Policy   *policy.Policy
 	Signer   AssertionSigner
 	Audience string
@@ -203,6 +259,13 @@ type Dependencies struct {
 	// signature that crosses its window threshold is minted into the evidence
 	// store — feeding the risk engine. Nil disables (no spray evidence).
 	Spray *anomaly.Detector
+
+	// Producers is an OPTIONAL set of live signal producers (BETA-07). When
+	// set, each admission observes request behavior through every producer and
+	// mints any resulting signals into the evidence store — feeding the risk
+	// engine from REAL request behavior rather than manually seeded evidence.
+	// Nil/empty disables live evidence production.
+	Producers []producers.Producer
 }
 
 // resourceController abstracts concurrency admission per scope.
@@ -258,8 +321,8 @@ func New(dep Dependencies) (*Terminator, error) {
 		if dep.Lanes == nil {
 			return nil, errors.New("terminator: ENFORCE mode requires a lane store")
 		}
-		if dep.Concurrency == nil {
-			return nil, errors.New("terminator: ENFORCE mode requires a hard concurrency controller (fail-closed config)")
+		if dep.Concurrency == nil && dep.Resource == nil {
+			return nil, errors.New("terminator: ENFORCE mode requires a hard concurrency controller or resource governor (fail-closed config)")
 		}
 		// P0.2: adaptive security state is REQUIRED in ENFORCE. Without an
 		// evidence backend, every request would evaluate risk=0 and a persisted
@@ -452,15 +515,27 @@ func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features,
 		// keys per source. Raw candidate bytes are never retained; the signal
 		// resolves through the same one-policy-authority path as all spray
 		// signals. No trusted source identity → no attribution (fail-closed).
-		if t.dep.Spray != nil && src.sourceID() != "" && errors.Is(err, credential.UnknownError) {
+		if t.dep.Spray != nil && src.sourceID() != "" && errors.Is(err, credential.ErrUnknown) {
 			// The spray key is the latest pepper key: SprayPseudonym is
 			// domain-separated from verifier derivation inside the sealed
 			// boundary, so the same key material never cross-purposes.
 			if key, ok := t.dep.Peppers.Get(t.dep.Peppers.Latest()); ok {
 				cand := presented.SprayPseudonym(key)
 				if sigs := t.dep.Spray.ObserveInvalidCredential(src.sourceID(), cand, now); len(sigs) > 0 {
+					// P0.8: the detector signals WHAT happened; the compiled policy
+					// rule's scope resolves the subject from the request context
+					// (here the source — the credential is unknown).
+					srcSubjects := producers.SubjectContext{SourceID: src.sourceID()}
 					for _, sig := range sigs {
-						if ev, merr := evidence.Mint(t.pol.EvidenceRules, sig.Code, sig.SubjectID, now, t.pol.Revision); merr == nil && t.dep.Evidence != nil {
+						rule, ok := t.pol.EvidenceRules[sig.Code]
+						if !ok {
+							continue
+						}
+						sid, ok := producers.ResolveSubject(rule.Scope, srcSubjects)
+						if !ok {
+							continue
+						}
+						if ev, merr := evidence.Mint(t.pol.EvidenceRules, sig.Code, sid, now, t.pol.Revision); merr == nil && t.dep.Evidence != nil {
 							_ = t.dep.Evidence.Append(ev)
 							tr.EvidenceIDs = append(tr.EvidenceIDs, ev.EvidenceID)
 							tr.EvidenceCodes = append(tr.EvidenceCodes, ev.Code)
@@ -544,22 +619,57 @@ func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features,
 	// lane).
 	syncEv := t.synchronousEvidence(laneNew, laneID)
 	var persistOnly []evidence.Evidence
+	var currentSourceEvidence []evidence.Evidence
+	var currentLaneEvidence []evidence.Evidence
+	var currentCredentialEvidence []evidence.Evidence
+	// The authoritative subject context for resolving scoped signals (P0.8): the
+	// same context feeds spray AND producer signal resolution, so both land on
+	// the correct current-request subject.
+	subjects := producers.SubjectContext{
+		RequestID:    out.RequestID,
+		SourceID:     src.sourceID(),
+		LaneID:       laneID,
+		CredentialID: cred.CredentialID,
+		AccountID:    cred.AccountID,
+	}
+	// BETA-07/P0.8: Spray and live producers both emit signal CODES only; the
+	// ONE resolveSignals path turns each into scoped evidence against the
+	// current compiled policy. A spray threshold crossed on THIS request now
+	// contributes to this request's evaluation at the correct scope, not just to
+	// a later snapshot.
 	if t.dep.Spray != nil && src.sourceID() != "" {
 		if sigs := t.dep.Spray.Observe(src.sourceID(), cred.CredentialID, feat.NetworkASN, now); len(sigs) > 0 {
-			// P0.12: the detector returns signals; THIS compiled policy is the
-			// one policy authority. Each signal resolves against the current
-			// compiled rule table — score/family/scope/TTL and the minting
-			// revision all come from here, never from the detector. A signal
-			// with no rule in this revision resolves to nothing (fail-closed).
-			for _, sig := range sigs {
-				ev, err := evidence.Mint(t.pol.EvidenceRules, sig.Code, sig.SubjectID, now, t.pol.Revision)
-				if err != nil {
-					continue // unknown code in this revision: no invented parameters
-				}
-				persistOnly = append(persistOnly, ev)
+			res := t.resolveSignals(sprayCodes(sigs), subjects, now)
+			persistOnly = append(persistOnly, res.persisted...)
+			currentSourceEvidence = append(currentSourceEvidence, res.source...)
+			currentCredentialEvidence = append(currentCredentialEvidence, res.credential...)
+		}
+	}
+	if len(t.dep.Producers) > 0 {
+		admissionBehavior := producers.AdmissionBehavior{
+			Subjects: subjects,
+			Features: producers.Features{
+				NetworkASN:   feat.NetworkASN,
+				NetworkType:  feat.NetworkType,
+				RegionClass:  feat.RegionClass,
+				ClientFamily: feat.ClientFamily,
+			},
+			EndpointFamily: feat.EndpointFamily,
+			// P0.4B: live concurrency from the resource governor. Measures lane
+			// concurrency (the scope for CONCURRENCY_OVER_* rules) plus this
+			// attempted request. Falls back to 0 if no governor is configured.
+			Concurrency: t.currentConcurrency(laneID),
+		}
+		for _, prod := range t.dep.Producers {
+			if sigs := prod.ObserveAdmission(admissionBehavior); len(sigs) > 0 {
+				res := t.resolveSignals(producerCodes(sigs), subjects, now)
+				persistOnly = append(persistOnly, res.persisted...)
+				currentSourceEvidence = append(currentSourceEvidence, res.source...)
+				currentLaneEvidence = append(currentLaneEvidence, res.lane...)
 			}
 		}
 	}
+
 	if (len(syncEv) > 0 || len(persistOnly) > 0) && t.dep.Evidence != nil {
 		// Append is an observation, not enforcement. A failure neither fails
 		// open nor is conflated with a snapshot outage (P0.3): evaluation never
@@ -570,20 +680,32 @@ func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features,
 		_ = t.dep.Evidence.Append(allEv...)
 	}
 
-	// 6. Snapshot evidence by subject (credential + lane INDEPENDENTLY, with
-	// SEPARATE error state per snapshot — P0.3). Never depend on read-after-write
-	// for current-request evidence: always combine historical snapshot + current
-	// sync evidence, deduplicated by EvidenceID.
+	// 6. Snapshot evidence by subject (credential + lane + source
+	// INDEPENDENTLY, with SEPARATE error state per snapshot — P0.3). Never
+	// depend on read-after-write for current-request evidence: always combine
+	// historical snapshot + current sync evidence, deduplicated by
+	// EvidenceID.
 	credSubjects := []evidence.SubjectKey{{Scope: evidence.ScopeCredential, ID: cred.CredentialID}}
 	laneSubjects := []evidence.SubjectKey{{Scope: evidence.ScopeLane, ID: laneID}}
+
+	// BETA-06: Source-scoped evidence snapshot. Source risk is an INDEPENDENT
+	// dimension — it must not be blended into lane or credential risk so
+	// that source-spray attack evidence can drive source-level enforcement
+	// without contaminating the lane/credential risk.
+	var sourceSubjects []evidence.SubjectKey
+	srcID := src.sourceID()
+	if srcID != "" {
+		sourceSubjects = []evidence.SubjectKey{{Scope: evidence.ScopeSource, ID: srcID}}
+	}
 
 	// adaptive tracks whether authoritative history was available (P0.1). An
 	// unavailable history is UNKNOWN, not empty: it must never become risk=0 in
 	// the state machine.
 	adaptive := AdaptiveAvailable
-	var credentialEvidence, laneEvidence []evidence.Evidence
+	var credentialEvidence, laneEvidence, sourceEvidence []evidence.Evidence
 	credSnapOK := t.dep.Evidence == nil
 	laneSnapOK := t.dep.Evidence == nil
+	sourceSnapOK := t.dep.Evidence == nil || srcID == ""
 	if t.dep.Evidence != nil {
 		snap, snapErr := t.dep.Evidence.Snapshot(credSubjects, now)
 		if snapErr != nil {
@@ -599,6 +721,17 @@ func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features,
 			laneEvidence = snap
 			laneSnapOK = true
 		}
+		// BETA-06: source snapshot is independent — an outage degrades
+		// adaptive posture but never silently drops source evidence.
+		if len(sourceSubjects) > 0 {
+			snap, snapErr = t.dep.Evidence.Snapshot(sourceSubjects, now)
+			if snapErr != nil {
+				adaptive = AdaptiveDegraded
+			} else {
+				sourceEvidence = snap
+				sourceSnapOK = true
+			}
+		}
 	}
 	// P0.50: per-subject evidence detail in the trace (IDs + codes), bounded.
 	for _, ev := range credentialEvidence {
@@ -609,6 +742,10 @@ func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features,
 		tr.EvidenceIDs = append(tr.EvidenceIDs, ev.EvidenceID)
 		tr.EvidenceCodes = append(tr.EvidenceCodes, ev.Code)
 	}
+	for _, ev := range sourceEvidence {
+		tr.EvidenceIDs = append(tr.EvidenceIDs, ev.EvidenceID)
+		tr.EvidenceCodes = append(tr.EvidenceCodes, ev.Code)
+	}
 	// P0.45: only evidence minted under the CURRENT policy revision may drive the
 	// authoritative state machine. Evidence from an older revision was scored
 	// under a different rule table; evaluating it after a policy change would
@@ -616,11 +753,19 @@ func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features,
 	// evidence is dropped); current-request sync evidence is always current-rev.
 	credentialEvidence = policyRevisionFilter(credentialEvidence, t.pol.Revision)
 	laneEvidence = policyRevisionFilter(laneEvidence, t.pol.Revision)
+	// P0.7 fix: source evidence must also be filtered by policy revision.
+	sourceEvidence = policyRevisionFilter(sourceEvidence, t.pol.Revision)
 	// Current-request sync evidence (scope: lane) is included in evaluation
 	// EVERY time it was minted, independent of append/snapshot success, so a
 	// store outage or read-after-write lag can never drop the current signal
 	// (P0.3). Deduplicate so an append that DID land cannot double-count.
 	laneEvidence = dedupAppend(laneEvidence, syncEv)
+	// P0.8 fix: include current signals in evaluation even if append fails, so a
+	// spray/producer threshold crossed on THIS request restricts THIS request at
+	// the correct scope — not just a later snapshot.
+	sourceEvidence = dedupAppend(sourceEvidence, currentSourceEvidence)
+	laneEvidence = dedupAppend(laneEvidence, currentLaneEvidence)
+	credentialEvidence = dedupAppend(credentialEvidence, currentCredentialEvidence)
 
 	// 7. Compute credential risk + lane risk independently. When a snapshot is
 	// unavailable, the historical side is unknown — but the CURRENT synchronous
@@ -648,7 +793,9 @@ func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features,
 	tr.LaneSnapshotOK = laneSnapOK
 
 	// Collect all evidence codes for outcome explainability.
+	// P0.7 fix: include source evidence.
 	allEvidence := append(append([]evidence.Evidence{}, credentialEvidence...), laneEvidence...)
+	allEvidence = append(allEvidence, sourceEvidence...)
 	evidenceCodes := evCodes(allEvidence)
 
 	// 8. Security observation: apply the risk observation to the AUTHORITATIVE
@@ -710,14 +857,32 @@ func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features,
 				}
 			case credential.TransitionConflict:
 				// A concurrent writer advanced the revision. Bounded retry once:
-				// re-read authoritative and apply the reduction, then re-commit.
+				// re-read authoritative and re-commit the same risk observation.
 				rec, lerr := t.dep.Registry.LookupAuthoritative(ctxFor(now), cred.CredentialID)
 				if lerr != nil {
 					adaptiveForObservation = AdaptiveDegraded
 					after = cred.Status
 				} else {
-					after = rec.Status
-					updatedCred = credFrom(rec)
+					// P0.20: Re-commit once against the authoritative record.
+					// If this also conflicts, preserve the stricter state (the
+					// concurrent writer's) rather than discarding our observation.
+					retry, rerr := t.dep.Registry.ObserveAndCommit(ctxFor(now), cred.CredentialID, credentialRisk, hy, now)
+					switch {
+					case rerr == nil:
+						after = retry.Record.Status
+						updatedCred = credFrom(retry.Record)
+						if retry.Status == credential.TransitionCommitted {
+							adaptiveForObservation = AdaptiveAvailable
+						}
+					case errors.Is(rerr, credential.ErrStaleCAS):
+						// Lost the race again — preserve the concurrent writer's state.
+						after = rec.Status
+						updatedCred = credFrom(rec)
+					default:
+						adaptiveForObservation = AdaptiveDegraded
+						after = rec.Status
+						updatedCred = credFrom(rec)
+					}
 				}
 			case credential.TransitionUnavailable:
 				adaptiveForObservation = AdaptiveDegraded
@@ -741,11 +906,11 @@ func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features,
 	}
 
 	// QUARANTINED at any point → deny immediately (with the actual quarantine
-	// error, not RevokedError — P0.30 transport-mapping cleanup).
+	// error, not ErrRevoked — P0.30 transport-mapping cleanup).
 	if after == credential.StatusQuarantined {
 		out.Authorized = false
 		out.Reason = "credential_restricted"
-		out.DenialErr = credential.CredentialQuarantinedError
+		out.DenialErr = credential.ErrQuarantined
 		out.CredentialRisk = credentialRisk
 		out.LaneRisk = laneRisk
 		out.RiskAfter = effectiveRisk
@@ -846,11 +1011,35 @@ func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features,
 	if adaptiveForObservation == AdaptiveDegraded {
 		riskDenied = false
 	}
+
+	// BETA-06 / P0.7: Source risk evaluation. Source evidence is scored
+	// independently from credential/lane risk. sourceWouldBlock is the raw
+	// threshold crossing (sourceRisk >= SourceBlockThresh). Admission is only
+	// actually denied when SourceMode == SourceEnforce; under the default
+	// SourceObserve the crossing is recorded in telemetry but never blocks.
+	// This is narrow containment: enforcement targets only the attacking
+	// source, not the credential globally, and an operator opts into enforcing
+	// it only after validating the source heuristics (NAT/VPN/CDN egress are
+	// not abuse by themselves).
+	sourceRisk := risk.Evaluate(sourceEvidence, now)
+	sourceWouldBlock := false
+	if srcID != "" && t.pol.Risk.SourceBlockThresh > 0 && sourceRisk >= t.pol.Risk.SourceBlockThresh {
+		sourceWouldBlock = true
+	}
+	// Telemetry truthfully reports whether the source WOULD block under
+	// enforcement, regardless of the current mode.
+	tr.SourceRisk = sourceRisk
+	tr.SourceBlocked = sourceWouldBlock
+	tr.SourceSnapshotOK = sourceSnapOK
+
 	in := policy.EvalInput{
 		CredentialRevoked: polCred.Status == credential.StatusRevoked,
 		Emergency:         polCred.Status == credential.StatusQuarantined,
 		LaneOverLimit:     laneRec != nil && (laneRec.State == lane.StateBlocked || laneSec == lane.LaneBlocked),
 		RiskDenied:        riskDenied,
+		// P0.7: enforcement is gated on the explicit SourceMode. Shadow
+		// (default) records the would-block but never denies.
+		SourceBlocked: t.pol.Risk.SourceMode == policy.SourceEnforce && sourceWouldBlock,
 	}
 	if denial := t.pol.Evaluate(in); denial != nil {
 		out.Authorized = false
@@ -976,12 +1165,29 @@ func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features,
 		}
 	}
 
+	// P0.4A: issue the completion token when completion producers are wired so
+	// token/cost velocity is judged against the ACTUAL usage at end-of-stream,
+	// not the admission estimate. It captures the authoritative subjects so the
+	// proxy cannot influence the scope a completion signal lands on.
+	if len(t.dep.Producers) > 0 {
+		out.Completion = &CompletionToken{
+			subjects: producers.SubjectContext{
+				RequestID:    out.RequestID,
+				SourceID:     src.sourceID(),
+				LaneID:       laneID,
+				CredentialID: cred.CredentialID,
+				AccountID:    cred.AccountID,
+			},
+			term: t,
+		}
+	}
+
 	// 14. Periodic evidence pruning (optimization only).
 	// Pruning runs every admission to bound memory, not just successful
 	// authorizations — evidence activity (including denied requests) can
 	// contribute to pruning needs.
 	if t.pruneCounter.Add(1)%50 == 0 && t.dep.Evidence != nil {
-		t.pruneEvidence(now, credSubjects, laneSubjects)
+		t.pruneEvidence(now, credSubjects, laneSubjects, sourceSubjects...)
 	}
 
 	// Every gate passed.
@@ -1024,9 +1230,9 @@ func (t *Terminator) provisionMultiscope(cred *credential.Credential, laneID str
 	// ConcurrencyCap behaves exactly as before.
 	gauges := resource.BucketSpec{
 		ConcurrencyCap: cap,
-		RequestsBurst:  resource.BucketConfig{Capacity: float64(limits.RequestsPerWindow.Capacity), RefillPer: float64(limits.RequestsPerWindow.RefillPer), RefillIn: limits.RequestsPerWindow.RefillIn},
-		TokensBurst:    resource.BucketConfig{Capacity: float64(limits.TokensPerWindow.Capacity), RefillPer: float64(limits.TokensPerWindow.RefillPer), RefillIn: limits.TokensPerWindow.RefillIn},
-		CostBurst:      resource.BucketConfig{Capacity: float64(limits.CostPerWindow.Capacity), RefillPer: float64(limits.CostPerWindow.RefillPer), RefillIn: limits.CostPerWindow.RefillIn},
+		RequestsBurst:  resource.BucketConfig{Capacity: float64(limits.Requests.Capacity), RefillPer: float64(limits.Requests.RefillPer), RefillIn: limits.Requests.RefillIn},
+		TokensBurst:    resource.BucketConfig{Capacity: float64(limits.Tokens.Capacity), RefillPer: float64(limits.Tokens.RefillPer), RefillIn: limits.Tokens.RefillIn},
+		CostBurst:      resource.BucketConfig{Capacity: float64(limits.Cost.Capacity), RefillPer: float64(limits.Cost.RefillPer), RefillIn: limits.Cost.RefillIn},
 	}
 	// Precedence order is the policy enum (P0.33): SOURCE → ACCOUNT →
 	// CREDENTIAL → LANE, GLOBAL last as the whole-plane gauge (P0.34). The
@@ -1044,10 +1250,11 @@ func (t *Terminator) provisionMultiscope(cred *credential.Credential, laneID str
 	if laneID != "" {
 		specs = append(specs, resource.ScopeSpec{Scope: resource.ScopeLane, ID: laneID, Buckets: gauges})
 	}
-	// GLOBAL scope (P0.34): the whole-plane gauge, keyed "fleet". Without it
-	// the governor's ScopeGlobal was implemented but never provisioned, so no
-	// fleet-wide bound existed. A fleet cap of 0 (unset) skips the gauge.
-	if fleetCap := t.pol.Limits.Normal.ConcurrencyCap * 1024; fleetCap > 0 {
+	// GLOBAL scope (P0.34, P0.19): the whole-plane gauge, keyed "fleet". The
+	// cap comes from Policy.Global — the explicit replacement for the old magic
+	// Normal.ConcurrencyCap*1024 derivation. A fleet cap of 0 (unset) skips the
+	// gauge.
+	if fleetCap := t.pol.Global.ConcurrencyCap; fleetCap > 0 {
 		specs = append(specs, resource.ScopeSpec{Scope: resource.ScopeGlobal, ID: "fleet", Buckets: resource.BucketSpec{ConcurrencyCap: fleetCap}})
 	}
 
@@ -1132,14 +1339,19 @@ func resourceScopeErr(s resource.Scope) error {
 
 // pruneEvidence prunes expired evidence for the relevant subjects. It is a
 // no-op on failure — pruning is optimization-only.
-func (t *Terminator) pruneEvidence(now time.Time, credSubjects, laneSubjects []evidence.SubjectKey) {
+// P0.7 fix: accepts source subjects too.
+func (t *Terminator) pruneEvidence(now time.Time, credSubjects, laneSubjects []evidence.SubjectKey, sourceSubjects ...evidence.SubjectKey) {
 	if t.dep.Evidence == nil {
 		return
 	}
-	// Combine subjects for pruning.
-	allSubjects := make([]evidence.SubjectKey, 0, len(credSubjects)+len(laneSubjects))
+	allSubjects := make([]evidence.SubjectKey, 0, len(credSubjects)+len(laneSubjects)+len(sourceSubjects))
 	allSubjects = append(allSubjects, credSubjects...)
 	allSubjects = append(allSubjects, laneSubjects...)
+	for _, s := range sourceSubjects {
+		if s.ID != "" {
+			allSubjects = append(allSubjects, s)
+		}
+	}
 	t.dep.Evidence.Prune(allSubjects, now)
 }
 
@@ -1162,6 +1374,137 @@ func (t *Terminator) finalizeBaseline(b *BaselineToken) {
 		b.CredentialID, b.LaneID, b.LaneRisk, promCrit, now,
 	)
 }
+
+// scopedSignals is the result of resolving one batch of signal CODES into
+// minted, scoped evidence: a flattened persist set plus per-scope current
+// request sets, so a signal crossed ON THIS REQUEST can restrict the same
+// request at the correct scope (P0.8) without waiting for a later snapshot.
+type scopedSignals struct {
+	persisted  []evidence.Evidence
+	source     []evidence.Evidence
+	lane       []evidence.Evidence
+	credential []evidence.Evidence
+}
+
+// resolveSignals is the ONE signal-to-evidence path (P0.8). Spray and producer
+// signals both reduce to a code; each code's scope and parameters come from the
+// CURRENT compiled policy (P0.12) and the subject is resolved from the request
+// context — the caller of a signal never decides the eventual evidence subject.
+// A code with no rule in this revision, or whose scope's subject is unavailable
+// (e.g. no source configured), resolves to nothing (fail-closed).
+func (t *Terminator) resolveSignals(codes []string, subjects producers.SubjectContext, now time.Time) scopedSignals {
+	var out scopedSignals
+	for _, code := range codes {
+		rule, ok := t.pol.EvidenceRules[code]
+		if !ok {
+			continue
+		}
+		subjectID, ok := producers.ResolveSubject(rule.Scope, subjects)
+		if !ok {
+			continue
+		}
+		ev, err := evidence.Mint(t.pol.EvidenceRules, code, subjectID, now, t.pol.Revision)
+		if err != nil {
+			continue
+		}
+		out.persisted = append(out.persisted, ev)
+		switch rule.Scope {
+		case evidence.ScopeSource:
+			out.source = append(out.source, ev)
+		case evidence.ScopeLane:
+			out.lane = append(out.lane, ev)
+		case evidence.ScopeCredential:
+			out.credential = append(out.credential, ev)
+		}
+	}
+	return out
+}
+
+// producerCodes flattens producer signals to their evidence codes.
+func producerCodes(sigs []producers.Signal) []string {
+	out := make([]string, 0, len(sigs))
+	for _, s := range sigs {
+		out = append(out, s.Code)
+	}
+	return out
+}
+
+// sprayCodes flattens spray-detector signals to their evidence codes.
+func sprayCodes(sigs []anomaly.Signal) []string {
+	out := make([]string, 0, len(sigs))
+	for _, s := range sigs {
+		out = append(out, s.Code)
+	}
+	return out
+}
+
+// observeCompletion drives the completion-time producers (P0.4A) with the
+// ACTUAL usage of a finished request and persists any scoped evidence they emit.
+// Completion signals affect SUBSEQUENT admissions — never the request that just
+// finished. Persistence is best-effort: an evidence store outage or a
+// non-compiled rule simply skips that signal; the finished request is not
+// re-evaluated (it already ran).
+func (t *Terminator) observeCompletion(subjects producers.SubjectContext, actual resource.UsageEstimate, success bool) CompletionResult {
+	if len(t.dep.Producers) == 0 {
+		return CompletionResult{}
+	}
+	behavior := producers.CompletionBehavior{
+		Subjects: subjects,
+		Actual: producers.UsageEstimate{
+			// resource.UsageEstimate is the settled governor amount; the producer
+			// surface exposes the token/cost dims as int64.
+			Combined: actual.CombinedTokens,
+			Cost:     actual.CostMicrounits,
+		},
+		Success: success,
+	}
+	var codes []string
+	persisted := false
+	var minted []evidence.Evidence
+	if t.dep.Evidence != nil {
+		minted = make([]evidence.Evidence, 0, 4)
+	}
+	for _, prod := range t.dep.Producers {
+		sigs := prod.ObserveCompletion(behavior)
+		for _, sig := range sigs {
+			rule, ok := t.pol.EvidenceRules[sig.Code]
+			if !ok {
+				continue // not compiled into the active policy — ignore
+			}
+			subjectID, ok := producers.ResolveSubject(rule.Scope, subjects)
+			if !ok {
+				continue // scope's subject unavailable (e.g. no source) — skip
+			}
+			ev, err := evidence.Mint(t.pol.EvidenceRules, sig.Code, subjectID, t.dep.RiskNow(), t.pol.Revision)
+			if err != nil {
+				continue
+			}
+			codes = append(codes, sig.Code)
+			if minted != nil {
+				minted = append(minted, ev)
+			}
+		}
+	}
+	if len(minted) > 0 {
+		if err := t.dep.Evidence.Append(minted...); err == nil {
+			persisted = true
+		}
+	}
+	result := CompletionResult{EvidenceCodes: codes, Persisted: persisted}
+	if codes != nil && t.dep.Evidence != nil && !persisted {
+		// Signals were produced but the durable append failed — surface it so the
+		// caller can observe the liveness/monitoring concern, without treating it
+		// as a control-plane error for an already-finished request.
+		result.Err = evidenceAppendError{}
+	}
+	return result
+}
+
+// evidenceAppendError is a sentinel wrapper for a completion whose signals could
+// not be persisted. It is observational, not a re-evaluation error.
+type evidenceAppendError struct{}
+
+func (evidenceAppendError) Error() string { return "terminator: completion evidence append failed" }
 
 // hasActiveDisqualifyingEvidence reports whether any currently-active evidence
 // against the lane or its credential carries a code on the policy's
@@ -1247,7 +1590,7 @@ var (
 // P0.28: when the registry implements the typed VerifierLookup seam, an
 // outage/timeout/corruption is DISTINCT from an unknown credential. An
 // unavailable registry is a degraded-admission signal: unknown credentials
-// fail closed as before (UnknownError), but the error is typed
+// fail closed as before (ErrUnknown), but the error is typed
 // LookupUnavailableError so callers/policy can distinguish spray traffic from
 // a backend outage instead of treating every miss as "no such credential".
 func (t *Terminator) authenticate(presented *secret.SealedSecret) (*credential.Credential, error) {
@@ -1284,7 +1627,7 @@ func (t *Terminator) authenticate(presented *secret.SealedSecret) (*credential.C
 			return nil, err
 		}
 	}
-	return nil, credential.UnknownError
+	return nil, credential.ErrUnknown
 }
 
 // lookupVerifier resolves a derived verifier through the typed seam (P0.28)
@@ -1317,20 +1660,33 @@ func (t *Terminator) classifyLane(credID string, feat lane.Features) (string, *l
 	if t.dep.Lanes == nil {
 		return "lane_" + credID, nil, false, nil
 	}
-	laneID := "lane_" + credID + "_" + shortTag(feat)
-	// P0.11: classify against the COMPILED policy revision's cutoffs, not the
-	// package-global lane.DefaultThresholds(), so anti-laundering sensitivity
-	// (MinComparableWeight etc.) is policy-tunable and versioned.
-	rec, created, err := t.dep.Lanes.BorrowOrCreate(credID, laneID, feat, t.pol.Classification)
+	// P0.21: the lane ID hashes the feature schema AND the classification
+	// universe revision, not just the feature vector. Re-keying classification
+	// semantics therefore creates a NEW lane universe (new IDs) instead of
+	// silently reusing lanes matched under different thresholds.
+	laneID := "lane_" + credID + "_" + laneTag(lane.FeatSchemaVersion, t.pol.ClassificationRevision, feat)
+	// P0.11: classify against the COMPILED policy revision's cutoffs AND its
+	// classification universe, not the package-global
+	// lane.DefaultThresholds(), so anti-laundering sensitivity
+	// (MinComparableWeight etc.) and re-keying are policy-tunable and versioned.
+	rec, created, err := t.dep.Lanes.BorrowOrCreate(credID, laneID, feat, lane.ClassificationContext{
+		Revision:   t.pol.ClassificationRevision,
+		Thresholds: t.pol.Classification,
+	})
 	if err != nil {
 		return laneID, nil, false, err
 	}
 	return rec.LaneID, rec, created, nil
 }
 
-// shortTag derives a stable tag for lane IDs from the full feature vector.
-func shortTag(f lane.Features) string {
+// laneTag derives a deterministic tag for lane IDs from the feature schema
+// revision, the classification-universe revision (P0.21), and the full feature
+// vector. Including the two revisions means a schema or classification change
+// re-keys the lane universe; requesting the same vector under a new universe
+// legitimately produces a new lane rather than reusing a mismatchable record.
+func laneTag(featureSchema, classificationRevision int, f lane.Features) string {
 	var b strings.Builder
+	fmt.Fprintf(&b, "schema=%d;classrev=%d;", featureSchema, classificationRevision)
 	for _, part := range []string{
 		f.NetworkASN, f.NetworkType, f.RegionClass, f.ClientFamily,
 		f.SDKFamily, f.HTTPVersion, f.Streaming, f.ModelFamily,
@@ -1343,18 +1699,16 @@ func shortTag(f lane.Features) string {
 	return base64.RawURLEncoding.EncodeToString(sum[:10])
 }
 
-// evaluatePolicy applies the fixed-precedence enforcement resolver (§58).
-// Deprecated: the new Admit pipeline evaluates policy inline with full state.
-// Kept for callers that still use the old flow.
-func (t *Terminator) evaluatePolicy(laneRec *lane.LaneRecord, cred *credential.Credential, riskScore int) error {
-	in := policy.EvalInput{
-		CredentialRevoked: cred.Status == credential.StatusRevoked,
-		Emergency:         cred.Status == credential.StatusQuarantined,
-		LaneOverLimit:     laneRec != nil && laneRec.State == lane.StateBlocked,
-		RiskDenied:        riskScore >= t.pol.Risk.Quarantine,
-	}
-	return t.pol.Evaluate(in)
+// shortTag derives a stable tag for lane IDs from the full feature vector
+// alone (legacy compatibility: some callers / tests still key lane IDs on the
+// vector without a classification universe). Prefer laneTag.
+func shortTag(f lane.Features) string {
+	return laneTag(lane.FeatSchemaVersion, currentClassificationRevisionLegacy, f)
 }
+
+// currentClassificationRevisionLegacy keeps legacy shortTag callers aligned
+// with the default lane universe so pre-P0.21 lane IDs remain stable.
+const currentClassificationRevisionLegacy = 1
 
 // denialReason maps a policy denial to a safe external reason string (§70).
 func denialReason(err error) string {
@@ -1383,26 +1737,19 @@ func safeReason(err error) string {
 		return ""
 	}
 	switch {
-	case errors.Is(err, credential.RevokedError):
+	case errors.Is(err, credential.ErrRevoked):
 		return "credential_revoked"
-	case errors.Is(err, credential.CredentialQuarantinedError):
+	case errors.Is(err, credential.ErrQuarantined):
 		return "credential_restricted"
-	case errors.Is(err, credential.CredentialExpiredError):
+	case errors.Is(err, credential.ErrExpired):
 		return "credential_expired"
-	case errors.Is(err, credential.UnknownError):
+	case errors.Is(err, credential.ErrUnknown):
 		return "invalid_credential"
 	case isExtractionError(err):
 		return "invalid_authentication"
 	default:
 		return "denied"
 	}
-}
-
-func laneStateName(rec *lane.LaneRecord) string {
-	if rec == nil {
-		return "NEW"
-	}
-	return rec.State.String()
 }
 
 // issueAssertion mints and signs the internal identity for the context.
@@ -1458,4 +1805,13 @@ func evCodes(items []evidence.Evidence) []string {
 		out = append(out, e.Code)
 	}
 	return out
+}
+
+// currentConcurrency returns the live lane concurrency for producer behavior
+// (P0.4B). Returns 0 when no resource governor is configured.
+func (t *Terminator) currentConcurrency(laneID string) int {
+	if t.dep.Resource == nil || laneID == "" {
+		return 0
+	}
+	return t.dep.Resource.InUseFor(resource.ScopeLane, laneID) + 1
 }

@@ -265,3 +265,196 @@ func TestReservationSettleCancelIdempotent(t *testing.T) {
 		t.Fatalf("available = %v, want 6", avail)
 	}
 }
+
+// TestSettleChargesOverageAsDebt (BETA-05) verifies that when actual usage
+// exceeds the reserved amount, the overage is charged against the bucket as
+// debt — the bucket's balance may exceed its capacity. Available() returns 0
+// while in debt. Future refills reduce the debt over time.
+func TestSettleChargesOverageAsDebt(t *testing.T) {
+	// No refill so we can observe debt directly.
+	b := NewTokenBucket(10, 0, 0, nil)
+
+	// Reserve 5, settle at 15 → 5 consumed + 10 debt → balance = 15 > capacity 10.
+	r := b.Reserve(5)
+	if r == nil {
+		t.Fatal("reserve failed")
+	}
+	r.Settle(15)
+
+	// Balance should be 5 (reserved) + 10 (overage) = 15.
+	if bal := b.Balance(); bal != 15 {
+		t.Fatalf("balance after overage settle = %v, want 15", bal)
+	}
+	// Available should be 0 (in debt: balance > capacity).
+	if avail := b.Available(); avail != 0 {
+		t.Fatalf("available while in debt = %v, want 0", avail)
+	}
+	// A new reservation should fail because the bucket is in debt.
+	if r2 := b.Reserve(3); r2 != nil {
+		t.Fatal("reservation must fail while bucket is in debt")
+	}
+}
+
+// TestSettleActualBelowEstimateRefunds (BETA-05) verifies the normal case:
+// actual < estimate → refund delta.
+func TestSettleActualBelowEstimateRefunds(t *testing.T) {
+	b := NewTokenBucket(10, 0, 0, nil)
+	r := b.Reserve(8)
+	if r == nil {
+		t.Fatal("reserve failed")
+	}
+	r.Settle(3)
+	// Reserved 8, actual 3 → 5 refunded → balance = 3.
+	if bal := b.Balance(); bal != 3 {
+		t.Fatalf("balance = %v, want 3", bal)
+	}
+	if avail := b.Available(); avail != 7 {
+		t.Fatalf("available = %v, want 7", avail)
+	}
+}
+
+// TestSettleActualEqualsEstimate (BETA-05) verifies exact match: no refund,
+// no debt.
+func TestSettleActualEqualsEstimate(t *testing.T) {
+	b := NewTokenBucket(10, 0, 0, nil)
+	r := b.Reserve(6)
+	if r == nil {
+		t.Fatal("reserve failed")
+	}
+	r.Settle(6)
+	if bal := b.Balance(); bal != 6 {
+		t.Fatalf("balance = %v, want 6", bal)
+	}
+	if avail := b.Available(); avail != 4 {
+		t.Fatalf("available = %v, want 4", avail)
+	}
+}
+
+// TestSettleMassiveOverage (BETA-05) verifies that overage much larger than
+// capacity creates proportional debt, not capped at capacity.
+func TestSettleMassiveOverage(t *testing.T) {
+	b := NewTokenBucket(100, 0, 0, nil)
+	r := b.Reserve(10)
+	if r == nil {
+		t.Fatal("reserve failed")
+	}
+	r.Settle(1000)
+	// Reserved 10, actual 1000 → balance = 10 + 990 = 1000.
+	if bal := b.Balance(); bal != 1000 {
+		t.Fatalf("balance after massive overage = %v, want 1000", bal)
+	}
+	if avail := b.Available(); avail != 0 {
+		t.Fatalf("available = %v, want 0", avail)
+	}
+}
+
+// TestEstimateZeroActualPositive (P0.12) verifies the estimate=0 / actual>0
+// edge case. A zero estimate creates a zero-amount reservation so that
+// Settle(actual) can create debt. This is essential because provider estimators
+// often cannot predict output tokens/cost before execution.
+func TestEstimateZeroActualPositive(t *testing.T) {
+	b := NewTokenBucket(10, 0, 0, nil)
+	// P0.12: Reserve(0) now returns a non-nil zero-amount reservation.
+	r := b.Reserve(0)
+	if r == nil {
+		t.Fatal("Reserve(0) should return a non-nil zero-amount reservation")
+	}
+	// Settle(5) should charge 5 units of debt (0 reserved + 5 overage).
+	r.Settle(5)
+	// Balance should reflect the debt.
+	if bal := b.Balance(); bal != 5 {
+		t.Fatalf("balance = %v, want 5 (debt from zero estimate)", bal)
+	}
+	// Available: capacity 10 - balance 5 = 5 (not in debt yet, just reduced)
+	if avail := b.Available(); avail != 5 {
+		t.Fatalf("available = %v, want 5", avail)
+	}
+}
+
+// TestReserveZeroDebtBypass (P0.12 fix) verifies that Reserve(0) is denied
+// when the bucket is already exhausted/debted.
+func TestReserveZeroDebtBypass(t *testing.T) {
+	// capacity 10, balance 5 (available = 5)
+	b := NewTokenBucket(10, 0, 0, nil)
+	b.Take(5)
+	if r := b.Reserve(0); r == nil {
+		t.Fatal("Reserve(0) should succeed when bucket has positive allowance")
+	}
+	// capacity 10, balance 10 (available = 0)
+	b2 := NewTokenBucket(10, 0, 0, nil)
+	b2.Take(10)
+	if r := b2.Reserve(0); r != nil {
+		t.Fatal("Reserve(0) should be denied when bucket is exhausted")
+	}
+	// capacity 10, balance 15 (in debt, available = -5)
+	b3 := NewTokenBucket(10, 0, 0, nil)
+	b3.Take(15)
+	if r := b3.Reserve(0); r != nil {
+		t.Fatal("Reserve(0) should be denied when bucket is in debt")
+	}
+}
+
+// TestDebtRecoveryThroughRefill (BETA-05) verifies that a bucket in debt
+// recovers as refills reduce the balance over time.
+func TestDebtRecoveryThroughRefill(t *testing.T) {
+	base := time.Now()
+	now := base
+	b := NewTokenBucket(100, 100, time.Hour, func() time.Time { return now })
+
+	r := b.Reserve(50)
+	r.Settle(200) // 50 consumed + 150 debt → balance = 200
+	if bal := b.Balance(); bal != 200 {
+		t.Fatalf("balance after overage = %v, want 200", bal)
+	}
+
+	// Advance time: 0.5 hours → 50 tokens refilled → balance = 150.
+	now = base.Add(30 * time.Minute)
+	if bal := b.Balance(); bal != 150 {
+		t.Fatalf("balance after 0.5h refill = %v, want 150", bal)
+	}
+	// Still in debt (balance 150 > capacity 100).
+	if avail := b.Available(); avail != 0 {
+		t.Fatalf("available = %v, want 0", avail)
+	}
+
+	// Advance another 0.5 hours (total 1h) → 50 more tokens → balance = 100.
+	now = base.Add(time.Hour)
+	if bal := b.Balance(); bal != 100 {
+		t.Fatalf("balance after 1h total = %v, want 100", bal)
+	}
+	// Exactly at capacity (not in debt).
+	if avail := b.Available(); avail != 0 {
+		t.Fatalf("available = %v, want 0", avail)
+	}
+
+	// Advance another 0.5 hours (total 1.5h) → 50 more → balance = 50.
+	now = base.Add(90 * time.Minute)
+	if bal := b.Balance(); bal != 50 {
+		t.Fatalf("balance after 1.5h total = %v, want 50", bal)
+	}
+	// Out of debt.
+	if avail := b.Available(); avail != 50 {
+		t.Fatalf("available = %v, want 50", avail)
+	}
+}
+
+// TestConcurrentSettleAndRelease (BETA-05) verifies that concurrent Settle
+// and Cancel calls are race-free.
+func TestConcurrentSettleAndRelease(t *testing.T) {
+	for iter := 0; iter < 100; iter++ {
+		b := NewTokenBucket(1000, 0, 0, nil)
+		var wg sync.WaitGroup
+		for i := 0; i < 50; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				r := b.Reserve(10)
+				if r == nil {
+					return
+				}
+				r.Settle(15) // overage
+			}()
+		}
+		wg.Wait()
+	}
+}

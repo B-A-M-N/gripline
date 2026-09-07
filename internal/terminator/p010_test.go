@@ -447,7 +447,7 @@ func TestLaneRevisionBumpedOnMutations(t *testing.T) {
 
 	// Create lane → revision=1.
 	laneID := "lane_test"
-	rec, created, err := store.BorrowOrCreate("cred_rev", laneID, laneFeatures("AS1"), lane.DefaultThresholds())
+	rec, created, err := store.BorrowOrCreate("cred_rev", laneID, laneFeatures("AS1"), lane.ClassificationContext{Thresholds: lane.DefaultThresholds()})
 	if err != nil || !created {
 		t.Fatalf("create: err=%v created=%v", err, created)
 	}
@@ -456,7 +456,7 @@ func TestLaneRevisionBumpedOnMutations(t *testing.T) {
 	}
 
 	// Borrow (re-request) → revision bumps.
-	rec, _, err = store.BorrowOrCreate("cred_rev", laneID, laneFeatures("AS1"), lane.DefaultThresholds())
+	rec, _, err = store.BorrowOrCreate("cred_rev", laneID, laneFeatures("AS1"), lane.ClassificationContext{Thresholds: lane.DefaultThresholds()})
 	if err != nil {
 		t.Fatalf("borrow: %v", err)
 	}
@@ -800,10 +800,10 @@ func TestCompiledPolicyClassificationDrivesLaneMatch(t *testing.T) {
 		th := policy.Default().Classification // the compiled policy's cutoffs
 		if _, created, err := store.BorrowOrCreate("cred_1", "lane_rich",
 			lane.Features{NetworkASN: "AS77", NetworkType: "residential", RegionClass: "us",
-				ClientFamily: "claude-code", SDKFamily: "go"}, th); err != nil || !created {
+				ClientFamily: "claude-code", SDKFamily: "go"}, lane.ClassificationContext{Thresholds: th}); err != nil || !created {
 			t.Fatalf("seed rich: created=%v err=%v", created, err)
 		}
-		if _, created, err := store.BorrowOrCreate("cred_1", "lane_sparse", sparse, th); err != nil {
+		if _, created, err := store.BorrowOrCreate("cred_1", "lane_sparse", sparse, lane.ClassificationContext{Thresholds: th}); err != nil {
 			t.Fatal(err)
 		} else if !created {
 			t.Fatal("P0.11: compiled policy floor 0.70 MUST reject sparse match (created=false means it borrowed)")
@@ -825,10 +825,10 @@ func TestCompiledPolicyClassificationDrivesLaneMatch(t *testing.T) {
 		th.MinComparableWeight = 0.35 // still demands meaningful source mass, but below this candidate's 0.375
 		if _, created, err := store.BorrowOrCreate("cred_1", "lane_rich",
 			lane.Features{NetworkASN: "AS77", NetworkType: "residential", RegionClass: "us",
-				ClientFamily: "claude-code", SDKFamily: "go"}, th); err != nil || !created {
+				ClientFamily: "claude-code", SDKFamily: "go"}, lane.ClassificationContext{Thresholds: th}); err != nil || !created {
 			t.Fatalf("seed rich: created=%v err=%v", created, err)
 		}
-		rec, created, err := store.BorrowOrCreate("cred_1", "lane_sparse", sparse, th)
+		rec, created, err := store.BorrowOrCreate("cred_1", "lane_sparse", sparse, lane.ClassificationContext{Thresholds: th})
 		if err != nil {
 			t.Fatal(err)
 		}

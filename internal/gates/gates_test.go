@@ -584,7 +584,7 @@ func TestGateH_AutomaticQuarantineDisabledUntilValidation(t *testing.T) {
 			out := term.Admit(map[string][]string{"Authorization": {"Bearer " + raw}}, feat)
 
 			// Read the authoritative persisted status after admission.
-			rec, err := reg.LookupAuthoritative(nil, "cred_h")
+			rec, err := reg.LookupAuthoritative(context.TODO(), "cred_h")
 			if err != nil {
 				t.Fatalf("gate H %s: read persisted credential: %v", name, err)
 			}

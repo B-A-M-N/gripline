@@ -130,3 +130,37 @@ func TestParseOperatorSpec(t *testing.T) {
 		t.Fatal("spec without colon must fail")
 	}
 }
+
+// TestAdminBindValidation (P0.7) enforces the "private interface only" contract
+// for the admin control plane: loopback and private/unique-local addresses pass;
+// wildcard/unspecified and public addresses are rejected unless allow_public.
+func TestAdminBindValidation(t *testing.T) {
+	adminBody := func(listen string, allowPublic bool) string {
+		ap := ""
+		if allowPublic {
+			ap = `,"allow_public":true`
+		}
+		return `{"listen":":8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"https://b","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"},"admin":{"listen":"` + listen + `","operator_tokens":{"t":"op:posture.control"}` + ap + `},"paths":{"audit_log":"a.jsonl"}}`
+	}
+
+	// Valid: loopback, RFC1918 private, IPv6 loopback.
+	for _, l := range []string{"127.0.0.1:9090", "10.0.0.5:9090", "192.168.1.2:9090", "[::1]:9090", "172.16.0.1:9090", "169.254.1.1:9090"} {
+		if _, err := Load(writeCfg(t, adminBody(l, false))); err != nil {
+			t.Errorf("admin listen %q must be valid, got %v", l, err)
+		}
+	}
+	// Invalid without override: wildcard (empty host), 0.0.0.0, [::], public.
+	for _, l := range []string{":9090", "0.0.0.0:9090", "[::]:9090", "8.8.8.8:9090", "52.0.0.1:9090"} {
+		if _, err := Load(writeCfg(t, adminBody(l, false))); err == nil {
+			t.Errorf("admin listen %q must be rejected without allow_public", l)
+		}
+	}
+	// A hostname (non-numeric) is rejected (we require numeric loopback/private).
+	if _, err := Load(writeCfg(t, adminBody("admin.internal:9090", false))); err == nil {
+		t.Error("admin listen hostname must be rejected (numeric loopback/private required)")
+	}
+	// allow_public opts out of the check.
+	if _, err := Load(writeCfg(t, adminBody("8.8.8.8:9090", true))); err != nil {
+		t.Errorf("allow_public=true must accept a public bind, got %v", err)
+	}
+}

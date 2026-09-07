@@ -19,11 +19,6 @@ import (
 	"github.com/B-A-M-N/gripline/internal/terminator"
 )
 
-// canary is a recognizable non-secret marker embedded in test material; a leak
-// is any formatted output that contains a canary value or any byte of raw
-// key/secret material.
-var canaries = []string{"canary", "topsecret", "pepperbytes", "pseudokey"}
-
 func checkRedacted(t *testing.T, name string, v any) {
 	t.Helper()
 	for _, verb := range []string{"%v", "%+v", "%#v", "%s"} {

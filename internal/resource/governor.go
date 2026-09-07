@@ -299,13 +299,15 @@ func (g *Governor) ProvisionUsage(scopes []ScopeSpec, est UsageEstimate) (*Multi
 	// its own unused amount).
 	for _, dim := range []Dimension{DimRequests, DimInputTokens, DimOutputTokens, DimCombinedTokens, DimCost} {
 		amount := est.amountFor(dim)
-		if amount <= 0 {
-			continue
-		}
 		for _, sp := range scopes {
 			cfg := sp.Buckets.specFor(dim)
 			if cfg.Capacity <= 0 {
 				continue // gauge not enforced at this scope
+			}
+			// P0.12 fix: Create a reservation even for zero-amount estimates
+			// so Settle(actual) can create debt from zero.
+			if amount < 0 {
+				continue
 			}
 			key := scopeKey(sp.Scope, sp.ID)
 			b := g.bucket(dim, key, cfg)
@@ -358,18 +360,21 @@ func (a *singleAcquired) release() {
 // Release returns all concurrency to their pools (idempotent across copies).
 type MultiReservation struct {
 	now      func() time.Time
+	mu       sync.Mutex
 	acquired []*singleAcquired
 	settled  bool
+	released bool
 }
 
-// Settle commits every dimension reservation against the ACTUAL usage (P0.3/
-// P0.36): each hold refunds only its own reserved−actual remainder, to its own
-// bucket. An actual above the estimate consumes the full hold (overage is
-// charged against future capacity through the buckets' refill, never negative
-// refunded). Concurrency leases are NOT released here — they stay held for the
-// request's lifetime and are returned by Release. Idempotent.
+// Settle commits every dimension reservation against the ACTUAL usage.
+// P0.13 fix: synchronized with mutex for concurrent safety.
 func (r *MultiReservation) Settle(actual UsageEstimate) {
 	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.settled {
 		return
 	}
 	for _, a := range r.acquired {
@@ -381,25 +386,28 @@ func (r *MultiReservation) Settle(actual UsageEstimate) {
 	r.settled = true
 }
 
-// Settled reports whether Settle has run (diagnostics; the proxy uses it to
-// guarantee settle-then-release ordering).
+// Settled reports whether Settle has run.
 func (r *MultiReservation) Settled() bool {
 	if r == nil {
 		return false
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return r.settled
 }
 
-// Release returns all held concurrency to their pools (idempotent). Any
-// not-yet-settled token reservation is CANCELLED so an abandoned admission
-// refunds its full token hold (never mints allowance — each cancel is its own
-// amount and can only release what was reserved). Settle-then-Release is the
-// normal completion order: settled dimensions are already done, so Release
-// only returns concurrency.
+// Release returns all held concurrency to their pools (idempotent).
+// P0.13 fix: synchronized with mutex for concurrent safety.
 func (r *MultiReservation) Release() {
 	if r == nil {
 		return
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.released {
+		return
+	}
+	r.released = true
 	for _, a := range r.acquired {
 		a.release()
 	}
@@ -429,6 +437,18 @@ func (g *Governor) InUseAll() int {
 		total += p.InUse()
 	}
 	return total
+}
+
+// InUseFor reports the current concurrency held for a specific scope+id
+// (P0.4B: live concurrency value for the ResourceVelocityProducer).
+// Returns 0 when the scope has no pool yet (no admissions against it).
+func (g *Governor) InUseFor(scope Scope, id string) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if p, ok := g.pools[scopeKey(scope, id)]; ok {
+		return p.InUse()
+	}
+	return 0
 }
 
 // AvailableFor reports a gauge's current availability for one scope+dimension

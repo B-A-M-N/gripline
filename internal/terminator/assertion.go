@@ -36,6 +36,12 @@ type Signer struct {
 	Version int
 }
 
+// Private returns a COPY of the private key for serialization (BETA-10).
+// The caller cannot mutate the live signer through the returned slice.
+func (s *Signer) Private() ed25519.PrivateKey {
+	return append(ed25519.PrivateKey(nil), s.priv...)
+}
+
 // NewSigner creates a signer from an Ed25519 private key. Use GenerateSigner
 // for a fresh key. The key size is validated (ed25519.PrivateKeySize) so a
 // truncated or mis-typed key fails loudly at construction instead of at

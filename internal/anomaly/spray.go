@@ -64,12 +64,13 @@ func DefaultThresholds() Thresholds {
 }
 
 // Signal is one detected spray signature, awaiting policy resolution. The
-// detector owns detection only; the admission engine resolves Signal.Code
-// against the CURRENT compiled policy's evidence table (P0.12) — scoring,
-// scope, TTL, and minting revision all come from that one authority.
+// detector owns detection only; it does NOT decide the eventual evidence
+// subject (P0.8). The admission engine resolves Signal.Code against the CURRENT
+// compiled policy's evidence table (P0.12) — scoring, scope, TTL, and minting
+// revision all come from that one authority, and the subject is derived from
+// the rule's scope against the request context.
 type Signal struct {
-	Code      string // evidence rule code (e.g. SOURCE_ATTEMPTING_MANY_UNRELATED_CREDENTIALS)
-	SubjectID string // the credential (ASN spray) or source (credential/invalid spray)
+	Code string // evidence rule code (e.g. SOURCE_ATTEMPTING_MANY_UNRELATED_CREDENTIALS)
 }
 
 // winSet is one subject's sliding window of distinct keys.
@@ -198,10 +199,10 @@ func (d *Detector) Observe(source, credentialID, asn string, now time.Time) []Si
 
 	var out []Signal
 	if asn != "" && d.observe(d.credAsn, credentialID, asn, "MORE_THAN_3_UNRELATED_ASNS_IN_10_MIN", d.th.MaxASNsPerCredentialInWindow, now) {
-		out = append(out, Signal{Code: "MORE_THAN_3_UNRELATED_ASNS_IN_10_MIN", SubjectID: credentialID})
+		out = append(out, Signal{Code: "MORE_THAN_3_UNRELATED_ASNS_IN_10_MIN"})
 	}
 	if source != "" && d.observe(d.srcCred, source, credentialID, "SOURCE_ATTEMPTING_MANY_UNRELATED_CREDENTIALS", d.th.MaxCredentialsPerSourceWindow, now) {
-		out = append(out, Signal{Code: "SOURCE_ATTEMPTING_MANY_UNRELATED_CREDENTIALS", SubjectID: source})
+		out = append(out, Signal{Code: "SOURCE_ATTEMPTING_MANY_UNRELATED_CREDENTIALS"})
 	}
 	return out
 }
@@ -222,7 +223,7 @@ func (d *Detector) ObserveInvalidCredential(source, candidate string, now time.T
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.observe(d.srcInvalid, source, candidate, "SOURCE_ATTEMPTING_MANY_INVALID_CREDENTIALS", d.th.MaxInvalidPerSourceWindow, now) {
-		return []Signal{{Code: "SOURCE_ATTEMPTING_MANY_INVALID_CREDENTIALS", SubjectID: source}}
+		return []Signal{{Code: "SOURCE_ATTEMPTING_MANY_INVALID_CREDENTIALS"}}
 	}
 	return nil
 }

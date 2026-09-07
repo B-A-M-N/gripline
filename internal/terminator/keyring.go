@@ -1,16 +1,157 @@
 package terminator
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 )
+
+// keyringPersist is the on-disk representation of a Keyring (BETA-10).
+// It carries the active private key AND all retained public keys so a
+// restart recovers signing authority without key rotation.
+type keyringPersist struct {
+	ActiveKid int               `json:"active_kid"` // P0.14: persist kid for rotation correctness
+	Active    string            `json:"active"`     // base64-encoded private key
+	Verifiers map[int]string    `json:"verifiers"`  // kid -> base64-encoded public key
+	Next      int               `json:"next"`
+}
+
+// Save writes the keyring's active private key and all retained public keys
+// to path with restricted permissions (0600). This is the persistence seam
+// for BETA-10: a restart can recover its signing authority without a
+// rotation event.
+func (k *Keyring) Save(path string) error {
+	if path == "" {
+		return nil
+	}
+	k.st.mu.Lock()
+	defer k.st.mu.Unlock()
+
+	persist := keyringPersist{
+		ActiveKid: k.st.active.Kid(),
+		Active:    base64.StdEncoding.EncodeToString([]byte(k.st.active.Private())),
+		Next:      k.st.next,
+		Verifiers: make(map[int]string, len(k.st.verifiers)),
+	}
+	for kid, pub := range k.st.verifiers {
+		persist.Verifiers[kid] = base64.StdEncoding.EncodeToString(pub)
+	}
+
+	data, err := json.Marshal(persist)
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// LoadKeyring reads a keyring from a file. If the file exists, it recovers
+// the active private key and all retained public keys. If not, it generates
+// a fresh keyring and saves it.
+func LoadKeyring(path string) (*Keyring, error) {
+	if path == "" {
+		return NewKeyring()
+	}
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			return nil, err
+		}
+	}
+
+	_, err := os.Stat(path)
+	switch {
+	case err == nil:
+		// File exists: load below.
+	case errors.Is(err, os.ErrNotExist):
+		// File doesn't exist: generate fresh and save.
+		kr, err := NewKeyring()
+		if err != nil {
+			return nil, err
+		}
+		if err := kr.Save(path); err != nil {
+			return nil, err
+		}
+		return kr, nil
+	default:
+		// Some other stat error (permissions, etc.): don't silently generate.
+		return nil, err
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var p keyringPersist
+	if err := json.Unmarshal(data, &p); err != nil {
+		return nil, err
+	}
+
+	k := &Keyring{st: &keyringState{
+		verifiers: make(map[int][]byte, len(p.Verifiers)),
+		next:      p.Next,
+		now:       time.Now,
+	}}
+	priv, err := base64.StdEncoding.DecodeString(p.Active)
+	if err != nil {
+		return nil, err
+	}
+	if len(priv) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("terminator: invalid persisted private key size %d, want %d", len(priv), ed25519.PrivateKeySize)
+	}
+	k.st.active = &Signer{priv: ed25519.PrivateKey(priv), Version: p.ActiveKid}
+	// Hardening (release): validate the packed keyring structurally BEFORE
+	// accepting it. A corrupt/truncated/hand-edited keyring must fail closed at
+	// load, not silently serve a wrong active key (which would mint assertions
+	// no backend can verify, or worse, reuse a mismatched signing pair).
+	if p.ActiveKid < 1 {
+		return nil, fmt.Errorf("terminator: persisted active_kid %d invalid (must be >= 1)", p.ActiveKid)
+	}
+	if p.Next <= p.ActiveKid {
+		return nil, fmt.Errorf("terminator: persisted next kid %d must exceed active_kid %d", p.Next, p.ActiveKid)
+	}
+	if len(p.Verifiers) == 0 {
+		return nil, fmt.Errorf("terminator: persisted keyring has no verifier keys")
+	}
+	if _, ok := p.Verifiers[p.ActiveKid]; !ok {
+		return nil, fmt.Errorf("terminator: persisted verifier table lacks the active kid %d", p.ActiveKid)
+	}
+	activePriv := ed25519.PrivateKey(priv)
+	activePub, ok := activePriv.Public().(ed25519.PublicKey)
+	if !ok {
+		return nil, fmt.Errorf("terminator: active key is not Ed25519")
+	}
+	if len(activePub) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("terminator: active public key size %d, want %d", len(activePub), ed25519.PublicKeySize)
+	}
+	wantActive := p.Verifiers[p.ActiveKid]
+	gotActive, err := base64.StdEncoding.DecodeString(wantActive)
+	if err != nil || !bytes.Equal(gotActive, activePub) {
+		return nil, fmt.Errorf("terminator: active private key's public component does not match persisted verifier %d (corrupt keyring)", p.ActiveKid)
+	}
+	for kid, pubB64 := range p.Verifiers {
+		pub, err := base64.StdEncoding.DecodeString(pubB64)
+		if err != nil {
+			return nil, err
+		}
+		if len(pub) != ed25519.PublicKeySize {
+			return nil, fmt.Errorf("terminator: verifier key %d size %d, want %d", kid, len(pub), ed25519.PublicKeySize)
+		}
+		k.st.verifiers[kid] = pub
+	}
+	return k, nil
+}
 
 // Keyring is a rotating set of assertion signers (generations), mirroring the
 // PepperRing rotation model (§21, P0.59/P0.60). It is the signer-side half of
@@ -133,9 +274,29 @@ func (k *Keyring) Public(kid int) ([]byte, bool) {
 	return append([]byte(nil), b...), true
 }
 
+// VerificationKeySource publishes the public verification material for backend
+// verification (P0.15). Signing and public-key publication are conceptually
+// separate: a remote signer/HSM may hold the private key while the runtime
+// publishes the corresponding public material to backends.
+type VerificationKeySource interface {
+	ActiveKid() int
+	PublicKeys() map[int]ed25519.PublicKey
+}
+
+// PublicKeys returns a copy of all retained generation public keys (P0.15).
+func (k *Keyring) PublicKeys() map[int]ed25519.PublicKey {
+	k.st.mu.Lock()
+	defer k.st.mu.Unlock()
+	out := make(map[int]ed25519.PublicKey, len(k.st.verifiers))
+	for kid, pub := range k.st.verifiers {
+		out[kid] = append(ed25519.PublicKey(nil), pub...)
+	}
+	return out
+}
+
 // PublishVerifier builds the VERIFIER-side keyring (P0.17): a
 // VerifierKeyring holding PUBLIC keys only, connected to this signer by key
-// publication. This is the boundary the deployment hands to private backends —
+// publication. This is the deployment hands to private backends —
 // never the SignerKeyring itself, whose possession implies signing authority.
 func (k *Keyring) PublishVerifier() *VerifierKeyring {
 	k.st.mu.Lock()

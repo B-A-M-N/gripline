@@ -57,11 +57,14 @@ type DecisionTrace struct {
 	LaneEvidenceCount int    `json:"lane_evidence_count"`
 
 	// Source attribution (P0.4): present only when the request carried trusted
-	// ingress source identity. SourceRisk is the (currently credential/lane-
-	// scoped) risk the request contributed; source-scoped enforcement rides the
-	// SOURCE resource gauge + spray evidence.
-	SourcePseudonym string `json:"source_pseudonym,omitempty"`
-	SourceObserved  bool   `json:"source_observed"`
+	// ingress source identity. SourceRisk is the independently computed
+	// source-scoped risk score (BETA-06); source-scoped enforcement rides the
+	// SOURCE resource gauge + spray evidence + source-blocked policy gate.
+	SourcePseudonym  string `json:"source_pseudonym,omitempty"`
+	SourceObserved   bool   `json:"source_observed"`
+	SourceRisk       int    `json:"source_risk"`
+	SourceBlocked    bool   `json:"source_blocked"`
+	SourceSnapshotOK bool   `json:"source_snapshot_ok"`
 
 	// Evidence contributing to the decision: IDs (durable, CSPRNG-derived) and
 	// codes. IDs let audit/replay resolve the exact evidence rows — scopes and
@@ -117,12 +120,7 @@ func trimStrings(in []string, max int) []string {
 	return out
 }
 
-func (dt *DecisionTrace) reason() string {
-	if dt == nil {
-		return ""
-	}
-	return dt.Reason
-}
+
 
 var (
 	_ = credential.StatusWatch

@@ -18,12 +18,7 @@ const (
 	carrierProvider
 )
 
-// extracted holds the sealed credential plus the carrier that supplied it.
-type extracted struct {
-	secret       *secret.SealedSecret
-	carrier      CredentialCarrier
-	credentialID string // reserved-internal id only after lookup; empty until then
-}
+
 
 // maxCredentialLen bounds the accepted raw credential size (§15 oversized).
 const maxCredentialLen = 1024

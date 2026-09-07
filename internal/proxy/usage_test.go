@@ -55,7 +55,7 @@ func TestDataPlaneSettlesReservationWithActualUsage(t *testing.T) {
 
 	pol := policy.Default()
 	// Burst-only token gauge for exact float accounting.
-	pol.Limits.Normal.TokensPerWindow = policy.BucketConfig{Capacity: 100}
+	pol.Limits.Normal.Tokens = policy.BucketConfig{Capacity: 100}
 
 	pep := &credential.PepperKey{Version: 1, Key: []byte("proxy-usage")}
 	rawBytes := make([]byte, 32)

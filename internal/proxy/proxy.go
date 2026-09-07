@@ -18,6 +18,7 @@ package proxy
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"path"
@@ -118,7 +119,29 @@ func (HeaderFeatures) Resolve(obs Observation) lane.Features {
 	} else {
 		f.Streaming = "non-streaming"
 	}
+	// P0.4C: Derive endpoint family from the request path for enumeration detection.
+	f.EndpointFamily = endpointFamily(obs.URLPath)
 	return f
+}
+
+// endpointFamily classifies the request path into a bounded set of categories
+// for endpoint enumeration detection. P0.4C: Do not use raw arbitrary paths
+// as unbounded producer keys.
+func endpointFamily(path string) string {
+	switch path {
+	case "/v1/messages":
+		return "messages"
+	case "/v1/chat/completions":
+		return "chat-completions"
+	case "/v1/completions":
+		return "completions"
+	case "/v1/embeddings":
+		return "embeddings"
+	case "/v1/models":
+		return "models"
+	default:
+		return "other"
+	}
 }
 
 // NoSource is the default SourceResolver: it derives no trusted source
@@ -154,6 +177,11 @@ type Config struct {
 	// minimal {Requests: 1} both ways — correct for pure-request accounting;
 	// token/cost dimension enforcement requires a real provider adapter.
 	Usage UsageEstimator
+
+	// MaxBodyBytes caps the request body (BETA-08). Inference prompts can be
+	// large but are not unbounded. Oversized bodies are rejected with 413
+	// BEFORE admission. Zero disables the limit (not recommended).
+	MaxBodyBytes int64
 }
 
 // UsageEstimator is the provider-adapter seam for resource accounting (P0.3).
@@ -232,14 +260,46 @@ func New(cfg Config) (*DataPlane, error) {
 // re-inject the signed assertion on the trusted hop → forward to the FIXED
 // backend (P0.7) → stream back.
 func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// BETA-08: Enforce MaxBodyBytes BEFORE admission. Reject oversized
+	// bodies with 413 before any credential extraction or forwarding.
+	if d.cfg.MaxBodyBytes > 0 {
+		if r.ContentLength > d.cfg.MaxBodyBytes {
+			http.Error(w, "payload_too_large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		// P0.16: Bounded spooling for chunked/unknown-length bodies. Read
+		// the body with an absolute cap, spooling to a temp file if it
+		// exceeds a memory threshold. This prevents an unauthenticated
+		// attacker from causing large per-connection allocations (32
+		// simultaneous 32MB requests = ~1GB).
+		if r.ContentLength < 0 {
+			body, err := spoolBody(r.Body, d.cfg.MaxBodyBytes+1, spoolMemoryThreshold)
+			if err != nil {
+				http.Error(w, "bad_request", http.StatusBadRequest)
+				return
+			}
+			r.Body.Close()
+			if body.tooLarge {
+				cleanupBody(body)
+				http.Error(w, "payload_too_large", http.StatusRequestEntityTooLarge)
+				return
+			}
+			r.Body = body
+			r.ContentLength = body.length
+		} else {
+			// Known Content-Length within limit: use MaxBytesReader for safety.
+			r.Body = http.MaxBytesReader(w, r.Body, d.cfg.MaxBodyBytes)
+		}
+	}
+
 	// 1. Copy headers so stripping never mutates the caller's request, and so we
 	// keep a normalized map for extraction + a pristine one for the backend.
-	headers := copyHeaders(r.Header)
+	authHeaders := copyHeaders(r.Header)
 
 	// 2. Terminate the credential BEFORE any adapter sees the request (P0.6):
 	// the extraction strips the secret carriers from our copy, and only that
 	// sanitized copy is handed to resolvers.
-	presented, _, err := terminator.ExtractExternalCredential(headers)
+	presented, _, err := terminator.ExtractExternalCredential(authHeaders)
 	if err != nil {
 		// Even on extraction failure the terminator's safe-reason mapping is
 		// reused so no header detail leaks into the response.
@@ -249,17 +309,29 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	presented.Zero() // the proxy never needs the raw secret again
 
+	// BETA-01: Build a SANITIZED header view for resolvers. The Observation must
+	// never carry secret carriers — resolvers (FeatureResolver, SourceResolver,
+	// UsageEstimator) are pluggable adapters that must not see Authorization /
+	// x-api-key. We strip a COPY so authHeaders remains intact for
+	// Terminator.AdmitUsage, which re-extracts and strips internally.
+	obsHeaders := copyHeaders(authHeaders)
+	terminator.StripSecretHeaders(obsHeaders)
+
 	obs := Observation{
-		Header:     headers,
+		Header:     obsHeaders,
 		RemoteAddr: remoteIP(r),
 		ProtoMajor: r.ProtoMajor,
 		URLPath:    r.URL.Path,
 	}
-	feat := d.feat.Resolve(obs)
 	src := d.srcs.ResolveSource(obs)
+	feat := d.feat.Resolve(obs)
+	// P0.6B: Merge trusted source network provenance into features. Trusted
+	// ingress metadata is the authority; the generic feature resolver's values
+	// are spoofable HTTP headers and must not compete with trusted metadata.
+	MergeSourceIntoFeatures(&feat, src)
 	est := d.cfg.Usage.Estimate(obs)
 
-	out := d.cfg.Terminator.AdmitUsage(headers, feat, src, est)
+	out := d.cfg.Terminator.AdmitUsage(authHeaders, feat, src, est)
 
 	if !out.Authorized {
 		d.writeDenial(w, out)
@@ -276,9 +348,13 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// 4. Resolve the (now stripped + re-injected) upstream headers: every secret
 	// carrier and any forged Gripline-* header is gone; the signed assertion is
-	// freshly minted.
+	// freshly minted. Hop-by-hop headers and untrusted provenance headers are
+	// also removed from the request path — the proxy must not forward the
+	// client's Connection-named or provenance headers to the backend (P0.17/P0.7).
 	upstreamHeaders := copyHeaders(r.Header)
 	terminator.StripSecretHeaders(upstreamHeaders)
+	stripHopByHopHeaders(upstreamHeaders)
+	stripUntrustedProvenanceHeaders(upstreamHeaders)
 	upstreamHeaders[assertionHeader] = []string{out.Assertion.Encode()}
 
 	// 5. Build and forward the upstream request, streaming the body. The
@@ -312,21 +388,6 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	// The backend ACCEPTED the request (transport + response head received):
-	// this is the "upstream accepted" lifecycle event (P0.27). Finalize the
-	// deferred baseline credit exactly once — a request that was admitted but
-	// never reached the backend earns no trust.
-	out.FinalizeBaseline()
-
-	// Settle the resource reservation against ACTUAL usage (P0.3/P0.36): only
-	// the reserved-but-unused remainder is refunded, and only to this
-	// reservation's own buckets. Runs BEFORE the deferred Release so unsettled
-	// holds are never cancelled-and-refunded in full. Concurrency is released
-	// by the deferred Release.
-	if mr, ok := reservation.(*resource.MultiReservation); ok && !mr.Settled() {
-		mr.Settle(d.cfg.Usage.Actual(obs, resp))
-	}
-
 	// 6. Copy the backend response headers + status, stream the body back.
 	copyResponseHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
@@ -337,19 +398,50 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// times bounded by the backend's, not the response's end.
 	flusher, _ := w.(http.Flusher)
 	buf := make([]byte, 32<<10)
+	var streamErr error
 	for {
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
 			if _, werr := w.Write(buf[:n]); werr != nil {
-				return // client went away; the deferred release runs
+				// Client went away; the deferred release runs.
+				streamErr = werr
+				break
 			}
 			if flusher != nil {
 				flusher.Flush()
 			}
 		}
 		if rerr != nil {
-			break // io.EOF or upstream error: nothing more to forward
+			if rerr != io.EOF {
+				// P0.17: Differentiate real upstream errors from clean EOF.
+				streamErr = rerr
+			}
+			break
 		}
+	}
+
+	// 7. Settle + complete at ACTUAL end-of-stream (P0.3/P0.36/P0.4A). Resource
+	// settlement was deliberately NOT done on response headers: for LLM APIs the
+	// real usage (token/cost) is reported in the final JSON/SSE envelope, which
+	// only exists after the body is consumed. A provider's Actual() reads that
+	// final surface; a header-only implementation still settles correctly here.
+	actual := d.cfg.Usage.Actual(obs, resp)
+	// P0.36: only the reserved-but-unused remainder is refunded, and only to this
+	// reservation's own buckets. Runs BEFORE the deferred Release so unsettled
+	// holds are never cancelled-and-refunded in full. Concurrency is released by
+	// the deferred Release.
+	if mr, ok := reservation.(*resource.MultiReservation); ok && !mr.Settled() {
+		mr.Settle(actual)
+	}
+	// P0.4A: drive the completion producers with the ACTUAL usage. `success`
+	// is false when the upstream stream failed, so a corrupt/failed stream is
+	// not credited as clean velocity. This affects SUBSEQUENT admissions.
+	out.Complete(actual, streamErr == nil)
+	// P0.27/P0.17: Finalize baseline trust ONLY after successful stream
+	// completion. A request whose backend stream corrupts/fails earns no clean
+	// trust.
+	if streamErr == nil {
+		out.FinalizeBaseline()
 	}
 }
 
@@ -390,12 +482,77 @@ func copyHeaders(h http.Header) map[string][]string {
 	return out
 }
 
-// copyResponseHeaders copies backend response headers onto w.
+// copyResponseHeaders copies backend response headers onto w, stripping
+// hop-by-hop headers (including any named by the backend's Connection header)
+// and the reserved Gripline-* namespace (P0.17).
 func copyResponseHeaders(dst, src http.Header) {
+	// Copy everything, then strip hop-by-hop + the internal namespace. Doing it
+	// this way keeps one implementation of the Connection-named hop-by-hop rule
+	// instead of re-deriving it in the per-key loop.
 	for k, vv := range src {
 		for _, v := range vv {
 			dst.Add(k, v)
 		}
+	}
+	stripHopByHopHeaders(dst)
+	for k := range dst {
+		// P0.17: Don't forward backend Gripline-* headers to public clients.
+		if strings.HasPrefix(strings.ToLower(k), "x-gripline-") ||
+			strings.HasPrefix(strings.ToLower(k), "gripline-") {
+			dst.Del(k)
+		}
+	}
+}
+
+// fixedHopByHopHeaders is the standard end-to-end hop-by-hop set (RFC 7230
+// §6.1). Headers ADDITIONALLY named by Connection are also hop-by-hop.
+var fixedHopByHopHeaders = map[string]struct{}{
+	"connection":          {},
+	"keep-alive":          {},
+	"proxy-authenticate":  {},
+	"proxy-authorization": {},
+	"te":                  {},
+	"trailers":            {},
+	"transfer-encoding":   {},
+	"upgrade":             {},
+}
+
+// stripHopByHopHeaders removes hop-by-hop headers from h in place: first every
+// header named by the h's own Connection value, then the fixed RFC 7230 set.
+// It is used on BOTH the request path (before forwarding upstream) and the
+// response path (before relaying to the client), so a header a hop marks
+// Connection-requested never leaks to the next hop.
+func stripHopByHopHeaders(h http.Header) {
+	for _, conn := range h.Values("Connection") {
+		for _, name := range strings.Split(conn, ",") {
+			if n := strings.TrimSpace(name); n != "" {
+				h.Del(n)
+			}
+		}
+	}
+	for name := range fixedHopByHopHeaders {
+		h.Del(name)
+	}
+}
+
+// stripUntrustedProvenanceHeaders removes client-supplied provenance headers
+// before forwarding to the backend (P0.7). The ingress resolver inspects them
+// ONLY when the direct peer is trusted; handing them blindly upstream lets a
+// client inventory/convince arbitrary backends of a spoofed source. The proxy
+// does not forward any of them — a trusted reverse proxy upstream may re-add
+// an authoritative X-Forwarded-For if it terminates the client directly.
+func stripUntrustedProvenanceHeaders(h http.Header) {
+	for _, name := range []string{
+		"Forwarded",
+		"X-Forwarded-For",
+		"X-Forwarded-Host",
+		"X-Forwarded-Proto",
+		"X-Real-IP",
+		"CF-Connecting-IP",
+		"True-Client-IP",
+		"X-Original-URL",
+	} {
+		h.Del(name)
 	}
 }
 

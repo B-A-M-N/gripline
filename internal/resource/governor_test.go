@@ -157,15 +157,20 @@ func TestGovernorTokenSettleConsumesCancelRefunds(t *testing.T) {
 		t.Fatalf("P0.27: abandoned reservation must refund its 40 tokens; available = %v, want %v", avail, afterSettle)
 	}
 
-	// P0.36: an actual ABOVE the estimate consumes the whole hold — never a
-	// negative refund, never minted allowance.
+	// BETA-05: an actual ABOVE the estimate charges the overage as debt
+	// against the bucket. Reserve 10, settle 999 → 10 consumed + 989 debt
+	// → balance = 20 (prior) + 989 = 1009 → available = 0 (in debt).
 	r3, err := g.ProvisionUsage(scopes, UsageEstimate{CombinedTokens: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
 	r3.Settle(UsageEstimate{CombinedTokens: 999})
-	if avail := b.Available(); avail != 80 {
-		t.Fatalf("over-estimate actual must consume the full hold; available = %v, want 80", avail)
+	if avail := b.Available(); avail != 0 {
+		t.Fatalf("over-estimate actual must charge overage as debt; available = %v, want 0", avail)
+	}
+	// Balance = 10 (from r1) + 10 (r3 reserve) + 989 (overage) = 1009.
+	if bal := b.Balance(); bal != 1009 {
+		t.Fatalf("balance after overage = %v, want 1009", bal)
 	}
 	r3.Release()
 }

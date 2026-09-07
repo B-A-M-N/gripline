@@ -15,7 +15,7 @@ func TestUnblockExitsBlockedAndReseedsClean(t *testing.T) {
 	store := NewStore(nil, func() time.Time { return now })
 
 	laneID := "lane_b"
-	rec, _, err := store.BorrowOrCreate("cred_c", laneID, Features{NetworkASN: "AS1"}, DefaultThresholds())
+	_, _, err := store.BorrowOrCreate("cred_c", laneID, Features{NetworkASN: "AS1"}, ClassificationContext{Thresholds: DefaultThresholds()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -28,7 +28,7 @@ func TestUnblockExitsBlockedAndReseedsClean(t *testing.T) {
 	if _, err := store.ObserveRisk("cred_c", laneID, 90, now); err != nil {
 		t.Fatal(err)
 	}
-	rec, _ = store.Get("cred_c", laneID)
+	rec, _ := store.Get("cred_c", laneID)
 	if rec.Security.Status != LaneBlocked {
 		t.Fatalf("want BLOCKED, got %v", rec.Security.Status)
 	}
@@ -67,7 +67,7 @@ func TestUnblockFailsOnNonBlockedLane(t *testing.T) {
 	now := time.Now()
 	store := NewStore(nil, func() time.Time { return now })
 	laneID := "lane_n"
-	store.BorrowOrCreate("cred_c", laneID, Features{NetworkASN: "AS1"}, DefaultThresholds())
+	store.BorrowOrCreate("cred_c", laneID, Features{NetworkASN: "AS1"}, ClassificationContext{Thresholds: DefaultThresholds()})
 
 	if _, err := store.Unblock("cred_c", laneID, "ops", "why", now); !errors.Is(err, ErrActionInvalid) {
 		t.Fatalf("P0.39: unblocking a NORMAL lane must fail closed (ErrActionInvalid), got %v", err)
@@ -90,7 +90,7 @@ func TestOperatorTransitionAtomicWithAuditSink(t *testing.T) {
 	now := time.Now()
 	store := NewStore(nil, func() time.Time { return now })
 	laneID := "lane_audit"
-	rec, _, err := store.BorrowOrCreate("cred_a", laneID, Features{NetworkASN: "AS1"}, DefaultThresholds())
+	_, _, err := store.BorrowOrCreate("cred_a", laneID, Features{NetworkASN: "AS1"}, ClassificationContext{Thresholds: DefaultThresholds()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +104,7 @@ func TestOperatorTransitionAtomicWithAuditSink(t *testing.T) {
 	if _, err := store.ObserveRisk("cred_a", laneID, 90, now); err != nil {
 		t.Fatal(err)
 	}
-	rec, _ = store.Get("cred_a", laneID)
+	rec, _ := store.Get("cred_a", laneID)
 	if rec.Security.Status != LaneBlocked {
 		t.Fatalf("setup: lane must be blocked, got %v", rec.Security.Status)
 	}

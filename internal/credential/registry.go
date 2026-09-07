@@ -99,6 +99,15 @@ func IsUnknownCredential(err error) bool { return errors.Is(err, ErrNotFound) }
 // one credential authenticate as another.
 var ErrVerifierOwned = errors.New("credential: verifier already owned by another credential")
 
+// Provisioner is the startup-provisioning seam (P0.10). Bootstrap uses
+// InsertIfAbsent so an env-provided GRIPLINE_CREDENTIAL_SECRET never overwrites
+// an operator-managed (e.g. CONSTRAINED/REVOKED) credential on restart.
+// Rotation/replacement is the explicit lifecycle path (Insert / UpdateStatusCAS),
+// not bootstrap.
+type Provisioner interface {
+	InsertIfAbsent(rec *CredentialRecord) (created bool, err error)
+}
+
 // MemoryRegistry is a concurrency-safe in-memory Registry. For development and
 // tests only; not durable.
 type MemoryRegistry struct {
@@ -161,6 +170,38 @@ func (m *MemoryRegistry) Insert(rec *CredentialRecord) error {
 		m.byVer[newKey] = rec.CredentialID
 	}
 	return nil
+}
+
+// InsertIfAbsent implements credential.Provisioner (P0.10): it creates the
+// credential ONLY if one with that id is not already present, returning
+// created=false when present. Startup bootstrap MUST use this so an env-provided
+// credential never overwrites an operator-managed (e.g. CONSTRAINED/REVOKED)
+// credential on every restart.
+func (m *MemoryRegistry) InsertIfAbsent(rec *CredentialRecord) (bool, error) {
+	if rec == nil {
+		return false, errors.New("credential: nil record")
+	}
+	if err := rec.Validate(); err != nil {
+		return false, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, exists := m.records[rec.CredentialID]; exists {
+		return false, nil // already present — leave untouched
+	}
+	newKey := ""
+	if len(rec.Verifier) > 0 {
+		newKey = verKeyFor(rec.PepperVersion, rec.Verifier)
+		if owner, taken := m.byVer[newKey]; taken && owner != rec.CredentialID {
+			return false, ErrVerifierOwned
+		}
+	}
+	c := cloneRecord(rec)
+	m.records[rec.CredentialID] = c
+	if newKey != "" {
+		m.byVer[newKey] = rec.CredentialID
+	}
+	return true, nil
 }
 
 // Lookup implements SecurityStateRepository with typed errors (P0.20): the

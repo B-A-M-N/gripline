@@ -94,11 +94,11 @@ func TestEvictionRetentionClasses(t *testing.T) {
 func TestRecoveryRestartsCleanWindowAndEpochsCounters(t *testing.T) {
 	now := time.Now()
 	s := NewStore(nil, func() time.Time { return now })
-	rec := newLaneForTest(t, s, "c1", "l1", now)
+	newLaneForTest(t, s, "c1", "l1", now)
 
 	// Accumulate baseline progress.
 	s.mu.Lock()
-	rec = s.byCred["c1"]["l1"]
+	rec := s.byCred["c1"]["l1"]
 	rec.AuthorizedCleanRequests = 150
 	rec.CleanActiveDays = 3
 	s.mu.Unlock()
@@ -267,7 +267,7 @@ func TestConcurrentFinalizeCountsOnce(t *testing.T) {
 // newLaneForTest creates a lane via BorrowOrCreate and returns the stored record.
 func newLaneForTest(t *testing.T, s *Store, credID, laneID string, now time.Time) *LaneRecord {
 	t.Helper()
-	if _, _, err := s.BorrowOrCreate(credID, laneID, Features{NetworkASN: "AS1"}, DefaultThresholds()); err != nil {
+	if _, _, err := s.BorrowOrCreate(credID, laneID, Features{NetworkASN: "AS1"}, ClassificationContext{Thresholds: DefaultThresholds()}); err != nil {
 		t.Fatal(err)
 	}
 	s.mu.Lock()

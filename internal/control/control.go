@@ -104,6 +104,16 @@ func (c *ControlPlane) InEmergency() bool {
 	return c.Posture() == EmergencyLockdown
 }
 
+// Restore sets the initialized posture without recording an OPERATOR audit
+// event (P0.10). BuildRuntime uses it to reload a persisted EMERGENCY_LOCKDOWN
+// at boot so a restart never silently returns to NORMAL. It is meant for
+// construction-time restore only — live transitions go through SetEmergency.
+func (c *ControlPlane) Restore(p Posture) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.posture = p
+}
+
 // SetEmergency is the operator firefight switch (P0.39). Transitioning INTO
 // lockdown records an OPERATOR audit event; exiting does too. The audit event
 // carries the actor + reason so the decision is reviewable (P0.35).
@@ -120,11 +130,11 @@ func (c *ControlPlane) SetEmergency(on bool, actor, reason string) Posture {
 	prev := c.posture
 	c.posture = next
 	c.recordLocked(Event{
-		Kind:    EventOperator,
-		At:      time.Now(),
-		Actor:   actor,
-		Posture: next.String(),
-		Reason:  reason,
+		Kind:       EventOperator,
+		At:         time.Now(),
+		Actor:      actor,
+		Posture:    next.String(),
+		Reason:     reason,
 		Authorized: false,
 	})
 	_ = prev

@@ -465,7 +465,7 @@ func TestAdmitLaneCollisionFailsClosed(t *testing.T) {
 	collideFeat := lane.Features{NetworkASN: "AS-ATTACK", RegionClass: "r1"}
 	collideID := "lane_cred_c_" + shortTag(collideFeat)
 	if _, created, err := store.BorrowOrCreate("cred_c", collideID,
-		lane.Features{NetworkASN: "AS-DIFFERENT", RegionClass: "r2"}, lane.DefaultThresholds()); err != nil || !created {
+		lane.Features{NetworkASN: "AS-DIFFERENT", RegionClass: "r2"}, lane.ClassificationContext{Thresholds: lane.DefaultThresholds()}); err != nil || !created {
 		t.Fatalf("seed lane: created=%v err=%v", created, err)
 	}
 

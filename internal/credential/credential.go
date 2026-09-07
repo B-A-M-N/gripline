@@ -18,11 +18,11 @@ import (
 	"github.com/B-A-M-N/gripline/internal/secret"
 )
 
-// RevokedError indicates authentication was attempted for a revoked credential.
-var RevokedError = errors.New("credential: revoked")
+// ErrRevoked indicates authentication was attempted for a revoked credential.
+var ErrRevoked = errors.New("credential: revoked")
 
-// UnknownError indicates the presented credential did not match any record.
-var UnknownError = errors.New("credential: unknown")
+// ErrUnknown indicates the presented credential did not match any record.
+var ErrUnknown = errors.New("credential: unknown")
 
 // Status is the credential lifecycle state (§30 of the spec).
 type Status int
@@ -72,14 +72,14 @@ type CredentialRecord struct {
 	// Security is the persisted hysteresis state (P0.5): the durable, reproducible
 	// record of risk observations that drive status transitions. It lives on the
 	// credential row so restart and replication do not erase escalation history.
-	Security SecurityState
-	PolicyID string
-	PlanID   string
-	CreatedAt time.Time
-	ExpiresAt time.Time
-	RotatedAt time.Time
+	Security   SecurityState
+	PolicyID   string
+	PlanID     string
+	CreatedAt  time.Time
+	ExpiresAt  time.Time
+	RotatedAt  time.Time
 	LastSeenAt time.Time
-	Revision  int // monotonic; echoed as cred_rev in internal assertions
+	Revision   int // monotonic; echoed as cred_rev in internal assertions
 }
 
 // Credential is the resolved authentication outcome handed to the terminator.
@@ -93,8 +93,8 @@ type Credential struct {
 	Revision     int
 }
 
-// CredentialExpiredError indicates the record's ExpiresAt has passed (§75).
-var CredentialExpiredError = errors.New("credential: expired")
+// ErrExpired indicates the record's ExpiresAt has passed (§75).
+var ErrExpired = errors.New("credential: expired")
 
 // Authenticatable reports whether a record in its current state may attempt
 // authentication: not revoked (INV-13), not quarantined (§30 — requests from a
@@ -103,26 +103,26 @@ var CredentialExpiredError = errors.New("credential: expired")
 // it cannot bypass credential-level policy (INV-6).
 func (rec *CredentialRecord) Authenticatable(now time.Time) error {
 	if rec == nil {
-		return UnknownError
+		return ErrUnknown
 	}
 	switch rec.Status {
 	case StatusRevoked:
-		return RevokedError
+		return ErrRevoked
 	case StatusQuarantined:
-		return CredentialQuarantinedError
+		return ErrQuarantined
 	}
 	// Expiry is inclusive-invalid: a credential is expired AT its expiration
 	// instant (now == ExpiresAt fails), matching assertion/evidence semantics
 	// (P0.21/P0.14).
 	if !rec.ExpiresAt.IsZero() && !now.Before(rec.ExpiresAt) {
-		return CredentialExpiredError
+		return ErrExpired
 	}
 	return nil
 }
 
-// CredentialQuarantinedError indicates authentication was attempted for a
-// quarantined credential (§30: requests from the affected scope are denied).
-var CredentialQuarantinedError = errors.New("credential: quarantined")
+// ErrQuarantined indicates authentication was attempted for a quarantined
+// credential (§30: requests from the affected scope are denied).
+var ErrQuarantined = errors.New("credential: quarantined")
 
 // supportedVerifierVersion is the only verifier algorithm this build accepts.
 // Unknown algorithm versions fail closed (P0.18).
@@ -337,7 +337,7 @@ func (r *PepperRing) Versions() []int {
 // constant-time. Revoked and expired credentials fail (INV-13 + §75).
 func (r *PepperRing) Validate(presented *secret.SealedSecret, rec *CredentialRecord) (*Credential, error) {
 	if rec == nil || presented == nil || presented.Zeroed() {
-		return nil, UnknownError
+		return nil, ErrUnknown
 	}
 	if err := rec.Authenticatable(r.now()); err != nil {
 		return nil, err
@@ -348,7 +348,7 @@ func (r *PepperRing) Validate(presented *secret.SealedSecret, rec *CredentialRec
 	}
 	derived := presented.DigestHMAC(key)
 	if !hmac.Equal(derived, rec.Verifier) {
-		return nil, UnknownError
+		return nil, ErrUnknown
 	}
 	return &Credential{
 		CredentialID: rec.CredentialID,
@@ -398,12 +398,6 @@ func DefaultHysteresis() Hysteresis {
 		WatchDwell:            30 * time.Minute,
 		WatchObs:              2,
 	}
-}
-
-// obs is a single risk observation retaining state needed for dwell checks.
-type obs struct {
-	score int
-	at    time.Time
 }
 
 // StateMachine tracks credential status across risk observations with

@@ -74,8 +74,8 @@ func TestValidateFailsForWrongSecret(t *testing.T) {
 	rec, _ := newNormalRecord("cred_2", "acct_2", pep)
 	wrong, _ := secret.Random(32)
 	defer wrong.Zero()
-	if _, err := mustRing(t, pep).Validate(wrong, rec); err != UnknownError {
-		t.Fatalf("expected UnknownError, got %v", err)
+	if _, err := mustRing(t, pep).Validate(wrong, rec); err != ErrUnknown {
+		t.Fatalf("expected ErrUnknown, got %v", err)
 	}
 }
 
@@ -85,8 +85,8 @@ func TestRevokedNeverAuthenticates(t *testing.T) {
 	rec, raw := newNormalRecord("cred_3", "acct_3", pep)
 	defer raw.Zero()
 	rec.Status = StatusRevoked
-	if _, err := mustRing(t, pep).Validate(raw, rec); err != RevokedError {
-		t.Fatalf("expected RevokedError, got %v", err)
+	if _, err := mustRing(t, pep).Validate(raw, rec); err != ErrRevoked {
+		t.Fatalf("expected ErrRevoked, got %v", err)
 	}
 }
 
@@ -114,6 +114,44 @@ func TestRegistryNeverStoresRaw(t *testing.T) {
 	// No raw-key field exists on the persisted record type.
 	if strings.Contains(recordFieldNames(), "RawKey") || strings.Contains(recordFieldNames(), "Secret") {
 		t.Fatal("CredentialRecord must not carry a raw-key field (INV-1)")
+	}
+}
+
+// TestInsertIfAbsentNeverOverwrites is the P0.10 bootstrap guarantee: startup
+// provisioning must not clobber an already-present credential (e.g. one an
+// operator has since REVOKED or CONSTRAINED) on a later restart.
+func TestInsertIfAbsentNeverOverwrites(t *testing.T) {
+	pep := testKey()
+	reg := NewMemoryRegistry()
+	first, raw := newNormalRecord("cred_prov", "acct_prov", pep)
+	defer raw.Zero()
+
+	created, err := reg.InsertIfAbsent(first)
+	if err != nil || !created {
+		t.Fatalf("first provision: created=%v err=%v", created, err)
+	}
+	got, ok := reg.Lookup("cred_prov")
+	if !ok || got.Revision != 1 {
+		t.Fatalf("first provision must store the record, got %+v", got)
+	}
+
+	// A second provision with a DIFFERENT verifier must NOT overwrite.
+	second, raw2 := newNormalRecord("cred_prov", "acct_prov", pep)
+	defer raw2.Zero()
+	created, err = reg.InsertIfAbsent(second)
+	if err != nil || created {
+		t.Fatalf("second provision must be created=false, got created=%v err=%v", created, err)
+	}
+	got, _ = reg.Lookup("cred_prov")
+	// The ORIGINAL verifier is retained.
+	if len(got.Verifier) == 0 || !bytes.Equal(got.Verifier, first.Verifier) {
+		t.Fatalf("original verifier must be retained, got %x want %x", got.Verifier, first.Verifier)
+	}
+	if _, ok := reg.FindByVerifier(first.Verifier, 1); !ok {
+		t.Fatal("original verifier must still authenticate")
+	}
+	if _, ok := reg.FindByVerifier(second.Verifier, 1); ok {
+		t.Fatal("replacement verifier must NOT authenticate")
 	}
 }
 

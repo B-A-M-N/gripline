@@ -59,22 +59,22 @@ func TestStoreBorrowOrCreateAndExplosion(t *testing.T) {
 	th := DefaultThresholds()
 
 	// two distinct lanes (full trusted source identity so three can coexist)
-	l1, created, err := store.BorrowOrCreate("cred_1", "lane_a", Features{NetworkASN: "AS1", NetworkType: "residential", RegionClass: "us"}, th)
+	l1, created, err := store.BorrowOrCreate("cred_1", "lane_a", Features{NetworkASN: "AS1", NetworkType: "residential", RegionClass: "us"}, ClassificationContext{Thresholds: th})
 	if err != nil || !created || l1.LaneID != "lane_a" {
 		t.Fatalf("create lane_a: created=%v err=%v", created, err)
 	}
-	l2, created, err := store.BorrowOrCreate("cred_1", "lane_b", Features{NetworkASN: "AS2", NetworkType: "hosting", RegionClass: "eu"}, th)
+	l2, created, err := store.BorrowOrCreate("cred_1", "lane_b", Features{NetworkASN: "AS2", NetworkType: "hosting", RegionClass: "eu"}, ClassificationContext{Thresholds: th})
 	if err != nil || !created || l2.LaneID != "lane_b" {
 		t.Fatalf("create lane_b: created=%v err=%v", created, err)
 	}
 	// third distinct lane over limit → ErrTooManyLanes
-	_, created, err = store.BorrowOrCreate("cred_1", "lane_c", Features{NetworkASN: "AS3", NetworkType: "hosting", RegionClass: "ap"}, th)
+	_, _, err = store.BorrowOrCreate("cred_1", "lane_c", Features{NetworkASN: "AS3", NetworkType: "hosting", RegionClass: "ap"}, ClassificationContext{Thresholds: th})
 	if err != ErrTooManyLanes {
 		t.Fatalf("explosion limit: got err=%v want ErrTooManyLanes", err)
 	}
 
 	// a matching re-request borrows lane_a (same ASN+type+region)
-	reuse, created, err := store.BorrowOrCreate("cred_1", "lane_x", Features{NetworkASN: "AS1", NetworkType: "residential", RegionClass: "us"}, th)
+	reuse, created, err := store.BorrowOrCreate("cred_1", "lane_x", Features{NetworkASN: "AS1", NetworkType: "residential", RegionClass: "us"}, ClassificationContext{Thresholds: th})
 	if err != nil {
 		t.Fatalf("reuse err: %v", err)
 	}
@@ -92,13 +92,13 @@ func TestIdleEviction(t *testing.T) {
 	store := NewStore(func() Limits {
 		return Limits{MaxActiveLanesPerCredential: 4, MaxProvisionalLanes: 4, LaneIdleExpiration: 10 * time.Minute}
 	}, func() time.Time { return clock })
-	store.BorrowOrCreate("cred_9", "lane_1", Features{NetworkASN: "AS9"}, DefaultThresholds())
+	store.BorrowOrCreate("cred_9", "lane_1", Features{NetworkASN: "AS9"}, ClassificationContext{Thresholds: DefaultThresholds()})
 	if store.ActiveLaneCount("cred_9") != 1 {
 		t.Fatal("one lane expected")
 	}
 	// advance past idle and add another lane, triggering eviction
 	clock = base.Add(11 * time.Minute)
-	store.BorrowOrCreate("cred_9", "lane_2", Features{NetworkASN: "AS8"}, DefaultThresholds())
+	store.BorrowOrCreate("cred_9", "lane_2", Features{NetworkASN: "AS8"}, ClassificationContext{Thresholds: DefaultThresholds()})
 	if store.ActiveLaneCount("cred_9") != 1 {
 		t.Fatalf("idle lane should be evicted, count=%d", store.ActiveLaneCount("cred_9"))
 	}
@@ -148,11 +148,11 @@ func TestLaneIdCollisionDoesNotResetState(t *testing.T) {
 	}, time.Now)
 	th := DefaultThresholds()
 
-	if _, _, err := store.BorrowOrCreate("cred_1", "lane_a", Features{NetworkASN: "AS1", RegionClass: "us"}, th); err != nil {
+	if _, _, err := store.BorrowOrCreate("cred_1", "lane_a", Features{NetworkASN: "AS1", RegionClass: "us"}, ClassificationContext{Thresholds: th}); err != nil {
 		t.Fatalf("create lane_a: %v", err)
 	}
 	// Same id, dissimilar features (no Match) → must conflict, not overwrite.
-	_, created, err := store.BorrowOrCreate("cred_1", "lane_a", Features{NetworkASN: "AS999", RegionClass: "eu"}, th)
+	_, created, err := store.BorrowOrCreate("cred_1", "lane_a", Features{NetworkASN: "AS999", RegionClass: "eu"}, ClassificationContext{Thresholds: th})
 	if err == nil {
 		t.Fatal("id collision with dissimilar features must error")
 	}
@@ -186,11 +186,11 @@ func TestFullFeatureVectorDistinguishesLanes(t *testing.T) {
 	b := Features{NetworkASN: "AS1", RegionClass: "us", ClientFamily: "claude-code",
 		SDKFamily: "python", ModelFamily: "haiku", Streaming: "non-streaming"}
 
-	la, ca, err := store.BorrowOrCreate("cred_1", "lane_a", a, th)
+	la, ca, err := store.BorrowOrCreate("cred_1", "lane_a", a, ClassificationContext{Thresholds: th})
 	if err != nil || !ca {
 		t.Fatalf("create a: %v", err)
 	}
-	lb, cb, err := store.BorrowOrCreate("cred_1", "lane_b", b, th)
+	lb, cb, err := store.BorrowOrCreate("cred_1", "lane_b", b, ClassificationContext{Thresholds: th})
 	if err != nil {
 		t.Fatalf("create b: %v", err)
 	}
@@ -230,11 +230,11 @@ func TestLaneSelectionDeterministicUnderTies(t *testing.T) {
 		s := NewStore(func() Limits {
 			return Limits{MaxActiveLanesPerCredential: 8, MaxProvisionalLanes: 8, LaneIdleExpiration: time.Hour}
 		}, time.Now)
-		if _, created, err := s.BorrowOrCreate("cred_1", "lane_full", full, th); err != nil || !created {
+		if _, created, err := s.BorrowOrCreate("cred_1", "lane_full", full, ClassificationContext{Thresholds: th}); err != nil || !created {
 			t.Fatalf("seed full: created=%v err=%v", created, err)
 		}
 		sparse := Features{NetworkASN: "AS1", ClientFamily: "cc"} // omits NetworkType+Region
-		if _, created, err := s.BorrowOrCreate("cred_1", "lane_sparse", sparse, th); err != nil {
+		if _, created, err := s.BorrowOrCreate("cred_1", "lane_sparse", sparse, ClassificationContext{Thresholds: th}); err != nil {
 			t.Fatal(err)
 		} else if !created {
 			t.Fatal("P0.9: sparse query must create a NEW lane, not borrow the established full lane")
@@ -249,10 +249,10 @@ func TestLaneSelectionDeterministicUnderTies(t *testing.T) {
 		s := NewStore(func() Limits {
 			return Limits{MaxActiveLanesPerCredential: 8, MaxProvisionalLanes: 8, LaneIdleExpiration: time.Hour}
 		}, time.Now)
-		if _, created, err := s.BorrowOrCreate("cred_1", "lane_alpha", full, th); err != nil || !created {
+		if _, created, err := s.BorrowOrCreate("cred_1", "lane_alpha", full, ClassificationContext{Thresholds: th}); err != nil || !created {
 			t.Fatalf("seed: created=%v err=%v", created, err)
 		}
-		rec, created, err := s.BorrowOrCreate("cred_1", "lane_query", full, th)
+		rec, created, err := s.BorrowOrCreate("cred_1", "lane_query", full, ClassificationContext{Thresholds: th})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -282,18 +282,18 @@ func TestExpiredLanesEvictedBeforeLimitRejection(t *testing.T) {
 	th := DefaultThresholds()
 
 	for _, id := range []string{"lane_1", "lane_2"} {
-		if _, _, err := store.BorrowOrCreate("cred_1", id, Features{NetworkASN: id}, th); err != nil {
+		if _, _, err := store.BorrowOrCreate("cred_1", id, Features{NetworkASN: id}, ClassificationContext{Thresholds: th}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	// At the limit — a third lane must be rejected NOW.
-	if _, _, err := store.BorrowOrCreate("cred_1", "lane_3", Features{NetworkASN: "AS3"}, th); err != ErrTooManyLanes {
+	if _, _, err := store.BorrowOrCreate("cred_1", "lane_3", Features{NetworkASN: "AS3"}, ClassificationContext{Thresholds: th}); err != ErrTooManyLanes {
 		t.Fatalf("at-limit create must fail: %v", err)
 	}
 	// Advance past idle expiration: the same create must now SUCCEED because
 	// eviction runs before the limit check.
 	clock = base.Add(11 * time.Minute)
-	rec, created, err := store.BorrowOrCreate("cred_1", "lane_3", Features{NetworkASN: "AS3"}, th)
+	rec, created, err := store.BorrowOrCreate("cred_1", "lane_3", Features{NetworkASN: "AS3"}, ClassificationContext{Thresholds: th})
 	if err != nil || !created {
 		t.Fatalf("expired lanes must free capacity before limit check: created=%v err=%v", created, err)
 	}
@@ -310,11 +310,11 @@ func TestMaxProvisionalLanesEnforced(t *testing.T) {
 	}, time.Now)
 	th := DefaultThresholds()
 	for i, id := range []string{"p1", "p2"} {
-		if _, _, err := store.BorrowOrCreate("cred_1", id, Features{NetworkASN: id}, th); err != nil {
+		if _, _, err := store.BorrowOrCreate("cred_1", id, Features{NetworkASN: id}, ClassificationContext{Thresholds: th}); err != nil {
 			t.Fatalf("provisional %d: %v", i, err)
 		}
 	}
-	if _, _, err := store.BorrowOrCreate("cred_1", "p3", Features{NetworkASN: "p3"}, th); err != ErrTooManyLanes {
+	if _, _, err := store.BorrowOrCreate("cred_1", "p3", Features{NetworkASN: "p3"}, ClassificationContext{Thresholds: th}); err != ErrTooManyLanes {
 		t.Fatalf("third provisional lane must be refused, got %v", err)
 	}
 }
@@ -332,7 +332,7 @@ func TestActiveDaysCountDistinctDays(t *testing.T) {
 	// the established lane (comparable weight well above the P0.9 floor).
 	feat := Features{NetworkASN: "AS1", NetworkType: "residential", RegionClass: "us", ClientFamily: "claude-code"}
 
-	rec, _, err := store.BorrowOrCreate("cred_1", "lane_d", feat, th)
+	rec, _, err := store.BorrowOrCreate("cred_1", "lane_d", feat, ClassificationContext{Thresholds: th})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -342,7 +342,7 @@ func TestActiveDaysCountDistinctDays(t *testing.T) {
 	// Same day: no change. The re-request must BORROW lane_d (identical
 	// features) and not advance ActiveDays.
 	clock = base.Add(2 * time.Hour)
-	rec, created, err := store.BorrowOrCreate("cred_1", "lane_d", feat, th)
+	rec, created, err := store.BorrowOrCreate("cred_1", "lane_d", feat, ClassificationContext{Thresholds: th})
 	if err != nil || created {
 		t.Fatalf("same-day borrow: created=%v err=%v", created, err)
 	}
@@ -354,7 +354,7 @@ func TestActiveDaysCountDistinctDays(t *testing.T) {
 	}
 	// Next day: +1 (borrow again, a day later).
 	clock = base.Add(26 * time.Hour)
-	rec, created, err = store.BorrowOrCreate("cred_1", "lane_d", feat, th)
+	rec, created, err = store.BorrowOrCreate("cred_1", "lane_d", feat, ClassificationContext{Thresholds: th})
 	if err != nil || created {
 		t.Fatalf("next-day borrow: created=%v err=%v", created, err)
 	}
@@ -381,12 +381,12 @@ func TestSparseCandidateCannotLaunderIntoEstablishedLane(t *testing.T) {
 	// Establish a rich lane with the full trusted source identity.
 	rich := Features{NetworkASN: "AS77", NetworkType: "residential", RegionClass: "us",
 		ClientFamily: "claude-code", SDKFamily: "go", HTTPVersion: "1.1", Streaming: "non-streaming"}
-	rec, created, err := store.BorrowOrCreate("cred_1", "lane_rich", rich, th)
+	rec, created, err := store.BorrowOrCreate("cred_1", "lane_rich", rich, ClassificationContext{Thresholds: th})
 	if err != nil || !created {
 		t.Fatalf("establish rich lane: created=%v err=%v", created, err)
 	}
 	// Rich identity matches itself (re-borrow): comparable weight is high.
-	if _, created, err := store.BorrowOrCreate("cred_1", "lane_rich", rich, th); err != nil || created {
+	if _, created, err := store.BorrowOrCreate("cred_1", "lane_rich", rich, ClassificationContext{Thresholds: th}); err != nil || created {
 		t.Fatalf("re-borrow full identity: created=%v err=%v (want borrow, not new)", created, err)
 	}
 
@@ -401,7 +401,7 @@ func TestSparseCandidateCannotLaunderIntoEstablishedLane(t *testing.T) {
 	if s := Similarity(sparse, rich); s < th.Match {
 		t.Fatalf("sparse renormalized similarity %v < Match=%v — test is not exercising the collapse", s, th.Match)
 	}
-	rec2, created2, err := store.BorrowOrCreate("cred_1", "lane_sparse", sparse, th)
+	rec2, created2, err := store.BorrowOrCreate("cred_1", "lane_sparse", sparse, ClassificationContext{Thresholds: th})
 	if err != nil {
 		t.Fatalf("sparse borrow err=%v", err)
 	}

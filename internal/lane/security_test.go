@@ -105,7 +105,7 @@ func TestCleanSinceResetOnElevation(t *testing.T) {
 
 	// Create a lane (CleanSince seeded at creation).
 	laneID := "lane_clean"
-	rec, created, err := store.BorrowOrCreate("cred_c", laneID, Features{NetworkASN: "AS1"}, DefaultThresholds())
+	rec, created, err := store.BorrowOrCreate("cred_c", laneID, Features{NetworkASN: "AS1"}, ClassificationContext{Thresholds: DefaultThresholds()})
 	if err != nil || !created {
 		t.Fatalf("create: %v", err)
 	}
@@ -181,7 +181,7 @@ func TestStoreObserveRiskRespectsAutomaticBlockGate(t *testing.T) {
 	now := time.Now()
 	store := NewStore(nil, func() time.Time { return now })
 	// Defaults: automatic block OFF.
-	if _, _, err := store.BorrowOrCreate("cred_g", "lane_g", Features{NetworkASN: "AS1"}, DefaultThresholds()); err != nil {
+	if _, _, err := store.BorrowOrCreate("cred_g", "lane_g", Features{NetworkASN: "AS1"}, ClassificationContext{Thresholds: DefaultThresholds()}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.ObserveRisk("cred_g", "lane_g", 100, now); err != nil {

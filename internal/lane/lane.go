@@ -50,6 +50,11 @@ type LaneRecord struct {
 	LastSeenAt   time.Time
 	Features     Features // full normalized classification vector (P0.8)
 	FeatSchema   int      // feature-schema revision the vector was classified under
+	// ClassificationRevision is the lane-universe revision the row was classified
+	// under (P0.21). BorrowOrCreate never borrows/reuses a row whose
+	// ClassificationRevision differs from the current context, preventing a
+	// re-keyed classification from silently laundering pre-change history.
+	ClassificationRevision int
 
 	RequestCount          int64  // total requests seen (includes denied)
 	ActiveDays            int    // distinct active days observed (§29 clean-active-days)
@@ -90,35 +95,7 @@ type Features struct {
 	EndpointFamily     string
 }
 
-// has reports whether a feature atom is present (non-empty). Every feature is a
-// string; empty means "unknown/absent" and is never scored as a match or a
-// mismatch (§27).
-func (f Features) has(field string) bool {
-	switch field {
-	case "NetworkASN":
-		return f.NetworkASN != ""
-	case "NetworkType":
-		return f.NetworkType != ""
-	case "RegionClass":
-		return f.RegionClass != ""
-	case "ClientFamily":
-		return f.ClientFamily != ""
-	case "SDKFamily":
-		return f.SDKFamily != ""
-	case "HTTPVersion":
-		return f.HTTPVersion != ""
-	case "ModelFamily":
-		return f.ModelFamily != ""
-	case "ConcurrencyPattern":
-		return f.ConcurrencyPattern != ""
-	case "EndpointFamily":
-		return f.EndpointFamily != ""
-	case "Streaming":
-		return f.Streaming != ""
-	default:
-		return false
-	}
-}
+
 
 // ClassificationThresholds carries the similarity cutoffs (policy-controlled):
 // similarity >= Match → candidate existing lane; >= Related → related context /
@@ -300,6 +277,28 @@ func sameFeatures(a, b Features) bool {
 // Store rows classified under an older schema are never silently compared
 // (P0.22); bump when the Features struct changes shape.
 const FeatSchemaVersion = featSchemaVersion
+
+// ClassificationContext binds a lane-universe revision to its thresholds
+// (P0.21). BorrowOrCreate keys lane identity and cross-revision borrowing on
+// BOTH the feature schema AND this revision: a lane stored under an older
+// ClassificationRevision is never borrowed by a candidate classified under the
+// current one, so re-keying classification semantics (feature schema, weights,
+// thresholds, comparable-mass, matching rules) legitimately fragments the lane
+// universe instead of silently mixing pre- and post-change rows.
+type ClassificationContext struct {
+	Revision   int
+	Thresholds ClassificationThresholds
+}
+
+// CurrentClassificationRevision is the initial lane-universe revision shipped by
+// the default policy (policy.Default sets ClassificationRevision to this).
+type CurrentClassificationRevision = int
+
+// currentClassificationRevision anchors the initial lane universe. It is the
+// store-only default for callers that do not supply an explicit context; a
+// policy-authored context always wins and MUST match policy.Default's value for
+// the default policy to behave as one universe.
+const currentClassificationRevision = 1
 
 // classify maps a similarity score to the classification label.
 func (c ClassificationThresholds) classify(sim float64) Classification {

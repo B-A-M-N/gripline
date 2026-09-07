@@ -93,22 +93,20 @@ func TestTokenBucketReconfigure(t *testing.T) {
 		t.Fatal("reserve past capacity must fail")
 	}
 
-	// Tighten to 50: spent 60 clamps down to the new capacity (the 10-unit
-	// overhang is necessarily refunded — capacity cannot be below spend); the
-	// bucket is then full at 50 and nothing more fits.
+	// Tighten to 50: spent 60 stays as debt (balance=60 > capacity=50).
+	// P0.11: Reconfigure must NOT destroy debt by clamping balance to capacity.
 	b.Reconfigure(50, 0, 0)
 	if avail := b.Capacity(); avail != 50 {
 		t.Fatalf("capacity after tighten = %.0f, want 50", avail)
 	}
 	if r := b.Reserve(1); r != nil {
-		t.Fatal("reserve over tightened capacity must fail (full at 50)")
+		t.Fatal("reserve over tightened capacity must fail (in debt)")
 	}
 
-	// Loosen to 100: allowance expands without resetting the spent balance
-	// (spend stays 50; 50 free).
+	// Loosen to 100: debt preserved (balance=60), so 40 free units.
 	b.Reconfigure(100, 0, 0)
-	if r := b.Reserve(50); r == nil {
-		t.Fatal("loosened bucket should admit the 50 free units")
+	if r := b.Reserve(40); r == nil {
+		t.Fatal("loosened bucket should admit the 40 free units")
 	}
 	if r := b.Reserve(1); r != nil {
 		t.Fatal("reserve beyond loosened capacity must still fail")

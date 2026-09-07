@@ -26,9 +26,6 @@ func TestSprayMoreThan3ASNsSignalsCredentialSpray(t *testing.T) {
 	for _, s := range sigs {
 		if s.Code == "MORE_THAN_3_UNRELATED_ASNS_IN_10_MIN" {
 			credentialSpray = true
-			if s.SubjectID != "cred_c" {
-				t.Fatalf("ASN-spray subject = %q, want cred_c", s.SubjectID)
-			}
 		}
 	}
 	if !credentialSpray {
@@ -53,9 +50,6 @@ func TestSpraySourceManyCredentialsSignalsSourceSpray(t *testing.T) {
 	for _, s := range sigs {
 		if s.Code == "SOURCE_ATTEMPTING_MANY_UNRELATED_CREDENTIALS" {
 			sourceSpray = true
-			if s.SubjectID != "src-1" {
-				t.Fatalf("credential-spray subject = %q, want src-1", s.SubjectID)
-			}
 		}
 	}
 	if !sourceSpray {
@@ -97,16 +91,17 @@ func TestSprayWindowDecays(t *testing.T) {
 	}
 }
 
-// TestSpraySignalsCarryNoPrivilegedFields proves P0.12: the detector has no
-// path to invent evidence parameters — a Signal carries only a code and a
-// subject. Scoring, family, scope, TTL, and minting revision are resolved by
-// the admission engine against the current compiled policy.
-func TestSpraySignalsCarryNoPrivilegedFields(t *testing.T) {
+// TestSpraySignalsCarryOnlyCode proves P0.8/P0.12: the detector has no path to
+// invent evidence parameters OR decide the eventual evidence subject. A Signal
+// carries only a code; scoring, family, scope, TTL, minting revision, and the
+// subject are resolved by the admission engine against the current compiled
+// policy.
+func TestSpraySignalsCarryOnlyCode(t *testing.T) {
 	d := NewDetector(nil, DefaultThresholds())
 	sigs := d.Observe("s", "c", "AS1", time.Now())
 	for _, s := range sigs {
-		if s.Code == "" || s.SubjectID == "" {
-			t.Fatalf("signal must carry code and subject: %+v", s)
+		if s.Code == "" {
+			t.Fatalf("signal must carry a code: %+v", s)
 		}
 	}
 }

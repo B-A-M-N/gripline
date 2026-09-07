@@ -66,7 +66,8 @@ func TestGovernorPerDimensionBuckets(t *testing.T) {
 
 	// But the token gauge (100 capacity, only 20 held) still admits when the
 	// request dimension is skipped — proving the buckets are distinct gauges.
-	r3, err := g.ProvisionUsage(specs, UsageEstimate{CombinedTokens: 50, CostMicrounits: 100})
+	// Use a fresh scope to avoid the exhausted request bucket.
+	r3, err := g.ProvisionUsage([]ScopeSpec{{Scope: ScopeAccount, ID: "a", Buckets: specs[0].Buckets}}, UsageEstimate{CombinedTokens: 50, CostMicrounits: 100})
 	if err != nil {
 		t.Fatalf("P0.35: token dimension must be a distinct gauge, denied: %v", err)
 	}

@@ -2,7 +2,6 @@ package lane
 
 import (
 	"errors"
-	"sort"
 	"sync"
 	"time"
 )
@@ -36,6 +35,37 @@ const featSchemaVersion = 2
 
 // GetConfig is a minimal hook returning the enforced limits; nil means defaults.
 type GetConfig func() Limits
+
+// Repository is the lane-persistence contract the terminator depends on (P0.10:
+// the memory Store and the durable Bolt repository both satisfy it, so the
+// security core stays database-agnostic). The memory implementation is `Store`;
+// the durable implementation lives in internal/statebolt.
+type Repository interface {
+	// SetSecurityHysteresis overrides the risk→status hysteresis to the given
+	// compiled policy's (P0.13). A zero value falls back to defaults.
+	SetSecurityHysteresis(hy SecurityHysteresis)
+
+	// BorrowOrCreate returns an existing lane within Match similarity of a
+	// candidate feature set, else creates a new one subject to explosion
+	// limits. Returns the lane and whether it was newly created. Cross-revision
+	// borrowing is impossible: a stored lane is only reusable when BOTH its
+	// feature schema AND its ClassificationRevision match the context (P0.21).
+	BorrowOrCreate(credID, candidateID string, features Features, classification ClassificationContext) (*LaneRecord, bool, error)
+
+	// Get returns a lane by credential + lane id (a copy); ok=false if absent.
+	Get(credID, laneID string) (*LaneRecord, bool)
+
+	// ObserveRisk atomically updates a lane's risk score AND drives its
+	// security status (P0.7), returning the updated record.
+	ObserveRisk(credID, laneID string, riskScore int, now time.Time) (*LaneRecord, error)
+
+	// RecordCleanAuthorizedAndPromote increments clean counters and attempts
+	// promotion for eligible states, one authoritative mutation (P0.25).
+	RecordCleanAuthorizedAndPromote(credID, laneID string, riskScore int, criteria PromotionCriteria, now time.Time) (*LaneRecord, bool, error)
+
+	// ListLaneIDs returns the lane IDs held by a credential (a copy).
+	ListLaneIDs(credID string) []string
+}
 
 // Store is a per-credential, bounded, concurrency-safe lane store with idle
 // eviction (§28, §81 bounded memory). Overflow low-value variants are folded
@@ -126,9 +156,22 @@ func (s *Store) lookupLocked(credID, laneID string) (*LaneRecord, bool) {
 // similarity, then lexicographically smallest lane id — never Go map iteration
 // order. Expired lanes are evicted (per-credential, before the limit check)
 // so a lane that should have expired cannot wedge creation (§28).
-func (s *Store) BorrowOrCreate(credID, newLaneID string, cand Features, th ClassificationThresholds) (*LaneRecord, bool, error) {
+//
+// Cross-revision gating (P0.21): a row is only reusable when BOTH its
+// FeatSchema AND its ClassificationRevision equal the context's. Re-keying
+// classification semantics fragments the lane universe instead of laundering
+// pre-change history into the new one.
+func (s *Store) BorrowOrCreate(credID, newLaneID string, cand Features, ctx ClassificationContext) (*LaneRecord, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	th := ctx.Thresholds
+	// P0.21: a zero/unset context revision means "the store's current
+	// universe". The terminator always passes an explicit policy revision; this
+	// default keeps legacy store-level callers in the same universe without
+	// forcing every test to spell out the revision.
+	if ctx.Revision < 1 {
+		ctx.Revision = currentClassificationRevision
+	}
 
 	// Evict idle lanes for THIS credential before the limit decision so an
 	// expired lane cannot consume capacity that its own expiration is about to
@@ -159,7 +202,7 @@ func (s *Store) BorrowOrCreate(credID, newLaneID string, cand Features, th Class
 	// §24 state-reset collision and fails closed (ErrLaneConflict), and a
 	// schema-stale record is never silently compared (P0.22).
 	if rec, exists := m[newLaneID]; exists {
-		if rec.FeatSchema == featSchemaVersion && sameFeatures(rec.Features, cand) {
+		if rec.FeatSchema == featSchemaVersion && rec.ClassificationRevision == ctx.Revision && sameFeatures(rec.Features, cand) {
 			rec.LastSeenAt = s.now()
 			rec.RequestCount++
 			rec.Revision++
@@ -174,11 +217,13 @@ func (s *Store) BorrowOrCreate(credID, newLaneID string, cand Features, th Class
 	var bestID string
 	var best *LaneRecord
 	for id, rec := range m {
-		// Never classify across feature-schema revisions (P0.22): a record
-		// stored under an older schema has dimensions this schema may score
-		// differently. Skip it for borrowing; the exact-reuse path above
-		// already rejected same-ID schema-stale records.
-		if rec.FeatSchema != featSchemaVersion {
+		// Never classify across feature-schema revisions (P0.22) or lane-universe
+		// revisions (P0.21): a record stored under an older schema has dimensions
+		// this schema may score differently, and one stored under an older
+		// ClassificationRevision belongs to a different lane universe. Skip both
+		// for borrowing; the exact-reuse path above already rejects same-ID
+		// stale records.
+		if rec.FeatSchema != featSchemaVersion || rec.ClassificationRevision != ctx.Revision {
 			continue
 		}
 		if sim := Similarity(cand, rec.Features); sim > bestSim {
@@ -249,9 +294,12 @@ func (s *Store) BorrowOrCreate(credID, newLaneID string, cand Features, th Class
 		LastSeenAt:   now,
 		Features:     cand, // full vector persisted (P0.8)
 		FeatSchema:   featSchemaVersion,
-		RequestCount: 1,
-		CleanSince:   now, // the clean window starts at lane creation (P0.42)
-		Revision:     1,
+		// P0.21: persist the classification universe the row was created under
+		// so a later re-key can never borrow it.
+		ClassificationRevision: ctx.Revision,
+		RequestCount:           1,
+		CleanSince:             now, // the clean window starts at lane creation (P0.42)
+		Revision:               1,
 	}
 	rec.trackActiveDayLocked(now)
 	m[newLaneID] = rec
@@ -337,21 +385,7 @@ func (s *Store) ListLaneIDs(credID string) []string {
 	return ids
 }
 
-// sortRecords is retained for deterministic iteration by callers that must
-// enumerate lanes (diagnostics/sweeper use); store internals never depend on
-// map order for decisions.
-func sortRecords(m map[string]*LaneRecord) []*LaneRecord {
-	ids := make([]string, 0, len(m))
-	for id := range m {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-	out := make([]*LaneRecord, 0, len(ids))
-	for _, id := range ids {
-		out = append(out, m[id])
-	}
-	return out
-}
+
 
 // ObserveRisk atomically updates a lane's risk score AND drives the lane
 // security-status dimension (P0.7) under the store lock. This prevents lost
