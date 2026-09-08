@@ -633,6 +633,8 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		mux.HandleFunc("/admin/policy/prepare", adminPolicyPrepare(svc, policyManager, policyVerifier))
 		mux.HandleFunc("/admin/policy/activate", adminPolicyActivate(svc, policyManager))
 		mux.HandleFunc("/admin/policy/rollback", adminPolicyRollback(svc, policyManager))
+		mux.HandleFunc("/admin/cluster", adminClusterStatus(svc, postgres))
+		mux.HandleFunc("/admin/crypto", adminClusterStatus(svc, postgres))
 		mux.HandleFunc("/admin/metrics", adminMetrics(svc, dp, governor, state, spray, decisionObserver, policyManager, signer, adaptiveHealth))
 		adminSrv = &http.Server{
 			Addr:              cfg.Admin.Listen,

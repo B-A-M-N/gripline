@@ -74,6 +74,8 @@ func parseSubcommand(args []string) (string, []string) {
 //	gripline state check|backup|restore|compact --config path.json
 //	gripline policy verify|status|prepare|activate|rollback --config path.json
 //	gripline migrate plan|apply --config path.json
+//	gripline cluster status --config path.json
+//	gripline crypto status --config path.json
 //	gripline status --config path.json
 //	gripline version
 //
@@ -107,6 +109,10 @@ func dispatchSubcommand(sub string, args []string) error {
 		return runPolicyCLI(args)
 	case "migrate":
 		return runMigrateCLI(args)
+	case "cluster":
+		return runClusterCLI(args)
+	case "crypto":
+		return runCryptoCLI(args)
 	case "status":
 		fs := flag.NewFlagSet("status", flag.ExitOnError)
 		cfgPath := fs.String("config", "/etc/gripline/config.json", "path to the deployment configuration")
@@ -121,7 +127,7 @@ func dispatchSubcommand(sub string, args []string) error {
 		fmt.Println(versionString())
 		return errSubcommand
 	default:
-		return fmt.Errorf("unknown subcommand %q (expected: keys, credential, lane, audit, state, policy, migrate, status, version)", sub)
+		return fmt.Errorf("unknown subcommand %q (expected: keys, credential, lane, audit, state, policy, migrate, cluster, crypto, status, version)", sub)
 	}
 }
 

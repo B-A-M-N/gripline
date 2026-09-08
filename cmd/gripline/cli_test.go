@@ -80,6 +80,12 @@ func TestCLILifecycleUsesLiveAdmin(t *testing.T) {
 			_ = json.NewEncoder(w).Encode([]adminLaneSummary{{LaneID: "lane_live", CredentialID: "cred_live", State: "NEW"}})
 		case r.Method == http.MethodGet && r.URL.Path == "/admin/security-events":
 			_, _ = w.Write([]byte(`[{"sequence":7,"at":"2026-09-07T00:00:00Z","kind":"lane_security","credential_id":"cred_live","lane_id":"lane_live","before":"NORMAL","after":"BLOCKED","risk_score":50,"revision":4,"policy_revision":3,"request_id":"req_live","evidence_codes":["CONCURRENCY_OVER_10X_BASELINE"]}]`))
+		case r.Method == http.MethodGet && (r.URL.Path == "/admin/cluster" || r.URL.Path == "/admin/crypto"):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"node_id": "node-a", "local_ready": true,
+				"nodes":  []map[string]any{{"node_id": "node-a", "state": "ready", "live": true}},
+				"crypto": map[string]any{"initialized": true, "generation_epoch": 3},
+			})
 		default:
 			http.NotFound(w, r)
 		}
@@ -88,7 +94,7 @@ func TestCLILifecycleUsesLiveAdmin(t *testing.T) {
 
 	dir := t.TempDir()
 	adminAddr := strings.TrimPrefix(admin.URL, "http://")
-	cfgJSON := `{"listen":"127.0.0.1:8080","backend":{"url":"http://backend.invalid:80","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"test-audience"},"admin":{"listen":"` + adminAddr + `","operator_tokens":{"` + token + `":"ops:credential.lifecycle,lane.lifecycle"}},"tls":{"terminate_tls_upstream":true},"paths":{"audit_log":"` + filepath.Join(dir, "audit.jsonl") + `"}}`
+	cfgJSON := `{"listen":"127.0.0.1:8080","backend":{"url":"http://backend.invalid:80","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"test-audience"},"admin":{"listen":"` + adminAddr + `","operator_tokens":{"` + token + `":"ops:credential.lifecycle,lane.lifecycle,cluster.read"}},"tls":{"terminate_tls_upstream":true},"paths":{"audit_log":"` + filepath.Join(dir, "audit.jsonl") + `"}}`
 	cfgPath := filepath.Join(dir, "config.json")
 	if err := os.WriteFile(cfgPath, []byte(cfgJSON), 0o640); err != nil {
 		t.Fatal(err)
@@ -123,6 +129,22 @@ func TestCLILifecycleUsesLiveAdmin(t *testing.T) {
 	})
 	if !strings.Contains(out, "CONCURRENCY_OVER_10X_BASELINE") || !strings.Contains(out, "req_live") {
 		t.Fatalf("security audit list did not use live admin response: %s", out)
+	}
+	out = captureStdout(t, func() {
+		if err := runClusterCLI([]string{"status", "--config", cfgPath, "--token", token}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(out, `"local_ready": true`) || !strings.Contains(out, `"generation_epoch": 3`) {
+		t.Fatalf("cluster status did not use live admin response: %s", out)
+	}
+	out = captureStdout(t, func() {
+		if err := runCryptoCLI([]string{"status", "--config", cfgPath, "--token", token}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(out, `"initialized": true`) {
+		t.Fatalf("crypto status did not use live admin response: %s", out)
 	}
 }
 

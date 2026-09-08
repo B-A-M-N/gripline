@@ -204,7 +204,58 @@ func runPolicyCLI(args []string) error {
 	default:
 		return fmt.Errorf("policy: unknown action %q", args[0])
 	}
-	return errSubcommand
+	return nil
+}
+
+// runClusterCLI exposes shared authority diagnostics through the authenticated
+// admin listener. It never opens or mutates the database locally, which keeps
+// status accurate when the CLI runs on a different operator workstation.
+func runClusterCLI(args []string) error {
+	if len(args) == 0 || args[0] != "status" {
+		return fmt.Errorf("cluster: expected status")
+	}
+	return runRemoteStatusCLI("cluster status", "/admin/cluster", args[1:])
+}
+
+// runCryptoCLI is the focused view of the same shared status response. The
+// authority's crypto generations are included in /admin/cluster as well, but
+// a separate command makes rotation readiness easy to inspect in runbooks.
+func runCryptoCLI(args []string) error {
+	if len(args) == 0 || args[0] != "status" {
+		return fmt.Errorf("crypto: expected status")
+	}
+	return runRemoteStatusCLI("crypto status", "/admin/crypto", args[1:])
+}
+
+func runRemoteStatusCLI(command, endpoint string, args []string) error {
+	fs := flag.NewFlagSet(command, flag.ContinueOnError)
+	cfgPath := fs.String("config", "/etc/gripline/config.json", "path to the deployment configuration")
+	token := fs.String("token", "", "operator token (env GRIPLINE_OPERATOR_TOKEN)")
+	tokenFile := fs.String("token-file", "", "read the operator token from this file")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	tok, err := operatorTokenFromFile(*token, *tokenFile)
+	if err != nil {
+		return err
+	}
+	if tok == "" {
+		return fmt.Errorf("%s: --token (or GRIPLINE_OPERATOR_TOKEN) is required", command)
+	}
+	client, err := newAdminClient(*cfgPath)
+	if err != nil {
+		return err
+	}
+	var status map[string]any
+	if err := client.request(http.MethodGet, endpoint, tok, nil, &status); err != nil {
+		return fmt.Errorf("%s: %w", command, err)
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(status); err != nil {
+		return err
+	}
+	return nil
 }
 
 // runCredentialCLI dispatches `gripline credential <list|revoke>`.

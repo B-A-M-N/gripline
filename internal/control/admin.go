@@ -143,6 +143,8 @@ const (
 	CapPolicyInstall Capability = "policy.install"
 	// CapAuditRead: read operator and automatic security audit history.
 	CapAuditRead Capability = "audit.read"
+	// CapClusterRead: read shared membership and crypto-generation status.
+	CapClusterRead Capability = "cluster.read"
 )
 
 // ErrUnauthenticated is returned when credentials are absent or invalid.
@@ -211,7 +213,7 @@ func NewTokenAuthenticator(tokens map[string]*Identity) (*TokenAuthenticator, er
 func ParseCapability(s string) (Capability, error) {
 	capability := Capability(s)
 	switch capability {
-	case CapCredentialLifecycle, CapLaneLifecycle, CapPosture, CapEvidence, CapPolicyInstall, CapAuditRead:
+	case CapCredentialLifecycle, CapLaneLifecycle, CapPosture, CapEvidence, CapPolicyInstall, CapAuditRead, CapClusterRead:
 		return capability, nil
 	default:
 		return "", fmt.Errorf("control: unknown capability %q", s)

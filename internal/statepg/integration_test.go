@@ -77,6 +77,16 @@ func TestPostgresAuthorityIntegration(t *testing.T) {
 	if err := c.Ready(ctx); err != nil {
 		t.Fatalf("node C readiness: %v", err)
 	}
+	clusterStatus, err := b.ClusterStatus(ctx)
+	if err != nil {
+		t.Fatalf("cluster status: %v", err)
+	}
+	if !clusterStatus.LocalReady || len(clusterStatus.Nodes) != 3 {
+		t.Fatalf("cluster status local_ready=%v nodes=%d, want ready and three nodes: %+v", clusterStatus.LocalReady, len(clusterStatus.Nodes), clusterStatus)
+	}
+	if !clusterStatus.Crypto.Initialized || clusterStatus.Crypto.GenerationEpoch < 1 {
+		t.Fatalf("cluster crypto status is not initialized: %+v", clusterStatus.Crypto)
+	}
 
 	now := time.Now().UTC()
 	credentialID := prefix + "-credential"
