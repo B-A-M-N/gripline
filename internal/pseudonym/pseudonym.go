@@ -139,6 +139,24 @@ func (r *Ring) SetActiveVersion(version int) error {
 	return nil
 }
 
+// RetireVersion removes a non-active generation. Cluster callers must first
+// prove that no persisted source aliases/scopes still depend on the
+// generation; keeping this guard in the ring prevents an accidental local
+// outage when the authority sequencing is bypassed.
+func (r *Ring) RetireVersion(version int) error {
+	if r == nil {
+		return fmt.Errorf("pseudonym: nil ring")
+	}
+	if version == r.ActiveVersion() {
+		return fmt.Errorf("pseudonym: cannot retire active key version %d", version)
+	}
+	if _, ok := r.active[version]; !ok {
+		return fmt.Errorf("pseudonym: key version %d is not loaded", version)
+	}
+	delete(r.active, version)
+	return nil
+}
+
 // ActiveVersion returns the generation used for new pseudonyms.
 func (r *Ring) ActiveVersion() int { return r.latest() }
 
@@ -218,6 +236,33 @@ func (r *Ring) Derive(family Family, raw []byte) (string, error) {
 		return "", fmt.Errorf("pseudonym: no key for version %d", v)
 	}
 	return deriveWith(family, raw, v, k), nil
+}
+
+// DeriveAll returns one candidate per loaded generation in ascending version
+// order. It is used by the clustered source resolver to find an existing
+// pre-rotation source scope and preserve that source identity while the active
+// key changes. The active Derive method remains the only default minting path.
+func (r *Ring) DeriveAll(family Family, raw []byte) ([]string, error) {
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("pseudonym: empty input")
+	}
+	versions := make([]int, 0, len(r.active))
+	for version := range r.active {
+		versions = append(versions, version)
+	}
+	sort.Ints(versions)
+	out := make([]string, 0, len(versions))
+	for _, version := range versions {
+		key := r.active[version]
+		if len(key) == 0 {
+			continue
+		}
+		out = append(out, deriveWith(family, raw, version, key))
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("pseudonym: no loaded key for derivation")
+	}
+	return out, nil
 }
 
 // Verify recomputes the pseudonym under every active key version and reports

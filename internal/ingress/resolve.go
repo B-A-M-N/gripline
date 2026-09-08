@@ -4,6 +4,7 @@
 package ingress
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/netip"
@@ -31,6 +32,13 @@ type PseudonymRing interface {
 	Derive(family []byte, raw []byte) (string, error)
 }
 
+// ContextPseudonymRing is the request-aware extension used when source
+// pseudonyms need a shared alias lookup during key rotation. Legacy rings may
+// implement only Derive; ResolveContext falls back to that method.
+type ContextPseudonymRing interface {
+	DeriveContext(context.Context, []byte, []byte) (string, error)
+}
+
 // NetworkMetadataResolver resolves ASN/network/region metadata for a source IP.
 type NetworkMetadataResolver interface {
 	Resolve(ip netip.Addr) (asn string, networkType string, region string, ok bool)
@@ -55,6 +63,14 @@ type TrustedSource struct {
 //  4. HMAC-pseudonymize the canonical peer IP.
 //  5. Enrich with ASN/network/region metadata if a resolver is configured.
 func (r *Resolver) Resolve(remoteAddr string, headers http.Header) (TrustedSource, error) {
+	return r.ResolveContext(context.Background(), remoteAddr, headers)
+}
+
+// ResolveContext is Resolve with a bounded request context. A clustered
+// pseudonym adapter may use it to resolve a pre-rotation source alias from
+// shared authority state; cancellation must stop that lookup before admission
+// continues.
+func (r *Resolver) ResolveContext(ctx context.Context, remoteAddr string, headers http.Header) (TrustedSource, error) {
 	if r.Pseudonyms == nil {
 		return TrustedSource{}, nil
 	}
@@ -81,7 +97,12 @@ func (r *Resolver) Resolve(remoteAddr string, headers http.Header) (TrustedSourc
 	canonical = canonical.WithZone("")
 
 	// HMAC-pseudonymize the canonical peer IP.
-	pseudonym, err := r.Pseudonyms.Derive([]byte("source"), []byte(canonical.String()))
+	var pseudonym string
+	if contextRing, ok := r.Pseudonyms.(ContextPseudonymRing); ok {
+		pseudonym, err = contextRing.DeriveContext(ctx, []byte("source"), []byte(canonical.String()))
+	} else {
+		pseudonym, err = r.Pseudonyms.Derive([]byte("source"), []byte(canonical.String()))
+	}
 	if err != nil {
 		return TrustedSource{}, fmt.Errorf("ingress: pseudonymize: %w", err)
 	}

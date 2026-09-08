@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"context"
+
 	"github.com/B-A-M-N/gripline/internal/ingress"
 	"github.com/B-A-M-N/gripline/internal/lane"
 	"github.com/B-A-M-N/gripline/internal/terminator"
@@ -26,7 +28,14 @@ func NewIngressSourceResolver(r *ingress.Resolver) *IngressSourceResolver {
 // peer, pseudonymization error) is returned as an error so the proxy can fail
 // closed instead of silently dropping source protection (P0.11).
 func (s *IngressSourceResolver) ResolveSource(obs Observation) (terminator.TrustedSource, error) {
-	src, err := s.inner.Resolve(obs.RemoteAddr, obs.Header)
+	return s.ResolveSourceContext(context.Background(), obs)
+}
+
+// ResolveSourceContext is the request-aware source path. It preserves the
+// legacy ResolveSource method for embedders while allowing a clustered ingress
+// pseudonym ring to consult shared source aliases without losing cancellation.
+func (s *IngressSourceResolver) ResolveSourceContext(ctx context.Context, obs Observation) (terminator.TrustedSource, error) {
+	src, err := s.inner.ResolveContext(ctx, obs.RemoteAddr, obs.Header)
 	if err != nil {
 		return terminator.TrustedSource{}, err
 	}

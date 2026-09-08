@@ -217,14 +217,100 @@ func runClusterCLI(args []string) error {
 	return runRemoteStatusCLI("cluster status", "/admin/cluster", args[1:])
 }
 
-// runCryptoCLI is the focused view of the same shared status response. The
-// authority's crypto generations are included in /admin/cluster as well, but
-// a separate command makes rotation readiness easy to inspect in runbooks.
+// runCryptoCLI is the focused view and activation surface for shared crypto
+// generations. Status is read-only; activation is authenticated, audited, and
+// replay-safe through the live admin authority.
 func runCryptoCLI(args []string) error {
-	if len(args) == 0 || args[0] != "status" {
-		return fmt.Errorf("crypto: expected status")
+	if len(args) == 0 {
+		return fmt.Errorf("crypto: expected status, activate, retire, or signer-prepare")
 	}
-	return runRemoteStatusCLI("crypto status", "/admin/crypto", args[1:])
+	if args[0] == "status" {
+		return runRemoteStatusCLI("crypto status", "/admin/crypto", args[1:])
+	}
+	if args[0] == "signer-prepare" {
+		return runCryptoSignerPrepareCLI(args[1:])
+	}
+	if args[0] != "activate" && args[0] != "retire" {
+		return fmt.Errorf("crypto: unknown action %q (expected status, activate, retire, or signer-prepare)", args[0])
+	}
+	action := args[0]
+	fs := flag.NewFlagSet("crypto "+action, flag.ContinueOnError)
+	cfgPath := fs.String("config", "/etc/gripline/config.json", "path to the deployment configuration")
+	kind := fs.String("kind", "", "generation kind: signer, pepper, or pseudonym")
+	generation := fs.Int("generation", 0, "loaded generation to activate")
+	fingerprint := fs.String("fingerprint", "", "exact loaded-generation fingerprint from crypto status")
+	reason := fs.String("reason", "", "operator reason")
+	notBefore := fs.String("not-before", "", "RFC3339 overlap horizon (retire only)")
+	operationID := fs.String("operation-id", "", "stable Idempotency-Key for retrying the activation")
+	token := fs.String("token", "", "operator token (env GRIPLINE_OPERATOR_TOKEN)")
+	tokenFile := fs.String("token-file", "", "read the operator token from this file")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	tok, err := operatorTokenFromFile(*token, *tokenFile)
+	if err != nil {
+		return err
+	}
+	if tok == "" || strings.TrimSpace(*kind) == "" || *generation < 1 || strings.TrimSpace(*fingerprint) == "" || strings.TrimSpace(*reason) == "" || strings.TrimSpace(*operationID) == "" {
+		return fmt.Errorf("crypto %s: --kind, --generation, --fingerprint, --reason, --operation-id, and --token (or --token-file/GRIPLINE_OPERATOR_TOKEN) are required", action)
+	}
+	body := map[string]any{"kind": *kind, "generation": *generation, "fingerprint": *fingerprint, "reason": *reason}
+	endpoint := "/admin/crypto/activate"
+	if action == "retire" {
+		parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(*notBefore))
+		if err != nil {
+			return fmt.Errorf("crypto retire: --not-before must be RFC3339: %w", err)
+		}
+		body["not_before"] = parsed.UTC()
+		endpoint = "/admin/crypto/retire"
+	}
+	client, err := newAdminClient(*cfgPath)
+	if err != nil {
+		return err
+	}
+	var result map[string]any
+	if err := client.requestWithOperationID(http.MethodPost, endpoint, tok, *operationID, body, &result); err != nil {
+		return fmt.Errorf("crypto %s: %w", action, err)
+	}
+	fmt.Printf("%s %s generation %d\n", action, *kind, *generation)
+	return nil
+}
+
+// runCryptoSignerPrepareCLI creates one durable local candidate. In a cluster
+// this is a stopped-node/key-material operation: the resulting sealed keyring
+// must be distributed identically to every node before the live activation
+// command can pass the authority acknowledgement barrier.
+func runCryptoSignerPrepareCLI(args []string) error {
+	fs := flag.NewFlagSet("crypto signer-prepare", flag.ContinueOnError)
+	cfgPath := fs.String("config", "/etc/gripline/config.json", "path to the deployment configuration")
+	offline := fs.Bool("offline", false, "confirm the serving deployment is stopped")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if !*offline {
+		return fmt.Errorf("crypto signer-prepare: --offline is required; prepare and distribute keyrings while the cluster is stopped")
+	}
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return fmt.Errorf("crypto signer-prepare: %w", err)
+	}
+	if cfg.Paths.SignerKeyring == "" {
+		return fmt.Errorf("crypto signer-prepare: paths.signer_keyring is required")
+	}
+	keyring, err := terminator.LoadExistingKeyring(cfg.Paths.SignerKeyring)
+	if err != nil {
+		return fmt.Errorf("crypto signer-prepare: load keyring: %w", err)
+	}
+	candidate, err := keyring.PrepareRotation(cfg.Paths.SignerKeyring)
+	if err != nil {
+		return fmt.Errorf("crypto signer-prepare: %w", err)
+	}
+	fingerprint, ok := keyring.PublicKeyFingerprint(candidate.KID)
+	if !ok {
+		return fmt.Errorf("crypto signer-prepare: candidate fingerprint unavailable")
+	}
+	fmt.Printf("prepared signer generation %d fingerprint=%s; distribute this sealed keyring to every node before activation\n", candidate.KID, fingerprint)
+	return errSubcommand
 }
 
 func runRemoteStatusCLI(command, endpoint string, args []string) error {

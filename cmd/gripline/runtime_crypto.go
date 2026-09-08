@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/B-A-M-N/gripline/internal/credential"
 	"github.com/B-A-M-N/gripline/internal/ingress"
@@ -12,6 +13,14 @@ import (
 
 type cryptoSynchronizer interface {
 	SynchronizeCrypto(context.Context, statepg.CryptoIdentity) (statepg.CryptoIdentity, error)
+}
+
+type preparedSignerAcceptor interface {
+	AcceptPrepared(context.Context, *terminator.Keyring, int, []byte) error
+}
+
+type signerVerifierRetirer interface {
+	RetireKey(context.Context, int, string) error
 }
 
 func localCryptoIdentity(signer *terminator.Keyring, peppers *credential.PepperRing, pseudonyms ingress.PseudonymRing) (statepg.CryptoIdentity, error) {
@@ -65,11 +74,63 @@ func localCryptoIdentity(signer *terminator.Keyring, peppers *credential.PepperR
 // activated the locally prepared private key; secret-ring generations must
 // never be guessed from the highest loaded version.
 func reconcileClusterCrypto(ctx context.Context, shared statepg.CryptoIdentity, authority cryptoSynchronizer, signer *terminator.Keyring, peppers *credential.PepperRing, pseudonyms ingress.PseudonymRing) error {
+	return reconcileClusterCryptoWithSigner(ctx, shared, authority, signer, peppers, pseudonyms, "", nil)
+}
+
+func reconcileClusterCryptoWithSigner(ctx context.Context, shared statepg.CryptoIdentity, authority cryptoSynchronizer, signer *terminator.Keyring, peppers *credential.PepperRing, pseudonyms ingress.PseudonymRing, signerPath string, acceptor preparedSignerAcceptor) error {
 	if signer == nil || peppers == nil || authority == nil {
 		return fmt.Errorf("gripline: incomplete cluster crypto reconciler")
 	}
 	if signer.ActiveKid() != shared.SignerActiveKID {
-		return fmt.Errorf("gripline: active signer generation %d requires explicit local activation; authority selected %d", signer.ActiveKid(), shared.SignerActiveKID)
+		if signerPath == "" || acceptor == nil {
+			return fmt.Errorf("gripline: active signer generation %d requires backend verifier acceptance; authority selected %d", signer.ActiveKid(), shared.SignerActiveKID)
+		}
+		prepared, ok := signer.PreparedKid()
+		if !ok || prepared != shared.SignerActiveKID {
+			return fmt.Errorf("gripline: signer generation %d is not locally prepared", shared.SignerActiveKID)
+		}
+		if err := signer.ActivatePrepared(signerPath, shared.SignerActiveKID, func(public []byte) error {
+			return acceptor.AcceptPrepared(ctx, signer, shared.SignerActiveKID, public)
+		}); err != nil {
+			return fmt.Errorf("gripline: activate signer generation %d: %w", shared.SignerActiveKID, err)
+		}
+	}
+	for _, retired := range shared.Retired {
+		switch retired.Kind {
+		case statepg.CryptoKindSigner:
+			if signer.ActiveKid() == retired.Generation {
+				return fmt.Errorf("gripline: shared retired signer generation %d is still active locally", retired.Generation)
+			}
+			if _, loaded := signer.Public(retired.Generation); loaded {
+				retirer, ok := acceptor.(signerVerifierRetirer)
+				if !ok {
+					return fmt.Errorf("gripline: retired signer generation %d requires backend verifier retirement", retired.Generation)
+				}
+				if err := retirer.RetireKey(ctx, retired.Generation, retired.Fingerprint); err != nil {
+					return fmt.Errorf("gripline: retire backend signer generation %d: %w", retired.Generation, err)
+				}
+				if signerPath == "" {
+					return fmt.Errorf("gripline: signer keyring path required to retire generation %d", retired.Generation)
+				}
+				if err := signer.RetireAfter(signerPath, retired.Generation, time.Time{}); err != nil {
+					return fmt.Errorf("gripline: retire local signer generation %d: %w", retired.Generation, err)
+				}
+			}
+		case statepg.CryptoKindPepper:
+			if _, loaded := peppers.VersionFingerprint(retired.Generation); loaded {
+				if err := peppers.RetireVersion(retired.Generation); err != nil {
+					return fmt.Errorf("gripline: retire local pepper generation %d: %w", retired.Generation, err)
+				}
+			}
+		case statepg.CryptoKindPseudonym:
+			if configured, ok := pseudonyms.(*pseudonymRingAdapter); ok {
+				if _, loaded := configured.VersionFingerprint(retired.Generation); loaded {
+					if err := configured.RetireVersion(retired.Generation); err != nil {
+						return fmt.Errorf("gripline: retire local pseudonym generation %d: %w", retired.Generation, err)
+					}
+				}
+			}
+		}
 	}
 	if err := peppers.SetActiveVersion(shared.PepperActiveVersion); err != nil {
 		return fmt.Errorf("gripline: reconcile pepper generation: %w", err)

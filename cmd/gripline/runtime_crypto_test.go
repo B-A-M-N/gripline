@@ -2,13 +2,25 @@ package main
 
 import (
 	"context"
+	"net/http"
 	"testing"
 
 	"github.com/B-A-M-N/gripline/internal/credential"
+	"github.com/B-A-M-N/gripline/internal/ingress"
 	"github.com/B-A-M-N/gripline/internal/pseudonym"
 	"github.com/B-A-M-N/gripline/internal/statepg"
 	"github.com/B-A-M-N/gripline/internal/terminator"
 )
+
+type sourceAliasTestLookup struct {
+	resolved string
+	seen     []string
+}
+
+func (l *sourceAliasTestLookup) ResolveExistingSourcePseudonym(_ context.Context, candidates []string) (string, error) {
+	l.seen = append([]string(nil), candidates...)
+	return l.resolved, nil
+}
 
 type recordingCryptoSynchronizer struct {
 	identity statepg.CryptoIdentity
@@ -81,5 +93,28 @@ func TestReconcileClusterCryptoRefusesSignerSwitch(t *testing.T) {
 	}
 	if authority.called {
 		t.Fatal("refused signer switch must not acknowledge the authority")
+	}
+}
+
+func TestClusterPseudonymRotationPreservesExistingSourceIdentity(t *testing.T) {
+	ring, err := pseudonym.NewRing(
+		&pseudonym.Key{Version: 1, Secret: []byte("pseudonym-generation-one-0123456789")},
+		&pseudonym.Key{Version: 2, Secret: []byte("pseudonym-generation-two-0123456789")},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lookup := &sourceAliasTestLookup{resolved: "v1.existing-source"}
+	adapter := &pseudonymRingAdapter{ring: ring, sourceAliases: lookup}
+	source := &ingress.Resolver{Pseudonyms: adapter}
+	got, err := source.ResolveContext(context.Background(), "198.51.100.88:443", http.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Pseudonym != lookup.resolved {
+		t.Fatalf("source pseudonym=%q, want shared alias %q", got.Pseudonym, lookup.resolved)
+	}
+	if len(lookup.seen) != 2 || lookup.seen[0] == lookup.seen[1] {
+		t.Fatalf("source alias lookup candidates=%v, want both loaded generations", lookup.seen)
 	}
 }

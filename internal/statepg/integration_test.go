@@ -794,6 +794,30 @@ func TestPostgresCryptoActivationRequiresLiveNodeAcknowledgements(t *testing.T) 
 	if _, err := b.ActivateCryptoGeneration(ctx, conflict); !errors.Is(err, control.ErrOperationConflict) {
 		t.Fatalf("reused activation operation error=%v, want conflict", err)
 	}
+	// Retirement is a separate, conservative lifecycle step. The node first
+	// acknowledges the newly active pepper, then the authority permits removal
+	// of the old generation because no credential still references it.
+	reconciled := staged
+	reconciled.PepperActiveVersion = 2
+	reconciled.PepperActiveFingerprint = request.Fingerprint
+	if _, err := a.SynchronizeCrypto(ctx, reconciled); err != nil {
+		t.Fatalf("acknowledge active pepper before retirement: %v", err)
+	}
+	retireRequest := CryptoRetirementRequest{
+		Kind: CryptoKindPepper, Generation: 1, Fingerprint: base.PepperFingerprint,
+		NotBefore: time.Now().Add(-time.Second), OperationID: "crypto-retirement-operation",
+		Actor: "integration-operator", Reason: "retire migrated pepper",
+	}
+	retired, err := a.RetireCryptoGeneration(ctx, retireRequest)
+	if err != nil {
+		t.Fatalf("retire unused pepper generation: %v", err)
+	}
+	if retired.GenerationEpoch != 3 || len(retired.Retired) != 1 || retired.Retired[0].Generation != 1 {
+		t.Fatalf("retired crypto identity=%+v, want epoch 3 with pepper 1 retired", retired)
+	}
+	if _, err := b.RetireCryptoGeneration(ctx, retireRequest); err != nil {
+		t.Fatalf("exact retirement retry: %v", err)
+	}
 }
 
 func TestPostgresCryptoReadinessRejectsUnreconciledActivation(t *testing.T) {

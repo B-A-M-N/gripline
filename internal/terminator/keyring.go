@@ -638,6 +638,33 @@ func (k *Keyring) Issue(c Claims, ttl time.Duration) (*Assertion, error) {
 	return k.st.active.Issue(c, ttl)
 }
 
+// IssuePrepared signs a short-lived canary with the persisted candidate
+// generation without making that generation active for normal traffic. It is
+// reserved for the backend verifier-acceptance handshake; callers must never
+// use the returned assertion as a data-plane identity before ActivatePrepared
+// completes.
+func (k *Keyring) IssuePrepared(c Claims, ttl time.Duration) (*Assertion, error) {
+	k.st.mu.Lock()
+	defer k.st.mu.Unlock()
+	if k.st.pending == nil {
+		return nil, errors.New("terminator: keyring has no prepared signer")
+	}
+	return k.st.pending.Issue(c, ttl)
+}
+
+// PreparedKid reports the persisted candidate generation, if one exists.
+func (k *Keyring) PreparedKid() (int, bool) {
+	if k == nil || k.st == nil {
+		return 0, false
+	}
+	k.st.mu.Lock()
+	defer k.st.mu.Unlock()
+	if k.st.pending == nil {
+		return 0, false
+	}
+	return k.st.pending.Kid(), true
+}
+
 // ActiveKid reports the current signing generation.
 func (k *Keyring) ActiveKid() int {
 	k.st.mu.Lock()

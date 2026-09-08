@@ -95,6 +95,13 @@ type SourceResolver interface {
 	ResolveSource(obs Observation) (terminator.TrustedSource, error)
 }
 
+// ContextSourceResolver is the request-aware extension of SourceResolver.
+// Implementations that consult shared authority state use this path so a
+// canceled request cannot leave a database lookup running into admission.
+type ContextSourceResolver interface {
+	ResolveSourceContext(context.Context, Observation) (terminator.TrustedSource, error)
+}
+
 // Peer is retained for adapter compatibility; resolvers should prefer the
 // Observation.RemoteAddr field.
 type Peer struct {
@@ -559,7 +566,13 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// source boundary exactly when resolution is broken). NoSource and healthy
 	// resolvers return a nil error; optional metadata (ASN/region) being absent
 	// is not an error.
-	src, srcErr := d.srcs.ResolveSource(obs)
+	var src terminator.TrustedSource
+	var srcErr error
+	if contextResolver, ok := d.srcs.(ContextSourceResolver); ok {
+		src, srcErr = contextResolver.ResolveSourceContext(r.Context(), obs)
+	} else {
+		src, srcErr = d.srcs.ResolveSource(obs)
+	}
 	if srcErr != nil {
 		out := &terminator.Outcome{RequestID: requestID, Authorized: false, Reason: "source_resolution_failed", DenialErr: srcErr}
 		observeAdmission(out)

@@ -215,6 +215,11 @@ type TLSSection struct {
 type BackendSection struct {
 	// URL is the upstream origin, e.g. "https://provider.internal:443".
 	URL string `json:"url"`
+	// VerifierControlURL is the private backend control endpoint used by the
+	// clustered signer-rotation handshake. The endpoint must durably publish a
+	// candidate public key and verify the supplied candidate canary before it
+	// returns success. Empty means signer activation is intentionally disabled.
+	VerifierControlURL string `json:"verifier_control_url,omitempty"`
 	// Timeout is the default for the dial, TLS-handshake, and response-header
 	// phases below. Streaming response bodies use the proxy's idle semantics;
 	// this is not an absolute wall-clock cap on a live stream.
@@ -425,14 +430,32 @@ func (c *Config) Validate() error {
 	if c.Backend.Timeout.D() <= 0 {
 		return fmt.Errorf("backend.timeout required (an unbounded upstream exchange is not deployable)")
 	}
-	if u, err := url.Parse(c.Backend.URL); err != nil || u.Scheme == "" || u.Host == "" {
+	backendURL, err := url.Parse(c.Backend.URL)
+	if err != nil || backendURL.Scheme == "" || backendURL.Host == "" {
 		return fmt.Errorf("backend.url must be an absolute http/https URL")
-	} else if u.Scheme != "http" && u.Scheme != "https" {
+	}
+	if backendURL.Scheme != "http" && backendURL.Scheme != "https" {
 		return fmt.Errorf("backend.url scheme must be http or https")
-	} else if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+	}
+	if backendURL.User != nil || backendURL.RawQuery != "" || backendURL.Fragment != "" {
 		return fmt.Errorf("backend.url must not contain userinfo, query, or fragment")
-	} else if u.Scheme != "https" && (c.Backend.TLS.CAFile != "" || c.Backend.TLS.ClientCertFile != "" || c.Backend.TLS.ClientKeyFile != "" || c.Backend.TLS.ServerName != "" || c.Backend.TLS.MinVersion != "") {
+	}
+	if backendURL.Scheme != "https" && (c.Backend.TLS.CAFile != "" || c.Backend.TLS.ClientCertFile != "" || c.Backend.TLS.ClientKeyFile != "" || c.Backend.TLS.ServerName != "" || c.Backend.TLS.MinVersion != "") {
 		return fmt.Errorf("backend.tls requires an https backend")
+	}
+	if raw := strings.TrimSpace(c.Backend.VerifierControlURL); raw != "" {
+		u, err := url.Parse(raw)
+		if err != nil || u.Scheme == "" || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+			return fmt.Errorf("backend.verifier_control_url must be an absolute http/https URL without userinfo, query, or fragment")
+		}
+		if u.Scheme != "https" && u.Hostname() != "localhost" {
+			if addr, parseErr := netip.ParseAddr(u.Hostname()); parseErr != nil || !addr.IsLoopback() {
+				return fmt.Errorf("backend.verifier_control_url must use https except for loopback control endpoints")
+			}
+		}
+		if !strings.EqualFold(u.Scheme, backendURL.Scheme) || !strings.EqualFold(u.Host, backendURL.Host) {
+			return fmt.Errorf("backend.verifier_control_url must use the backend's exact origin")
+		}
 	}
 	if _, err := c.BackendTLSConfig(); err != nil {
 		return err

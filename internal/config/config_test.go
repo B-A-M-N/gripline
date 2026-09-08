@@ -89,6 +89,35 @@ func TestValidateClusterAuthorityContract(t *testing.T) {
 	}
 }
 
+func TestValidateVerifierControlUsesBackendOrigin(t *testing.T) {
+	c := &Config{
+		Listen: "127.0.0.1:8080",
+		TLS:    TLSSection{TerminateTLSUpstream: true},
+		Backend: BackendSection{
+			URL:                "https://provider.internal:443/v1",
+			VerifierControlURL: "https://provider.internal:443/private/verifier",
+			Timeout:            Duration(time.Second),
+		},
+		Server:   ServerSection{ReadTimeout: Duration(time.Second), WriteTimeout: Duration(time.Second), IdleTimeout: Duration(time.Second), ReadHeaderTimeout: Duration(time.Second)},
+		Identity: IdentitySection{Audience: "a"},
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("same-origin verifier control endpoint rejected: %v", err)
+	}
+	for name, endpoint := range map[string]string{
+		"different host":   "https://other.internal/private/verifier",
+		"different scheme": "http://provider.internal:443/private/verifier",
+	} {
+		t.Run(name, func(t *testing.T) {
+			copy := *c
+			copy.Backend.VerifierControlURL = endpoint
+			if err := copy.Validate(); err == nil {
+				t.Fatal("verifier control endpoint must share the backend origin")
+			}
+		})
+	}
+}
+
 func TestValidateClusterAdminUsesPostgresAuditAuthority(t *testing.T) {
 	c := &Config{
 		Listen:   "127.0.0.1:8080",

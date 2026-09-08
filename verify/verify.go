@@ -13,12 +13,14 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -184,6 +186,7 @@ type TransportTrust interface {
 // Verifier validates the short-lived assertion and provides middleware for a
 // protected HTTP handler.
 type Verifier struct {
+	mu                  sync.RWMutex
 	keys                map[int]ed25519.PublicKey
 	audience            string
 	now                 func() time.Time
@@ -194,6 +197,50 @@ type Verifier struct {
 	contextPolicyEpochs ContextPolicyEpochSource
 	minPolicyEpoch      uint64
 	transport           TransportTrust
+}
+
+// PublishKey installs one public signer generation for the verifier overlap
+// window. A backend control plane may call this only after authenticating its
+// operator/runtime transport; the caller can then verify a candidate canary
+// before Gripline makes the generation authoritative. Re-publishing the exact
+// same key is idempotent, while a KID collision with different material fails
+// closed.
+func (v *Verifier) PublishKey(kid int, pub ed25519.PublicKey) error {
+	if v == nil || kid < 1 || len(pub) != ed25519.PublicKeySize {
+		return errors.New("gripline verify: invalid public key publication")
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if existing, ok := v.keys[kid]; ok {
+		if !bytes.Equal(existing, pub) {
+			return fmt.Errorf("gripline verify: key %d already published with different material", kid)
+		}
+		return nil
+	}
+	v.keys[kid] = append(ed25519.PublicKey(nil), pub...)
+	return nil
+}
+
+// RetireKey removes one previously published generation after the caller has
+// enforced its assertion-overlap horizon. The fingerprint check prevents a
+// control-plane request for one generation from deleting a different key
+// after a misconfiguration or KID reuse. Repeating retirement is idempotent.
+func (v *Verifier) RetireKey(kid int, fingerprint string) error {
+	if v == nil || kid < 1 || strings.TrimSpace(fingerprint) == "" {
+		return errors.New("gripline verify: invalid public key retirement")
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	pub, ok := v.keys[kid]
+	if !ok {
+		return nil
+	}
+	sum := sha256.Sum256(pub)
+	if hex.EncodeToString(sum[:]) != fingerprint {
+		return fmt.Errorf("gripline verify: key %d fingerprint mismatch during retirement", kid)
+	}
+	delete(v.keys, kid)
+	return nil
 }
 
 // New constructs a verifier bound to one exact audience.
@@ -349,7 +396,10 @@ func (v *Verifier) verifyEncodedContext(ctx context.Context, encoded string) (*C
 	if err := rejectDuplicateKeys(payload); err != nil || json.Unmarshal(payload, &envelope) != nil || envelope.KeyID < 1 {
 		return nil, ErrBadAssertion
 	}
+	v.mu.RLock()
 	pub, ok := v.keys[envelope.KeyID]
+	pub = append(ed25519.PublicKey(nil), pub...)
+	v.mu.RUnlock()
 	if !ok {
 		return nil, ErrUnknownKey
 	}

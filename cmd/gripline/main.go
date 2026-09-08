@@ -75,7 +75,7 @@ func parseSubcommand(args []string) (string, []string) {
 //	gripline policy verify|status|prepare|activate|rollback --config path.json
 //	gripline migrate plan|apply --config path.json
 //	gripline cluster status --config path.json
-//	gripline crypto status --config path.json
+//	gripline crypto status|activate|retire|signer-prepare --config path.json
 //	gripline status --config path.json
 //	gripline version
 //

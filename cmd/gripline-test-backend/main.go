@@ -7,6 +7,10 @@ package main
 import (
 	"compress/gzip"
 	"context"
+	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -31,6 +35,7 @@ func main() {
 	audience := flag.String("audience", "", "expected assertion audience")
 	minPolicyRev := flag.Int("min-policy-rev", 0, "minimum accepted policy revision for test freshness checks")
 	policyEpochFile := flag.String("policy-epoch-file", "", "optional file containing the current accepted policy activation epoch")
+	verifierControlPath := flag.String("verifier-control", "", "optional private path for candidate verifier publication and canary acceptance")
 	capturePath := flag.String("capture", "", "optional accepted-request header capture path")
 	assertionPath := flag.String("assertion-path", "", "optional path receiving the latest assertion for test inspection")
 	workDelay := flag.Duration("work-delay", 0, "duration for /v1/work before completing")
@@ -52,6 +57,13 @@ func main() {
 	verifier, err := verify.New(keySet, *audience)
 	if err != nil {
 		log.Fatalf("construct verifier: %v", err)
+	}
+	// The verifier-control canary proves signer-key acceptance, not policy
+	// freshness. Keep a separate verifier without the workload's policy epoch
+	// check so a key rotation cannot be blocked by an unrelated policy rollout.
+	controlVerifier, err := verify.New(keySet, *audience)
+	if err != nil {
+		log.Fatalf("construct verifier control: %v", err)
 	}
 	if *policyEpochFile != "" {
 		verifier.WithPolicyEpochChecks(policyEpochFileSource{path: *policyEpochFile}, 1)
@@ -110,6 +122,72 @@ func main() {
 		_ = f.Close()
 	}
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if *verifierControlPath != "" && r.URL.Path == *verifierControlPath {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			var controlRequest struct {
+				Action          string `json:"action"`
+				Protocol        string `json:"protocol"`
+				KID             int    `json:"kid"`
+				PublicKey       string `json:"public_key"`
+				Fingerprint     string `json:"fingerprint"`
+				CanaryAssertion string `json:"canary_assertion"`
+			}
+			decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32<<10))
+			decoder.DisallowUnknownFields()
+			if err := decoder.Decode(&controlRequest); err != nil || controlRequest.Protocol != "gripline.verifier-control/v1" || controlRequest.KID < 1 || (controlRequest.Action != "publish" && controlRequest.Action != "retire") || controlRequest.Fingerprint == "" {
+				http.Error(w, "invalid verifier control request", http.StatusBadRequest)
+				return
+			}
+			if controlRequest.Action == "retire" {
+				if controlRequest.PublicKey != "" || controlRequest.CanaryAssertion != "" {
+					http.Error(w, "invalid verifier retirement request", http.StatusBadRequest)
+					return
+				}
+				if err := verifier.RetireKey(controlRequest.KID, controlRequest.Fingerprint); err != nil {
+					http.Error(w, "verifier control retirement rejected", http.StatusConflict)
+					return
+				}
+				if err := controlVerifier.RetireKey(controlRequest.KID, controlRequest.Fingerprint); err != nil {
+					http.Error(w, "verifier control retirement rejected", http.StatusConflict)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"retired": true, "kid": controlRequest.KID})
+				return
+			}
+			if controlRequest.CanaryAssertion == "" {
+				http.Error(w, "candidate canary is required", http.StatusBadRequest)
+				return
+			}
+			public, err := base64.StdEncoding.DecodeString(controlRequest.PublicKey)
+			if err != nil || len(public) != ed25519.PublicKeySize {
+				http.Error(w, "invalid verifier control public key", http.StatusBadRequest)
+				return
+			}
+			sum := sha256.Sum256(public)
+			if hex.EncodeToString(sum[:]) != controlRequest.Fingerprint {
+				http.Error(w, "verifier control fingerprint mismatch", http.StatusBadRequest)
+				return
+			}
+			if err := verifier.PublishKey(controlRequest.KID, public); err != nil {
+				http.Error(w, "verifier control publication rejected", http.StatusConflict)
+				return
+			}
+			if err := controlVerifier.PublishKey(controlRequest.KID, public); err != nil {
+				http.Error(w, "verifier control publication rejected", http.StatusConflict)
+				return
+			}
+			r.Header.Set(verify.AssertionHeader, controlRequest.CanaryAssertion)
+			claims, err := controlVerifier.VerifyAndStrip(r)
+			if err != nil || claims.KeyID != controlRequest.KID {
+				http.Error(w, "verifier control canary rejected", http.StatusBadGateway)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"accepted": true, "kid": controlRequest.KID})
+			return
+		}
 		// A protected backend must never accept a raw external credential, even
 		// if a caller reaches this private listener directly.
 		if r.Header.Get("Authorization") != "" || r.Header.Get("X-API-Key") != "" {

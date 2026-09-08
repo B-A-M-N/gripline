@@ -60,7 +60,7 @@ for node in a b c; do
 {
   "listen": "127.0.0.1:${node_port}",
   "tls": {"terminate_tls_upstream": true},
-  "backend": {"url": "http://127.0.0.1:${backend_port}", "timeout": "5s"},
+  "backend": {"url": "http://127.0.0.1:${backend_port}", "verifier_control_url": "http://127.0.0.1:${backend_port}/v1/verifier/rotate", "timeout": "5s"},
   "server": {
     "read_timeout": "10s", "write_timeout": "10s", "idle_timeout": "10s",
     "read_header_timeout": "5s", "stream_write_idle_timeout": "1s", "max_body_bytes": 1048576,
@@ -68,7 +68,7 @@ for node in a b c; do
   },
   "identity": {"audience": "${audience}"},
   "secrets": {"pepper_versions": {"1": "${pepper_b64}"}},
-  "admin": {"listen": "127.0.0.1:${admin_port}", "operator_tokens": {"${operator_token}": "harness:posture.control,credential.lifecycle,lane.lifecycle,policy.install,audit.read"}},
+  "admin": {"listen": "127.0.0.1:${admin_port}", "operator_tokens": {"${operator_token}": "harness:posture.control,credential.lifecycle,lane.lifecycle,policy.install,audit.read,cluster.read,crypto.lifecycle"}},
   "paths": {"signer_keyring": "${harness_dir}/keyring.json"},
   "policy": {"file": "${harness_dir}/policy.json", "verifier_key_file": "${harness_dir}/policy-verifier.key"},
   "authority": {
@@ -79,6 +79,19 @@ for node in a b c; do
   "deployment": {"allow_ephemeral_state": false}
 }
 EOF
+done
+
+# Prepare one sealed candidate while the cluster is stopped. Every node uses
+# this identical keyring, so the authority can compare one signer fingerprint
+# across all live acknowledgements.
+"$harness_dir/gripline" crypto signer-prepare --config "$harness_dir/config-a.json" --offline >"$harness_dir/signer-prepare.log"
+signer_fingerprint="$(awk -F'fingerprint=' '/fingerprint=/{split($2, fields, ";"); print fields[1]; exit}' "$harness_dir/signer-prepare.log")"
+if [[ -z "$signer_fingerprint" ]]; then
+	echo "cluster harness: signer preparation did not produce a fingerprint" >&2
+	exit 1
+fi
+
+for node in a b c; do
 	"$harness_dir/gripline" -config "$harness_dir/config-${node}.json" >"$harness_dir/gripline-${node}.log" 2>&1 &
 	pids+=("$!")
 done
@@ -89,6 +102,7 @@ done
 	-keys "$harness_dir/keys.json" \
 	-audience "$audience" \
 	-work-delay 2s \
+	-verifier-control "/v1/verifier/rotate" \
 	-active "$harness_dir/backend-active" \
 	-peak "$harness_dir/backend-peak" \
 	-policy-epoch-file "$policy_epoch_file" \
@@ -138,6 +152,51 @@ provision() {
 }
 provision cluster-credential-one "$secret_one"
 provision cluster-credential-two "$secret_two"
+
+# Capture an assertion signed by the original key before rotation. Retirement
+# below must make this assertion unverifiable at the backend after its TTL
+# overlap has explicitly elapsed.
+pre_rotation_assertion="$(curl -fsS "http://127.0.0.1:${lb_port}/v1/messages" -H "Authorization: Bearer ${secret_two}")"
+printf '%s\n' "$pre_rotation_assertion" | rg -q '"policy_revision":1'
+old_assertion="$(<"$harness_dir/latest-assertion")"
+test -n "$old_assertion"
+
+# Read the initial generation fingerprint before activating its replacement.
+crypto_status_before="$(curl -fsS "http://127.0.0.1:$((base + 20))/admin/crypto" -H "Authorization: Bearer ${operator_token}")"
+old_signer_fingerprint="$(printf '%s' "$crypto_status_before" | sed -n 's/.*"kind":"signer","generation":1,"fingerprint":"\([^"]*\)".*/\1/p')"
+if [[ -z "$old_signer_fingerprint" ]]; then
+	echo "cluster harness: initial signer fingerprint unavailable" >&2
+	exit 1
+fi
+
+# Signer activation requires the backend to publish the candidate and verify a
+# candidate-signed canary before the shared authority changes active KID.
+signer_activation_code="$(curl -sS -o "$harness_dir/signer-activation-body" -w '%{http_code}' "http://127.0.0.1:$((base + 20))/admin/crypto/activate" \
+	-H "Authorization: Bearer ${operator_token}" -H 'Content-Type: application/json' \
+	-H 'Idempotency-Key: cluster-signer-activate' \
+	--data "{\"kind\":\"signer\",\"generation\":2,\"fingerprint\":\"${signer_fingerprint}\",\"reason\":\"cluster signer canary\"}")"
+if [[ "$signer_activation_code" != "200" ]]; then
+	cat "$harness_dir/signer-activation-body" >&2
+	exit 1
+fi
+for port in $((base + 10)) $((base + 11)) $((base + 12)); do
+	wait_status "http://127.0.0.1:${port}/readyz"
+done
+
+retire_not_before="$(date -u -d '1 second ago' '+%Y-%m-%dT%H:%M:%SZ')"
+retire_code="$(curl -sS -o "$harness_dir/signer-retirement-body" -w '%{http_code}' "http://127.0.0.1:$((base + 20))/admin/crypto/retire" \
+	-H "Authorization: Bearer ${operator_token}" -H 'Content-Type: application/json' \
+	-H 'Idempotency-Key: cluster-signer-retire-old' \
+	--data "{\"kind\":\"signer\",\"generation\":1,\"fingerprint\":\"${old_signer_fingerprint}\",\"not_before\":\"${retire_not_before}\",\"reason\":\"cluster signer overlap expired\"}")"
+if [[ "$retire_code" != "200" ]]; then
+	cat "$harness_dir/signer-retirement-body" >&2
+	exit 1
+fi
+for port in $((base + 10)) $((base + 11)) $((base + 12)); do
+	wait_status "http://127.0.0.1:${port}/readyz"
+done
+old_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${backend_port}/v1/messages" -H "X-Gripline-Assertion: ${old_assertion}")"
+test "$old_code" = 401
 
 curl_data_code() {
 	local url=$1 secret=$2
@@ -210,8 +269,6 @@ candidate="$(<"$harness_dir/candidate.json")"
 old_response="$(curl -fsS "http://127.0.0.1:${lb_port}/v1/messages" -H "Authorization: Bearer ${secret_two}")"
 printf '%s\n' "$old_response" | rg -q '"policy_revision":1'
 printf '%s\n' "$old_response" | rg -q '"policy_epoch":1'
-old_assertion="$(<"$harness_dir/latest-assertion")"
-test -n "$old_assertion"
 prepare_payload="$(printf '{"artifact":%s,"reason":"cluster policy canary"}' "$candidate")"
 prepare_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((base + 20))/admin/policy/prepare" \
 	-H "Authorization: Bearer ${operator_token}" -H 'Content-Type: application/json' \
@@ -256,9 +313,6 @@ for port in $((base + 10)) $((base + 11)) $((base + 12)); do
 	curl -fsS "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_two}" | rg -q '"policy_revision":1'
 	curl -fsS "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_two}" | rg -q '"policy_epoch":3'
 done
-old_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${backend_port}/v1/messages" -H "X-Gripline-Assertion: ${old_assertion}")"
-test "$old_code" = 401
-
 # A killed replica with in-flight work must cancel the upstream request. The
 # fixture's active-work counter measures backend work, not merely proxy
 # sockets; this proves the concurrency cap is released only after cancellation

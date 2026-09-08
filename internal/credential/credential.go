@@ -359,6 +359,23 @@ func (r *PepperRing) SetActiveVersion(version int) error {
 	return nil
 }
 
+// RetireVersion removes a non-active pepper generation after all credentials
+// have migrated away from it. The cluster authority performs that durable
+// usage check first; this local operation only changes the in-process ring.
+func (r *PepperRing) RetireVersion(version int) error {
+	if r == nil {
+		return errors.New("credential: nil pepper ring")
+	}
+	if version == r.ActiveVersion() {
+		return fmt.Errorf("credential: cannot retire active pepper version %d", version)
+	}
+	if _, ok := r.active[version]; !ok {
+		return fmt.Errorf("credential: pepper version %d is not loaded", version)
+	}
+	delete(r.active, version)
+	return nil
+}
+
 // ActiveVersion returns the selected generation used for new verifiers.
 func (r *PepperRing) ActiveVersion() int { return r.Latest() }
 
