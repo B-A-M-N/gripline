@@ -210,6 +210,17 @@ curl_data_code() {
 	curl -sS -o /dev/null -w '%{http_code}' "$url" -H "Authorization: Bearer ${secret}" 2>/dev/null || true
 }
 
+wait_data_denied() {
+	local url=$1 secret=$2
+	for _ in $(seq 1 60); do
+		if [[ "$(curl_data_code "$url" "$secret")" != "200" ]]; then
+			return 0
+		fi
+		sleep 0.1
+	done
+	return 1
+}
+
 crypto_fingerprint() {
 	local status=$1 kind=$2 generation=$3
 	printf '%s' "$status" | sed -n "s/.*\"kind\":\"${kind}\",\"generation\":${generation},\"fingerprint\":\"\([^\"]*\)\".*/\1/p"
@@ -236,6 +247,13 @@ activate_crypto_generation() {
 			sleep 0.1
 		done
 		printf '%s' "$status" | rg -q "\"${kind}_active_(version|kid)\":${generation}"
+	done
+	# The shared generation becoming visible is not sufficient: every node
+	# withdraws readiness while it applies the local material and re-acknowledges
+	# the new epoch. Wait for that serving invariant before sending data-plane
+	# traffic, otherwise this harness races the deliberately fail-closed rollout.
+	for port in $((base + 10)) $((base + 11)) $((base + 12)); do
+		wait_status "http://127.0.0.1:${port}/readyz"
 	done
 }
 
@@ -282,7 +300,7 @@ test "$source_scopes_after" = "$source_scopes_before"
 mkdir -p "$harness_dir/codes"
 work_pids=()
 for i in $(seq 1 15); do
-	curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${lb_port}/v1/work" \
+	curl -sS -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:${lb_port}/v1/work" \
 		-H "Authorization: Bearer ${secret_one}" >"$harness_dir/codes/${i}" 2>/dev/null &
 	work_pids+=("$!")
 done
@@ -294,6 +312,8 @@ if [[ "$peak" -gt 5 ]]; then
 	echo "cluster harness: backend peak ${peak} exceeded global cap 5" >&2
 	exit 1
 fi
+# Keep one status per file. Without the newline, concurrent curl outputs such
+# as 503403200 become one awk field and a successful request is miscounted.
 if [[ "$(awk '$1 == 200 {n++} END {print n+0}' "$harness_dir/codes"/*)" -lt 1 ]]; then
 	echo "cluster harness: no work request completed through the LB" >&2
 	exit 1
@@ -329,7 +349,7 @@ lockdown_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((ba
 	--data '{"on":true,"reason":"cluster lockdown"}')"
 test "$lockdown_code" = 200
 for port in $((base + 10)) $((base + 11)) $((base + 12)); do
-	test "$(curl_data_code "http://127.0.0.1:${port}/v1/messages" "$secret_two")" != 200
+	wait_data_denied "http://127.0.0.1:${port}/v1/messages" "$secret_two"
 done
 unlock_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((base + 20))/admin/posture" \
 	-H "Authorization: Bearer ${operator_token}" -H 'Content-Type: application/json' \

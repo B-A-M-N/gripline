@@ -357,6 +357,14 @@ func (s *Store) loadResourceBucket(ctx context.Context, tx pgx.Tx, sp resource.S
 	if dim == resource.DimConcurrency {
 		capacity = float64(cfgCapacity(sp.Buckets))
 	}
+	if dim != resource.DimConcurrency && capacity > oldCapacity {
+		// Preserve the amount already spent while restoring the headroom
+		// introduced by a less restrictive policy. Without this adjustment,
+		// an emergency bucket that was exhausted during lockdown remains
+		// empty until its old refill interval elapses after normal limits are
+		// restored.
+		row.available += capacity - oldCapacity
+	}
 	if row.available > capacity {
 		row.available = capacity
 	}

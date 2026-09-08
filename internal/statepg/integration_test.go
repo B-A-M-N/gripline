@@ -1152,6 +1152,61 @@ func TestPostgresForwardedLeaseConservativelyConsumesEstimate(t *testing.T) {
 	refunded.Release()
 }
 
+func TestPostgresResourceCapacityIncreaseRestoresHeadroomAcrossNodes(t *testing.T) {
+	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("GRIPLINE_TEST_POSTGRES_DSN is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resetIntegrationAuthority(t, ctx, dsn)
+	a := openIntegrationStore(t, ctx, dsn, "resource-resize-a")
+	b := openIntegrationStore(t, ctx, dsn, "resource-resize-b")
+	defer a.Close()
+	defer b.Close()
+	identity := CryptoIdentity{
+		SignerActiveKID: 1, SignerFingerprint: "resource-resize-signer",
+		PepperActiveVersion: 1, PepperFingerprint: "resource-resize-pepper",
+		PseudonymVersion: 0, PseudonymFingerprint: "disabled",
+	}
+	if _, err := a.SynchronizeCrypto(ctx, identity); err != nil {
+		t.Fatalf("synchronize resource resize node A: %v", err)
+	}
+	if _, err := b.SynchronizeCrypto(ctx, identity); err != nil {
+		t.Fatalf("synchronize resource resize node B: %v", err)
+	}
+
+	scope := func(capacity float64) resource.ScopeSpec {
+		return resource.ScopeSpec{
+			Scope: resource.ScopeCredential, ID: "resource-resize-credential",
+			Buckets: resource.BucketSpec{CostBurst: resource.BucketConfig{Capacity: capacity}},
+		}
+	}
+	first, err := a.Reserve(ctx, resource.ReserveRequest{
+		RequestID: "resource-resize-first", Scopes: []resource.ScopeSpec{scope(1)},
+		Estimate: resource.UsageEstimate{CostMicrounits: 1},
+	})
+	if err != nil {
+		t.Fatalf("reserve under constrained capacity: %v", err)
+	}
+	if err := first.MarkForwarded(ctx); err != nil {
+		t.Fatalf("mark constrained lease forwarded: %v", err)
+	}
+	if err := first.SettleContext(ctx, resource.UsageEstimate{CostMicrounits: 1}); err != nil {
+		t.Fatalf("settle constrained lease: %v", err)
+	}
+	first.Release()
+
+	second, err := b.Reserve(ctx, resource.ReserveRequest{
+		RequestID: "resource-resize-second", Scopes: []resource.ScopeSpec{scope(64)},
+		Estimate: resource.UsageEstimate{CostMicrounits: 1},
+	})
+	if err != nil {
+		t.Fatalf("restored capacity must provide headroom on another node: %v", err)
+	}
+	second.Release()
+}
+
 func TestPostgresSourceScopeEvictsOnlySafeIdleScopes(t *testing.T) {
 	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
 	if dsn == "" {
