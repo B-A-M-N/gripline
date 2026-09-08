@@ -92,7 +92,7 @@ func (s *Store) BorrowOrCreateWithPolicy(ctx context.Context, credID, candidateI
 	}
 	var out *lane.LaneRecord
 	var created bool
-	err := withTransactionRetry(ctx, "lane borrow/create", func() error {
+	err := s.withTransactionRetry(ctx, "lane borrow/create", func() error {
 		var err error
 		out, created, err = s.borrowOrCreateWithPolicyOnce(ctx, credID, candidateID, features, policy)
 		return err
@@ -245,7 +245,7 @@ func (s *Store) ObserveRiskWithPolicy(ctx context.Context, credID, laneID string
 		return nil, err
 	}
 	var out *lane.LaneRecord
-	err := withTransactionRetry(ctx, "lane risk observation", func() error {
+	err := s.withTransactionRetry(ctx, "lane risk observation", func() error {
 		var err error
 		out, err = s.observeRiskWithPolicyOnce(ctx, credID, laneID, riskScore, now, policy, meta)
 		return err
@@ -326,7 +326,7 @@ func (s *Store) RecordCleanAuthorizedAndPromoteWithPolicy(ctx context.Context, c
 	}
 	var out *lane.LaneRecord
 	var promoted bool
-	err := withTransactionRetry(ctx, "lane promotion", func() error {
+	err := s.withTransactionRetry(ctx, "lane promotion", func() error {
 		var err error
 		out, promoted, err = s.recordCleanAuthorizedAndPromoteOnce(ctx, credID, laneID, riskScore, criteria, now, policy, meta)
 		return err

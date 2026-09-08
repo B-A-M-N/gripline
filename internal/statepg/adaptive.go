@@ -31,7 +31,7 @@ func (s *Store) ObserveWindow(ctx context.Context, obs adaptive.WindowObservatio
 		obs.MaxKeys = defaultAdaptiveMaxKeys
 	}
 	var emitted bool
-	err := withTransactionRetry(ctx, "adaptive window observation", func() error {
+	err := s.withTransactionRetry(ctx, "adaptive window observation", func() error {
 		var err error
 		emitted, err = s.observeWindowOnce(ctx, obs)
 		return err
@@ -138,7 +138,7 @@ func (s *Store) ObserveBaseline(ctx context.Context, obs adaptive.BaselineObserv
 		return "", errors.New("statepg: invalid adaptive baseline observation")
 	}
 	var signal string
-	err := withTransactionRetry(ctx, "adaptive baseline observation", func() error {
+	err := s.withTransactionRetry(ctx, "adaptive baseline observation", func() error {
 		var err error
 		signal, err = s.observeBaselineOnce(ctx, obs)
 		return err

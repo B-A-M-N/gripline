@@ -71,7 +71,7 @@ func (s *Store) Insert(rec *credential.CredentialRecord) error {
 	}
 	ctx, cancel := s.operationContext(context.Background())
 	defer cancel()
-	return withTransactionRetry(ctx, "credential insert", func() error {
+	return s.withTransactionRetry(ctx, "credential insert", func() error {
 		return s.insertCredentialOnce(ctx, rec, security)
 	})
 }
@@ -114,7 +114,7 @@ func (s *Store) InsertIfAbsent(rec *credential.CredentialRecord) (bool, error) {
 	ctx, cancel := s.operationContext(context.Background())
 	defer cancel()
 	var created bool
-	err = withTransactionRetry(ctx, "credential insert-if-absent", func() error {
+	err = s.withTransactionRetry(ctx, "credential insert-if-absent", func() error {
 		var err error
 		created, err = s.insertCredentialIfAbsentOnce(ctx, rec, security)
 		return err
@@ -327,7 +327,7 @@ func (s *Store) UpdateStatusCAS(credentialID string, expectedRevision int, fromS
 	ctx, cancel := s.operationContext(context.Background())
 	defer cancel()
 	var out *credential.CredentialRecord
-	err := withTransactionRetry(ctx, "credential status transition", func() error {
+	err := s.withTransactionRetry(ctx, "credential status transition", func() error {
 		var err error
 		out, err = s.updateStatusCASOnce(ctx, credentialID, expectedRevision, fromStatus, toStatus)
 		return err
@@ -386,7 +386,7 @@ func (s *Store) RotateVerifierCASContext(ctx context.Context, credentialID strin
 		return nil, errors.New("credential: invalid rotated verifier")
 	}
 	var out *credential.CredentialRecord
-	err := withTransactionRetry(ctx, "credential verifier rotation", func() error {
+	err := s.withTransactionRetry(ctx, "credential verifier rotation", func() error {
 		var err error
 		out, err = s.rotateVerifierCASOnce(ctx, credentialID, expectedRevision, pepperVersion, verifier)
 		return err
@@ -437,7 +437,7 @@ func (s *Store) rotateVerifierCASOnce(ctx context.Context, credentialID string, 
 func (s *Store) updateCredential(ctx context.Context, id string, mutate func(*credential.CredentialRecord, time.Time) error) error {
 	ctx, cancel := s.operationContext(ctx)
 	defer cancel()
-	return withTransactionRetry(ctx, "credential mutation", func() error {
+	return s.withTransactionRetry(ctx, "credential mutation", func() error {
 		return s.updateCredentialOnce(ctx, id, mutate)
 	})
 }
@@ -538,7 +538,7 @@ func (s *Store) ObserveAndCommit(ctx context.Context, credentialID string, score
 	}
 	meta := credential.TransitionMetadataFromContext(ctx)
 	var out credential.TransitionResult
-	err := withTransactionRetry(ctx, "credential observation", func() error {
+	err := s.withTransactionRetry(ctx, "credential observation", func() error {
 		var err error
 		out, err = s.observeAndCommitOnce(ctx, credentialID, score, hy, now, meta)
 		return err

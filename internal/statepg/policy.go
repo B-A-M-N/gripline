@@ -99,7 +99,7 @@ func (s *Store) PersistPolicyManifestContext(ctx context.Context, manifest polic
 	if err != nil {
 		return err
 	}
-	return withTransactionRetry(ctx, "policy manifest persistence", func() error {
+	return s.withTransactionRetry(ctx, "policy manifest persistence", func() error {
 		return s.persistPolicyManifestOnce(ctx, raw, manifest.UpdatedAt)
 	})
 }
@@ -149,7 +149,7 @@ func (s *Store) InitializePolicyManifestContext(ctx context.Context, manifest po
 	if err != nil {
 		return err
 	}
-	return withTransactionRetry(ctx, "policy manifest initialization", func() error {
+	return s.withTransactionRetry(ctx, "policy manifest initialization", func() error {
 		return s.initializePolicyManifestOnce(ctx, raw, manifest.UpdatedAt)
 	})
 }
@@ -201,7 +201,7 @@ func (s *Store) PersistPolicyArtifactContext(ctx context.Context, compiled *poli
 	if err := validatePolicyRef(policy.PolicyRef{ID: compiled.ID, Revision: compiled.Revision, Digest: digest}); err != nil {
 		return err
 	}
-	return withTransactionRetry(ctx, "policy artifact persistence", func() error {
+	return s.withTransactionRetry(ctx, "policy artifact persistence", func() error {
 		return s.persistPolicyArtifactOnce(ctx, compiled.ID, compiled.Revision, digest, raw)
 	})
 }
@@ -271,7 +271,7 @@ func (s *Store) AcknowledgePolicyContext(ctx context.Context, manifest policy.Ma
 	if manifest.ActivationEpoch > uint64(1<<63-1) {
 		return errors.New("statepg: policy activation epoch exceeds database range")
 	}
-	return withTransactionRetry(ctx, "policy observation", func() error {
+	return s.withTransactionRetry(ctx, "policy observation", func() error {
 		return s.acknowledgePolicyOnce(ctx, manifest)
 	})
 }
@@ -369,7 +369,7 @@ func (s *Store) PersistPolicyTransitionContext(ctx context.Context, manifest pol
 	if err != nil {
 		return err
 	}
-	return withTransactionRetry(ctx, "policy transition", func() error {
+	return s.withTransactionRetry(ctx, "policy transition", func() error {
 		return s.persistPolicyTransitionOnce(ctx, manifest, event, rawManifest, rawEvent)
 	})
 }

@@ -21,7 +21,7 @@ var (
 func (s *Store) registerNode(ctx context.Context) error {
 	var instanceID string
 	var epoch int64
-	err := withTransactionRetry(ctx, "node registration", func() error {
+	err := s.withTransactionRetry(ctx, "node registration", func() error {
 		var err error
 		instanceID, epoch, err = s.registerNodeOnce(ctx)
 		return err

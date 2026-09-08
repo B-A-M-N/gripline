@@ -426,7 +426,7 @@ func (s *Store) ActivateCryptoGeneration(ctx context.Context, req CryptoActivati
 		return CryptoIdentity{}, err
 	}
 	returnCrypto := CryptoIdentity{}
-	err := withTransactionRetry(ctx, "crypto generation activation", func() error {
+	err := s.withTransactionRetry(ctx, "crypto generation activation", func() error {
 		var err error
 		returnCrypto, err = s.activateCryptoGenerationOnce(ctx, req)
 		return err
@@ -449,7 +449,7 @@ func (s *Store) RetireCryptoGeneration(ctx context.Context, req CryptoRetirement
 		return CryptoIdentity{}, err
 	}
 	var returnCrypto CryptoIdentity
-	err := withTransactionRetry(ctx, "crypto generation retirement", func() error {
+	err := s.withTransactionRetry(ctx, "crypto generation retirement", func() error {
 		var err error
 		returnCrypto, err = s.retireCryptoGenerationOnce(ctx, req)
 		return err

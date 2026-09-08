@@ -48,6 +48,7 @@ type Options struct {
 // methods are split across files but use this same pool and transaction model.
 type Store struct {
 	pool             *pgxpool.Pool
+	metrics          authorityMetrics
 	now              func() time.Time
 	nodeID           string
 	instanceID       string
@@ -807,6 +808,20 @@ func begin(ctx context.Context, pool *pgxpool.Pool) (pgx.Tx, error) {
 // serialization failures and deadlocks are retried by the callback's error
 // classification.
 func withTransactionRetry(ctx context.Context, operation string, fn func() error) error {
+	return withTransactionRetryObserved(ctx, operation, fn, nil)
+}
+
+// withTransactionRetry is also exposed as a Store method so production
+// authority operations contribute to per-node transaction telemetry without
+// coupling the package-level test helper to a particular Store instance.
+func (s *Store) withTransactionRetry(ctx context.Context, operation string, fn func() error) error {
+	if s == nil {
+		return withTransactionRetry(ctx, operation, fn)
+	}
+	return withTransactionRetryObserved(ctx, operation, fn, &s.metrics)
+}
+
+func withTransactionRetryObserved(ctx context.Context, operation string, fn func() error, metrics *authorityMetrics) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -815,7 +830,26 @@ func withTransactionRetry(ctx context.Context, operation string, fn func() error
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if metrics != nil {
+			metrics.transactionAttempts.Add(1)
+		}
+		started := time.Now()
 		lastErr = fn()
+		if metrics != nil {
+			metrics.transactionLatencyNanos.Add(time.Since(started).Nanoseconds())
+			if lastErr != nil {
+				metrics.transactionErrors.Add(1)
+			}
+			var pgErr *pgconn.PgError
+			if errors.As(lastErr, &pgErr) {
+				switch pgErr.Code {
+				case "40001":
+					metrics.serializationRetries.Add(1)
+				case "40P01":
+					metrics.deadlockRetries.Add(1)
+				}
+			}
+		}
 		if lastErr == nil || !retryableTransactionError(lastErr) {
 			return lastErr
 		}

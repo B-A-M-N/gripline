@@ -68,7 +68,7 @@ func (s *Store) AppendContext(ctx context.Context, items ...evidence.Evidence) e
 	if len(items) == 0 {
 		return nil
 	}
-	return withTransactionRetry(ctx, "evidence append", func() error {
+	return s.withTransactionRetry(ctx, "evidence append", func() error {
 		return s.appendContextOnce(ctx, items)
 	})
 }

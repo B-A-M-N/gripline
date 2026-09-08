@@ -39,7 +39,7 @@ func (s *Store) AppendOperator(ctx context.Context, rec control.OperatorRecord) 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return withTransactionRetry(ctx, "operator audit append", func() error {
+	return s.withTransactionRetry(ctx, "operator audit append", func() error {
 		return s.appendOperatorOnce(ctx, rec)
 	})
 }
@@ -159,7 +159,7 @@ func (s *Store) LoadPosture() (control.Posture, error) {
 func (s *Store) SavePosture(posture control.Posture) error {
 	ctx, cancel := s.operationContext(context.Background())
 	defer cancel()
-	return withTransactionRetry(ctx, "posture mutation", func() error {
+	return s.withTransactionRetry(ctx, "posture mutation", func() error {
 		return s.savePostureOnce(ctx, posture)
 	})
 }
@@ -197,7 +197,7 @@ func (s *Store) AppendAdmission(ctx context.Context, e control.Event) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return withTransactionRetry(ctx, "admission audit append", func() error {
+	return s.withTransactionRetry(ctx, "admission audit append", func() error {
 		return s.appendAdmissionOnce(ctx, e)
 	})
 }
@@ -291,7 +291,7 @@ func (s *Store) ProvisionCredentialWithAuditOperation(ctx context.Context, rec c
 	if err != nil {
 		return err
 	}
-	return withTransactionRetry(ctx, "operator credential provision", func() error {
+	return s.withTransactionRetry(ctx, "operator credential provision", func() error {
 		return s.provisionCredentialWithAuditOperationOnce(ctx, rec, audit, operationID, security)
 	})
 }
@@ -342,7 +342,7 @@ func (s *Store) UnblockLaneWithAuditOperation(ctx context.Context, credID, laneI
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return withTransactionRetry(ctx, "operator lane unblock", func() error {
+	return s.withTransactionRetry(ctx, "operator lane unblock", func() error {
 		return s.unblockLaneWithAuditOperationOnce(ctx, credID, laneID, audit, now, operationID)
 	})
 }
@@ -420,7 +420,7 @@ func (s *Store) RevokeCredentialWithAuditOperation(ctx context.Context, credID s
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return withTransactionRetry(ctx, "operator credential revoke", func() error {
+	return s.withTransactionRetry(ctx, "operator credential revoke", func() error {
 		return s.revokeCredentialWithAuditOperationOnce(ctx, credID, audit, operationID)
 	})
 }
@@ -483,7 +483,7 @@ func (s *Store) SetPostureWithAuditOperation(ctx context.Context, posture contro
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return withTransactionRetry(ctx, "operator posture mutation", func() error {
+	return s.withTransactionRetry(ctx, "operator posture mutation", func() error {
 		return s.setPostureWithAuditOperationOnce(ctx, posture, audit, operationID)
 	})
 }
