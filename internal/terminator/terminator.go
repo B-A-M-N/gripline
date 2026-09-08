@@ -1538,109 +1538,13 @@ func (t *Terminator) admitUsageWithRequestID(ctx context.Context, reqID string, 
 	return out
 }
 
-// provisionMultiscope is the hard multi-scope resource gate (P0.23-P0.27). It
-// provisions SOURCE/LANE/CREDENTIAL/ACCOUNT capacity all-or-nothing through the
-// configured Governor, issues the internal assertion while holding the
-// reservation, and attaches the reservation to the Outcome for proxy release.
-//
-// It returns a non-nil *Outcome to short-circuit Admit when the gate denies or
-// issuance fails; nil means the request cleared every scope and proceeds.
-//
-// DEFAULT FLAG (P0.23): the SOURCE and ACCOUNT scopes share the credential's
-// concurrency cap, because the policy model currently exposes a single
-// per-credential cap (ScopedLimits.Normal/Constrained), not distinct per-scope
-// budget tables. The Governor accepts a distinct cap per scope; when per-scope
-// tables land in the policy, only the spec construction here changes. Today a
-// single hostile actor cannot exceed the credential cap across its lanes/sources
-// without tripping the shared budget — a conservative first posture.
 func (t *Terminator) provisionMultiscope(requestCtx context.Context, cred *credential.Credential, laneID string, laneSec lane.SecurityStatus, limits policy.Limits, authCtx principal.AuthorizedContext, reqID string, out *Outcome, adaptiveForObservation AdaptiveStateStatus, laneRisk, credentialRisk, effectiveRisk int, evidenceCodes []string, src TrustedSource, est resource.UsageEstimate, tr *DecisionTrace) *Outcome {
-	// P0.35: the selected limits' per-dimension gauges (requests/tokens/cost)
-	// ride EVERY scope's spec — requests, tokens and spend are different
-	// resources with different buckets, and each scope enforces the same
-	// policy-authored gauge parameters. Zero-capacity gauges are inert at
-	// every scope (the governor skips them), so concurrency-only policies keep
-	// their existing behavior.
-	gauges := resourceSpec(limits)
-	// Precedence order is the policy enum (P0.33): SOURCE → ACCOUNT →
-	// CREDENTIAL → LANE, GLOBAL last as the whole-plane gauge (P0.34). The
-	// SOURCE scope keys on this REQUEST's source pseudonym (P0.4) — empty
-	// means no trusted source identity for the request, so SOURCE is skipped
-	// rather than bucketed under a shared process-global id.
-	specs := []resource.ScopeSpec{}
-	if src.sourceID() != "" {
-		specs = append(specs, resource.ScopeSpec{Scope: resource.ScopeSource, ID: src.sourceID(), Buckets: gauges})
-	}
-	specs = append(specs,
-		resource.ScopeSpec{Scope: resource.ScopeAccount, ID: cred.AccountID, Buckets: gauges},
-		resource.ScopeSpec{Scope: resource.ScopeCredential, ID: cred.CredentialID, Buckets: gauges},
-	)
-	if laneID != "" {
-		specs = append(specs, resource.ScopeSpec{Scope: resource.ScopeLane, ID: laneID, Buckets: gauges})
-	}
-	// GLOBAL scope (P0.34, P0.19): the whole-plane gauge, keyed "fleet". Any
-	// authored gauge enables the scope; checking only ConcurrencyCap silently
-	// discarded global request/token/cost limits.
-	global := resourceSpec(t.pol.Global)
-	if resourceSpecEnabled(global) {
-		specs = append(specs, resource.ScopeSpec{Scope: resource.ScopeGlobal, ID: "fleet", Buckets: global})
-	}
-
-	deny := func(reason string, err error) *Outcome {
-		out.Authorized = false
-		out.Reason = reason
-		out.DenialErr = err
-		out.CredentialRisk = credentialRisk
-		out.LaneRisk = laneRisk
-		out.RiskAfter = effectiveRisk
-		out.Evidence = evidenceCodes
-		out.Adaptive = adaptiveForObservation
-		out.Degraded = adaptiveForObservation == AdaptiveDegraded
-		return out
-	}
-
-	// Typed per-dimension usage (P0.3): the estimate is reserved atomically
-	// across every scope; the proxy settles the reservation with ACTUALS after
-	// the backend responds. Dimensions the policy doesn't gauge (zero capacity)
-	// are inert; dimensions the estimate leaves zero reserve nothing.
-	reservation, err := t.dep.Resource.Reserve(requestCtx, resource.ReserveRequest{
-		RequestID: reqID,
-		Scopes:    specs,
-		Estimate:  est,
-	})
-	if err != nil {
-		tr.ReservationResult = "denied"
-		if errors.Is(err, resource.ErrSourceScopeSaturated) {
-			return deny("resource_unavailable", err)
-		}
-		var sle *resource.ScopeLimitError
-		if errors.As(err, &sle) {
-			tr.ReservationScope = sle.Scope.String()
-			tr.ReservationDimension = sle.Dimension.String()
-			// Preserve the typed hard-cap cause for internal traces and
-			// observers. The public reason stays scope-agnostic.
-			return deny("rate_limit", err)
-		}
-		return deny("resource_unavailable", err)
-	}
-	if reservation == nil {
-		tr.ReservationResult = "unavailable"
-		return deny("resource_unavailable", errors.New("terminator: resource authority returned no reservation"))
-	}
-	tr.ReservationResult = "granted"
-	// Every scope provisioned. Issue the assertion; if it fails, release the
-	// reservation so held capacity is refunded (never a leaked hold).
-	assertion, aerr := t.issueAssertion(authCtx, reqID, cred)
-	if aerr != nil {
-		reservation.Release()
-		return deny("internal_identity_failure", aerr)
-	}
-	out.Assertion = assertion
-	out.ResourceReservation = reservation // proxy releases on completion (M4)
-	if local, ok := reservation.(*resource.MultiReservation); ok {
-		// Compatibility fields for legacy in-process callers. The data plane
-		// itself uses ResourceReservation and never type-switches on the holder.
-		out.ResourceRes = local
-		out.UsageRes = local
-	}
-	return nil
+	_ = laneSec
+	return resourceAdmission{
+		term: t, requestCtx: requestCtx, cred: cred, laneID: laneID,
+		limits: limits, authCtx: authCtx, requestID: reqID, out: out,
+		adaptive: adaptiveForObservation, laneRisk: laneRisk,
+		credentialRisk: credentialRisk, effectiveRisk: effectiveRisk,
+		evidenceCodes: evidenceCodes, source: src, estimate: est, trace: tr,
+	}.run()
 }
