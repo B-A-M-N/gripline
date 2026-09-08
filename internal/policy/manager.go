@@ -12,7 +12,7 @@ import (
 // activation. The data plane receives immutable CompiledPolicy snapshots and
 // never observes a partially loaded candidate.
 type Manager struct {
-	mu                sync.RWMutex
+	mu                sync.Mutex
 	current           *CompiledPolicy
 	candidate         *CompiledPolicy
 	knownGood         map[int]*CompiledPolicy
@@ -20,6 +20,8 @@ type Manager struct {
 	audit             func(Event) error
 	persistArtifact   func(*CompiledPolicy) error
 	persistTransition func(Manifest, Event) error
+	loadManifest      func() (Manifest, error)
+	loadArtifact      func(PolicyRef) (*CompiledPolicy, error)
 	lastRevision      int
 }
 
@@ -83,6 +85,8 @@ func NewManager(initial *Policy, opts Options) (*Manager, error) {
 		audit:             opts.Audit,
 		persistArtifact:   opts.PersistArtifact,
 		persistTransition: opts.PersistTransition,
+		loadManifest:      opts.LoadManifest,
+		loadArtifact:      opts.LoadArtifact,
 		lastRevision:      compiled.Revision,
 	}
 	if opts.LoadManifest != nil {
@@ -167,8 +171,11 @@ func (m *Manager) Current() *CompiledPolicy {
 	if m == nil {
 		return nil
 	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.refreshDurableLocked(); err != nil {
+		return nil
+	}
 	return cloneCompiled(m.current)
 }
 
@@ -177,9 +184,94 @@ func (m *Manager) Candidate() *CompiledPolicy {
 	if m == nil {
 		return nil
 	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.refreshDurableLocked(); err != nil {
+		return nil
+	}
 	return cloneCompiled(m.candidate)
+}
+
+// refreshDurableLocked reconciles this process with the shared lifecycle
+// manifest. It runs before every policy snapshot so a node observes a
+// committed activation or rollback without a restart. A read failure returns
+// an error; Current then returns nil and the data plane fails closed instead of
+// enforcing a potentially stale policy during an authority outage.
+func (m *Manager) refreshDurableLocked() error {
+	if m.loadManifest == nil || m.loadArtifact == nil {
+		return nil
+	}
+	manifest, err := m.loadManifest()
+	if err != nil {
+		return err
+	}
+	if manifest.Active.Revision == 0 {
+		return nil
+	}
+	if m.current == nil {
+		return errors.New("policy: current policy is nil")
+	}
+	activeDigest, err := Digest(&m.current.Policy)
+	if err != nil {
+		return err
+	}
+	if m.current.ID != manifest.Active.ID || m.current.Revision != manifest.Active.Revision || activeDigest != manifest.Active.Digest {
+		active, err := m.loadArtifact(manifest.Active)
+		if err != nil {
+			return fmt.Errorf("policy: refresh active artifact: %w", err)
+		}
+		if err := validateCompiledRef(active, manifest.Active); err != nil {
+			return err
+		}
+		m.current = active
+		m.knownGood[active.Revision] = active
+		if active.Revision > m.lastRevision {
+			m.lastRevision = active.Revision
+		}
+	}
+	if manifest.Candidate == nil {
+		m.candidate = nil
+	} else if m.candidate == nil || m.candidate.ID != manifest.Candidate.ID || m.candidate.Revision != manifest.Candidate.Revision {
+		candidate, err := m.loadArtifact(*manifest.Candidate)
+		if err != nil {
+			return fmt.Errorf("policy: refresh candidate artifact: %w", err)
+		}
+		if err := validateCompiledRef(candidate, *manifest.Candidate); err != nil {
+			return err
+		}
+		if candidate.Revision <= m.current.Revision {
+			return errors.New("policy: durable candidate revision is not newer than active policy")
+		}
+		m.candidate = candidate
+		if candidate.Revision > m.lastRevision {
+			m.lastRevision = candidate.Revision
+		}
+	}
+	if manifest.Previous == nil {
+		return nil
+	}
+	if _, ok := m.knownGood[manifest.Previous.Revision]; !ok {
+		previous, err := m.loadArtifact(*manifest.Previous)
+		if err != nil {
+			return fmt.Errorf("policy: refresh previous artifact: %w", err)
+		}
+		if err := validateCompiledRef(previous, *manifest.Previous); err != nil {
+			return err
+		}
+		m.knownGood[previous.Revision] = previous
+	}
+	return nil
+}
+
+func validateCompiledRef(compiled *CompiledPolicy, ref PolicyRef) error {
+	if compiled == nil {
+		return errors.New("policy: durable artifact is nil")
+	}
+	digest, err := Digest(&compiled.Policy)
+	if err != nil || compiled.ID != ref.ID || compiled.Revision != ref.Revision || digest != ref.Digest {
+		return errors.New("policy: durable artifact does not match manifest")
+	}
+	return nil
 }
 
 // cloneCompiled returns a newly compiled copy of a manager-owned snapshot.
@@ -220,6 +312,9 @@ func (m *Manager) PrepareBy(p *Policy, actor, reason string) (*CompiledPolicy, e
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.refreshDurableLocked(); err != nil {
+		return nil, err
+	}
 	if compiled.Revision <= m.lastRevision {
 		return nil, fmt.Errorf("policy: revision %d is not newer than %d", compiled.Revision, m.lastRevision)
 	}
@@ -255,6 +350,9 @@ func (m *Manager) ActivateBy(reason, actor string) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.refreshDurableLocked(); err != nil {
+		return err
+	}
 	if m.candidate == nil {
 		return errors.New("policy: no prepared candidate")
 	}
@@ -288,6 +386,9 @@ func (m *Manager) RollbackBy(revision int, reason, actor string) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.refreshDurableLocked(); err != nil {
+		return err
+	}
 	target := m.knownGood[revision]
 	if target == nil {
 		return fmt.Errorf("policy: revision %d is not known-good", revision)

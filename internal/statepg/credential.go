@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/B-A-M-N/gripline/internal/control"
 	"github.com/B-A-M-N/gripline/internal/credential"
 	"github.com/jackc/pgx/v5"
 )
@@ -155,6 +156,47 @@ func (s *Store) FindByVerifierContext(ctx context.Context, verifier []byte, pepp
 	return rec, nil
 }
 
+// ListCredentials returns sanitized credential summaries for administrative
+// consumers. Verifier material is intentionally excluded.
+func (s *Store) ListCredentials() ([]credential.Summary, error) {
+	rows, err := s.pool.Query(context.Background(), `SELECT credential_id, account_id,
+		status, policy_id, plan_id, created_at, revision FROM gripline_credentials ORDER BY credential_id`)
+	if err != nil {
+		return nil, mapDBError(err)
+	}
+	defer rows.Close()
+	var out []credential.Summary
+	for rows.Next() {
+		var rec credential.Summary
+		var status int
+		if err := rows.Scan(&rec.CredentialID, &rec.AccountID, &status, &rec.PolicyID, &rec.PlanID, &rec.CreatedAt, &rec.Revision); err != nil {
+			return nil, mapDBError(err)
+		}
+		rec.Status = credential.Status(status).String()
+		out = append(out, rec)
+	}
+	return out, mapDBError(rows.Err())
+}
+
+// CountCredentialsByPepperVersion is the operator safety check used before a
+// pepper generation is retired.
+func (s *Store) CountCredentialsByPepperVersion() (map[int]int, error) {
+	rows, err := s.pool.Query(context.Background(), `SELECT pepper_version, COUNT(*) FROM gripline_credentials GROUP BY pepper_version ORDER BY pepper_version`)
+	if err != nil {
+		return nil, mapDBError(err)
+	}
+	defer rows.Close()
+	counts := make(map[int]int)
+	for rows.Next() {
+		var version, count int
+		if err := rows.Scan(&version, &count); err != nil {
+			return nil, mapDBError(err)
+		}
+		counts[version] = count
+	}
+	return counts, mapDBError(rows.Err())
+}
+
 func mapCredentialReadError(err error) error {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return credential.ErrLookupTimeout
@@ -288,16 +330,77 @@ func updateCredentialRow(ctx context.Context, tx pgx.Tx, rec *credential.Credent
 	return mapDBError(err)
 }
 
+// credentialReceipt is the durable result of one request-correlated security
+// observation. Keeping the complete validated records makes a replay return
+// the original authoritative result even if a later observation has already
+// advanced the live credential row.
+type credentialReceipt struct {
+	Changed bool
+	Before  *credential.CredentialRecord
+	After   *credential.CredentialRecord
+}
+
+func loadCredentialReceipt(ctx context.Context, tx pgx.Tx, requestID, credentialID string) (credentialReceipt, bool, error) {
+	var (
+		changed             bool
+		beforeRaw, afterRaw []byte
+	)
+	err := tx.QueryRow(ctx, `SELECT changed, before_record, after_record
+		FROM gripline_credential_receipts WHERE request_id=$1 AND credential_id=$2`, requestID, credentialID).
+		Scan(&changed, &beforeRaw, &afterRaw)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return credentialReceipt{}, false, nil
+	}
+	if err != nil {
+		return credentialReceipt{}, false, mapDBError(err)
+	}
+	var before, after credential.CredentialRecord
+	if json.Unmarshal(beforeRaw, &before) != nil || json.Unmarshal(afterRaw, &after) != nil || before.Validate() != nil || after.Validate() != nil {
+		return credentialReceipt{}, false, credential.ErrLookupCorrupt
+	}
+	return credentialReceipt{Changed: changed, Before: cloneCredential(&before), After: cloneCredential(&after)}, true, nil
+}
+
+func storeCredentialReceipt(ctx context.Context, tx pgx.Tx, requestID, credentialID string, changed bool, before, after *credential.CredentialRecord) error {
+	if requestID == "" {
+		return nil
+	}
+	beforeRaw, err := json.Marshal(before)
+	if err != nil {
+		return err
+	}
+	afterRaw, err := json.Marshal(after)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO gripline_credential_receipts
+		(request_id, credential_id, changed, before_record, after_record)
+		VALUES ($1,$2,$3,$4,$5) ON CONFLICT (request_id, credential_id) DO NOTHING`, requestID, credentialID, changed, beforeRaw, afterRaw)
+	return mapDBError(err)
+}
+
 // ObserveAndCommit serializes the reducer against the shared credential row.
 func (s *Store) ObserveAndCommit(ctx context.Context, credentialID string, score int, hy credential.Hysteresis, now time.Time) (credential.TransitionResult, error) {
 	if err := ctx.Err(); err != nil {
 		return credential.TransitionResult{}, credential.ErrTimeout
 	}
+	meta := credential.TransitionMetadataFromContext(ctx)
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return credential.TransitionResult{}, mapDBError(err)
 	}
 	defer tx.Rollback(ctx)
+	if meta.RequestID != "" {
+		if receipt, ok, err := loadCredentialReceipt(ctx, tx, meta.RequestID, credentialID); err != nil {
+			return credential.TransitionResult{}, err
+		} else if ok {
+			status := credential.TransitionNoChange
+			if receipt.Changed {
+				status = credential.TransitionCommitted
+			}
+			return credential.TransitionResult{Status: status, Before: receipt.Before, Record: receipt.After}, nil
+		}
+	}
 	rec, err := scanCredential(tx.QueryRow(ctx, `SELECT `+credentialColumns+` FROM gripline_credentials WHERE credential_id=$1 FOR UPDATE`, credentialID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return credential.TransitionResult{}, credential.ErrNotFound
@@ -320,12 +423,18 @@ func (s *Store) ObserveAndCommit(ctx context.Context, credentialID string, score
 	if err := updateCredentialRow(ctx, tx, rec); err != nil {
 		return credential.TransitionResult{}, err
 	}
-	meta := credential.TransitionMetadataFromContext(ctx)
-	codes, _ := json.Marshal(meta.EvidenceCodes)
 	if reduced.Changed {
-		if _, err := tx.Exec(ctx, `INSERT INTO gripline_credential_transitions (at, request_id, credential_id, before_status, after_status, risk_score, revision, policy_revision, evidence_codes) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`, now.UTC(), meta.RequestID, credentialID, before.Status, rec.Status, score, rec.Revision, meta.PolicyRevision, codes); err != nil {
-			return credential.TransitionResult{}, mapDBError(err)
+		if err := appendSecurityTransition(ctx, tx, control.SecurityTransitionRecord{
+			At: now.UTC(), Kind: "credential_status", RequestID: meta.RequestID,
+			CredentialID: credentialID, Before: before.Status.String(), After: rec.Status.String(),
+			RiskScore: score, Revision: rec.Revision, PolicyRevision: meta.PolicyRevision,
+			EvidenceCodes: append([]string(nil), meta.EvidenceCodes...),
+		}); err != nil {
+			return credential.TransitionResult{}, err
 		}
+	}
+	if err := storeCredentialReceipt(ctx, tx, meta.RequestID, credentialID, reduced.Changed, before, rec); err != nil {
+		return credential.TransitionResult{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return credential.TransitionResult{}, mapDBError(err)

@@ -11,6 +11,8 @@
 package control
 
 import (
+	"context"
+	"errors"
 	"sync"
 	"time"
 )
@@ -81,6 +83,11 @@ type ControlPlane struct {
 	posture  Posture
 	audit    []Event
 	auditCap int
+	// Remote readers/recorders are installed by a clustered composition root.
+	// The resident buffer remains useful as a local cache and test fixture, but
+	// security decisions consult the shared authority when one is configured.
+	postureReader     func(context.Context) (Posture, error)
+	admissionRecorder func(context.Context, Event) error
 }
 
 // New builds a ControlPlane with a bounded, non-lossy-in-practice audit log
@@ -97,6 +104,50 @@ func (c *ControlPlane) Posture() Posture {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.posture
+}
+
+// SetPostureReader binds the shared posture authority used by clustered
+// admission. A nil reader restores resident-only behavior.
+func (c *ControlPlane) SetPostureReader(reader func(context.Context) (Posture, error)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.postureReader = reader
+}
+
+// SetAdmissionRecorder binds the shared admission-audit authority used by
+// clustered deployments. The local bounded audit remains populated as a
+// diagnostic cache regardless of recorder success.
+func (c *ControlPlane) SetAdmissionRecorder(recorder func(context.Context, Event) error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.admissionRecorder = recorder
+}
+
+// PostureContext reads the authoritative posture for one request. Clustered
+// callers must treat a returned error as unavailable, not as NORMAL.
+func (c *ControlPlane) PostureContext(ctx context.Context) (Posture, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	c.mu.Lock()
+	reader := c.postureReader
+	local := c.posture
+	c.mu.Unlock()
+	if reader == nil {
+		return local, nil
+	}
+	p, err := reader(ctx)
+	if err != nil {
+		return Normal, err
+	}
+	return p, nil
+}
+
+// InEmergencyContext returns the shared posture decision for one request.
+// Callers must propagate an error as an unavailable control authority.
+func (c *ControlPlane) InEmergencyContext(ctx context.Context) (bool, error) {
+	p, err := c.PostureContext(ctx)
+	return p == EmergencyLockdown, err
 }
 
 // InEmergency reports whether the plane is in EMERGENCY_LOCKDOWN.
@@ -144,12 +195,33 @@ func (c *ControlPlane) SetEmergency(on bool, actor, reason string) Posture {
 // RecordAdmission appends an admission decision to the audit trail (P0.35). The
 // caller supplies only non-secret fields from the decision outcome.
 func (c *ControlPlane) RecordAdmission(e Event) {
+	_ = c.RecordAdmissionContext(context.Background(), e)
+}
+
+// RecordAdmissionContext appends an admission to the shared recorder when
+// configured and always updates the local bounded diagnostic trail.
+func (c *ControlPlane) RecordAdmissionContext(ctx context.Context, e Event) error {
 	e.Kind = EventAdmission
 	e.At = time.Now()
-	e.Posture = c.Posture().String()
+	posture, postureErr := c.PostureContext(ctx)
+	if postureErr == nil {
+		e.Posture = posture.String()
+	} else {
+		e.Posture = "UNAVAILABLE"
+	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	recorder := c.admissionRecorder
 	c.recordLocked(e)
+	c.mu.Unlock()
+	if recorder != nil {
+		if err := recorder(ctx, e); err != nil {
+			return err
+		}
+	}
+	if postureErr != nil {
+		return errors.Join(errors.New("control: posture unavailable"), postureErr)
+	}
+	return nil
 }
 
 // Audit returns a copy of the audit trail (newest-last).

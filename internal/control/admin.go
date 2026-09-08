@@ -340,18 +340,18 @@ type MutationStore interface {
 func (s *Service) ProvisionCredential(ctx context.Context, token string, rec credential.CredentialRecord, reason string) error {
 	id, err := s.authorize(ctx, token, CapCredentialLifecycle, reason)
 	if err != nil {
-		s.record("", "credential.add", rec.CredentialID, reason, false, err.Error())
+		s.record(ctx, "", "credential.add", rec.CredentialID, reason, false, err.Error())
 		return err
 	}
 	if s.mutations == nil {
-		s.record(id.Name, "credential.add", rec.CredentialID, reason, false, "no transactional credential provisioner wired")
+		s.record(ctx, id.Name, "credential.add", rec.CredentialID, reason, false, "no transactional credential provisioner wired")
 		return errors.New("control: credential provisioning requires a transactional state store")
 	}
 	if err := s.mutations.ProvisionCredentialWithAudit(ctx, rec, OperatorRecord{
 		At: s.now().UTC(), Actor: id.Name, Action: "credential.add", Target: rec.CredentialID,
-		Reason: reason, Posture: s.plane.Posture().String(), Committed: true,
+		Reason: reason, Posture: s.postureString(ctx), Committed: true,
 	}); err != nil {
-		s.record(id.Name, "credential.add", rec.CredentialID, reason, false, err.Error())
+		s.record(ctx, id.Name, "credential.add", rec.CredentialID, reason, false, err.Error())
 		return err
 	}
 	return nil
@@ -415,22 +415,35 @@ func (s *Service) AuthorizeCapability(ctx context.Context, token string, cap Cap
 	return id, nil
 }
 
+func (s *Service) postureString(ctx context.Context) string {
+	posture, err := s.plane.PostureContext(ctx)
+	if err != nil {
+		return "UNAVAILABLE"
+	}
+	return posture.String()
+}
+
 // record durably commits the operator audit row. Committed=false rows are
 // also recorded (a DENIED attempt is exactly what an investigation needs).
-func (s *Service) record(actor, action, target, reason string, committed bool, detail string) {
+func (s *Service) record(ctx context.Context, actor, action, target, reason string, committed bool, detail string) {
 	rec := OperatorRecord{
 		At:        s.now().UTC(),
 		Actor:     actor,
 		Action:    action,
 		Target:    target,
 		Reason:    reason,
-		Posture:   s.plane.Posture().String(),
+		Posture:   s.postureString(ctx),
 		Committed: committed,
 		Detail:    detail,
 	}
 	// Best-effort for the RECORD-OF-A-DENIED-ACTION path only; committed
 	// actions audit inside the transaction (callers use commitAudit).
-	_ = s.audit.AppendOperator(context.Background(), rec)
+	// Preserve the request's values for traceability while detaching cancellation
+	// so a client disconnect cannot erase the denied-action record. The timeout
+	// bounds the amount of work a failing remote authority may retain.
+	auditCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	_ = s.audit.AppendOperator(auditCtx, rec)
 }
 
 // commitAudit durably commits the record for a COMPLETED action; a failure
@@ -440,7 +453,7 @@ func (s *Service) record(actor, action, target, reason string, committed bool, d
 func (s *Service) commitAudit(ctx context.Context, actor, action, target, reason string) error {
 	return s.audit.AppendOperator(ctx, OperatorRecord{
 		At: s.now().UTC(), Actor: actor, Action: action, Target: target,
-		Reason: reason, Posture: s.plane.Posture().String(), Committed: true,
+		Reason: reason, Posture: s.postureString(ctx), Committed: true,
 	})
 }
 
@@ -450,7 +463,7 @@ func (s *Service) commitAudit(ctx context.Context, actor, action, target, reason
 func (s *Service) SetEmergency(ctx context.Context, token string, on bool, reason string) (Posture, error) {
 	id, err := s.authorize(ctx, token, CapPosture, reason)
 	if err != nil {
-		s.record("", "posture.set_emergency", "global", reason, false, err.Error())
+		s.record(ctx, "", "posture.set_emergency", "global", reason, false, err.Error())
 		return s.plane.Posture(), err
 	}
 	target := Normal
@@ -467,7 +480,7 @@ func (s *Service) SetEmergency(ctx context.Context, token string, on bool, reaso
 			At: s.now().UTC(), Actor: id.Name, Action: "posture.set_emergency",
 			Target: "global", Reason: reason, Posture: target.String(), Committed: true,
 		}); err != nil {
-			s.record(id.Name, "posture.set_emergency", "global", reason, false, err.Error())
+			s.record(ctx, id.Name, "posture.set_emergency", "global", reason, false, err.Error())
 			return s.plane.Posture(), fmt.Errorf("control: posture persist + audit failed, action aborted: %w", err)
 		}
 		posture := s.plane.SetEmergency(on, id.Name, reason)
@@ -475,7 +488,7 @@ func (s *Service) SetEmergency(ctx context.Context, token string, on bool, reaso
 	}
 	if s.posturePersist != nil {
 		if err := s.posturePersist(ctx, target, id.Name, reason); err != nil {
-			s.record(id.Name, "posture.set_emergency", "global", reason, false, err.Error())
+			s.record(ctx, id.Name, "posture.set_emergency", "global", reason, false, err.Error())
 			return s.plane.Posture(), fmt.Errorf("control: posture persist + audit failed, action aborted: %w", err)
 		}
 		posture := s.plane.SetEmergency(on, id.Name, reason)
@@ -487,7 +500,7 @@ func (s *Service) SetEmergency(ctx context.Context, token string, on bool, reaso
 		At: s.now().UTC(), Actor: id.Name, Action: "posture.set_emergency",
 		Target: "global", Reason: reason, Posture: target.String(), Committed: true,
 	}); err != nil {
-		s.record(id.Name, "posture.set_emergency", "global", reason, false, err.Error())
+		s.record(ctx, id.Name, "posture.set_emergency", "global", reason, false, err.Error())
 		return s.plane.Posture(), fmt.Errorf("control: audit commit failed, action aborted: %w", err)
 	}
 	posture := s.plane.SetEmergency(on, id.Name, reason)
@@ -503,27 +516,27 @@ func (s *Service) SetEmergency(ctx context.Context, token string, on bool, reaso
 func (s *Service) RevokeCredential(ctx context.Context, token, credID, reason string) error {
 	id, err := s.authorize(ctx, token, CapCredentialLifecycle, reason)
 	if err != nil {
-		s.record("", "credential.revoke", credID, reason, false, err.Error())
+		s.record(ctx, "", "credential.revoke", credID, reason, false, err.Error())
 		return err
 	}
 	if s.mutations != nil {
 		if err := s.mutations.RevokeCredentialWithAudit(ctx, credID, OperatorRecord{
 			At: s.now().UTC(), Actor: id.Name, Action: "credential.revoke",
-			Target: credID, Reason: reason, Posture: s.plane.Posture().String(), Committed: true,
+			Target: credID, Reason: reason, Posture: s.postureString(ctx), Committed: true,
 		}); err != nil {
-			s.record(id.Name, "credential.revoke", credID, reason, false, err.Error())
+			s.record(ctx, id.Name, "credential.revoke", credID, reason, false, err.Error())
 			return err
 		}
 		return nil
 	}
 	if s.creds == nil {
-		s.record(id.Name, "credential.revoke", credID, reason, false, "no credential operator wired")
+		s.record(ctx, id.Name, "credential.revoke", credID, reason, false, "no credential operator wired")
 		return errors.New("control: no credential operator wired")
 	}
 	// BETA-11: Mutation FIRST, then audit. The audit records what HAPPENED,
 	// not what was attempted.
 	if err := s.creds.Revoke(credID); err != nil {
-		s.record(id.Name, "credential.revoke", credID, reason, false, err.Error())
+		s.record(ctx, id.Name, "credential.revoke", credID, reason, false, err.Error())
 		return err
 	}
 	if err := s.commitAudit(ctx, id.Name, "credential.revoke", credID, reason); err != nil {
@@ -542,26 +555,26 @@ func (s *Service) RevokeCredential(ctx context.Context, token, credID, reason st
 func (s *Service) UnblockLane(ctx context.Context, token, credID, laneID, reason string) error {
 	id, err := s.authorize(ctx, token, CapLaneLifecycle, reason)
 	if err != nil {
-		s.record("", "lane.unblock", laneID, reason, false, err.Error())
+		s.record(ctx, "", "lane.unblock", laneID, reason, false, err.Error())
 		return err
 	}
 	if s.mutations != nil {
 		if err := s.mutations.UnblockLaneWithAudit(ctx, credID, laneID, OperatorRecord{
 			At: s.now().UTC(), Actor: id.Name, Action: "lane.unblock",
-			Target: credID + "/" + laneID, Reason: reason, Posture: s.plane.Posture().String(), Committed: true,
+			Target: credID + "/" + laneID, Reason: reason, Posture: s.postureString(ctx), Committed: true,
 		}, s.now()); err != nil {
-			s.record(id.Name, "lane.unblock", laneID, reason, false, err.Error())
+			s.record(ctx, id.Name, "lane.unblock", laneID, reason, false, err.Error())
 			return err
 		}
 		return nil
 	}
 	if s.lanes == nil {
-		s.record(id.Name, "lane.unblock", laneID, reason, false, "no lane operator wired")
+		s.record(ctx, id.Name, "lane.unblock", laneID, reason, false, "no lane operator wired")
 		return errors.New("control: no lane operator wired")
 	}
 	// BETA-11: Mutation FIRST.
 	if err := s.lanes.UnblockOperator(credID, laneID, id.Name, reason, s.now()); err != nil {
-		s.record(id.Name, "lane.unblock", laneID, reason, false, err.Error())
+		s.record(ctx, id.Name, "lane.unblock", laneID, reason, false, err.Error())
 		return err
 	}
 	if err := s.commitAudit(ctx, id.Name, "lane.unblock", laneID, reason); err != nil {

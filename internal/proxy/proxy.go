@@ -17,6 +17,7 @@
 package proxy
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -224,6 +225,9 @@ type Config struct {
 	// zero disables that particular aggregate bound.
 	SpoolMaxBytes int64
 	SpoolMaxFiles int
+	// ReservationRenewEvery is the heartbeat for distributed usage leases.
+	// Zero leaves renewal to the authority's own lifecycle.
+	ReservationRenewEvery time.Duration
 
 	// WriteTimeout is the initial response budget, from WriteHeader until the
 	// first deadline expiry. Zero = no server-managed write deadline change
@@ -639,12 +643,25 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	stripUntrustedProvenanceHeaders(upstreamHeaders)
 	stripRequestTrailers(r.Trailer)
 	upstreamHeaders[assertionHeader] = []string{out.Assertion.Encode()}
+	forwardCtx, cancelForward := context.WithCancel(r.Context())
+	defer cancelForward()
+	if out.UsageRes != nil {
+		if err := out.UsageRes.MarkForwarded(r.Context()); err != nil {
+			http.Error(w, "resource_lease_error", http.StatusBadGateway)
+			return
+		}
+		if d.cfg.ReservationRenewEvery > 0 {
+			stopRenew := make(chan struct{})
+			defer close(stopRenew)
+			go renewReservation(forwardCtx, out.UsageRes, d.cfg.ReservationRenewEvery, cancelForward, stopRenew)
+		}
+	}
 
 	// 5. Build and forward the upstream request, streaming the body. The
 	// upstream origin is the CONFIGURED backend (P0.7): scheme and host come
 	// from BackendURL, the path is safely joined, and the client's query is
 	// preserved. The client cannot redirect the proxy at another host.
-	upr := r.Clone(r.Context())
+	upr := r.Clone(forwardCtx)
 	upr.Header = upstreamHeaders
 	upr.Trailer = copyHeaders(r.Trailer)
 	stripRequestTrailers(upr.Trailer)
@@ -766,7 +783,13 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// reservation's own buckets. Runs BEFORE the deferred Release so unsettled
 	// holds are never cancelled-and-refunded in full. Concurrency is released by
 	// the deferred Release.
-	if mr, ok := reservation.(*resource.MultiReservation); ok && !mr.Settled() {
+	if out.UsageRes != nil {
+		settleCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
+		if err := out.UsageRes.SettleContext(settleCtx, actual); err != nil {
+			d.metrics.completionFailures.Add(1)
+		}
+		cancel()
+	} else if mr, ok := reservation.(*resource.MultiReservation); ok && !mr.Settled() {
 		mr.Settle(actual)
 	}
 	// P0.4A: drive the completion producers with the ACTUAL usage. `success`
@@ -803,6 +826,24 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// trust-building provider activity; resource accounting still settled above.
 	if streamErr == nil && resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
 		out.FinalizeBaseline()
+	}
+}
+
+func renewReservation(ctx context.Context, reservation resource.UsageReservation, every time.Duration, cancel context.CancelFunc, stop <-chan struct{}) {
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if err := reservation.Renew(ctx); err != nil {
+				cancel()
+				return
+			}
+		case <-stop:
+			return
+		case <-ctx.Done():
+			return
+		}
 	}
 }
 

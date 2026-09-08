@@ -108,6 +108,25 @@ type Config struct {
 	// empty path retains the beta default; a supplied path is loaded and passed
 	// through policy.Compile during runtime construction.
 	Policy PolicySection `json:"policy,omitempty"`
+
+	// Authority selects the authoritative state backend. The empty backend is
+	// the explicit single-process mode; "postgres" is the clustered mode and
+	// requires a shared DSN reference plus a stable node identity.
+	Authority AuthoritySection `json:"authority,omitempty"`
+}
+
+// AuthoritySection configures the shared PostgreSQL authority. DSNEnv names an
+// environment variable rather than storing database credentials in the config
+// file. Lease timings are validated even before the first remote lease is
+// requested so every node shares an explicit fencing/expiry contract.
+type AuthoritySection struct {
+	Backend    string   `json:"backend,omitempty"` // standalone | postgres
+	DSNEnv     string   `json:"dsn_env,omitempty"`
+	NodeID     string   `json:"node_id,omitempty"`
+	LeaseTTL   Duration `json:"lease_ttl,omitempty"`
+	RenewEvery Duration `json:"renew_every,omitempty"`
+	MaxConns   int32    `json:"max_conns,omitempty"`
+	MinConns   int32    `json:"min_conns,omitempty"`
 }
 
 // PolicySection selects the versioned policy artifact for the deployment.
@@ -504,6 +523,42 @@ func (c *Config) Validate() error {
 	// Identity boundary.
 	if c.Identity.Audience == "" {
 		return fmt.Errorf("identity.audience required (INV-11: assertions are audience-bound)")
+	}
+	// Authority posture is explicit. A PostgreSQL node cannot accidentally
+	// combine a shared credential authority with a local Bolt/evidence/audit
+	// authority, and lease timing is part of the cluster's safety contract.
+	switch strings.ToLower(strings.TrimSpace(c.Authority.Backend)) {
+	case "", "standalone":
+		if c.Authority.DSNEnv != "" || c.Authority.NodeID != "" || c.Authority.LeaseTTL.D() != 0 || c.Authority.RenewEvery.D() != 0 {
+			return fmt.Errorf("authority.dsn_env, node_id, lease timings require authority.backend=postgres")
+		}
+	case "postgres":
+		if c.Deployment.AllowEphemeralState {
+			return fmt.Errorf("deployment.allow_ephemeral_state cannot be enabled with authority.backend=postgres")
+		}
+		if c.Authority.DSNEnv == "" {
+			return fmt.Errorf("authority.dsn_env required for authority.backend=postgres")
+		}
+		if strings.TrimSpace(c.Authority.NodeID) == "" {
+			return fmt.Errorf("authority.node_id required for authority.backend=postgres")
+		}
+		if c.Paths.State != "" {
+			return fmt.Errorf("paths.state must be empty when authority.backend=postgres")
+		}
+		if c.Paths.Evidence != "" || c.Paths.AuditLog != "" {
+			return fmt.Errorf("paths.evidence and paths.audit_log must be empty when authority.backend=postgres")
+		}
+		if c.Authority.LeaseTTL.D() < 5*time.Second {
+			return fmt.Errorf("authority.lease_ttl must be at least 5s for authority.backend=postgres")
+		}
+		if c.Authority.RenewEvery.D() <= 0 || c.Authority.RenewEvery.D() >= c.Authority.LeaseTTL.D()/2 {
+			return fmt.Errorf("authority.renew_every must be positive and less than half authority.lease_ttl")
+		}
+		if c.Authority.MaxConns < 0 || c.Authority.MinConns < 0 || (c.Authority.MaxConns > 0 && c.Authority.MinConns > c.Authority.MaxConns) {
+			return fmt.Errorf("authority min/max connection bounds are invalid")
+		}
+	default:
+		return fmt.Errorf("authority.backend must be standalone or postgres")
 	}
 	// P0.7: state-backed deployments use Bolt as the sole operator-audit
 	// authority. Reject a second JSONL path even when the admin listener is

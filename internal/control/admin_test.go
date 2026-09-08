@@ -15,14 +15,16 @@ import (
 // memAudit is an in-memory AuditRepository recording every append (test only —
 // production uses FileAuditRepository or a DB-backed implementation).
 type memAudit struct {
-	mu   sync.Mutex
-	rows []OperatorRecord
-	fail error
+	mu         sync.Mutex
+	rows       []OperatorRecord
+	fail       error
+	lastCtxErr error
 }
 
-func (m *memAudit) AppendOperator(_ context.Context, rec OperatorRecord) error {
+func (m *memAudit) AppendOperator(ctx context.Context, rec OperatorRecord) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.lastCtxErr = ctx.Err()
 	if m.fail != nil {
 		return m.fail
 	}
@@ -34,6 +36,12 @@ func (m *memAudit) count() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return len(m.rows)
+}
+
+func (m *memAudit) contextErr() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lastCtxErr
 }
 
 // staticAuth is a fixed-identity Authenticator (test double).
@@ -118,6 +126,20 @@ func TestServiceActionPreconditions(t *testing.T) {
 	}
 	_ = svc
 	_ = audit
+}
+
+func TestDeniedActionAuditDetachesRequestCancellation(t *testing.T) {
+	svc, audit, _, _ := newTestService(t)
+	svc.auth = staticAuth{id: &Identity{Name: "limited"}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := svc.SetEmergency(ctx, "tok", true, "incident"); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("expected denied action, got %v", err)
+	}
+	if audit.contextErr() != nil {
+		t.Fatalf("denied-action audit must use a live bounded context, got %v", audit.contextErr())
+	}
 }
 
 // P0.47: a successful action commits its durable audit record with the

@@ -88,3 +88,33 @@ func TestManagerSnapshotsAreDefensiveCopies(t *testing.T) {
 		t.Fatal("mutating Current result changed manager-owned policy")
 	}
 }
+
+func TestManagerRefreshesCommittedSharedPolicy(t *testing.T) {
+	var manifest Manifest
+	var active *CompiledPolicy
+	m, err := NewManager(Default(), Options{
+		LoadManifest: func() (Manifest, error) { return manifest, nil },
+		LoadArtifact: func(ref PolicyRef) (*CompiledPolicy, error) {
+			if active == nil || active.ID != ref.ID || active.Revision != ref.Revision {
+				return nil, errors.New("artifact not found")
+			}
+			return active, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := Default()
+	next.Revision = 2
+	active, err = Compile(next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err = manifestFor(active, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Current(); got == nil || got.Revision != 2 {
+		t.Fatalf("manager did not refresh shared active policy: %+v", got)
+	}
+}

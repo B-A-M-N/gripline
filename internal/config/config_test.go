@@ -63,6 +63,32 @@ func TestLoadValid(t *testing.T) {
 	}
 }
 
+func TestValidateClusterAuthorityContract(t *testing.T) {
+	c := &Config{
+		Listen:    "127.0.0.1:8080",
+		TLS:       TLSSection{TerminateTLSUpstream: true},
+		Backend:   BackendSection{URL: "https://provider.internal", Timeout: Duration(time.Second)},
+		Server:    ServerSection{ReadTimeout: Duration(time.Second), WriteTimeout: Duration(time.Second), IdleTimeout: Duration(time.Second), ReadHeaderTimeout: Duration(time.Second)},
+		Identity:  IdentitySection{Audience: "a"},
+		Authority: AuthoritySection{Backend: "postgres", DSNEnv: "GRIPLINE_DSN", NodeID: "node-a", LeaseTTL: Duration(30 * time.Second), RenewEvery: Duration(10 * time.Second)},
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("valid postgres authority rejected: %v", err)
+	}
+	for name, mutate := range map[string]func(*Config){
+		"missing DSN reference": func(v *Config) { v.Authority.DSNEnv = "" },
+		"missing node id":       func(v *Config) { v.Authority.NodeID = "" },
+		"renewal too slow":      func(v *Config) { v.Authority.RenewEvery = Duration(15 * time.Second) },
+		"local state split":     func(v *Config) { v.Paths.State = "/tmp/state.db" },
+	} {
+		copy := *c
+		mutate(&copy)
+		if err := copy.Validate(); err == nil {
+			t.Errorf("%s must be rejected", name)
+		}
+	}
+}
+
 func writeCertificateMaterial(t *testing.T, dir, name string) (certPath, keyPath string) {
 	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)

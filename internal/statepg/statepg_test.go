@@ -5,9 +5,11 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/B-A-M-N/gripline/internal/control"
 	"github.com/B-A-M-N/gripline/internal/credential"
 	"github.com/B-A-M-N/gripline/internal/evidence"
 	"github.com/B-A-M-N/gripline/internal/lane"
+	"github.com/B-A-M-N/gripline/internal/resource"
 )
 
 func TestOpenRequiresDSNBeforeDialing(t *testing.T) {
@@ -26,4 +28,10 @@ func TestSharedAuthorityInterfaceConformance(t *testing.T) {
 	var _ lane.ReadRepository = (*Store)(nil)
 	var _ evidence.Store = (*Store)(nil)
 	var _ evidence.ContextStore = (*Store)(nil)
+	var _ control.AuditRepository = (*Store)(nil)
+	var _ control.MutationStore = (*Store)(nil)
+	var _ control.SecurityTransitionReader = (*Store)(nil)
+	var _ resource.Authority = (*Store)(nil)
+	var _ resource.DistributedAuthority = (*Store)(nil)
+	var _ resource.RequestDistributedAuthority = (*Store)(nil)
 }

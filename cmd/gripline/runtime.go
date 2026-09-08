@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
@@ -34,8 +35,25 @@ import (
 	"github.com/B-A-M-N/gripline/internal/pseudonym"
 	"github.com/B-A-M-N/gripline/internal/resource"
 	"github.com/B-A-M-N/gripline/internal/statebolt"
+	"github.com/B-A-M-N/gripline/internal/statepg"
 	"github.com/B-A-M-N/gripline/internal/terminator"
 )
+
+// adminStateAuthority is the read-only administrative view shared by the
+// standalone Bolt and clustered PostgreSQL authorities. Handlers depend on
+// this contract rather than a particular database implementation.
+type adminStateAuthority interface {
+	ListCredentials() ([]credential.Summary, error)
+	CountCredentialsByPepperVersion() (map[int]int, error)
+	ListLaneRecords(string) ([]*lane.LaneRecord, error)
+	ListOperatorAudit(uint64, int) ([]control.OperatorRecord, error)
+	ListSecurityTransitions(uint64, int) ([]control.SecurityTransitionRecord, error)
+}
+
+type adaptiveStateAuthority interface {
+	LoadDetectorState(string) ([]byte, bool, error)
+	SaveDetectorState(string, []byte) error
+}
 
 // Runtime is the single application composition root (P0.1/P0.2).
 // All security-critical state is instantiated once and shared.
@@ -59,6 +77,7 @@ type Runtime struct {
 	Policy         *policy.Policy
 	PolicyManager  *policy.Manager
 	State          *statebolt.Store // non-nil when backed by the transactional store
+	Postgres       *statepg.Store   // non-nil when backed by the clustered authority
 	Audience       string
 	DataPlane      http.Handler
 	Admin          *http.Server
@@ -79,6 +98,11 @@ func (rt *Runtime) Ready() error {
 	if rt.State != nil {
 		if err := rt.State.Ping(); err != nil {
 			return fmt.Errorf("gripline: state store not ready: %w", err)
+		}
+	}
+	if rt.Postgres != nil {
+		if err := rt.Postgres.Ready(context.Background()); err != nil {
+			return fmt.Errorf("gripline: postgres authority not ready: %w", err)
 		}
 	}
 	for _, health := range rt.adaptiveHealth {
@@ -121,13 +145,13 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 	// explicitly opts into ephemeral development mode
 	// (deployment.allow_ephemeral_state=true). The safe deployment is the path
 	// of least resistance.
-	if !cfg.Deployment.AllowEphemeralState {
+	if !cfg.Deployment.AllowEphemeralState && strings.ToLower(strings.TrimSpace(cfg.Authority.Backend)) != "postgres" {
 		if cfg.Paths.State == "" {
 			return nil, fmt.Errorf("gripline: paths.state is required (deployment.allow_ephemeral_state is false; set it only for development)")
 		}
-		if cfg.Paths.SignerKeyring == "" {
-			return nil, fmt.Errorf("gripline: paths.signer_keyring is required (deployment.allow_ephemeral_state is false; set it only for development)")
-		}
+	}
+	if !cfg.Deployment.AllowEphemeralState && cfg.Paths.SignerKeyring == "" {
+		return nil, fmt.Errorf("gripline: paths.signer_keyring is required (deployment.allow_ephemeral_state is false; set it only for development)")
 	}
 
 	// P0.2-fix: when a state DB is configured it is the SINGLE security
@@ -139,27 +163,56 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 	var lanes lane.Repository
 	var evStore evidence.Store
 	var state *statebolt.Store
-	if cfg.Paths.State != "" {
-		if cfg.Paths.Evidence != "" {
-			return nil, fmt.Errorf("gripline: paths.evidence must be empty when paths.state is configured: the Bolt state database is the single evidence authority (P0.2)")
+	var postgres *statepg.Store
+	var adminState adminStateAuthority
+	var adaptiveState adaptiveStateAuthority
+	switch strings.ToLower(strings.TrimSpace(cfg.Authority.Backend)) {
+	case "postgres":
+		dsn := os.Getenv(cfg.Authority.DSNEnv)
+		if dsn == "" {
+			return nil, fmt.Errorf("gripline: authority DSN environment variable %q is empty", cfg.Authority.DSNEnv)
 		}
-		s, err := statebolt.Open(cfg.Paths.State, statebolt.Options{})
+		s, err := statepg.Open(context.Background(), statepg.Options{
+			DSN: dsn, MaxConns: cfg.Authority.MaxConns, MinConns: cfg.Authority.MinConns,
+			NodeID: cfg.Authority.NodeID, LeaseTTL: cfg.Authority.LeaseTTL.D(), RenewEvery: cfg.Authority.RenewEvery.D(), MaxSourceScopes: cfg.Server.MaxSourceScopes,
+		})
 		if err != nil {
-			return nil, fmt.Errorf("gripline: state db: %w", err)
+			return nil, fmt.Errorf("gripline: postgres authority: %w", err)
 		}
-		state = s
-		closers = append(closers, func() error { return s.Close() })
-		// Sweep expired evidence that no longer has a live traffic subject. The
-		// stop function is appended after the DB close function so close order
-		// joins the worker before releasing the database (P1-14).
-		closers = append(closers, startStateMaintenance(s))
+		postgres = s
+		closers = append(closers, func() error { s.Close(); return nil })
 		reg = s
-		lanes = s   // durable lane.Repository (P0.10)
-		evStore = s // durable evidence.Store (P0.2-fix)
-	} else {
-		reg = credential.NewMemoryRegistry()
-		lanes = lane.NewStore(nil, time.Now)
-		evStore = evidence.NewMemoryStore()
+		lanes = s
+		evStore = s
+		adminState = s
+		adaptiveState = s
+	case "", "standalone":
+		if cfg.Paths.State != "" {
+			if cfg.Paths.Evidence != "" {
+				return nil, fmt.Errorf("gripline: paths.evidence must be empty when paths.state is configured: the Bolt state database is the single evidence authority (P0.2)")
+			}
+			s, err := statebolt.Open(cfg.Paths.State, statebolt.Options{})
+			if err != nil {
+				return nil, fmt.Errorf("gripline: state db: %w", err)
+			}
+			state = s
+			closers = append(closers, func() error { return s.Close() })
+			// Sweep expired evidence that no longer has a live traffic subject. The
+			// stop function is appended after the DB close function so close order
+			// joins the worker before releasing the database (P1-14).
+			closers = append(closers, startStateMaintenance(s))
+			reg = s
+			lanes = s   // durable lane.Repository (P0.10)
+			evStore = s // durable evidence.Store (P0.2-fix)
+			adminState = s
+			adaptiveState = s
+		} else {
+			reg = credential.NewMemoryRegistry()
+			lanes = lane.NewStore(nil, time.Now)
+			evStore = evidence.NewMemoryStore()
+		}
+	default:
+		return nil, fmt.Errorf("gripline: unsupported authority backend %q", cfg.Authority.Backend)
 	}
 	if cfg.Deployment.AllowEphemeralState {
 		if err := bootstrapCredentials(reg); err != nil {
@@ -174,18 +227,24 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		return nil, fmt.Errorf("gripline: signer: %w", err)
 	}
 
-	// P0.1 fix: Instantiate each authority exactly once
-	governor := resource.NewGovernor(nil)
+	// P0.1 fix: Instantiate exactly one hard-resource authority. Standalone
+	// mode uses the resident governor; clustered mode uses PostgreSQL-backed
+	// leases with the same resource scope ordering and lifecycle contract.
+	localGovernor := resource.NewGovernor(nil)
 	// A configured idle horizon must not turn a zero max into an unlimited
 	// attacker-controlled source table. The governor normalizes zero to its
 	// conservative default; calling it for either knob keeps the runtime config
 	// semantics explicit (P1-11).
 	if cfg.Server.MaxSourceScopes != 0 || cfg.Server.SourceScopeIdle.D() > 0 {
-		governor.SetSourceScopeLimits(cfg.Server.MaxSourceScopes, cfg.Server.SourceScopeIdle.D())
+		localGovernor.SetSourceScopeLimits(cfg.Server.MaxSourceScopes, cfg.Server.SourceScopeIdle.D())
+	}
+	var governor resource.Authority = localGovernor
+	if postgres != nil {
+		governor = postgres
 	}
 	var spray *anomaly.Detector
-	if state != nil {
-		spray, err = anomaly.NewPersistentDetector(time.Now, anomaly.DefaultThresholds(), state, "spray")
+	if adaptiveState != nil {
+		spray, err = anomaly.NewPersistentDetector(time.Now, anomaly.DefaultThresholds(), adaptiveState, "spray")
 		if err != nil {
 			return nil, fmt.Errorf("gripline: spray state: %w", err)
 		}
@@ -203,6 +262,10 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 			return nil, fmt.Errorf("gripline: load posture: %w", err)
 		}
 		ctrl.Restore(p)
+	}
+	if postgres != nil {
+		ctrl.SetPostureReader(postgres.LoadPostureContext)
+		ctrl.SetAdmissionRecorder(postgres.AppendAdmission)
 	}
 
 	pol, err := policyFor(cfg)
@@ -225,6 +288,14 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 			LoadManifest:      state.LoadPolicyManifest,
 			LoadArtifact:      state.LoadPolicyArtifact,
 		}
+	} else if postgres != nil {
+		policyOptions = policy.Options{
+			Persist:           postgres.PersistPolicyManifest,
+			PersistArtifact:   postgres.PersistPolicyArtifact,
+			PersistTransition: postgres.PersistPolicyTransition,
+			LoadManifest:      postgres.LoadPolicyManifest,
+			LoadArtifact:      postgres.LoadPolicyArtifact,
+		}
 	}
 	policyManager, err := policy.NewManager(pol, policyOptions)
 	if err != nil {
@@ -238,14 +309,14 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		producers.NewResourceVelocityProducer(time.Now),
 		producers.NewEnumerationProducer(time.Now),
 	}
-	if state != nil {
+	if adaptiveState != nil {
 		names := []string{"source_novelty", "resource_velocity", "enumeration"}
 		for i, name := range names {
 			snapshot, ok := producerList[i].(producers.StateSnapshotter)
 			if !ok {
 				return nil, fmt.Errorf("gripline: producer %s does not support persistence", name)
 			}
-			persistent, perr := producers.NewPersistentProducer(producerList[i], snapshot, state, name)
+			persistent, perr := producers.NewPersistentProducer(producerList[i], snapshot, adaptiveState, name)
 			if perr != nil {
 				return nil, fmt.Errorf("gripline: producer state %s: %w", name, perr)
 			}
@@ -264,7 +335,7 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		Audience:       cfg.Identity.Audience,
 		Evidence:       evStore,
 		Mode:           terminator.ModeEnforce,
-		Resource:       governor, // Shared resource governor
+		Resource:       governor, // Shared resource authority
 		Control:        ctrl,     // Shared control plane
 		Spray:          spray,    // Shared spray detector
 		Producers:      producerList,
@@ -362,6 +433,7 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		SpoolDir:               cfg.Server.SpoolDir,
 		SpoolMaxBytes:          cfg.Server.SpoolMaxBytes,
 		SpoolMaxFiles:          cfg.Server.SpoolMaxFiles,
+		ReservationRenewEvery:  cfg.Authority.RenewEvery.D(),
 	}
 	if cfg.Usage.Mode == "openai" || cfg.Usage.Mode == "anthropic" {
 		format := publicusage.FormatOpenAI
@@ -405,6 +477,8 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		var audit control.AuditRepository
 		if state != nil {
 			audit = state
+		} else if postgres != nil {
+			audit = postgres
 		} else {
 			fileAudit, err := control.NewFileAuditRepository(cfg.Paths.AuditLog)
 			if err != nil {
@@ -446,6 +520,8 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		// (P0.49).
 		if state != nil {
 			opts = append(opts, control.WithMutationStore(state))
+		} else if postgres != nil {
+			opts = append(opts, control.WithMutationStore(postgres))
 		} else {
 			opts = append(opts, control.WithLaneOperator(control.LaneUnblockAdapter{Unblock: func(credID, laneID, actor, reason string, now time.Time) error {
 				mem, ok := lanes.(*lane.Store)
@@ -464,14 +540,14 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 
 		mux := http.NewServeMux()
 		mux.HandleFunc("/admin/posture", adminPosture(svc))
-		mux.HandleFunc("/admin/credentials", adminCredentials(svc, state))
-		mux.HandleFunc("/admin/credentials/add", adminCredentialAdd(svc, state, peppers))
-		mux.HandleFunc("/admin/credentials/pepper-status", adminCredentialPepperStatus(svc, state))
+		mux.HandleFunc("/admin/credentials", adminCredentials(svc, adminState))
+		mux.HandleFunc("/admin/credentials/add", adminCredentialAdd(svc, adminState, peppers))
+		mux.HandleFunc("/admin/credentials/pepper-status", adminCredentialPepperStatus(svc, adminState))
 		mux.HandleFunc("/admin/credentials/revoke", adminCredentialRevoke(svc))
-		mux.HandleFunc("/admin/lanes", adminLanes(svc, state))
+		mux.HandleFunc("/admin/lanes", adminLanes(svc, adminState))
 		mux.HandleFunc("/admin/lanes/unblock", adminLaneUnblock(svc))
-		mux.HandleFunc("/admin/audit", adminAudit(svc, state))
-		mux.HandleFunc("/admin/security-events", adminSecurityEvents(svc, state))
+		mux.HandleFunc("/admin/audit", adminAudit(svc, adminState))
+		mux.HandleFunc("/admin/security-events", adminSecurityEvents(svc, adminState))
 		mux.HandleFunc("/admin/policy", adminPolicyStatus(svc, policyManager))
 		mux.HandleFunc("/admin/policy/prepare", adminPolicyPrepare(svc, policyManager, policyVerifier))
 		mux.HandleFunc("/admin/policy/activate", adminPolicyActivate(svc, policyManager))
@@ -492,13 +568,14 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		Lanes:          lanes, // Shared lane authority
 		AdminService:   adminSvc,
 		Evidence:       evStore,
-		Resource:       governor, // Shared resource governor
+		Resource:       governor, // Shared resource authority
 		Control:        ctrl,     // Shared control plane
 		Spray:          spray,    // Shared spray detector
 		Signer:         signer,
 		Policy:         pol,
 		PolicyManager:  policyManager,
 		State:          state,
+		Postgres:       postgres,
 		Audience:       cfg.Identity.Audience,
 		DataPlane:      dp,
 		Admin:          adminSrv,
@@ -754,7 +831,7 @@ func adminPosture(svc *control.Service) http.HandlerFunc {
 	}
 }
 
-func adminCredentials(svc *control.Service, state *statebolt.Store) http.HandlerFunc {
+func adminCredentials(svc *control.Service, state adminStateAuthority) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			adminMethodNotAllowed(w)
@@ -803,7 +880,7 @@ func adminCredentialRevoke(svc *control.Service) http.HandlerFunc {
 	}
 }
 
-func adminCredentialAdd(svc *control.Service, state *statebolt.Store, peppers *credential.PepperRing) http.HandlerFunc {
+func adminCredentialAdd(svc *control.Service, state adminStateAuthority, peppers *credential.PepperRing) http.HandlerFunc {
 	type request struct {
 		CredentialID    string `json:"credential_id"`
 		AccountID       string `json:"account_id"`
@@ -878,7 +955,7 @@ func adminCredentialAdd(svc *control.Service, state *statebolt.Store, peppers *c
 	}
 }
 
-func adminCredentialPepperStatus(svc *control.Service, state *statebolt.Store) http.HandlerFunc {
+func adminCredentialPepperStatus(svc *control.Service, state adminStateAuthority) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			adminMethodNotAllowed(w)
@@ -901,7 +978,7 @@ func adminCredentialPepperStatus(svc *control.Service, state *statebolt.Store) h
 	}
 }
 
-func adminLanes(svc *control.Service, state *statebolt.Store) http.HandlerFunc {
+func adminLanes(svc *control.Service, state adminStateAuthority) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			adminMethodNotAllowed(w)
@@ -974,7 +1051,7 @@ func adminLaneUnblock(svc *control.Service) http.HandlerFunc {
 	}
 }
 
-func adminAudit(svc *control.Service, state *statebolt.Store) http.HandlerFunc {
+func adminAudit(svc *control.Service, state adminStateAuthority) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			adminMethodNotAllowed(w)
@@ -1019,7 +1096,7 @@ func adminAudit(svc *control.Service, state *statebolt.Store) http.HandlerFunc {
 	}
 }
 
-func adminSecurityEvents(svc *control.Service, state *statebolt.Store) http.HandlerFunc {
+func adminSecurityEvents(svc *control.Service, state adminStateAuthority) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			adminMethodNotAllowed(w)

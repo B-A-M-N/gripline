@@ -6,6 +6,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/B-A-M-N/gripline/internal/control"
 	"github.com/B-A-M-N/gripline/internal/lane"
 	"github.com/jackc/pgx/v5"
 )
@@ -62,6 +63,18 @@ func putLane(ctx context.Context, tx pgx.Tx, rec *lane.LaneRecord) error {
 	return err
 }
 
+// lockLaneGuard serializes every mutation for one credential, including
+// operations that touch different lane rows. Serializable isolation alone can
+// report retryable serialization failures; the explicit guard makes the
+// bounded lane-set reducer's ordering deterministic before it runs.
+func (s *Store) lockLaneGuard(ctx context.Context, tx pgx.Tx, credID string) error {
+	if _, err := tx.Exec(ctx, `INSERT INTO gripline_lane_guards (credential_id, created_at) VALUES ($1,$2) ON CONFLICT (credential_id) DO NOTHING`, credID, s.now().UTC()); err != nil {
+		return err
+	}
+	_, err := tx.Exec(ctx, `SELECT credential_id FROM gripline_lane_guards WHERE credential_id=$1 FOR UPDATE`, credID)
+	return err
+}
+
 // BorrowOrCreate implements lane.Repository with a serializable transaction
 // over the complete credential lane set. This preserves the bounded-set
 // reducer's all-or-nothing behavior across gateway processes.
@@ -80,6 +93,9 @@ func (s *Store) BorrowOrCreateWithPolicy(ctx context.Context, credID, candidateI
 		return nil, false, err
 	}
 	defer tx.Rollback(ctx)
+	if err := s.lockLaneGuard(ctx, tx, credID); err != nil {
+		return nil, false, err
+	}
 	records, err := loadLanes(ctx, tx, credID, true)
 	if err != nil {
 		return nil, false, err
@@ -161,19 +177,42 @@ func (s *Store) ListIDs(ctx context.Context, credID string) ([]string, error) {
 	return ids, rows.Err()
 }
 
+// ListLaneRecords returns fully decoded authoritative rows for administrative
+// inspection. Decode failures remain visible to the caller.
+func (s *Store) ListLaneRecords(credID string) ([]*lane.LaneRecord, error) {
+	rows, err := s.pool.Query(context.Background(), `SELECT record FROM gripline_lanes WHERE credential_id=$1 ORDER BY lane_id`, credID)
+	if err != nil {
+		return nil, mapDBError(err)
+	}
+	defer rows.Close()
+	var out []*lane.LaneRecord
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			return nil, mapDBError(err)
+		}
+		rec, err := decodeLane(raw)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	return out, mapDBError(rows.Err())
+}
+
 func (s *Store) ObserveRisk(credID, laneID string, riskScore int, now time.Time) (*lane.LaneRecord, error) {
 	return s.ObserveRiskWithPolicy(context.Background(), credID, laneID, riskScore, now, lane.DefaultPolicyContext(), lane.TransitionMetadata{})
 }
 
 func (s *Store) ObserveRiskWithRequestID(credID, laneID string, riskScore int, now time.Time, requestID string) (*lane.LaneRecord, error) {
-	return s.ObserveRisk(credID, laneID, riskScore, now)
+	return s.ObserveRiskWithPolicy(context.Background(), credID, laneID, riskScore, now, lane.DefaultPolicyContext(), lane.TransitionMetadata{RequestID: requestID})
 }
 
 func (s *Store) ObserveRiskWithMetadata(credID, laneID string, riskScore int, now time.Time, meta lane.TransitionMetadata) (*lane.LaneRecord, error) {
 	return s.ObserveRiskWithPolicy(context.Background(), credID, laneID, riskScore, now, lane.DefaultPolicyContext(), meta)
 }
 
-func (s *Store) ObserveRiskWithPolicy(ctx context.Context, credID, laneID string, riskScore int, now time.Time, policy lane.PolicyContext, _ lane.TransitionMetadata) (*lane.LaneRecord, error) {
+func (s *Store) ObserveRiskWithPolicy(ctx context.Context, credID, laneID string, riskScore int, now time.Time, policy lane.PolicyContext, meta lane.TransitionMetadata) (*lane.LaneRecord, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -182,6 +221,9 @@ func (s *Store) ObserveRiskWithPolicy(ctx context.Context, credID, laneID string
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
+	if err := s.lockLaneGuard(ctx, tx, credID); err != nil {
+		return nil, err
+	}
 	var raw []byte
 	err = tx.QueryRow(ctx, `SELECT record FROM gripline_lanes WHERE credential_id=$1 AND lane_id=$2 FOR UPDATE`, credID, laneID).Scan(&raw)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -195,9 +237,23 @@ func (s *Store) ObserveRiskWithPolicy(ctx context.Context, credID, laneID string
 		return nil, err
 	}
 	security := lane.EffectiveSecurityHysteresis(policy.Security, policy.Limits.Security)
+	if meta.PolicyRevision == 0 {
+		meta.PolicyRevision = policy.PolicyRevision
+	}
+	before := rec.Security.Status
 	lane.ApplyRiskObservation(rec, riskScore, security, now)
 	if err := putLane(ctx, tx, rec); err != nil {
 		return nil, err
+	}
+	if before != rec.Security.Status {
+		if err := appendSecurityTransition(ctx, tx, control.SecurityTransitionRecord{
+			At: now.UTC(), Kind: "lane_security", RequestID: meta.RequestID,
+			CredentialID: credID, LaneID: laneID, Before: before.String(), After: rec.Security.Status.String(),
+			RiskScore: riskScore, Revision: rec.Revision, PolicyRevision: meta.PolicyRevision,
+			EvidenceCodes: append([]string(nil), meta.EvidenceCodes...),
+		}); err != nil {
+			return nil, err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
@@ -210,14 +266,14 @@ func (s *Store) RecordCleanAuthorizedAndPromote(credID, laneID string, riskScore
 }
 
 func (s *Store) RecordCleanAuthorizedAndPromoteWithRequestID(credID, laneID string, riskScore int, criteria lane.PromotionCriteria, now time.Time, requestID string) (*lane.LaneRecord, bool, error) {
-	return s.RecordCleanAuthorizedAndPromote(credID, laneID, riskScore, criteria, now)
+	return s.RecordCleanAuthorizedAndPromoteWithPolicy(context.Background(), credID, laneID, riskScore, criteria, now, lane.DefaultPolicyContext(), lane.TransitionMetadata{RequestID: requestID})
 }
 
 func (s *Store) RecordCleanAuthorizedAndPromoteWithMetadata(credID, laneID string, riskScore int, criteria lane.PromotionCriteria, now time.Time, meta lane.TransitionMetadata) (*lane.LaneRecord, bool, error) {
 	return s.RecordCleanAuthorizedAndPromoteWithPolicy(context.Background(), credID, laneID, riskScore, criteria, now, lane.DefaultPolicyContext(), meta)
 }
 
-func (s *Store) RecordCleanAuthorizedAndPromoteWithPolicy(ctx context.Context, credID, laneID string, riskScore int, criteria lane.PromotionCriteria, now time.Time, _ lane.PolicyContext, _ lane.TransitionMetadata) (*lane.LaneRecord, bool, error) {
+func (s *Store) RecordCleanAuthorizedAndPromoteWithPolicy(ctx context.Context, credID, laneID string, riskScore int, criteria lane.PromotionCriteria, now time.Time, policy lane.PolicyContext, meta lane.TransitionMetadata) (*lane.LaneRecord, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
 	}
@@ -226,6 +282,9 @@ func (s *Store) RecordCleanAuthorizedAndPromoteWithPolicy(ctx context.Context, c
 		return nil, false, err
 	}
 	defer tx.Rollback(ctx)
+	if err := s.lockLaneGuard(ctx, tx, credID); err != nil {
+		return nil, false, err
+	}
 	var raw []byte
 	err = tx.QueryRow(ctx, `SELECT record FROM gripline_lanes WHERE credential_id=$1 AND lane_id=$2 FOR UPDATE`, credID, laneID).Scan(&raw)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -238,9 +297,23 @@ func (s *Store) RecordCleanAuthorizedAndPromoteWithPolicy(ctx context.Context, c
 	if err != nil {
 		return nil, false, err
 	}
+	if meta.PolicyRevision == 0 {
+		meta.PolicyRevision = policy.PolicyRevision
+	}
+	before := rec.State
 	promoted := lane.ApplyCleanAuthorizedAndPromote(rec, riskScore, criteria, now)
 	if err := putLane(ctx, tx, rec); err != nil {
 		return nil, false, err
+	}
+	if before != rec.State {
+		if err := appendSecurityTransition(ctx, tx, control.SecurityTransitionRecord{
+			At: now.UTC(), Kind: "lane_trust", RequestID: meta.RequestID,
+			CredentialID: credID, LaneID: laneID, Before: before.String(), After: rec.State.String(),
+			RiskScore: riskScore, Revision: rec.Revision, PolicyRevision: meta.PolicyRevision,
+			EvidenceCodes: append([]string(nil), meta.EvidenceCodes...),
+		}); err != nil {
+			return nil, false, err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, false, err

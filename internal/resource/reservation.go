@@ -1,6 +1,9 @@
 package resource
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // Authority is the backend-neutral hard-resource admission contract. The
 // built-in Governor is one implementation; a clustered lease service can
@@ -8,9 +11,15 @@ import "context"
 // in-process maps. Returned reservations remain ownership-safe and are
 // settled/released by the caller exactly once.
 type Authority interface {
-	ProvisionUsage(scopes []ScopeSpec, estimate UsageEstimate) (*MultiReservation, error)
 	RemoveScope(scope Scope, id string) bool
 	InUseFor(scope Scope, id string) int
+}
+
+// UsageAuthority is the legacy in-process usage-admission extension. It is
+// separate from Authority so a remote implementation can expose an abstract
+// reservation lifecycle without returning an in-memory concrete type.
+type UsageAuthority interface {
+	ProvisionUsage(scopes []ScopeSpec, estimate UsageEstimate) (*MultiReservation, error)
 }
 
 // ContextAuthority is the cancellable extension of Authority. The terminator
@@ -18,6 +27,30 @@ type Authority interface {
 // source-compatible legacy embedders.
 type ContextAuthority interface {
 	ProvisionUsageContext(ctx context.Context, scopes []ScopeSpec, estimate UsageEstimate) (*MultiReservation, error)
+}
+
+// UsageReservation is the backend-neutral lifecycle contract for a distributed
+// usage hold. These operations may cross a network boundary and therefore
+// accept a context; implementations must keep release/settlement idempotent.
+type UsageReservation interface {
+	AdmissionReservation
+	MarkForwarded(context.Context) error
+	Renew(context.Context) error
+	SettleContext(context.Context, UsageEstimate) error
+	ExpiresAt() time.Time
+}
+
+// DistributedAuthority is implemented by a shared lease authority. The
+// returned reservation owns every scope hold and may be renewed for a stream.
+type DistributedAuthority interface {
+	ProvisionDistributed(ctx context.Context, scopes []ScopeSpec, estimate UsageEstimate) (UsageReservation, error)
+}
+
+// RequestDistributedAuthority adds an ingress request key to distributed
+// provisioning. Authorities use it to return the original lease on a retry
+// after a lost response instead of charging the request twice.
+type RequestDistributedAuthority interface {
+	ProvisionDistributedWithRequestID(ctx context.Context, requestID string, scopes []ScopeSpec, estimate UsageEstimate) (UsageReservation, error)
 }
 
 // AdmissionReservation is the ONE lifecycle abstraction for capacity an
@@ -42,8 +75,10 @@ func (NoopReservation) Release() {}
 // an Outcome must satisfy the interface.
 var (
 	_ Authority            = (*Governor)(nil)
+	_ UsageAuthority       = (*Governor)(nil)
 	_ ContextAuthority     = (*Governor)(nil)
 	_ AdmissionReservation = (*MultiReservation)(nil)
+	_ UsageReservation     = (*MultiReservation)(nil)
 	_ AdmissionReservation = (*LeaseHandle)(nil)
 	_ AdmissionReservation = NoopReservation{}
 )

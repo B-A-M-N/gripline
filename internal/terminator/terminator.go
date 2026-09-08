@@ -44,9 +44,12 @@ type Outcome struct {
 	// when the upstream request completes; until then the capacity is held for
 	// this request only.
 	ResourceRes *resource.MultiReservation
-	RiskAfter   int      // effectiveRisk = max(credentialRisk, laneRisk)
-	Evidence    []string // evidence codes that contributed (explainability)
-	LaneNew     bool
+	// UsageRes is the backend-neutral reservation returned by a distributed
+	// resource authority. ResourceRes remains for resident compatibility.
+	UsageRes  resource.UsageReservation
+	RiskAfter int      // effectiveRisk = max(credentialRisk, laneRisk)
+	Evidence  []string // evidence codes that contributed (explainability)
+	LaneNew   bool
 	// Degraded reports that the decision ran in AdaptiveDegraded posture: some
 	// authoritative history/state was unavailable, so the outcome preserved
 	// persisted restrictions rather than transitioning (P0.1).
@@ -191,6 +194,9 @@ func (o *Outcome) Reservation() resource.AdmissionReservation {
 	}
 	if o.ResourceRes != nil {
 		return o.ResourceRes
+	}
+	if o.UsageRes != nil {
+		return o.UsageRes
 	}
 	if o.Lease != nil {
 		return o.Lease
@@ -691,6 +697,17 @@ func (t *Terminator) admitUsageWithRequestID(ctx context.Context, reqID string, 
 	tr.CredentialStatusAfter = cred.Status.String()
 	tr.CredentialRevBefore = cred.Revision
 	tr.CredentialRevAfter = cred.Revision
+	controlEmergency := false
+	if t.dep.Control != nil {
+		var controlErr error
+		controlEmergency, controlErr = t.dep.Control.InEmergencyContext(ctx)
+		if controlErr != nil {
+			out.Authorized = false
+			out.Reason = "control_unavailable"
+			out.DenialErr = controlErr
+			return out
+		}
+	}
 	// Record last-seen on successful authentication (P0.22). Analytics-grade and
 	// best-effort; must never influence the authorization outcome.
 	markLastSeen(t.dep.Registry, cred.CredentialID, now)
@@ -701,7 +718,9 @@ func (t *Terminator) admitUsageWithRequestID(ctx context.Context, reqID string, 
 	if t.dep.Control != nil {
 		credID, acctID := cred.CredentialID, cred.AccountID
 		defer func() {
-			t.dep.Control.RecordAdmission(control.Event{
+			auditCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			_ = t.dep.Control.RecordAdmissionContext(auditCtx, control.Event{
 				RequestID:    out.RequestID,
 				CredentialID: credID,
 				AccountID:    acctID,
@@ -1099,7 +1118,7 @@ func (t *Terminator) admitUsageWithRequestID(ctx context.Context, reqID string, 
 	// while ESTABLISHED lanes and persisted restrictions remain in force. The
 	// authoritative risk observation above still ran (so elevation is durable even
 	// during the firefight); only NEW lanes are refused.
-	if laneNew && t.dep.Control != nil && t.dep.Control.InEmergency() {
+	if laneNew && controlEmergency {
 		out.Authorized = false
 		out.Reason = "emergency_lockdown"
 		out.DenialErr = ErrorEmergencyLockdown
@@ -1189,7 +1208,7 @@ func (t *Terminator) admitUsageWithRequestID(ctx context.Context, reqID string, 
 		limits = t.pol.Limits.Constrained
 		limitsClass = "constrained"
 	}
-	if t.dep.Control != nil && t.dep.Control.InEmergency() {
+	if controlEmergency {
 		limits = t.emergencyLimits()
 		limitsClass = "emergency"
 	}
@@ -1502,14 +1521,21 @@ func (t *Terminator) provisionMultiscope(requestCtx context.Context, cred *crede
 	// the backend responds. Dimensions the policy doesn't gauge (zero capacity)
 	// are inert; dimensions the estimate leaves zero reserve nothing.
 	var res *resource.MultiReservation
+	var usageRes resource.UsageReservation
 	var err error
-	if authority, ok := t.dep.Resource.(resource.ContextAuthority); ok {
+	if authority, ok := t.dep.Resource.(resource.RequestDistributedAuthority); ok {
+		usageRes, err = authority.ProvisionDistributedWithRequestID(requestCtx, reqID, specs, est)
+	} else if authority, ok := t.dep.Resource.(resource.DistributedAuthority); ok {
+		usageRes, err = authority.ProvisionDistributed(requestCtx, specs, est)
+	} else if authority, ok := t.dep.Resource.(resource.ContextAuthority); ok {
 		res, err = authority.ProvisionUsageContext(requestCtx, specs, est)
-	} else {
+	} else if authority, ok := t.dep.Resource.(resource.UsageAuthority); ok {
 		if err := contextErr(requestCtx); err != nil {
 			return deny("resource_unavailable", err)
 		}
-		res, err = t.dep.Resource.ProvisionUsage(specs, est)
+		res, err = authority.ProvisionUsage(specs, est)
+	} else {
+		return deny("resource_unavailable", errors.New("terminator: resource authority has no usage provisioner"))
 	}
 	if err != nil {
 		tr.ReservationResult = "denied"
@@ -1526,16 +1552,25 @@ func (t *Terminator) provisionMultiscope(requestCtx context.Context, cred *crede
 		}
 		return deny("resource_unavailable", err)
 	}
+	if res == nil && usageRes == nil {
+		tr.ReservationResult = "unavailable"
+		return deny("resource_unavailable", errors.New("terminator: resource authority returned no reservation"))
+	}
 	tr.ReservationResult = "granted"
 	// Every scope provisioned. Issue the assertion; if it fails, release the
 	// reservation so held capacity is refunded (never a leaked hold).
 	assertion, aerr := t.issueAssertion(authCtx, reqID, cred)
 	if aerr != nil {
-		res.Release()
+		if usageRes != nil {
+			usageRes.Release()
+		} else if res != nil {
+			res.Release()
+		}
 		return deny("internal_identity_failure", aerr)
 	}
 	out.Assertion = assertion
 	out.ResourceRes = res // proxy releases on completion (M4)
+	out.UsageRes = usageRes
 	return nil
 }
 

@@ -590,6 +590,40 @@ func (r *MultiReservation) Settle(actual UsageEstimate) {
 	r.settled = true
 }
 
+// MarkForwarded satisfies the distributed reservation contract. An in-process
+// reservation is already authoritative at provision time, so forwarding is a
+// lifecycle no-op apart from honoring cancellation.
+func (r *MultiReservation) MarkForwarded(ctx context.Context) error {
+	if ctx != nil {
+		return ctx.Err()
+	}
+	return nil
+}
+
+// Renew satisfies the distributed reservation contract. Local holds do not
+// expire while owned by the process, so renewal only checks cancellation.
+func (r *MultiReservation) Renew(ctx context.Context) error {
+	if ctx != nil {
+		return ctx.Err()
+	}
+	return nil
+}
+
+// SettleContext is the cancellable form used by a backend-neutral proxy.
+func (r *MultiReservation) SettleContext(ctx context.Context, actual UsageEstimate) error {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	r.Settle(actual)
+	return nil
+}
+
+// ExpiresAt is zero for resident reservations because their lifetime is
+// bounded by the owning request and explicit Release.
+func (r *MultiReservation) ExpiresAt() time.Time { return time.Time{} }
+
 // Settled reports whether Settle has run.
 func (r *MultiReservation) Settled() bool {
 	if r == nil {
