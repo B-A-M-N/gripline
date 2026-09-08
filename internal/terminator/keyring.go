@@ -726,6 +726,36 @@ func (k *Keyring) PublicKeysetFingerprint() string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+// PublicKeyFingerprint identifies one loaded public signer generation. It is
+// intentionally distinct from PublicKeysetFingerprint: adding a staged key
+// must not make a node disagree about the already-active generation.
+func (k *Keyring) PublicKeyFingerprint(kid int) (string, bool) {
+	if k == nil {
+		return "", false
+	}
+	pub, ok := k.Public(kid)
+	if !ok || len(pub) == 0 {
+		return "", false
+	}
+	sum := sha256.Sum256(pub)
+	return hex.EncodeToString(sum[:]), true
+}
+
+// PublicKeyFingerprints returns one safe fingerprint per loaded signer
+// generation, including a prepared candidate.
+func (k *Keyring) PublicKeyFingerprints() map[int]string {
+	if k == nil {
+		return nil
+	}
+	keys := k.PublicKeys()
+	out := make(map[int]string, len(keys))
+	for kid, pub := range keys {
+		sum := sha256.Sum256(pub)
+		out[kid] = hex.EncodeToString(sum[:])
+	}
+	return out
+}
+
 // PublishVerifier builds the VERIFIER-side keyring (P0.17): a
 // VerifierKeyring holding PUBLIC keys only, connected to this signer by key
 // publication. This is the deployment hands to private backends —

@@ -163,6 +163,38 @@ func (r *Ring) Fingerprint() string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+// VersionFingerprint identifies one loaded pseudonym generation without
+// exposing its secret. Cluster rotation uses this to distinguish staged
+// capabilities from the currently active derivation generation.
+func (r *Ring) VersionFingerprint(version int) (string, bool) {
+	if r == nil {
+		return "", false
+	}
+	key, ok := r.active[version]
+	if !ok || len(key) == 0 {
+		return "", false
+	}
+	h := sha256.New()
+	_, _ = h.Write([]byte(strconv.Itoa(version)))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write(key)
+	return hex.EncodeToString(h.Sum(nil)), true
+}
+
+// VersionFingerprints returns one safe fingerprint per loaded generation.
+func (r *Ring) VersionFingerprints() map[int]string {
+	if r == nil {
+		return nil
+	}
+	out := make(map[int]string, len(r.active))
+	for version := range r.active {
+		if fingerprint, ok := r.VersionFingerprint(version); ok {
+			out[version] = fingerprint
+		}
+	}
+	return out
+}
+
 // keyFor returns the key bytes for a version.
 func (r *Ring) keyFor(v int) ([]byte, bool) {
 	k, ok := r.active[v]

@@ -42,11 +42,31 @@ func TestPostgresAuthorityIntegration(t *testing.T) {
 	if _, err := a.SynchronizeCrypto(ctx, identity); err != nil {
 		t.Fatalf("synchronize node A crypto: %v", err)
 	}
-	if _, err := b.SynchronizeCrypto(ctx, identity); err != nil {
+	stagedIdentity := identity
+	stagedIdentity.Loaded = []CryptoGeneration{
+		{Kind: CryptoKindSigner, Generation: 1, Fingerprint: identity.SignerFingerprint},
+		{Kind: CryptoKindSigner, Generation: 2, Fingerprint: "integration-signer-2"},
+		{Kind: CryptoKindPepper, Generation: 1, Fingerprint: identity.PepperFingerprint},
+		{Kind: CryptoKindPepper, Generation: 2, Fingerprint: "integration-pepper-2"},
+	}
+	if _, err := b.SynchronizeCrypto(ctx, stagedIdentity); err != nil {
 		t.Fatalf("synchronize node B crypto: %v", err)
 	}
 	if _, err := c.SynchronizeCrypto(ctx, identity); err != nil {
 		t.Fatalf("synchronize node C crypto: %v", err)
+	}
+	var activeGenerations, stagedAcks int
+	if err := a.pool.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_cluster_crypto_generations WHERE state='active'`).Scan(&activeGenerations); err != nil {
+		t.Fatalf("count active crypto generations: %v", err)
+	}
+	if activeGenerations != 2 {
+		t.Fatalf("active crypto generations=%d, want signer and pepper", activeGenerations)
+	}
+	if err := a.pool.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_cluster_crypto_acks WHERE node_id=$1 AND node_epoch=$2 AND generation=2`, b.nodeID, b.nodeEpoch).Scan(&stagedAcks); err != nil {
+		t.Fatalf("count staged crypto acknowledgements: %v", err)
+	}
+	if stagedAcks != 2 {
+		t.Fatalf("staged crypto acknowledgements=%d, want signer and pepper", stagedAcks)
 	}
 	if err := a.Ready(ctx); err != nil {
 		t.Fatalf("node A readiness: %v", err)
@@ -510,6 +530,8 @@ func resetIntegrationAuthority(t *testing.T, ctx context.Context, dsn string) {
 		gripline_adaptive_baselines,
 		gripline_adaptive_state,
 		gripline_cluster_crypto,
+		gripline_cluster_crypto_generations,
+		gripline_cluster_crypto_acks,
 		gripline_membership`
 	if _, err := pool.Exec(ctx, "TRUNCATE TABLE "+tables+" RESTART IDENTITY CASCADE"); err != nil {
 		t.Fatalf("reset integration authority: %v", err)

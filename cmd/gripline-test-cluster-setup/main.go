@@ -137,6 +137,8 @@ func resetAuthority(dsn string) {
 		gripline_adaptive_baselines,
 		gripline_adaptive_state,
 		gripline_cluster_crypto,
+		gripline_cluster_crypto_generations,
+		gripline_cluster_crypto_acks,
 		gripline_membership`
 	if _, err := pool.Exec(ctx, "TRUNCATE TABLE "+tables+" RESTART IDENTITY CASCADE"); err != nil {
 		fatal("reset authority: %v", err)

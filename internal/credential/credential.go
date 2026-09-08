@@ -379,6 +379,38 @@ func (r *PepperRing) Fingerprint() string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+// VersionFingerprint identifies one loaded pepper generation without
+// publishing key material. It is the cluster capability fingerprint used
+// while a future generation is staged but not yet active.
+func (r *PepperRing) VersionFingerprint(version int) (string, bool) {
+	if r == nil {
+		return "", false
+	}
+	key, ok := r.active[version]
+	if !ok || len(key) == 0 {
+		return "", false
+	}
+	h := sha256.New()
+	_, _ = h.Write([]byte(strconv.Itoa(version)))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write(key)
+	return hex.EncodeToString(h.Sum(nil)), true
+}
+
+// VersionFingerprints returns one safe fingerprint per loaded generation.
+func (r *PepperRing) VersionFingerprints() map[int]string {
+	if r == nil {
+		return nil
+	}
+	out := make(map[int]string, len(r.active))
+	for version := range r.active {
+		if fingerprint, ok := r.VersionFingerprint(version); ok {
+			out[version] = fingerprint
+		}
+	}
+	return out
+}
+
 // Versions returns the configured versions in ascending order. Authentication
 // iterates THIS list (never the 0..latest integer range, which is pathological
 // for sparse/high version numbers).

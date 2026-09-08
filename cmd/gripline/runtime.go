@@ -497,17 +497,48 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 	if postgres != nil {
 		pseudonymVersion := 0
 		pseudonymFingerprint := "disabled"
+		pseudonymLoadedFingerprint := "disabled"
+		loaded := make([]statepg.CryptoGeneration, 0)
+		for kid, fingerprint := range signer.PublicKeyFingerprints() {
+			loaded = append(loaded, statepg.CryptoGeneration{Kind: statepg.CryptoKindSigner, Generation: kid, Fingerprint: fingerprint})
+		}
+		for version, fingerprint := range peppers.VersionFingerprints() {
+			loaded = append(loaded, statepg.CryptoGeneration{Kind: statepg.CryptoKindPepper, Generation: version, Fingerprint: fingerprint})
+		}
 		if configured, ok := pseudonyms.(*pseudonymRingAdapter); ok {
 			pseudonymVersion = configured.ActiveVersion()
-			pseudonymFingerprint = configured.Fingerprint()
+			pseudonymLoadedFingerprint = configured.Fingerprint()
+			if pseudonymVersion > 0 {
+				var found bool
+				pseudonymFingerprint, found = configured.VersionFingerprint(pseudonymVersion)
+				if !found {
+					return nil, fmt.Errorf("gripline: active pseudonym generation %d is not loaded", pseudonymVersion)
+				}
+			}
+			for version, fingerprint := range configured.VersionFingerprints() {
+				loaded = append(loaded, statepg.CryptoGeneration{Kind: statepg.CryptoKindPseudonym, Generation: version, Fingerprint: fingerprint})
+			}
+		}
+		signerFingerprint, ok := signer.PublicKeyFingerprint(signer.ActiveKid())
+		if !ok {
+			return nil, fmt.Errorf("gripline: active signer generation %d is not loaded", signer.ActiveKid())
+		}
+		pepperVersion := peppers.ActiveVersion()
+		pepperFingerprint, ok := peppers.VersionFingerprint(pepperVersion)
+		if !ok {
+			return nil, fmt.Errorf("gripline: active pepper generation %d is not loaded", pepperVersion)
 		}
 		sharedCrypto, err := postgres.SynchronizeCrypto(context.Background(), statepg.CryptoIdentity{
-			SignerActiveKID:      signer.ActiveKid(),
-			SignerFingerprint:    signer.PublicKeysetFingerprint(),
-			PepperActiveVersion:  peppers.ActiveVersion(),
-			PepperFingerprint:    peppers.Fingerprint(),
-			PseudonymVersion:     pseudonymVersion,
-			PseudonymFingerprint: pseudonymFingerprint,
+			SignerActiveKID:            signer.ActiveKid(),
+			SignerFingerprint:          signer.PublicKeysetFingerprint(),
+			SignerActiveFingerprint:    signerFingerprint,
+			PepperActiveVersion:        pepperVersion,
+			PepperFingerprint:          peppers.Fingerprint(),
+			PepperActiveFingerprint:    pepperFingerprint,
+			PseudonymVersion:           pseudonymVersion,
+			PseudonymFingerprint:       pseudonymLoadedFingerprint,
+			PseudonymActiveFingerprint: pseudonymFingerprint,
+			Loaded:                     loaded,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("gripline: cluster crypto identity: %w", err)
@@ -1665,4 +1696,18 @@ func (a *pseudonymRingAdapter) Fingerprint() string {
 		return ""
 	}
 	return a.ring.Fingerprint()
+}
+
+func (a *pseudonymRingAdapter) VersionFingerprint(version int) (string, bool) {
+	if a == nil || a.ring == nil {
+		return "", false
+	}
+	return a.ring.VersionFingerprint(version)
+}
+
+func (a *pseudonymRingAdapter) VersionFingerprints() map[int]string {
+	if a == nil || a.ring == nil {
+		return nil
+	}
+	return a.ring.VersionFingerprints()
 }

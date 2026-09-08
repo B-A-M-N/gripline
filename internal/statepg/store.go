@@ -56,10 +56,11 @@ type Store struct {
 // to membership and resource leases. Version 5 adds keyed adaptive windows
 // and baselines. Version 6 adds the cluster crypto identity record. Version 7
 // adds durable control-operation claims. Version 8 adds evidence subject
-// guards for deterministic first-write locking. Keep the marker versioned
-// even though the DDL below is idempotent: CREATE TABLE IF NOT EXISTS cannot
-// add columns to an already initialized database.
-const currentSchemaVersion = 8
+// guards for deterministic first-write locking. Version 9 adds staged
+// cluster-crypto generations and per-node capability acknowledgements. Keep
+// the marker versioned even though the DDL below is idempotent: CREATE TABLE
+// IF NOT EXISTS cannot add columns to an already initialized database.
+const currentSchemaVersion = 9
 
 const maxTransactionAttempts = 3
 
@@ -382,11 +383,36 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			singleton BOOLEAN PRIMARY KEY,
 			signer_active_kid INTEGER NOT NULL,
 			signer_fingerprint TEXT NOT NULL,
+			signer_active_fingerprint TEXT NOT NULL DEFAULT '',
 			pepper_active_version INTEGER NOT NULL,
 			pepper_fingerprint TEXT NOT NULL,
+			pepper_active_fingerprint TEXT NOT NULL DEFAULT '',
 			pseudonym_version INTEGER NOT NULL,
 			pseudonym_fingerprint TEXT NOT NULL,
+			pseudonym_active_fingerprint TEXT NOT NULL DEFAULT '',
+			generation_epoch BIGINT NOT NULL DEFAULT 1,
 			updated_at TIMESTAMPTZ NOT NULL
+		)`,
+		`ALTER TABLE gripline_cluster_crypto ADD COLUMN IF NOT EXISTS generation_epoch BIGINT NOT NULL DEFAULT 1`,
+		`ALTER TABLE gripline_cluster_crypto ADD COLUMN IF NOT EXISTS signer_active_fingerprint TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE gripline_cluster_crypto ADD COLUMN IF NOT EXISTS pepper_active_fingerprint TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE gripline_cluster_crypto ADD COLUMN IF NOT EXISTS pseudonym_active_fingerprint TEXT NOT NULL DEFAULT ''`,
+		`CREATE TABLE IF NOT EXISTS gripline_cluster_crypto_generations (
+			kind TEXT NOT NULL,
+			generation INTEGER NOT NULL,
+			fingerprint TEXT NOT NULL,
+			state TEXT NOT NULL,
+			updated_at TIMESTAMPTZ NOT NULL,
+			PRIMARY KEY (kind, generation)
+		)`,
+		`CREATE TABLE IF NOT EXISTS gripline_cluster_crypto_acks (
+			node_id TEXT NOT NULL,
+			node_epoch BIGINT NOT NULL,
+			kind TEXT NOT NULL,
+			generation INTEGER NOT NULL,
+			fingerprint TEXT NOT NULL,
+			acknowledged_at TIMESTAMPTZ NOT NULL,
+			PRIMARY KEY (node_id, node_epoch, kind, generation)
 		)`,
 		`CREATE TABLE IF NOT EXISTS gripline_evidence (
 			scope TEXT NOT NULL,
@@ -493,6 +519,11 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 		// Version 8's evidence subject guard table is created by the idempotent
 		// DDL above; advancing the marker is sufficient for existing databases.
 		version = 8
+	}
+	if version == 8 {
+		// Version 9's staged crypto capability tables and generation epoch
+		// column are created by the idempotent DDL above.
+		version = 9
 	}
 	if version != currentSchemaVersion {
 		return fmt.Errorf("%w: unsupported migration state %d", ErrMigrationRequired, version)
