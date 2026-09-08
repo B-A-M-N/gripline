@@ -77,6 +77,8 @@ const currentSchemaVersion = 10
 
 const maxTransactionAttempts = 3
 
+const transactionRetryBaseDelay = 5 * time.Millisecond
+
 var ErrMigrationRequired = errors.New("statepg: database schema requires migration")
 var ErrDSNRequired = errors.New("statepg: DSN required")
 
@@ -686,19 +688,46 @@ func begin(ctx context.Context, pool *pgxpool.Pool) (pgx.Tx, error) {
 // serialization failures and deadlocks are retried by the callback's error
 // classification.
 func withTransactionRetry(ctx context.Context, operation string, fn func() error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var lastErr error
 	for attempt := 0; attempt < maxTransactionAttempts; attempt++ {
-		if ctx != nil {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		lastErr = fn()
 		if lastErr == nil || !retryableTransactionError(lastErr) {
 			return lastErr
 		}
+		if attempt+1 < maxTransactionAttempts {
+			if err := waitTransactionRetry(ctx, attempt); err != nil {
+				return err
+			}
+		}
 	}
 	return fmt.Errorf("statepg: %s remained conflicted after retries: %w", operation, lastErr)
+}
+
+// waitTransactionRetry backs off only between retryable database conflicts.
+// The small time-derived jitter prevents a group of replicas that collided on
+// the same serializable transaction from immediately colliding again, while
+// the context-aware timer keeps retry sleep inside the caller's deadline.
+func waitTransactionRetry(ctx context.Context, attempt int) error {
+	delay := transactionRetryBaseDelay << attempt
+	jitterWindow := delay / 2
+	if jitterWindow > 0 {
+		jitter := time.Duration(time.Now().UnixNano() % int64(jitterWindow))
+		delay += jitter
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func mapDBError(err error) error {

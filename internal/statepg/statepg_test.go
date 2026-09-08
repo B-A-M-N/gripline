@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/B-A-M-N/gripline/internal/adaptive"
 	"github.com/B-A-M-N/gripline/internal/authority"
@@ -12,6 +13,7 @@ import (
 	"github.com/B-A-M-N/gripline/internal/evidence"
 	"github.com/B-A-M-N/gripline/internal/lane"
 	"github.com/B-A-M-N/gripline/internal/resource"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func TestOpenRequiresDSNBeforeDialing(t *testing.T) {
@@ -73,5 +75,20 @@ func TestResourceLeaseRefundRequiresUnforwardedState(t *testing.T) {
 				t.Fatalf("shouldRefundLeaseHold(%q, %t) = %t, want %t", tt.state, tt.settled, got, tt.shouldRef)
 			}
 		})
+	}
+}
+
+func TestTransactionRetryHonorsContextDuringBackoff(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := withTransactionRetry(ctx, "test retry", func() error {
+		return &pgconn.PgError{Code: "40001", Message: "serialization failure"}
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("retry error=%v, want context deadline", err)
+	}
+	if time.Since(started) > 100*time.Millisecond {
+		t.Fatalf("retry backoff ignored context: elapsed=%s", time.Since(started))
 	}
 }
