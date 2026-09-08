@@ -57,6 +57,32 @@ func (s *Store) LoadPosture() (control.Posture, error) {
 	return out, err
 }
 
+// LoadPostureContext implements control.PostureAuthority. bbolt is local and
+// does not expose cancellable transactions, so honor cancellation at the
+// boundary and preserve the strict persisted-read error semantics.
+func (s *Store) LoadPostureContext(ctx context.Context) (control.Posture, error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return control.Normal, err
+		}
+	}
+	posture, err := s.LoadPosture()
+	if err != nil {
+		return control.Normal, err
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return control.Normal, err
+		}
+	}
+	return posture, nil
+}
+
+// PostureContext implements control.PostureAuthority.
+func (s *Store) PostureContext(ctx context.Context) (control.Posture, error) {
+	return s.LoadPostureContext(ctx)
+}
+
 // AppendOperator implements control.AuditRepository for the Bolt store (an
 // alternative to FileAuditRepository): every operator row is appended into the
 // operator_audit bucket. This is the durable audit sink the control plane can

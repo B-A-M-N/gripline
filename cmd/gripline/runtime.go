@@ -23,6 +23,7 @@ import (
 	publicingress "github.com/B-A-M-N/gripline/adapter/ingress"
 	publicusage "github.com/B-A-M-N/gripline/adapter/usage"
 	"github.com/B-A-M-N/gripline/internal/anomaly"
+	"github.com/B-A-M-N/gripline/internal/authority"
 	"github.com/B-A-M-N/gripline/internal/config"
 	"github.com/B-A-M-N/gripline/internal/control"
 	"github.com/B-A-M-N/gripline/internal/credential"
@@ -55,6 +56,13 @@ type adaptiveStateAuthority interface {
 	SaveDetectorState(string, []byte) error
 }
 
+// StateHealth is the backend-neutral readiness contract. Standalone bbolt and
+// clustered PostgreSQL expose the same bounded probe while keeping their
+// backend-specific operational APIs private to their own packages.
+type StateHealth interface {
+	Ready(context.Context) error
+}
+
 // Runtime is the single application composition root (P0.1/P0.2).
 // All security-critical state is instantiated once and shared.
 type Runtime struct {
@@ -72,10 +80,13 @@ type Runtime struct {
 	Evidence       evidence.Store
 	Resource       resource.ResourceAuthority
 	Control        *control.ControlPlane
+	Posture        control.PostureAuthority
+	Authorities    authority.Bundle
 	Spray          *anomaly.Detector
 	Signer         terminator.AssertionSigner
 	Policy         *policy.Policy
 	PolicyManager  *policy.Manager
+	StateHealth    StateHealth
 	State          *statebolt.Store // non-nil when backed by the transactional store
 	Postgres       *statepg.Store   // non-nil when backed by the clustered authority
 	Audience       string
@@ -95,14 +106,24 @@ func (rt *Runtime) controlService() *control.Service { return rt.AdminService }
 // the Bolt database answers a probe read. A /readyz handler that only echoes a
 // static flag is a lie — this is the check behind the endpoint (P1-24).
 func (rt *Runtime) Ready() error {
-	if rt.State != nil {
-		if err := rt.State.Ping(); err != nil {
-			return fmt.Errorf("gripline: state store not ready: %w", err)
+	if rt.StateHealth != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		err := rt.StateHealth.Ready(ctx)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("gripline: state authority not ready: %w", err)
 		}
-	}
-	if rt.Postgres != nil {
-		if err := rt.Postgres.Ready(context.Background()); err != nil {
-			return fmt.Errorf("gripline: postgres authority not ready: %w", err)
+	} else {
+		// Compatibility for hand-built Runtime values from older embedders.
+		if rt.State != nil {
+			if err := rt.State.Ping(); err != nil {
+				return fmt.Errorf("gripline: state store not ready: %w", err)
+			}
+		}
+		if rt.Postgres != nil {
+			if err := rt.Postgres.Ready(context.Background()); err != nil {
+				return fmt.Errorf("gripline: postgres authority not ready: %w", err)
+			}
 		}
 	}
 	for _, health := range rt.adaptiveHealth {
@@ -164,6 +185,8 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 	var evStore evidence.Store
 	var state *statebolt.Store
 	var postgres *statepg.Store
+	var stateHealth StateHealth
+	var authorities authority.Bundle
 	var adminState adminStateAuthority
 	var adaptiveState adaptiveStateAuthority
 	switch strings.ToLower(strings.TrimSpace(cfg.Authority.Backend)) {
@@ -180,12 +203,17 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 			return nil, fmt.Errorf("gripline: postgres authority: %w", err)
 		}
 		postgres = s
+		stateHealth = s
 		closers = append(closers, func() error { s.Close(); return nil })
 		reg = s
 		lanes = s
 		evStore = s
 		adminState = s
 		adaptiveState = s
+		authorities = authority.Bundle{
+			Credentials: s, Lanes: s, Evidence: s, Adaptive: s, Health: s,
+			Posture: s, Mutations: s, AuditSink: s, Audit: s, SecurityLog: s,
+		}
 	case "", "standalone":
 		if cfg.Paths.State != "" {
 			if cfg.Paths.Evidence != "" {
@@ -196,6 +224,7 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 				return nil, fmt.Errorf("gripline: state db: %w", err)
 			}
 			state = s
+			stateHealth = s
 			closers = append(closers, func() error { return s.Close() })
 			// Sweep expired evidence that no longer has a live traffic subject. The
 			// stop function is appended after the DB close function so close order
@@ -206,10 +235,15 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 			evStore = s // durable evidence.Store (P0.2-fix)
 			adminState = s
 			adaptiveState = s
+			authorities = authority.Bundle{
+				Credentials: s, Lanes: s, Evidence: s, Adaptive: s, Health: s,
+				Posture: s, Mutations: s, AuditSink: s, Audit: s, SecurityLog: s,
+			}
 		} else {
 			reg = credential.NewMemoryRegistry()
 			lanes = lane.NewStore(nil, time.Now)
 			evStore = evidence.NewMemoryStore()
+			authorities = authority.Bundle{Credentials: reg, Lanes: lanes, Evidence: evStore}
 		}
 	default:
 		return nil, fmt.Errorf("gripline: unsupported authority backend %q", cfg.Authority.Backend)
@@ -275,6 +309,24 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		ctrl.SetPostureReader(postgres.LoadPostureContext)
 		ctrl.SetAdmissionRecorder(postgres.AppendAdmission)
 	}
+	var postureAuthority control.PostureAuthority = ctrl
+	if state != nil {
+		postureAuthority = state
+	} else if postgres != nil {
+		postureAuthority = postgres
+	}
+	authorities.Credentials = reg
+	authorities.Lanes = lanes
+	authorities.Evidence = evStore
+	authorities.Resource = governor
+	authorities.Posture = postureAuthority
+	authorities.Adaptive = adaptiveState
+	authorities.Health = stateHealth
+	if state != nil {
+		authorities.Mutations, authorities.AuditSink, authorities.Audit, authorities.SecurityLog = state, state, state, state
+	} else if postgres != nil {
+		authorities.Mutations, authorities.AuditSink, authorities.Audit, authorities.SecurityLog = postgres, postgres, postgres, postgres
+	}
 
 	pol, err := policyFor(cfg)
 	if err != nil {
@@ -335,17 +387,18 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 	}
 
 	term, err := terminator.New(terminator.Dependencies{
-		Registry:       reg,
+		Registry:       authorities.Credentials,
 		Peppers:        peppers,
-		Lanes:          lanes, // Shared lane authority
+		Lanes:          authorities.Lanes, // Shared lane authority
 		Policy:         pol,
 		Signer:         signer,
 		Audience:       cfg.Identity.Audience,
-		Evidence:       evStore,
+		Evidence:       authorities.Evidence,
 		Mode:           terminator.ModeEnforce,
-		Resource:       governor, // Shared resource authority
-		Control:        ctrl,     // Shared control plane
-		Spray:          spray,    // Shared spray detector
+		Resource:       authorities.Resource, // Shared resource authority
+		Control:        ctrl,                 // Shared control plane
+		Posture:        authorities.Posture,
+		Spray:          spray, // Shared spray detector
 		Producers:      producerList,
 		AdaptiveHealth: adaptiveHealth,
 		Policies:       policyManager,
@@ -482,17 +535,14 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		// audit sink — every operator action appends into the same transaction
 		// as the mutation it documents. Config validation rejects a JSONL path
 		// here so a mirror can never be mistaken for authoritative history.
-		var audit control.AuditRepository
-		if state != nil {
-			audit = state
-		} else if postgres != nil {
-			audit = postgres
-		} else {
+		audit := authorities.AuditSink
+		if audit == nil {
 			fileAudit, err := control.NewFileAuditRepository(cfg.Paths.AuditLog)
 			if err != nil {
 				return nil, err
 			}
 			audit = fileAudit
+			authorities.AuditSink = audit
 			closers = append(closers, func() error { return fileAudit.Close() })
 		}
 
@@ -526,10 +576,8 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		// transaction via control.MutationStore. The lane-unblock path also
 		// commits its lane-side audit entry atomically inside the state store
 		// (P0.49).
-		if state != nil {
-			opts = append(opts, control.WithMutationStore(state))
-		} else if postgres != nil {
-			opts = append(opts, control.WithMutationStore(postgres))
+		if authorities.Mutations != nil {
+			opts = append(opts, control.WithMutationStore(authorities.Mutations))
 		} else {
 			opts = append(opts, control.WithLaneOperator(control.LaneUnblockAdapter{Unblock: func(credID, laneID, actor, reason string, now time.Time) error {
 				mem, ok := lanes.(*lane.Store)
@@ -572,16 +620,19 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 	}
 
 	return &Runtime{
-		Registry:       reg,
-		Lanes:          lanes, // Shared lane authority
+		Registry:       authorities.Credentials,
+		Lanes:          authorities.Lanes, // Shared lane authority
 		AdminService:   adminSvc,
-		Evidence:       evStore,
-		Resource:       governor, // Shared resource authority
-		Control:        ctrl,     // Shared control plane
-		Spray:          spray,    // Shared spray detector
+		Evidence:       authorities.Evidence,
+		Resource:       authorities.Resource, // Shared resource authority
+		Control:        ctrl,                 // Shared control plane
+		Posture:        authorities.Posture,
+		Spray:          spray, // Shared spray detector
 		Signer:         signer,
 		Policy:         pol,
 		PolicyManager:  policyManager,
+		StateHealth:    stateHealth,
+		Authorities:    authorities,
 		State:          state,
 		Postgres:       postgres,
 		Audience:       cfg.Identity.Audience,

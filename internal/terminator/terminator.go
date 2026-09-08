@@ -269,6 +269,13 @@ type Dependencies struct {
 	// (P0.35). Nil disables both. Keep it nil unless a control plane is wired.
 	Control *control.ControlPlane
 
+	// Posture is the explicit authoritative posture reader for admission. In a
+	// cluster this must be the shared state authority, not a process-local
+	// ControlPlane cache. Control is retained separately for audit recording and
+	// operator lifecycle compatibility; when Posture is nil, Control remains the
+	// legacy fallback for standalone embedders.
+	Posture control.PostureAuthority
+
 	// SourceID was REMOVED (P0.4): a Terminator serves many clients, and a
 	// process-global source id either disabled source security (empty) or
 	// collapsed every client into one bucket. Source identity now rides the
@@ -741,15 +748,21 @@ func (t *Terminator) admitUsageWithRequestID(ctx context.Context, reqID string, 
 	tr.CredentialRevBefore = cred.Revision
 	tr.CredentialRevAfter = cred.Revision
 	controlEmergency := false
-	if t.dep.Control != nil {
+	postureAuthority := t.dep.Posture
+	if postureAuthority == nil && t.dep.Control != nil {
+		postureAuthority = t.dep.Control
+	}
+	if postureAuthority != nil {
 		var controlErr error
-		controlEmergency, controlErr = t.dep.Control.InEmergencyContext(ctx)
+		var posture control.Posture
+		posture, controlErr = postureAuthority.PostureContext(ctx)
 		if controlErr != nil {
 			out.Authorized = false
 			out.Reason = "control_unavailable"
 			out.DenialErr = controlErr
 			return out
 		}
+		controlEmergency = posture == control.EmergencyLockdown
 	}
 	// Record last-seen on successful authentication (P0.22). Analytics-grade and
 	// best-effort; must never influence the authorization outcome.

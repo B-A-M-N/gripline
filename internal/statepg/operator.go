@@ -67,6 +67,11 @@ func (s *Store) LoadPostureContext(ctx context.Context) (control.Posture, error)
 	return control.Posture(raw), nil
 }
 
+// PostureContext implements control.PostureAuthority.
+func (s *Store) PostureContext(ctx context.Context) (control.Posture, error) {
+	return s.LoadPostureContext(ctx)
+}
+
 func (s *Store) LoadPosture() (control.Posture, error) {
 	return s.LoadPostureContext(context.Background())
 }

@@ -601,7 +601,7 @@ func (c *Config) Validate() error {
 				}
 			}
 		}
-		if c.Paths.AuditLog == "" && c.Paths.State == "" {
+		if c.Paths.AuditLog == "" && c.Paths.State == "" && strings.ToLower(strings.TrimSpace(c.Authority.Backend)) != "postgres" {
 			return fmt.Errorf("paths.audit_log required when the admin section is present without paths.state (P0.47: durable operator audit)")
 		}
 		// P0.7 hardening: reject a public/unspecified admin bind. The admin

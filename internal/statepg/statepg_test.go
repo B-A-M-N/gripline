@@ -30,9 +30,31 @@ func TestSharedAuthorityInterfaceConformance(t *testing.T) {
 	var _ evidence.ContextStore = (*Store)(nil)
 	var _ control.AuditRepository = (*Store)(nil)
 	var _ control.MutationStore = (*Store)(nil)
+	var _ control.PostureAuthority = (*Store)(nil)
 	var _ control.SecurityTransitionReader = (*Store)(nil)
 	var _ resource.Authority = (*Store)(nil)
 	var _ resource.ResourceAuthority = (*Store)(nil)
 	var _ resource.DistributedAuthority = (*Store)(nil)
 	var _ resource.RequestDistributedAuthority = (*Store)(nil)
+}
+
+func TestResourceLeaseRefundRequiresUnforwardedState(t *testing.T) {
+	tests := []struct {
+		name      string
+		state     string
+		settled   bool
+		shouldRef bool
+	}{
+		{name: "reserved", state: leaseReserved, shouldRef: true},
+		{name: "forwarded", state: leaseForwarded},
+		{name: "forwarded settled", state: leaseForwarded, settled: true},
+		{name: "settled", state: leaseSettled, settled: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldRefundLeaseHold(tt.state, tt.settled); got != tt.shouldRef {
+				t.Fatalf("shouldRefundLeaseHold(%q, %t) = %t, want %t", tt.state, tt.settled, got, tt.shouldRef)
+			}
+		})
+	}
 }

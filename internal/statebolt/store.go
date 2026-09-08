@@ -15,6 +15,7 @@
 package statebolt
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -323,6 +324,25 @@ func (s *Store) Ping() error {
 		}
 		return nil
 	})
+}
+
+// Ready implements the backend-neutral state health seam. bbolt is local, so
+// the readiness probe is a bounded context check around its transaction probe.
+func (s *Store) Ready(ctx context.Context) error {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	if err := s.Ping(); err != nil {
+		return err
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // DBPath returns the on-disk path (diagnostics).

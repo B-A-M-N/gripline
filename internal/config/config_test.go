@@ -89,6 +89,59 @@ func TestValidateClusterAuthorityContract(t *testing.T) {
 	}
 }
 
+func TestValidateClusterAdminUsesPostgresAuditAuthority(t *testing.T) {
+	c := &Config{
+		Listen:   "127.0.0.1:8080",
+		TLS:      TLSSection{TerminateTLSUpstream: true},
+		Backend:  BackendSection{URL: "https://provider.internal", Timeout: Duration(time.Second)},
+		Server:   ServerSection{ReadTimeout: Duration(time.Second), WriteTimeout: Duration(time.Second), IdleTimeout: Duration(time.Second), ReadHeaderTimeout: Duration(time.Second)},
+		Identity: IdentitySection{Audience: "a"},
+		Authority: AuthoritySection{
+			Backend: "postgres", DSNEnv: "GRIPLINE_DSN", NodeID: "node-a",
+			LeaseTTL: Duration(30 * time.Second), RenewEvery: Duration(10 * time.Second),
+		},
+		Admin: &AdminSection{
+			Listen: "127.0.0.1:9090",
+			OperatorTokens: map[string]string{
+				"operator-token-0123456789abcdef0123456789abcdef": "operator:posture.control",
+			},
+		},
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("postgres authority must satisfy admin audit durability: %v", err)
+	}
+
+	withLocalAudit := *c
+	withLocalAudit.Paths.AuditLog = "/tmp/gripline-audit.jsonl"
+	if err := withLocalAudit.Validate(); err == nil {
+		t.Fatal("postgres authority must reject a local audit path")
+	}
+}
+
+func TestValidateStandaloneEphemeralAdminRequiresAuditPath(t *testing.T) {
+	c := &Config{
+		Listen:     "127.0.0.1:8080",
+		TLS:        TLSSection{TerminateTLSUpstream: true},
+		Backend:    BackendSection{URL: "https://provider.internal", Timeout: Duration(time.Second)},
+		Server:     ServerSection{ReadTimeout: Duration(time.Second), WriteTimeout: Duration(time.Second), IdleTimeout: Duration(time.Second), ReadHeaderTimeout: Duration(time.Second)},
+		Identity:   IdentitySection{Audience: "a"},
+		Deployment: DeploymentSection{AllowEphemeralState: true},
+		Admin: &AdminSection{
+			Listen: "127.0.0.1:9090",
+			OperatorTokens: map[string]string{
+				"operator-token-0123456789abcdef0123456789abcdef": "operator:posture.control",
+			},
+		},
+	}
+	if err := c.Validate(); err == nil {
+		t.Fatal("standalone ephemeral admin must require a durable JSONL audit path")
+	}
+	c.Paths.AuditLog = "/tmp/gripline-audit.jsonl"
+	if err := c.Validate(); err != nil {
+		t.Fatalf("standalone ephemeral admin with audit path rejected: %v", err)
+	}
+}
+
 func writeCertificateMaterial(t *testing.T, dir, name string) (certPath, keyPath string) {
 	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)

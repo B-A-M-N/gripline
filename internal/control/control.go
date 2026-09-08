@@ -42,6 +42,15 @@ func (p Posture) String() string {
 	}
 }
 
+// PostureAuthority is the authoritative, context-aware posture read used by
+// admission. A clustered implementation reads the singleton posture from the
+// shared store; ControlPlane implements the same seam for standalone and test
+// deployments. The data plane must treat an error as unavailable, never as
+// NORMAL.
+type PostureAuthority interface {
+	PostureContext(context.Context) (Posture, error)
+}
+
 // EventKind distinguishes audit records.
 type EventKind int
 

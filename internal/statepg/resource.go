@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -113,7 +114,15 @@ func (s *Store) provisionDistributedOnce(ctx context.Context, requestID, fingerp
 	if _, err := tx.Exec(ctx, `INSERT INTO gripline_resource_leases (lease_id, request_id, request_fingerprint, node_id, state, expires_at, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7)`, leaseID, requestID, fingerprint, s.nodeID, leaseReserved, expiresAt, now); err != nil {
 		return nil, mapDBError(err)
 	}
-	for _, original := range scopes {
+	orderedScopes := append([]resource.ScopeSpec(nil), scopes...)
+	sort.SliceStable(orderedScopes, func(i, j int) bool {
+		if orderedScopes[i].Scope != orderedScopes[j].Scope {
+			return orderedScopes[i].Scope < orderedScopes[j].Scope
+		}
+		return orderedScopes[i].ID < orderedScopes[j].ID
+	})
+	resolvedScopes := make([]resource.ScopeSpec, 0, len(orderedScopes))
+	for _, original := range orderedScopes {
 		sp, err := s.resolveResourceScope(ctx, tx, original, now)
 		if err != nil {
 			return nil, err
@@ -121,6 +130,18 @@ func (s *Store) provisionDistributedOnce(ctx context.Context, requestID, fingerp
 		if sp.ID == "" {
 			return nil, errors.New("resource: scope id required")
 		}
+		resolvedScopes = append(resolvedScopes, sp)
+	}
+	// Every transaction must acquire resource rows in the same order. Source
+	// scope resolution above is ordered too, because its upsert locks the
+	// source-scope row before the resource bucket rows.
+	sort.SliceStable(resolvedScopes, func(i, j int) bool {
+		if resolvedScopes[i].Scope != resolvedScopes[j].Scope {
+			return resolvedScopes[i].Scope < resolvedScopes[j].Scope
+		}
+		return resolvedScopes[i].ID < resolvedScopes[j].ID
+	})
+	for _, sp := range resolvedScopes {
 		if shouldReserveConcurrency(sp.Buckets) {
 			if err := s.reserveResourceGauge(ctx, tx, leaseID, sp, resource.DimConcurrency, 1, now); err != nil {
 				return nil, err
@@ -161,7 +182,7 @@ func resourceRequestFingerprint(scopes []resource.ScopeSpec, estimate resource.U
 
 func retryableTransactionError(err error) bool {
 	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && (pgErr.Code == "40001" || pgErr.Code == "23505")
+	return errors.As(err, &pgErr) && (pgErr.Code == "40001" || pgErr.Code == "40P01" || pgErr.Code == "23505")
 }
 
 func shouldReserveConcurrency(spec resource.BucketSpec) bool {
@@ -334,6 +355,10 @@ type distributedReservation struct {
 	forwarded, settled, released bool
 }
 
+// ID is the durable operation/lease identifier. It can be carried to a
+// backend that supports authoritative start/complete/cancel accounting.
+func (r *distributedReservation) ID() string { return r.leaseID }
+
 func (r *distributedReservation) MarkForwarded(ctx context.Context) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -462,7 +487,7 @@ type leaseHold struct {
 }
 
 func loadLeaseHolds(ctx context.Context, tx pgx.Tx, leaseID string) ([]leaseHold, error) {
-	rows, err := tx.Query(ctx, `SELECT scope, scope_id, dimension, amount, settled FROM gripline_resource_holds WHERE lease_id=$1 ORDER BY scope, scope_id, dimension FOR UPDATE`, leaseID)
+	rows, err := tx.Query(ctx, `SELECT scope, scope_id, dimension, amount, settled FROM gripline_resource_holds WHERE lease_id=$1 ORDER BY scope, scope_id, CASE WHEN dimension=$2 THEN 0 ELSE 1 END, dimension FOR UPDATE`, leaseID, resource.DimConcurrency)
 	if err != nil {
 		return nil, mapDBError(err)
 	}
@@ -546,7 +571,7 @@ func releaseLease(ctx context.Context, s *Store, leaseID, nodeID string) error {
 		return err
 	}
 	for _, hold := range holds {
-		if err := releaseBucket(ctx, tx, hold, now); err != nil {
+		if err := releaseBucket(ctx, tx, hold, state, now); err != nil {
 			return err
 		}
 	}
@@ -559,7 +584,7 @@ func releaseLease(ctx context.Context, s *Store, leaseID, nodeID string) error {
 	return mapDBError(tx.Commit(ctx))
 }
 
-func releaseBucket(ctx context.Context, tx pgx.Tx, hold leaseHold, now time.Time) error {
+func releaseBucket(ctx context.Context, tx pgx.Tx, hold leaseHold, leaseState string, now time.Time) error {
 	var capacity, refillPer, available float64
 	var refillInNS int64
 	var used int
@@ -572,7 +597,10 @@ func releaseBucket(ctx context.Context, tx pgx.Tx, hold leaseHold, now time.Time
 		if used > 0 {
 			used--
 		}
-	} else if !hold.settled {
+	} else if shouldRefundLeaseHold(leaseState, hold.settled) {
+		// A reservation that never reached the backend may refund its
+		// estimate. Once forwarding was acknowledged, the backend may have
+		// started work and an uncertain outcome must consume the estimate.
 		if refillPer > 0 && refillInNS > 0 && now.After(updated) {
 			available += refillPer * float64(now.Sub(updated).Nanoseconds()) / float64(refillInNS)
 			if available > capacity {
@@ -586,6 +614,10 @@ func releaseBucket(ctx context.Context, tx pgx.Tx, hold leaseHold, now time.Time
 	}
 	_, err = tx.Exec(ctx, `UPDATE gripline_resource_buckets SET available=$4, concurrency_used=$5, updated_at=$6 WHERE scope=$1 AND scope_id=$2 AND dimension=$3`, hold.scope, hold.scopeID, hold.dimension, available, used, now)
 	return mapDBError(err)
+}
+
+func shouldRefundLeaseHold(leaseState string, settled bool) bool {
+	return leaseState == leaseReserved && !settled
 }
 
 func (s *Store) leaseReaper() {
@@ -618,14 +650,14 @@ func (s *Store) reapExpired(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	rows, err := tx.Query(ctx, `SELECT lease_id, node_id FROM gripline_resource_leases WHERE state <> $1 AND expires_at <= $2 ORDER BY expires_at LIMIT 100 FOR UPDATE SKIP LOCKED`, leaseReleased, now)
+	rows, err := tx.Query(ctx, `SELECT lease_id, node_id, state FROM gripline_resource_leases WHERE state <> $1 AND expires_at <= $2 ORDER BY expires_at LIMIT 100 FOR UPDATE SKIP LOCKED`, leaseReleased, now)
 	if err != nil {
 		return mapDBError(err)
 	}
-	var expired []struct{ id, node string }
+	var expired []struct{ id, node, state string }
 	for rows.Next() {
-		var item struct{ id, node string }
-		if err := rows.Scan(&item.id, &item.node); err != nil {
+		var item struct{ id, node, state string }
+		if err := rows.Scan(&item.id, &item.node, &item.state); err != nil {
 			rows.Close()
 			return mapDBError(err)
 		}
@@ -642,7 +674,7 @@ func (s *Store) reapExpired(ctx context.Context) error {
 			return err
 		}
 		for _, hold := range holds {
-			if err := releaseBucket(ctx, tx, hold, now); err != nil {
+			if err := releaseBucket(ctx, tx, hold, item.state, now); err != nil {
 				return err
 			}
 		}
