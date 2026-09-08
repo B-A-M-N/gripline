@@ -546,7 +546,7 @@ func (s *Store) ObserveAndCommit(ctx context.Context, credentialID string, score
 	return out, err
 }
 
-func (s *Store) observeAndCommitOnce(ctx context.Context, credentialID string, score int, hy credential.Hysteresis, now time.Time, meta credential.TransitionMetadata) (credential.TransitionResult, error) {
+func (s *Store) observeAndCommitOnce(ctx context.Context, credentialID string, score int, hy credential.Hysteresis, _ time.Time, meta credential.TransitionMetadata) (credential.TransitionResult, error) {
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return credential.TransitionResult{}, mapDBError(err)
@@ -559,7 +559,6 @@ func (s *Store) observeAndCommitOnce(ctx context.Context, credentialID string, s
 	if err != nil {
 		return credential.TransitionResult{}, err
 	}
-	now = authorityNow
 	if meta.RequestID != "" {
 		if receipt, ok, err := loadCredentialReceipt(ctx, tx, meta.RequestID, credentialID); err != nil {
 			return credential.TransitionResult{}, err
@@ -579,7 +578,7 @@ func (s *Store) observeAndCommitOnce(ctx context.Context, credentialID string, s
 		return credential.TransitionResult{}, mapCredentialReadError(err)
 	}
 	before := cloneCredential(rec)
-	reduced := credential.ReduceTransition(hy, rec.Status, rec.Security, score, now)
+	reduced := credential.ReduceTransition(hy, rec.Status, rec.Security, score, authorityNow)
 	rec.Security = reduced.Next
 	if reduced.Changed {
 		if rec.Status == credential.StatusQuarantined || rec.Status == credential.StatusRevoked {
@@ -587,15 +586,15 @@ func (s *Store) observeAndCommitOnce(ctx context.Context, credentialID string, s
 		}
 		rec.Status = reduced.Status
 		rec.Revision++
-		rec.Security.LastStateChangeAt = now
-		rec.RotatedAt = now
+		rec.Security.LastStateChangeAt = authorityNow
+		rec.RotatedAt = authorityNow
 	}
 	if err := updateCredentialRow(ctx, tx, rec); err != nil {
 		return credential.TransitionResult{}, err
 	}
 	if reduced.Changed {
 		if err := appendSecurityTransition(ctx, tx, control.SecurityTransitionRecord{
-			At: now.UTC(), Kind: "credential_status", RequestID: meta.RequestID,
+			At: authorityNow.UTC(), Kind: "credential_status", RequestID: meta.RequestID,
 			CredentialID: credentialID, Before: before.Status.String(), After: rec.Status.String(),
 			RiskScore: score, Revision: rec.Revision, PolicyRevision: meta.PolicyRevision,
 			EvidenceCodes: append([]string(nil), meta.EvidenceCodes...),

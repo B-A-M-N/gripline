@@ -253,7 +253,7 @@ func (s *Store) ObserveRiskWithPolicy(ctx context.Context, credID, laneID string
 	return out, err
 }
 
-func (s *Store) observeRiskWithPolicyOnce(ctx context.Context, credID, laneID string, riskScore int, now time.Time, policy lane.PolicyContext, meta lane.TransitionMetadata) (*lane.LaneRecord, error) {
+func (s *Store) observeRiskWithPolicyOnce(ctx context.Context, credID, laneID string, riskScore int, _ time.Time, policy lane.PolicyContext, meta lane.TransitionMetadata) (*lane.LaneRecord, error) {
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return nil, err
@@ -286,14 +286,13 @@ func (s *Store) observeRiskWithPolicyOnce(ctx context.Context, credID, laneID st
 		meta.PolicyRevision = policy.PolicyRevision
 	}
 	before := rec.Security.Status
-	now = authorityNow
-	lane.ApplyRiskObservation(rec, riskScore, security, now)
+	lane.ApplyRiskObservation(rec, riskScore, security, authorityNow)
 	if err := putLane(ctx, tx, rec); err != nil {
 		return nil, err
 	}
 	if before != rec.Security.Status {
 		if err := appendSecurityTransition(ctx, tx, control.SecurityTransitionRecord{
-			At: now.UTC(), Kind: "lane_security", RequestID: meta.RequestID,
+			At: authorityNow.UTC(), Kind: "lane_security", RequestID: meta.RequestID,
 			CredentialID: credID, LaneID: laneID, Before: before.String(), After: rec.Security.Status.String(),
 			RiskScore: riskScore, Revision: rec.Revision, PolicyRevision: meta.PolicyRevision,
 			EvidenceCodes: append([]string(nil), meta.EvidenceCodes...),
@@ -335,7 +334,7 @@ func (s *Store) RecordCleanAuthorizedAndPromoteWithPolicy(ctx context.Context, c
 	return out, promoted, err
 }
 
-func (s *Store) recordCleanAuthorizedAndPromoteOnce(ctx context.Context, credID, laneID string, riskScore int, criteria lane.PromotionCriteria, now time.Time, policy lane.PolicyContext, meta lane.TransitionMetadata) (*lane.LaneRecord, bool, error) {
+func (s *Store) recordCleanAuthorizedAndPromoteOnce(ctx context.Context, credID, laneID string, riskScore int, criteria lane.PromotionCriteria, _ time.Time, policy lane.PolicyContext, meta lane.TransitionMetadata) (*lane.LaneRecord, bool, error) {
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return nil, false, err
@@ -367,14 +366,13 @@ func (s *Store) recordCleanAuthorizedAndPromoteOnce(ctx context.Context, credID,
 		meta.PolicyRevision = policy.PolicyRevision
 	}
 	before := rec.State
-	now = authorityNow
-	promoted := lane.ApplyCleanAuthorizedAndPromote(rec, riskScore, criteria, now)
+	promoted := lane.ApplyCleanAuthorizedAndPromote(rec, riskScore, criteria, authorityNow)
 	if err := putLane(ctx, tx, rec); err != nil {
 		return nil, false, err
 	}
 	if before != rec.State {
 		if err := appendSecurityTransition(ctx, tx, control.SecurityTransitionRecord{
-			At: now.UTC(), Kind: "lane_trust", RequestID: meta.RequestID,
+			At: authorityNow.UTC(), Kind: "lane_trust", RequestID: meta.RequestID,
 			CredentialID: credID, LaneID: laneID, Before: before.String(), After: rec.State.String(),
 			RiskScore: riskScore, Revision: rec.Revision, PolicyRevision: meta.PolicyRevision,
 			EvidenceCodes: append([]string(nil), meta.EvidenceCodes...),

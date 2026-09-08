@@ -347,7 +347,7 @@ func (s *Store) UnblockLaneWithAuditOperation(ctx context.Context, credID, laneI
 	})
 }
 
-func (s *Store) unblockLaneWithAuditOperationOnce(ctx context.Context, credID, laneID string, audit control.OperatorRecord, now time.Time, operationID string) error {
+func (s *Store) unblockLaneWithAuditOperationOnce(ctx context.Context, credID, laneID string, audit control.OperatorRecord, _ time.Time, operationID string) error {
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return mapDBError(err)
@@ -356,23 +356,23 @@ func (s *Store) unblockLaneWithAuditOperationOnce(ctx context.Context, credID, l
 	if err := s.requireNodeOwnership(ctx, tx, false); err != nil {
 		return err
 	}
-	now, err = dbNow(ctx, tx)
+	authorityNow, err := dbNow(ctx, tx)
 	if err != nil {
 		return err
 	}
-	audit.At = now
+	audit.At = authorityNow
 	replayed, err := claimControlOperation(ctx, tx, operationID, audit.Action,
 		operatorMutationPayload(audit, struct {
 			CredentialID string `json:"credential_id"`
 			LaneID       string `json:"lane_id"`
-		}{CredentialID: credID, LaneID: laneID}), now)
+		}{CredentialID: credID, LaneID: laneID}), authorityNow)
 	if err != nil {
 		return err
 	}
 	if replayed {
 		return nil
 	}
-	if err := s.lockLaneGuard(ctx, tx, credID, now); err != nil {
+	if err := s.lockLaneGuard(ctx, tx, credID, authorityNow); err != nil {
 		return mapDBError(err)
 	}
 	var raw []byte
@@ -387,7 +387,7 @@ func (s *Store) unblockLaneWithAuditOperationOnce(ctx context.Context, credID, l
 	if err != nil {
 		return err
 	}
-	before, err := lane.ApplyUnblock(rec, now)
+	before, err := lane.ApplyUnblock(rec, authorityNow)
 	if err != nil {
 		return err
 	}
@@ -396,7 +396,7 @@ func (s *Store) unblockLaneWithAuditOperationOnce(ctx context.Context, credID, l
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO gripline_lane_operator_audit
 		(at, credential_id, lane_id, actor, action, before_state, after_state, revision, reason)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`, now.UTC(), credID, laneID, audit.Actor,
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`, authorityNow.UTC(), credID, laneID, audit.Actor,
 		lane.ActionUnblock, before.String(), rec.Security.Status.String(), rec.Revision, audit.Reason); err != nil {
 		return mapDBError(err)
 	}

@@ -10,6 +10,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -82,6 +84,7 @@ const transactionRetryBaseDelay = 5 * time.Millisecond
 
 var ErrMigrationRequired = errors.New("statepg: database schema requires migration")
 var ErrDSNRequired = errors.New("statepg: DSN required")
+var ErrInsecureTransport = errors.New("statepg: remote PostgreSQL requires authenticated TLS")
 
 // SupportedSchemaVersion is the schema marker expected by serving nodes.
 func SupportedSchemaVersion() int { return currentSchemaVersion }
@@ -105,6 +108,9 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 	config, err := pgxpool.ParseConfig(opts.DSN)
 	if err != nil {
 		return nil, fmt.Errorf("statepg: parse DSN: %w", err)
+	}
+	if err := validateTransport(config); err != nil {
+		return nil, err
 	}
 	// pgx uses this value for connections opened after the initial pool
 	// creation too. Bounding only NewWithConfig would still allow a later
@@ -208,6 +214,9 @@ func InspectSchema(ctx context.Context, opts Options) (SchemaStatus, error) {
 	if err != nil {
 		return status, fmt.Errorf("statepg: parse DSN: %w", err)
 	}
+	if err := validateTransport(config); err != nil {
+		return status, err
+	}
 	config.ConnConfig.ConnectTimeout = opts.ConnectTimeout
 	if opts.MaxConns > 0 {
 		config.MaxConns = opts.MaxConns
@@ -238,6 +247,47 @@ func InspectSchema(ctx context.Context, opts Options) (SchemaStatus, error) {
 	status.Present = true
 	status.Version = version
 	return status, nil
+}
+
+// validateTransport rejects the libpq/pgx default "prefer" mode for remote
+// authorities because its fallback can silently downgrade to plaintext. A
+// local Unix socket or loopback connection is an explicit local deployment
+// boundary; every other host must use a TLS configuration that authenticates
+// the server (verify-full, or verify-ca with a peer-verification callback).
+func validateTransport(config *pgxpool.Config) error {
+	if config == nil {
+		return errors.New("statepg: nil PostgreSQL connection config")
+	}
+	configs := []*pgconn.Config{{
+		Host:      config.ConnConfig.Host,
+		Port:      config.ConnConfig.Port,
+		TLSConfig: config.ConnConfig.TLSConfig,
+	}}
+	for _, fallback := range config.ConnConfig.Fallbacks {
+		configs = append(configs, &pgconn.Config{Host: fallback.Host, Port: fallback.Port, TLSConfig: fallback.TLSConfig})
+	}
+	for _, candidate := range configs {
+		if candidate == nil {
+			continue
+		}
+		network, _ := pgconn.NetworkAddress(candidate.Host, candidate.Port)
+		if network == "unix" || isLoopbackDatabaseHost(candidate.Host) {
+			continue
+		}
+		if candidate.TLSConfig == nil || (candidate.TLSConfig.InsecureSkipVerify && candidate.TLSConfig.VerifyPeerCertificate == nil) {
+			return fmt.Errorf("%w: host %q", ErrInsecureTransport, candidate.Host)
+		}
+	}
+	return nil
+}
+
+func isLoopbackDatabaseHost(host string) bool {
+	host = strings.TrimSpace(host)
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // CheckSchemaCompatibility verifies that a serving node can use the

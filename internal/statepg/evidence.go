@@ -199,7 +199,7 @@ func (s *Store) PruneContext(ctx context.Context, subjects []evidence.SubjectKey
 	return 0, fmt.Errorf("statepg: evidence prune remained conflicted after retries: %w", lastErr)
 }
 
-func (s *Store) pruneContextOnce(ctx context.Context, subjects []evidence.SubjectKey, now time.Time) (int, error) {
+func (s *Store) pruneContextOnce(ctx context.Context, subjects []evidence.SubjectKey, _ time.Time) (int, error) {
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return 0, err
@@ -212,7 +212,6 @@ func (s *Store) pruneContextOnce(ctx context.Context, subjects []evidence.Subjec
 	if err != nil {
 		return 0, err
 	}
-	now = authorityNow
 	pruned := 0
 	orderedSubjects := append([]evidence.SubjectKey(nil), subjects...)
 	sort.Slice(orderedSubjects, func(i, j int) bool {
@@ -234,7 +233,7 @@ func (s *Store) pruneContextOnce(ctx context.Context, subjects []evidence.Subjec
 			return 0, err
 		}
 		for _, item := range items {
-			if !item.Valid(now) {
+			if !item.Valid(authorityNow) {
 				if _, err := tx.Exec(ctx, `DELETE FROM gripline_evidence WHERE scope=$1 AND subject_id=$2 AND evidence_id=$3`, scope, id, item.EvidenceID); err != nil {
 					return 0, err
 				}

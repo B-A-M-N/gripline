@@ -14,12 +14,48 @@ import (
 	"github.com/B-A-M-N/gripline/internal/lane"
 	"github.com/B-A-M-N/gripline/internal/resource"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func TestOpenRequiresDSNBeforeDialing(t *testing.T) {
 	_, err := Open(context.Background(), Options{})
 	if err == nil || !errors.Is(err, ErrDSNRequired) {
 		t.Fatalf("Open without DSN = %v", err)
+	}
+}
+
+func TestValidateTransport(t *testing.T) {
+	tests := []struct {
+		name    string
+		dsn     string
+		wantErr bool
+	}{
+		{name: "loopback without TLS", dsn: "postgres://user@127.0.0.1/db?sslmode=disable"},
+		{name: "localhost without TLS", dsn: "postgres://user@localhost/db?sslmode=disable"},
+		{name: "unix socket without TLS", dsn: "host=/var/run/postgresql user=user dbname=db sslmode=disable"},
+		{name: "remote plaintext", dsn: "postgres://user@db.internal/db?sslmode=disable", wantErr: true},
+		{name: "remote prefer fallback", dsn: "postgres://user@db.internal/db?sslmode=prefer", wantErr: true},
+		{name: "remote unauthenticated TLS", dsn: "postgres://user@db.internal/db?sslmode=require", wantErr: true},
+		{name: "remote verified TLS", dsn: "postgres://user@db.internal/db?sslmode=verify-full", wantErr: false},
+		{name: "remote fallback plaintext", dsn: "postgres://user@localhost,db.internal/db?sslmode=disable", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config, err := pgxpool.ParseConfig(tt.dsn)
+			if err != nil {
+				t.Fatalf("ParseConfig() error = %v", err)
+			}
+			err = validateTransport(config)
+			if tt.wantErr {
+				if !errors.Is(err, ErrInsecureTransport) {
+					t.Fatalf("validateTransport() error = %v, want ErrInsecureTransport", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("validateTransport() error = %v", err)
+			}
+		})
 	}
 }
 
