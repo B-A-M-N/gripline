@@ -716,7 +716,7 @@ func (t *Terminator) admitUsageWithRequestID(ctx context.Context, reqID string, 
 			// domain-separated from verifier derivation inside the sealed
 			// boundary, so the same key material never cross-purposes.
 			if cand := t.dep.Peppers.DeriveSprayPseudonym(presented, t.dep.Peppers.Latest()); cand != "" {
-				if sigs := t.dep.Spray.ObserveInvalidCredential(src.sourceID(), cand, now); len(sigs) > 0 {
+				if sigs := t.dep.Spray.ObserveInvalidCredentialContext(ctx, src.sourceID(), cand, now); len(sigs) > 0 {
 					// P0.8: the detector signals WHAT happened; the compiled policy
 					// rule's scope resolves the subject from the request context
 					// (here the source — the credential is unknown).
@@ -886,7 +886,7 @@ func (t *Terminator) admitUsageWithRequestID(ctx context.Context, reqID string, 
 	// contributes to this request's evaluation at the correct scope, not just to
 	// a later snapshot.
 	if t.dep.Spray != nil && src.sourceID() != "" {
-		if sigs := t.dep.Spray.Observe(src.sourceID(), cred.CredentialID, feat.NetworkASN, now); len(sigs) > 0 {
+		if sigs := t.dep.Spray.ObserveContext(ctx, src.sourceID(), cred.CredentialID, feat.NetworkASN, now); len(sigs) > 0 {
 			res := t.resolveSignals(sprayCodes(sigs), subjects, now)
 			persistOnly = append(persistOnly, res.persisted...)
 			currentSourceEvidence = append(currentSourceEvidence, res.source...)
@@ -910,7 +910,13 @@ func (t *Terminator) admitUsageWithRequestID(ctx context.Context, reqID string, 
 			Concurrency: tr.ObservedConcurrency,
 		}
 		for _, prod := range t.dep.Producers {
-			if sigs := prod.ObserveAdmission(admissionBehavior); len(sigs) > 0 {
+			var sigs []producers.Signal
+			if contextual, ok := prod.(producers.ContextProducer); ok {
+				sigs = contextual.ObserveAdmissionContext(ctx, admissionBehavior)
+			} else {
+				sigs = prod.ObserveAdmission(admissionBehavior)
+			}
+			if len(sigs) > 0 {
 				res := t.resolveSignals(producerCodes(sigs), subjects, now)
 				persistOnly = append(persistOnly, res.persisted...)
 				currentSourceEvidence = append(currentSourceEvidence, res.source...)
@@ -1788,7 +1794,12 @@ func (t *Terminator) observeCompletion(ctx context.Context, pol *policy.Compiled
 		minted = make([]evidence.Evidence, 0, 4)
 	}
 	for _, prod := range t.dep.Producers {
-		sigs := prod.ObserveCompletion(behavior)
+		var sigs []producers.Signal
+		if contextual, ok := prod.(producers.ContextProducer); ok {
+			sigs = contextual.ObserveCompletionContext(ctx, behavior)
+		} else {
+			sigs = prod.ObserveCompletion(behavior)
+		}
 		for _, sig := range sigs {
 			rule, ok := pol.EvidenceRules[sig.Code]
 			if !ok {

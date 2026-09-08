@@ -1,8 +1,11 @@
 package producers
 
 import (
+	"context"
 	"sync"
 	"time"
+
+	"github.com/B-A-M-N/gripline/internal/adaptive"
 )
 
 // SourceNoveltyProducer detects source-discontinuity novelty: a credential
@@ -15,6 +18,9 @@ type SourceNoveltyProducer struct {
 	window      time.Duration
 	cooldown    time.Duration
 	maxSubjects int
+	distributed adaptive.Store
+	stateMu     sync.Mutex
+	stateErr    error
 
 	// credASN tracks distinct ASNs per credential.
 	credASN map[string]*windowKey
@@ -22,6 +28,15 @@ type SourceNoveltyProducer struct {
 	credRegion map[string]*windowKey
 	// credSource tracks keyed source pseudonyms per credential.
 	credSource map[string]*windowKey
+}
+
+// NewDistributedSourceNoveltyProducer uses keyed authority rows instead of a
+// process-local snapshot. The local maps remain initialized for compatibility,
+// but are not consulted when distributed is set.
+func NewDistributedSourceNoveltyProducer(now func() time.Time, store adaptive.Store) *SourceNoveltyProducer {
+	p := NewSourceNoveltyProducer(now)
+	p.distributed = store
+	return p
 }
 
 // NewSourceNoveltyProducer builds a SourceNoveltyProducer.
@@ -42,6 +57,17 @@ func NewSourceNoveltyProducer(now func() time.Time) *SourceNoveltyProducer {
 
 // ObserveAdmission records one request's source behavior and returns any novelty signals.
 func (p *SourceNoveltyProducer) ObserveAdmission(behavior AdmissionBehavior) []Signal {
+	return p.ObserveAdmissionContext(context.Background(), behavior)
+}
+
+func (p *SourceNoveltyProducer) ObserveAdmissionContext(ctx context.Context, behavior AdmissionBehavior) []Signal {
+	if p.distributed != nil {
+		return p.observeAdmissionDistributed(ctx, behavior)
+	}
+	return p.observeAdmissionLocal(behavior)
+}
+
+func (p *SourceNoveltyProducer) observeAdmissionLocal(behavior AdmissionBehavior) []Signal {
 	if behavior.Subjects.CredentialID == "" {
 		return nil
 	}
@@ -79,7 +105,52 @@ func (p *SourceNoveltyProducer) ObserveAdmission(behavior AdmissionBehavior) []S
 	return signals
 }
 
+func (p *SourceNoveltyProducer) observeAdmissionDistributed(ctx context.Context, behavior AdmissionBehavior) []Signal {
+	if behavior.Subjects.CredentialID == "" {
+		return nil
+	}
+	subject := behavior.Subjects.CredentialID
+	var signals []Signal
+	var observedErr error
+	observe := func(detector, key string, threshold int, code string) {
+		if key == "" {
+			return
+		}
+		emitted, err := p.distributed.ObserveWindow(ctx, adaptive.WindowObservation{
+			Detector: detector, Subject: subject, Key: key, Threshold: threshold,
+			Window: p.window, Cooldown: p.cooldown, MaxSubjects: p.maxSubjects, MaxKeys: 256,
+		})
+		if err != nil {
+			observedErr = err
+			return
+		}
+		if emitted {
+			signals = append(signals, Signal{Code: code})
+		}
+	}
+	observe("source_novelty_source", behavior.Subjects.SourceID, 1, "NEW_SOURCE")
+	observe("source_novelty_asn", behavior.Features.NetworkASN, 1, "NEW_ASN")
+	if behavior.Features.NetworkASN != "" && behavior.Features.NetworkType == "hosting" {
+		observe("source_novelty_hosting_asn", behavior.Features.NetworkASN, 1, "NEW_HOSTING_ASN")
+	}
+	observe("source_novelty_region", behavior.Features.RegionClass, 1, "NEW_COUNTRY")
+	p.stateMu.Lock()
+	p.stateErr = observedErr
+	p.stateMu.Unlock()
+	return signals
+}
+
 // ObserveCompletion is a no-op for source novelty (admission-time only).
 func (p *SourceNoveltyProducer) ObserveCompletion(behavior CompletionBehavior) []Signal {
 	return nil
+}
+
+func (p *SourceNoveltyProducer) ObserveCompletionContext(context.Context, CompletionBehavior) []Signal {
+	return nil
+}
+
+func (p *SourceNoveltyProducer) PersistenceError() error {
+	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
+	return p.stateErr
 }

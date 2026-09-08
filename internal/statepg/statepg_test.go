@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/B-A-M-N/gripline/internal/adaptive"
 	"github.com/B-A-M-N/gripline/internal/authority"
 	"github.com/B-A-M-N/gripline/internal/control"
 	"github.com/B-A-M-N/gripline/internal/credential"
@@ -38,6 +39,7 @@ func TestSharedAuthorityInterfaceConformance(t *testing.T) {
 	var _ resource.DistributedAuthority = (*Store)(nil)
 	var _ resource.RequestDistributedAuthority = (*Store)(nil)
 	var _ authority.Membership = (*Store)(nil)
+	var _ adaptive.Store = (*Store)(nil)
 }
 
 func TestMembershipStateClassification(t *testing.T) {

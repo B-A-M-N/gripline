@@ -15,6 +15,7 @@
 package producers
 
 import (
+	"context"
 	"time"
 
 	"github.com/B-A-M-N/gripline/internal/evidence"
@@ -66,6 +67,15 @@ type Producer interface {
 	// ObserveCompletion records the actual usage after backend response and
 	// returns any signals that crossed their threshold.
 	ObserveCompletion(behavior CompletionBehavior) []Signal
+}
+
+// ContextProducer is the cancellable extension used by remote adaptive
+// authorities. Legacy in-process producers continue to implement Producer;
+// the terminator prefers this interface when available.
+type ContextProducer interface {
+	Producer
+	ObserveAdmissionContext(context.Context, AdmissionBehavior) []Signal
+	ObserveCompletionContext(context.Context, CompletionBehavior) []Signal
 }
 
 // Features carries the observable non-secret feature atoms of one request.

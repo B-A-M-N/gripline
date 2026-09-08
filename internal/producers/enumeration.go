@@ -1,8 +1,11 @@
 package producers
 
 import (
+	"context"
 	"sync"
 	"time"
+
+	"github.com/B-A-M-N/gripline/internal/adaptive"
 )
 
 // EnumerationProducer detects rapid endpoint/model enumeration: a client
@@ -15,8 +18,19 @@ type EnumerationProducer struct {
 	cooldown    time.Duration
 	maxSubjects int
 	threshold   int // distinct endpoints before signal
+	distributed adaptive.Store
+	stateMu     sync.Mutex
+	stateErr    error
 
 	credEndpoint map[string]*windowKey
+}
+
+// NewDistributedEnumerationProducer uses a keyed PostgreSQL window rather
+// than a process-local snapshot.
+func NewDistributedEnumerationProducer(now func() time.Time, store adaptive.Store) *EnumerationProducer {
+	p := NewEnumerationProducer(now)
+	p.distributed = store
+	return p
 }
 
 // NewEnumerationProducer builds an EnumerationProducer.
@@ -37,6 +51,34 @@ func NewEnumerationProducer(now func() time.Time) *EnumerationProducer {
 // ObserveAdmission records one request's endpoint behavior and returns an enumeration
 // signal when the distinct-endpoint threshold is crossed.
 func (p *EnumerationProducer) ObserveAdmission(behavior AdmissionBehavior) []Signal {
+	return p.ObserveAdmissionContext(context.Background(), behavior)
+}
+
+func (p *EnumerationProducer) ObserveAdmissionContext(ctx context.Context, behavior AdmissionBehavior) []Signal {
+	if p.distributed != nil {
+		if behavior.Subjects.CredentialID == "" || behavior.EndpointFamily == "" {
+			return nil
+		}
+		emitted, err := p.distributed.ObserveWindow(ctx, adaptive.WindowObservation{
+			Detector: "enumeration", Subject: behavior.Subjects.CredentialID,
+			Key: behavior.EndpointFamily, Threshold: p.threshold, Window: p.window,
+			Cooldown: p.cooldown, MaxSubjects: p.maxSubjects, MaxKeys: 256,
+		})
+		p.stateMu.Lock()
+		p.stateErr = err
+		p.stateMu.Unlock()
+		if err != nil {
+			return nil
+		}
+		if emitted {
+			return []Signal{{Code: "RAPID_ENDPOINT_OR_MODEL_ENUMERATION"}}
+		}
+		return nil
+	}
+	return p.observeAdmissionLocal(behavior)
+}
+
+func (p *EnumerationProducer) observeAdmissionLocal(behavior AdmissionBehavior) []Signal {
 	if behavior.Subjects.CredentialID == "" || behavior.EndpointFamily == "" {
 		return nil
 	}
@@ -52,4 +94,14 @@ func (p *EnumerationProducer) ObserveAdmission(behavior AdmissionBehavior) []Sig
 // ObserveCompletion is a no-op for enumeration (admission-time only).
 func (p *EnumerationProducer) ObserveCompletion(behavior CompletionBehavior) []Signal {
 	return nil
+}
+
+func (p *EnumerationProducer) ObserveCompletionContext(context.Context, CompletionBehavior) []Signal {
+	return nil
+}
+
+func (p *EnumerationProducer) PersistenceError() error {
+	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
+	return p.stateErr
 }

@@ -219,9 +219,8 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		lanes = s
 		evStore = s
 		adminState = s
-		adaptiveState = s
 		authorities = authority.Bundle{
-			Credentials: s, Lanes: s, Evidence: s, Adaptive: s, Health: s, Membership: s,
+			Credentials: s, Lanes: s, Evidence: s, AdaptiveRows: s, Health: s, Membership: s,
 			Posture: s, Mutations: s, AuditSink: s, Audit: s, SecurityLog: s,
 		}
 	case "", "standalone":
@@ -295,7 +294,10 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		governor = postgres
 	}
 	var spray *anomaly.Detector
-	if adaptiveState != nil {
+	if postgres != nil {
+		spray = anomaly.NewDistributedDetector(time.Now, anomaly.DefaultThresholds(), postgres)
+		adaptiveHealth = append(adaptiveHealth, spray)
+	} else if adaptiveState != nil {
 		spray, err = anomaly.NewPersistentDetector(time.Now, anomaly.DefaultThresholds(), adaptiveState, "spray")
 		if err != nil {
 			return nil, fmt.Errorf("gripline: spray state: %w", err)
@@ -330,7 +332,12 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 	authorities.Evidence = evStore
 	authorities.Resource = governor
 	authorities.Posture = postureAuthority
-	authorities.Adaptive = adaptiveState
+	if postgres != nil {
+		authorities.Adaptive = nil
+		authorities.AdaptiveRows = postgres
+	} else {
+		authorities.Adaptive = adaptiveState
+	}
 	authorities.Health = stateHealth
 	if state != nil {
 		authorities.Mutations, authorities.AuditSink, authorities.Audit, authorities.SecurityLog = state, state, state, state
@@ -379,7 +386,18 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		producers.NewResourceVelocityProducer(time.Now),
 		producers.NewEnumerationProducer(time.Now),
 	}
-	if adaptiveState != nil {
+	if postgres != nil {
+		producerList = []producers.Producer{
+			producers.NewDistributedSourceNoveltyProducer(time.Now, postgres),
+			producers.NewDistributedResourceVelocityProducer(time.Now, postgres),
+			producers.NewDistributedEnumerationProducer(time.Now, postgres),
+		}
+		for _, producer := range producerList {
+			if health, ok := producer.(terminator.AdaptivePersistenceHealth); ok {
+				adaptiveHealth = append(adaptiveHealth, health)
+			}
+		}
+	} else if adaptiveState != nil {
 		names := []string{"source_novelty", "resource_velocity", "enumeration"}
 		for i, name := range names {
 			snapshot, ok := producerList[i].(producers.StateSnapshotter)

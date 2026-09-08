@@ -25,9 +25,12 @@
 package anomaly
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/B-A-M-N/gripline/internal/adaptive"
 )
 
 // Spray thresholds align with the evidence table's signatures:
@@ -105,6 +108,15 @@ type Detector struct {
 	checkpointStop chan struct{}
 	checkpointDone chan struct{}
 	closeOnce      sync.Once
+	distributed    adaptive.Store
+}
+
+// NewDistributedDetector aggregates spray windows in authority-owned keyed
+// rows. It deliberately does not restore or checkpoint a whole detector map.
+func NewDistributedDetector(now func() time.Time, th Thresholds, store adaptive.Store) *Detector {
+	d := NewDetector(now, th)
+	d.distributed = store
+	return d
 }
 
 // Stats reports bounded-state pressure without exposing detector subjects.
@@ -213,6 +225,21 @@ func (d *Detector) evictColdestLocked(m map[string]*winSet, now time.Time) {
 // emission. Empty source/ASN fields are skipped (zeros never score — matches
 // lane classification semantics for unknown metadata).
 func (d *Detector) Observe(source, credentialID, asn string, now time.Time) []Signal {
+	return d.ObserveContext(context.Background(), source, credentialID, asn, now)
+}
+
+// ObserveContext is the cancellable admission path for a remote adaptive
+// authority. A PostgreSQL failure emits no synthetic signal and is exposed via
+// PersistenceError so the terminator can remain degraded rather than treating
+// missing history as clean.
+func (d *Detector) ObserveContext(ctx context.Context, source, credentialID, asn string, now time.Time) []Signal {
+	if d.distributed != nil {
+		return d.observeDistributed(ctx, source, credentialID, asn)
+	}
+	return d.observeLocal(source, credentialID, asn, now)
+}
+
+func (d *Detector) observeLocal(source, credentialID, asn string, now time.Time) []Signal {
 	if now.IsZero() {
 		now = d.now()
 	}
@@ -242,6 +269,32 @@ func (d *Detector) Observe(source, credentialID, asn string, now time.Time) []Si
 // signal when the source's distinct-invalid-pseudonym count crosses the
 // threshold and cooldown permits.
 func (d *Detector) ObserveInvalidCredential(source, candidate string, now time.Time) []Signal {
+	return d.ObserveInvalidCredentialContext(context.Background(), source, candidate, now)
+}
+
+func (d *Detector) ObserveInvalidCredentialContext(ctx context.Context, source, candidate string, now time.Time) []Signal {
+	if d.distributed != nil {
+		if source == "" || candidate == "" {
+			return nil
+		}
+		emitted, err := d.distributed.ObserveWindow(ctx, adaptive.WindowObservation{
+			Detector: "spray_invalid", Subject: source, Key: candidate,
+			Threshold: d.th.MaxInvalidPerSourceWindow, Window: d.th.Window,
+			Cooldown: d.th.Cooldown, MaxSubjects: d.th.MaxSubjects,
+			MaxKeys: d.th.MaxKeysPerSubject,
+		})
+		d.mu.Lock()
+		d.stateErr = err
+		d.mu.Unlock()
+		if err == nil && emitted {
+			return []Signal{{Code: "SOURCE_ATTEMPTING_MANY_INVALID_CREDENTIALS"}}
+		}
+		return nil
+	}
+	return d.observeInvalidLocal(source, candidate, now)
+}
+
+func (d *Detector) observeInvalidLocal(source, candidate string, now time.Time) []Signal {
 	if now.IsZero() {
 		now = d.now()
 	}
@@ -258,4 +311,35 @@ func (d *Detector) ObserveInvalidCredential(source, candidate string, now time.T
 	d.persistLocked()
 	d.mu.Unlock()
 	return nil
+}
+
+func (d *Detector) observeDistributed(ctx context.Context, source, credentialID, asn string) []Signal {
+	if credentialID == "" {
+		return nil
+	}
+	var out []Signal
+	var observedErr error
+	observe := func(detector, subject, key string, threshold int, code string) {
+		if subject == "" || key == "" {
+			return
+		}
+		emitted, err := d.distributed.ObserveWindow(ctx, adaptive.WindowObservation{
+			Detector: detector, Subject: subject, Key: key, Threshold: threshold,
+			Window: d.th.Window, Cooldown: d.th.Cooldown,
+			MaxSubjects: d.th.MaxSubjects, MaxKeys: d.th.MaxKeysPerSubject,
+		})
+		if err != nil {
+			observedErr = err
+			return
+		}
+		if emitted {
+			out = append(out, Signal{Code: code})
+		}
+	}
+	observe("spray_credential_asn", credentialID, asn, d.th.MaxASNsPerCredentialInWindow, "MORE_THAN_3_UNRELATED_ASNS_IN_10_MIN")
+	observe("spray_source_credential", source, credentialID, d.th.MaxCredentialsPerSourceWindow, "SOURCE_ATTEMPTING_MANY_UNRELATED_CREDENTIALS")
+	d.mu.Lock()
+	d.stateErr = observedErr
+	d.mu.Unlock()
+	return out
 }

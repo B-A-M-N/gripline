@@ -51,10 +51,11 @@ type Store struct {
 // adds request-correlated resource leases, credential transition receipts,
 // and the shared audit/state tables now used by the runtime. Version 3 binds
 // a request id to its resource payload. Version 4 adds node-instance fencing
-// to membership and resource leases. Keep the marker versioned even though
+// to membership and resource leases. Version 5 adds keyed adaptive windows
+// and baselines. Keep the marker versioned even though
 // the DDL below is idempotent: CREATE TABLE IF NOT EXISTS cannot add columns
 // to an already initialized database.
-const currentSchemaVersion = 4
+const currentSchemaVersion = 5
 
 var ErrMigrationRequired = errors.New("statepg: database schema requires migration")
 var ErrDSNRequired = errors.New("statepg: DSN required")
@@ -275,6 +276,34 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			data BYTEA NOT NULL,
 			updated_at TIMESTAMPTZ NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS gripline_adaptive_window_subjects (
+			detector TEXT NOT NULL,
+			subject TEXT NOT NULL,
+			last_seen_at TIMESTAMPTZ NOT NULL,
+			last_emit_at TIMESTAMPTZ,
+			PRIMARY KEY (detector, subject)
+		)`,
+		`CREATE TABLE IF NOT EXISTS gripline_adaptive_window_keys (
+			detector TEXT NOT NULL,
+			subject TEXT NOT NULL,
+			observation_key TEXT NOT NULL,
+			observed_at TIMESTAMPTZ NOT NULL,
+			PRIMARY KEY (detector, subject, observation_key),
+			FOREIGN KEY (detector, subject) REFERENCES gripline_adaptive_window_subjects(detector, subject) ON DELETE CASCADE
+		)`,
+		`CREATE INDEX IF NOT EXISTS gripline_adaptive_window_keys_expiry_idx ON gripline_adaptive_window_keys (detector, observed_at)`,
+		`CREATE TABLE IF NOT EXISTS gripline_adaptive_baselines (
+			detector TEXT NOT NULL,
+			subject TEXT NOT NULL,
+			metric TEXT NOT NULL,
+			ema DOUBLE PRECISION NOT NULL,
+			sample_count BIGINT NOT NULL,
+			last_seen_at TIMESTAMPTZ NOT NULL,
+			last_emit_at TIMESTAMPTZ,
+			PRIMARY KEY (detector, subject, metric)
+		)`,
+		`CREATE INDEX IF NOT EXISTS gripline_adaptive_window_subjects_seen_idx ON gripline_adaptive_window_subjects (detector, last_seen_at)`,
+		`CREATE INDEX IF NOT EXISTS gripline_adaptive_baselines_seen_idx ON gripline_adaptive_baselines (detector, last_seen_at)`,
 		`CREATE TABLE IF NOT EXISTS gripline_resource_buckets (
 			scope INTEGER NOT NULL,
 			scope_id TEXT NOT NULL,
@@ -411,6 +440,11 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			}
 		}
 		version = 4
+	}
+	if version == 4 {
+		// Version 5's keyed adaptive tables are created by the idempotent DDL
+		// above; advancing the marker is sufficient for existing databases.
+		version = 5
 	}
 	if version != currentSchemaVersion {
 		return fmt.Errorf("%w: unsupported migration state %d", ErrMigrationRequired, version)

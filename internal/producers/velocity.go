@@ -1,8 +1,11 @@
 package producers
 
 import (
+	"context"
 	"sync"
 	"time"
+
+	"github.com/B-A-M-N/gripline/internal/adaptive"
 )
 
 // absoluteCostFloorMicrounits is the minimum spend (in integer micro-units of a
@@ -29,6 +32,9 @@ type ResourceVelocityProducer struct {
 	alpha       float64 // EMA smoothing factor
 	cooldown    time.Duration
 	maxSubjects int
+	distributed adaptive.Store
+	stateMu     sync.Mutex
+	stateErr    error
 
 	// concurrencyBaseline tracks per-lane concurrency EMA (ScopeLane).
 	concurrencyBaseline map[string]*baseline
@@ -36,6 +42,14 @@ type ResourceVelocityProducer struct {
 	tokenBaseline map[string]*baseline
 	// costBaseline tracks per-credential cost EMA (ScopeCredential).
 	costBaseline map[string]*baseline
+}
+
+// NewDistributedResourceVelocityProducer uses authority-owned baseline rows
+// so completion observations from different nodes share one EMA.
+func NewDistributedResourceVelocityProducer(now func() time.Time, store adaptive.Store) *ResourceVelocityProducer {
+	p := NewResourceVelocityProducer(now)
+	p.distributed = store
+	return p
 }
 
 // NewResourceVelocityProducer builds a ResourceVelocityProducer.
@@ -70,6 +84,32 @@ func laneSubject(subjects SubjectContext) string {
 // Concurrency is a LANE-scoped quantity (CONCURRENCY_OVER_* → ScopeLane), so it
 // is measured per lane.
 func (p *ResourceVelocityProducer) ObserveAdmission(behavior AdmissionBehavior) []Signal {
+	return p.ObserveAdmissionContext(context.Background(), behavior)
+}
+
+func (p *ResourceVelocityProducer) ObserveAdmissionContext(ctx context.Context, behavior AdmissionBehavior) []Signal {
+	if p.distributed != nil {
+		if behavior.Subjects.CredentialID == "" || behavior.Concurrency <= 0 {
+			return nil
+		}
+		signal, err := p.distributed.ObserveBaseline(ctx, adaptive.BaselineObservation{
+			Detector: "resource_velocity", Subject: laneSubject(behavior.Subjects), Metric: "concurrency",
+			Value: float64(behavior.Concurrency), Alpha: p.alpha, Cooldown: p.cooldown,
+			Threshold4: 4, Threshold10: 10, Code4: "CONCURRENCY_OVER_4X_BASELINE",
+			Code10: "CONCURRENCY_OVER_10X_BASELINE", ConcurrencyRamp: true,
+		})
+		p.stateMu.Lock()
+		p.stateErr = err
+		p.stateMu.Unlock()
+		if err != nil || signal == "" {
+			return nil
+		}
+		return []Signal{{Code: signal}}
+	}
+	return p.observeAdmissionLocal(behavior)
+}
+
+func (p *ResourceVelocityProducer) observeAdmissionLocal(behavior AdmissionBehavior) []Signal {
 	if behavior.Subjects.CredentialID == "" {
 		return nil
 	}
@@ -140,6 +180,17 @@ func (p *ResourceVelocityProducer) checkConcurrencyVelocity(key string, value fl
 // Token velocity is LANE-scoped (TOKEN_VELOCITY_* → ScopeLane); cost velocity
 // is CREDENTIAL-scoped (COST_VELOCITY_* → ScopeCredential).
 func (p *ResourceVelocityProducer) ObserveCompletion(behavior CompletionBehavior) []Signal {
+	return p.ObserveCompletionContext(context.Background(), behavior)
+}
+
+func (p *ResourceVelocityProducer) ObserveCompletionContext(ctx context.Context, behavior CompletionBehavior) []Signal {
+	if p.distributed != nil {
+		return p.observeCompletionDistributed(ctx, behavior)
+	}
+	return p.observeCompletionLocal(behavior)
+}
+
+func (p *ResourceVelocityProducer) observeCompletionLocal(behavior CompletionBehavior) []Signal {
 	if behavior.Subjects.CredentialID == "" || !behavior.Success {
 		return nil
 	}
@@ -172,6 +223,44 @@ func (p *ResourceVelocityProducer) ObserveCompletion(behavior CompletionBehavior
 	}
 
 	return signals
+}
+
+func (p *ResourceVelocityProducer) observeCompletionDistributed(ctx context.Context, behavior CompletionBehavior) []Signal {
+	if behavior.Subjects.CredentialID == "" || !behavior.Success {
+		return nil
+	}
+	var signals []Signal
+	var observedErr error
+	observe := func(subject, metric string, value float64, code4, code10 string, floor float64) {
+		if value <= 0 {
+			return
+		}
+		signal, err := p.distributed.ObserveBaseline(ctx, adaptive.BaselineObservation{
+			Detector: "resource_velocity", Subject: subject, Metric: metric, Value: value,
+			Alpha: p.alpha, Cooldown: p.cooldown, Threshold4: 4, Threshold10: 10,
+			Code4: code4, Code10: code10, AbsoluteFloor: floor,
+		})
+		if err != nil {
+			observedErr = err
+			return
+		}
+		if signal != "" {
+			signals = append(signals, Signal{Code: signal})
+		}
+	}
+	lane := laneSubject(behavior.Subjects)
+	observe(lane, "token", float64(behavior.Actual.Combined), "TOKEN_VELOCITY_OVER_4X_BASELINE", "TOKEN_VELOCITY_OVER_10X_BASELINE", 0)
+	observe(behavior.Subjects.CredentialID, "cost", float64(behavior.Actual.Cost), "COST_VELOCITY_OVER_4X_BASELINE_AND_ABSOLUTE_FLOOR", "", absoluteCostFloorMicrounits)
+	p.stateMu.Lock()
+	p.stateErr = observedErr
+	p.stateMu.Unlock()
+	return signals
+}
+
+func (p *ResourceVelocityProducer) PersistenceError() error {
+	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
+	return p.stateErr
 }
 
 // checkVelocity updates the baseline and returns the appropriate signal code

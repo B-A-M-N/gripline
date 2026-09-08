@@ -8,6 +8,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/B-A-M-N/gripline/internal/adaptive"
 	"github.com/B-A-M-N/gripline/internal/control"
 	"github.com/B-A-M-N/gripline/internal/credential"
 	"github.com/B-A-M-N/gripline/internal/evidence"
@@ -37,16 +38,17 @@ type AdaptiveState interface {
 // only for explicitly ephemeral/test deployments; production cluster mode
 // supplies the shared PostgreSQL implementations for the authoritative paths.
 type Bundle struct {
-	Credentials credential.Registry
-	Lanes       lane.Repository
-	Evidence    evidence.Store
-	Resource    resource.ResourceAuthority
-	Posture     control.PostureAuthority
-	Mutations   control.MutationStore
-	AuditSink   control.AuditRepository
-	Audit       control.AuditRecordReader
-	SecurityLog control.SecurityTransitionReader
-	Adaptive    AdaptiveState
-	Health      Health
-	Membership  Membership
+	Credentials  credential.Registry
+	Lanes        lane.Repository
+	Evidence     evidence.Store
+	Resource     resource.ResourceAuthority
+	Posture      control.PostureAuthority
+	Mutations    control.MutationStore
+	AuditSink    control.AuditRepository
+	Audit        control.AuditRecordReader
+	SecurityLog  control.SecurityTransitionReader
+	Adaptive     AdaptiveState
+	AdaptiveRows adaptive.Store
+	Health       Health
+	Membership   Membership
 }
