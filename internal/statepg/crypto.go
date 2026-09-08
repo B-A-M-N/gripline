@@ -73,7 +73,7 @@ func (s *Store) synchronizeCryptoOnce(ctx context.Context, local CryptoIdentity)
 		return CryptoIdentity{}, retryableTransactionError(err), mapDBError(err)
 	}
 	defer tx.Rollback(ctx)
-	if err := s.requireNodeOwnership(ctx, tx, false); err != nil {
+	if err := s.requireNodeMembership(ctx, tx, false, false); err != nil {
 		return CryptoIdentity{}, false, err
 	}
 	var shared CryptoIdentity

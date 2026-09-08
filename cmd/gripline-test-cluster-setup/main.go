@@ -118,7 +118,6 @@ func resetAuthority(dsn string) {
 		gripline_resource_buckets,
 		gripline_resource_source_scopes,
 		gripline_credential_receipts,
-		gripline_credential_transitions,
 		gripline_security_transitions,
 		gripline_admission_audit,
 		gripline_lane_operator_audit,

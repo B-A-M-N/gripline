@@ -72,7 +72,7 @@ func (s *Store) registerNodeOnce(ctx context.Context) (string, int64, error) {
 	// is being replaced is checked above; other live nodes must still agree on
 	// the exact authority layout this process will use.
 	rows, err := tx.Query(ctx, `SELECT protocol_version, schema_version FROM gripline_membership
-		WHERE node_id <> $1 AND state IN ('ready','draining') AND last_seen_at > $2 - ($3 * interval '1 second')`, s.nodeID, now, int64(s.leaseTTL/time.Second))
+		WHERE node_id <> $1 AND state IN ('ready','draining') AND last_seen_at > $2::timestamptz - ($3::double precision * interval '1 second')`, s.nodeID, now, int64(s.leaseTTL/time.Second))
 	if err != nil {
 		return "", 0, mapDBError(err)
 	}
@@ -160,10 +160,17 @@ func (s *Store) heartbeatNode(ctx context.Context) error {
 // process cannot pass an ownership check and then create or mutate state after
 // its node ID has been acquired by a new instance.
 func (s *Store) requireNodeOwnership(ctx context.Context, tx pgx.Tx, allowDraining bool) error {
+	return s.requireNodeMembership(ctx, tx, allowDraining, true)
+}
+
+// requireNodeMembership validates the fenced node instance before crypto
+// identity synchronization. That first binding cannot use the normal serving
+// guard because serving ownership intentionally requires cryptoReady.
+func (s *Store) requireNodeMembership(ctx context.Context, tx pgx.Tx, allowDraining, requireCrypto bool) error {
 	if s.nodeID == "" {
 		return nil
 	}
-	if !s.cryptoReady.Load() {
+	if requireCrypto && !s.cryptoReady.Load() {
 		return errors.New("statepg: cluster crypto identity is not synchronized")
 	}
 	if s.fenced.Load() {
