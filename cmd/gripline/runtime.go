@@ -109,72 +109,6 @@ type Runtime struct {
 // controlService returns the admin control-plane service (test/CLI seam).
 func (rt *Runtime) controlService() *control.Service { return rt.AdminService }
 
-// Ready reports whether the runtime can actually serve: the authorities are
-// constructed (guaranteed by BuildRuntime returning) and, when state-backed,
-// the Bolt database answers a probe read. A /readyz handler that only echoes a
-// static flag is a lie — this is the check behind the endpoint (P1-24).
-func (rt *Runtime) Ready() error {
-	if rt.StateHealth != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		err := rt.StateHealth.Ready(ctx)
-		if err != nil {
-			return fmt.Errorf("gripline: state authority not ready: %w", err)
-		}
-		if rt.Postgres != nil {
-			if err := rt.Postgres.CryptoReady(ctx); err != nil {
-				return fmt.Errorf("gripline: cluster crypto not ready: %w", err)
-			}
-		}
-		if rt.PolicyHealth != nil {
-			if err := rt.PolicyHealth.Ready(ctx); err != nil {
-				return fmt.Errorf("gripline: policy authority not ready: %w", err)
-			}
-		}
-	} else {
-		// Compatibility for hand-built Runtime values from older embedders.
-		if rt.State != nil {
-			if err := rt.State.Ping(); err != nil {
-				return fmt.Errorf("gripline: state store not ready: %w", err)
-			}
-		}
-		if rt.Postgres != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancel()
-			if err := rt.Postgres.Ready(ctx); err != nil {
-				return fmt.Errorf("gripline: postgres authority not ready: %w", err)
-			}
-			if err := rt.Postgres.CryptoReady(ctx); err != nil {
-				return fmt.Errorf("gripline: cluster crypto not ready: %w", err)
-			}
-		}
-		if rt.PolicyHealth != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			err := rt.PolicyHealth.Ready(ctx)
-			cancel()
-			if err != nil {
-				return fmt.Errorf("gripline: policy authority not ready: %w", err)
-			}
-		}
-	}
-	for _, health := range rt.adaptiveHealth {
-		if health != nil && health.PersistenceError() != nil {
-			return fmt.Errorf("gripline: adaptive state checkpoint unavailable")
-		}
-	}
-	return nil
-}
-
-// MarkDraining withdraws this node from cluster readiness before HTTP
-// shutdown. Existing handlers remain able to renew and settle their leases
-// while the load balancer stops sending new work.
-func (rt *Runtime) MarkDraining(ctx context.Context, until time.Time) error {
-	if rt == nil || rt.Authorities.Membership == nil {
-		return nil
-	}
-	return rt.Authorities.Membership.MarkDraining(ctx, until)
-}
-
 // BuildRuntime constructs the full application from configuration.
 // P0.1 fix: Every authority is instantiated exactly once and shared.
 func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
@@ -794,23 +728,6 @@ func loadPepperRing(cfg *config.Config) (*credential.PepperRing, error) {
 		return nil, fmt.Errorf("gripline: verifier pepper ring: %w", err)
 	}
 	return ring, nil
-}
-
-// Close releases the runtime's resources exactly once (P1.23). Errors from
-// individual closers are aggregated.
-func (rt *Runtime) Close() error {
-	rt.closeOnce.Do(func() {
-		var errs []error
-		for i := len(rt.closers) - 1; i >= 0; i-- {
-			if err := rt.closers[i](); err != nil {
-				errs = append(errs, err)
-			}
-		}
-		if len(errs) > 0 {
-			rt.closeErr = fmt.Errorf("gripline: close errors: %w", errors.Join(errs...))
-		}
-	})
-	return rt.closeErr
 }
 
 type adminPolicySnapshot struct {
