@@ -216,20 +216,6 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		return nil, fmt.Errorf("gripline: paths.signer_keyring is required (deployment.allow_ephemeral_state is false; set it only for development)")
 	}
 
-	// P0.2-fix: when a state DB is configured it is the SINGLE security
-	// authority — credentials, lanes, evidence, operator audit, and posture
-	// all live behind one transactional write path. A second persistence
-	// authority (the legacy Gob evidence file) must not silently split
-	// security state across databases.
-	var reg credential.Registry
-	var lanes lane.Repository
-	var evStore evidence.Store
-	var state *statebolt.Store
-	var postgres *statepg.Store
-	var stateHealth StateHealth
-	var authorities authority.Bundle
-	var adminState adminStateAuthority
-	var adaptiveState adaptiveStateAuthority
 	connectTimeout := cfg.Authority.ConnectTimeout.D()
 	if connectTimeout <= 0 {
 		connectTimeout = 10 * time.Second
@@ -238,68 +224,20 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 	if operationTimeout <= 0 {
 		operationTimeout = 2 * time.Second
 	}
-	switch strings.ToLower(strings.TrimSpace(cfg.Authority.Backend)) {
-	case "postgres":
-		dsn := os.Getenv(cfg.Authority.DSNEnv)
-		if dsn == "" {
-			return nil, fmt.Errorf("gripline: authority DSN environment variable %q is empty", cfg.Authority.DSNEnv)
-		}
-		connectCtx, connectCancel := context.WithTimeout(context.Background(), connectTimeout)
-		s, err := statepg.Open(connectCtx, statepg.Options{
-			DSN: dsn, MaxConns: cfg.Authority.MaxConns, MinConns: cfg.Authority.MinConns,
-			NodeID: cfg.Authority.NodeID, LeaseTTL: cfg.Authority.LeaseTTL.D(), RenewEvery: cfg.Authority.RenewEvery.D(), MaxSourceScopes: cfg.Server.MaxSourceScopes, SourceScopeIdle: cfg.Server.SourceScopeIdle.D(),
-			ConnectTimeout: connectTimeout, OperationTimeout: operationTimeout,
-			Migrate: false,
-		})
-		connectCancel()
-		if err != nil {
-			return nil, fmt.Errorf("gripline: postgres authority: %w", err)
-		}
-		postgres = s
-		stateHealth = s
-		closers = append(closers, func() error { s.Close(); return nil })
-		reg = s
-		lanes = s
-		evStore = s
-		adminState = s
-		authorities = authority.Bundle{
-			Credentials: s, Lanes: s, Evidence: s, AdaptiveRows: s, Health: s, Membership: s,
-			Posture: s, Mutations: s, AuditSink: s, Audit: s, SecurityLog: s,
-		}
-	case "", "standalone":
-		if cfg.Paths.State != "" {
-			if cfg.Paths.Evidence != "" {
-				return nil, fmt.Errorf("gripline: paths.evidence must be empty when paths.state is configured: the Bolt state database is the single evidence authority (P0.2)")
-			}
-			s, err := statebolt.Open(cfg.Paths.State, statebolt.Options{})
-			if err != nil {
-				return nil, fmt.Errorf("gripline: state db: %w", err)
-			}
-			state = s
-			stateHealth = s
-			closers = append(closers, func() error { return s.Close() })
-			// Sweep expired evidence that no longer has a live traffic subject. The
-			// stop function is appended after the DB close function so close order
-			// joins the worker before releasing the database (P1-14).
-			closers = append(closers, startStateMaintenance(s))
-			reg = s
-			lanes = s   // durable lane.Repository (P0.10)
-			evStore = s // durable evidence.Store (P0.2-fix)
-			adminState = s
-			adaptiveState = s
-			authorities = authority.Bundle{
-				Credentials: s, Lanes: s, Evidence: s, Adaptive: s, Health: s,
-				Posture: s, Mutations: s, AuditSink: s, Audit: s, SecurityLog: s,
-			}
-		} else {
-			reg = credential.NewMemoryRegistry()
-			lanes = lane.NewStore(nil, time.Now)
-			evStore = evidence.NewMemoryStore()
-			authorities = authority.Bundle{Credentials: reg, Lanes: lanes, Evidence: evStore}
-		}
-	default:
-		return nil, fmt.Errorf("gripline: unsupported authority backend %q", cfg.Authority.Backend)
+	authoritySet, authorityClosers, err := openRuntimeAuthorities(cfg, connectTimeout, operationTimeout)
+	if err != nil {
+		return nil, err
 	}
+	closers = append(closers, authorityClosers...)
+	reg := authoritySet.registry
+	lanes := authoritySet.lanes
+	evStore := authoritySet.evidence
+	state := authoritySet.state
+	postgres := authoritySet.postgres
+	stateHealth := authoritySet.stateHealth
+	authorities := authoritySet.authorities
+	adminState := authoritySet.adminState
+	adaptiveState := authoritySet.adaptiveState
 	if cfg.Deployment.AllowEphemeralState {
 		if err := bootstrapCredentials(reg); err != nil {
 			return nil, err
