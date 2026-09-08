@@ -69,7 +69,41 @@ func (s *Store) LoadPostureContext(ctx context.Context) (control.Posture, error)
 
 // PostureContext implements control.PostureAuthority.
 func (s *Store) PostureContext(ctx context.Context) (control.Posture, error) {
-	return s.LoadPostureContext(ctx)
+	if s.nodeID == "" {
+		return s.LoadPostureContext(ctx)
+	}
+	if err := ctx.Err(); err != nil {
+		return control.Normal, err
+	}
+	var raw int
+	var state string
+	var lastSeen, now time.Time
+	err := s.pool.QueryRow(ctx, `SELECT COALESCE(p.posture,0), m.state, m.last_seen_at,
+		CURRENT_TIMESTAMP FROM gripline_membership m LEFT JOIN gripline_operator_posture p
+		ON p.singleton=TRUE WHERE m.node_id=$1 AND m.instance_id=$2 AND m.node_epoch=$3`,
+		s.nodeID, s.instanceID, s.nodeEpoch).Scan(&raw, &state, &lastSeen, &now)
+	if errors.Is(err, pgx.ErrNoRows) {
+		s.fenced.Store(true)
+		return control.Normal, ErrNodeFenced
+	}
+	if err != nil {
+		return control.Normal, mapDBError(err)
+	}
+	if now.Sub(lastSeen) >= s.leaseTTL {
+		s.fenced.Store(true)
+		return control.Normal, ErrNodeFenced
+	}
+	if state == "draining" {
+		return control.Normal, ErrNodeDraining
+	}
+	if state != "ready" {
+		s.fenced.Store(true)
+		return control.Normal, ErrNodeFenced
+	}
+	if raw < int(control.Normal) || raw > int(control.EmergencyLockdown) {
+		return control.Normal, fmt.Errorf("statepg: unknown persisted posture %d", raw)
+	}
+	return control.Posture(raw), nil
 }
 
 func (s *Store) LoadPosture() (control.Posture, error) {

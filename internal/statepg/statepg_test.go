@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/B-A-M-N/gripline/internal/authority"
 	"github.com/B-A-M-N/gripline/internal/control"
 	"github.com/B-A-M-N/gripline/internal/credential"
 	"github.com/B-A-M-N/gripline/internal/evidence"
@@ -36,6 +37,20 @@ func TestSharedAuthorityInterfaceConformance(t *testing.T) {
 	var _ resource.ResourceAuthority = (*Store)(nil)
 	var _ resource.DistributedAuthority = (*Store)(nil)
 	var _ resource.RequestDistributedAuthority = (*Store)(nil)
+	var _ authority.Membership = (*Store)(nil)
+}
+
+func TestMembershipStateClassification(t *testing.T) {
+	for _, state := range []string{"ready", "draining"} {
+		if !isLiveMembershipState(state) {
+			t.Fatalf("%q should be live for takeover protection", state)
+		}
+	}
+	for _, state := range []string{"stopped", ""} {
+		if isLiveMembershipState(state) {
+			t.Fatalf("%q should not block a replacement instance", state)
+		}
+	}
 }
 
 func TestResourceLeaseRefundRequiresUnforwardedState(t *testing.T) {

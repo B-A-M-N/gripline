@@ -84,6 +84,9 @@ func (s *Store) provisionDistributedOnce(ctx context.Context, requestID, fingerp
 	if err != nil {
 		return nil, err
 	}
+	if err := s.requireNodeOwnership(ctx, tx, false); err != nil {
+		return nil, err
+	}
 	leaseID, err := newLeaseID()
 	if err != nil {
 		return nil, err
@@ -93,13 +96,14 @@ func (s *Store) provisionDistributedOnce(ctx context.Context, requestID, fingerp
 		requestID = leaseID
 	} else {
 		var existingID, existingNode, existingState, existingFingerprint string
+		var existingEpoch int64
 		var existingExpiry time.Time
-		err := tx.QueryRow(ctx, `SELECT lease_id, node_id, state, expires_at, request_fingerprint FROM gripline_resource_leases WHERE request_id=$1`, requestID).Scan(&existingID, &existingNode, &existingState, &existingExpiry, &existingFingerprint)
+		err := tx.QueryRow(ctx, `SELECT lease_id, node_id, node_epoch, state, expires_at, request_fingerprint FROM gripline_resource_leases WHERE request_id=$1`, requestID).Scan(&existingID, &existingNode, &existingEpoch, &existingState, &existingExpiry, &existingFingerprint)
 		if err == nil {
 			if existingFingerprint != "" && existingFingerprint != fingerprint {
 				return nil, ErrRequestConflict
 			}
-			if existingNode != s.nodeID {
+			if existingNode != s.nodeID || existingEpoch != s.nodeEpoch {
 				return nil, ErrLeaseOwner
 			}
 			if existingState == leaseReleased || !existingExpiry.After(now) {
@@ -111,7 +115,7 @@ func (s *Store) provisionDistributedOnce(ctx context.Context, requestID, fingerp
 			return nil, mapDBError(err)
 		}
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO gripline_resource_leases (lease_id, request_id, request_fingerprint, node_id, state, expires_at, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7)`, leaseID, requestID, fingerprint, s.nodeID, leaseReserved, expiresAt, now); err != nil {
+	if _, err := tx.Exec(ctx, `INSERT INTO gripline_resource_leases (lease_id, request_id, request_fingerprint, node_id, node_epoch, state, expires_at, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, leaseID, requestID, fingerprint, s.nodeID, s.nodeEpoch, leaseReserved, expiresAt, now); err != nil {
 		return nil, mapDBError(err)
 	}
 	orderedScopes := append([]resource.ScopeSpec(nil), scopes...)
@@ -374,8 +378,11 @@ func (r *distributedReservation) MarkForwarded(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if err := r.store.requireNodeOwnership(ctx, tx, false); err != nil {
+		return err
+	}
 	var expires time.Time
-	err = tx.QueryRow(ctx, `UPDATE gripline_resource_leases SET state=$1, forwarded_at=$2 WHERE lease_id=$3 AND node_id=$4 AND state=$5 AND expires_at>$2 RETURNING expires_at`, leaseForwarded, now, r.leaseID, r.store.nodeID, leaseReserved).Scan(&expires)
+	err = tx.QueryRow(ctx, `UPDATE gripline_resource_leases SET state=$1, forwarded_at=$2 WHERE lease_id=$3 AND node_id=$4 AND node_epoch=$5 AND state=$6 AND expires_at>$2 RETURNING expires_at`, leaseForwarded, now, r.leaseID, r.store.nodeID, r.store.nodeEpoch, leaseReserved).Scan(&expires)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrLeaseExpired
 	}
@@ -404,8 +411,11 @@ func (r *distributedReservation) Renew(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if err := r.store.requireNodeOwnership(ctx, tx, true); err != nil {
+		return err
+	}
 	var expires time.Time
-	err = tx.QueryRow(ctx, `UPDATE gripline_resource_leases SET expires_at=$1 WHERE lease_id=$2 AND node_id=$3 AND state IN ($4,$5) AND expires_at>$6 RETURNING expires_at`, now.Add(r.store.leaseTTL), r.leaseID, r.store.nodeID, leaseReserved, leaseForwarded, now).Scan(&expires)
+	err = tx.QueryRow(ctx, `UPDATE gripline_resource_leases SET expires_at=$1 WHERE lease_id=$2 AND node_id=$3 AND node_epoch=$4 AND state IN ($5,$6) AND expires_at>$7 RETURNING expires_at`, now.Add(r.store.leaseTTL), r.leaseID, r.store.nodeID, r.store.nodeEpoch, leaseReserved, leaseForwarded, now).Scan(&expires)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrLeaseExpired
 	}
@@ -434,9 +444,12 @@ func (r *distributedReservation) SettleContext(ctx context.Context, actual resou
 	if err != nil {
 		return err
 	}
+	if err := r.store.requireNodeOwnership(ctx, tx, true); err != nil {
+		return err
+	}
 	var state string
 	var expires time.Time
-	err = tx.QueryRow(ctx, `SELECT state, expires_at FROM gripline_resource_leases WHERE lease_id=$1 AND node_id=$2 FOR UPDATE`, r.leaseID, r.store.nodeID).Scan(&state, &expires)
+	err = tx.QueryRow(ctx, `SELECT state, expires_at FROM gripline_resource_leases WHERE lease_id=$1 AND node_id=$2 AND node_epoch=$3 FOR UPDATE`, r.leaseID, r.store.nodeID, r.store.nodeEpoch).Scan(&state, &expires)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrLeaseOwner
 	}
@@ -534,7 +547,7 @@ func (r *distributedReservation) Release() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := releaseLease(ctx, r.store, r.leaseID, r.store.nodeID); err == nil {
+	if err := releaseLease(ctx, r.store, r.leaseID, r.store.nodeID, r.store.nodeEpoch); err == nil {
 		r.released = true
 	}
 }
@@ -545,7 +558,7 @@ func (r *distributedReservation) ExpiresAt() time.Time {
 	return r.expiresAt
 }
 
-func releaseLease(ctx context.Context, s *Store, leaseID, nodeID string) error {
+func releaseLease(ctx context.Context, s *Store, leaseID, nodeID string, nodeEpoch int64) error {
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return mapDBError(err)
@@ -555,8 +568,11 @@ func releaseLease(ctx context.Context, s *Store, leaseID, nodeID string) error {
 	if err != nil {
 		return err
 	}
+	if err := s.requireNodeOwnership(ctx, tx, true); err != nil {
+		return err
+	}
 	var state string
-	err = tx.QueryRow(ctx, `SELECT state FROM gripline_resource_leases WHERE lease_id=$1 AND node_id=$2 FOR UPDATE`, leaseID, nodeID).Scan(&state)
+	err = tx.QueryRow(ctx, `SELECT state FROM gripline_resource_leases WHERE lease_id=$1 AND node_id=$2 AND node_epoch=$3 FOR UPDATE`, leaseID, nodeID, nodeEpoch).Scan(&state)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil
 	}

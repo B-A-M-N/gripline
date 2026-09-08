@@ -281,6 +281,13 @@ func run(cfgPath string) (retErr error) {
 		log.Printf("gripline: %v received — draining", s)
 		ready.Store(false)
 	}
+	if rt.Authorities.Membership != nil {
+		drainCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := rt.MarkDraining(drainCtx, time.Now().Add(30*time.Second)); err != nil {
+			lifecycleErr = errors.Join(lifecycleErr, fmt.Errorf("gripline: mark draining: %w", err))
+		}
+		cancel()
+	}
 
 	// Give each server its own bounded shutdown context. This lets a stuck
 	// admin handler consume its own budget without preventing the data plane

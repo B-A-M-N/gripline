@@ -134,6 +134,16 @@ func (rt *Runtime) Ready() error {
 	return nil
 }
 
+// MarkDraining withdraws this node from cluster readiness before HTTP
+// shutdown. Existing handlers remain able to renew and settle their leases
+// while the load balancer stops sending new work.
+func (rt *Runtime) MarkDraining(ctx context.Context, until time.Time) error {
+	if rt == nil || rt.Authorities.Membership == nil {
+		return nil
+	}
+	return rt.Authorities.Membership.MarkDraining(ctx, until)
+}
+
 // BuildRuntime constructs the full application from configuration.
 // P0.1 fix: Every authority is instantiated exactly once and shared.
 func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
@@ -211,7 +221,7 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		adminState = s
 		adaptiveState = s
 		authorities = authority.Bundle{
-			Credentials: s, Lanes: s, Evidence: s, Adaptive: s, Health: s,
+			Credentials: s, Lanes: s, Evidence: s, Adaptive: s, Health: s, Membership: s,
 			Posture: s, Mutations: s, AuditSink: s, Audit: s, SecurityLog: s,
 		}
 	case "", "standalone":

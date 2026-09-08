@@ -6,6 +6,7 @@ package authority
 
 import (
 	"context"
+	"time"
 
 	"github.com/B-A-M-N/gripline/internal/control"
 	"github.com/B-A-M-N/gripline/internal/credential"
@@ -17,6 +18,11 @@ import (
 // Health is the bounded readiness probe for the selected state authority.
 type Health interface {
 	Ready(context.Context) error
+}
+
+// Membership is the lifecycle seam for a node's shared ownership row.
+type Membership interface {
+	MarkDraining(context.Context, time.Time) error
 }
 
 // AdaptiveState is the checkpoint seam for adaptive detectors. Adaptive state
@@ -42,4 +48,5 @@ type Bundle struct {
 	SecurityLog control.SecurityTransitionReader
 	Adaptive    AdaptiveState
 	Health      Health
+	Membership  Membership
 }

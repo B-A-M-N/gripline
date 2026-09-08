@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -35,6 +36,9 @@ type Store struct {
 	pool            *pgxpool.Pool
 	now             func() time.Time
 	nodeID          string
+	instanceID      string
+	nodeEpoch       int64
+	fenced          atomic.Bool
 	leaseTTL        time.Duration
 	maxSourceScopes int
 	leaseStop       chan struct{}
@@ -46,10 +50,11 @@ type Store struct {
 // Schema version 1 is the original clustered-authority layout. Version 2
 // adds request-correlated resource leases, credential transition receipts,
 // and the shared audit/state tables now used by the runtime. Version 3 binds
-// a request id to its resource payload. Keep the marker versioned even though
+// a request id to its resource payload. Version 4 adds node-instance fencing
+// to membership and resource leases. Keep the marker versioned even though
 // the DDL below is idempotent: CREATE TABLE IF NOT EXISTS cannot add columns
 // to an already initialized database.
-const currentSchemaVersion = 3
+const currentSchemaVersion = 4
 
 var ErrMigrationRequired = errors.New("statepg: database schema requires migration")
 var ErrDSNRequired = errors.New("statepg: DSN required")
@@ -291,6 +296,7 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			request_id TEXT NOT NULL UNIQUE,
 			request_fingerprint TEXT NOT NULL DEFAULT '',
 			node_id TEXT NOT NULL,
+			node_epoch BIGINT NOT NULL DEFAULT 0,
 			state TEXT NOT NULL,
 			expires_at TIMESTAMPTZ NOT NULL,
 			created_at TIMESTAMPTZ NOT NULL,
@@ -318,6 +324,8 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 		)`,
 		`CREATE TABLE IF NOT EXISTS gripline_membership (
 			node_id TEXT PRIMARY KEY,
+			instance_id TEXT NOT NULL DEFAULT '',
+			node_epoch BIGINT NOT NULL DEFAULT 0,
 			protocol_version INTEGER NOT NULL,
 			schema_version INTEGER NOT NULL,
 			state TEXT NOT NULL,
@@ -391,6 +399,18 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			return fmt.Errorf("statepg: migrate resource request fingerprint: %w", mapDBError(err))
 		}
 		version = 3
+	}
+	if version == 3 {
+		for _, statement := range []string{
+			`ALTER TABLE gripline_membership ADD COLUMN IF NOT EXISTS instance_id TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE gripline_membership ADD COLUMN IF NOT EXISTS node_epoch BIGINT NOT NULL DEFAULT 0`,
+			`ALTER TABLE gripline_resource_leases ADD COLUMN IF NOT EXISTS node_epoch BIGINT NOT NULL DEFAULT 0`,
+		} {
+			if _, err := tx.Exec(ctx, statement); err != nil {
+				return fmt.Errorf("statepg: migrate node fencing: %w", mapDBError(err))
+			}
+		}
+		version = 4
 	}
 	if version != currentSchemaVersion {
 		return fmt.Errorf("%w: unsupported migration state %d", ErrMigrationRequired, version)
