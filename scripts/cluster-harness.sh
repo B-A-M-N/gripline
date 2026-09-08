@@ -364,14 +364,20 @@ old_response="$(curl -fsS "http://127.0.0.1:${lb_port}/v1/messages" -H "Authoriz
 printf '%s\n' "$old_response" | rg -q '"policy_revision":1'
 printf '%s\n' "$old_response" | rg -q '"policy_epoch":1'
 prepare_payload="$(printf '{"artifact":%s,"reason":"cluster policy canary"}' "$candidate")"
+missing_policy_operation_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((base + 20))/admin/policy/prepare" \
+	-H "Authorization: Bearer ${operator_token}" -H 'Content-Type: application/json' \
+	--data "$prepare_payload")"
+test "$missing_policy_operation_code" = 400
 prepare_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((base + 20))/admin/policy/prepare" \
 	-H "Authorization: Bearer ${operator_token}" -H 'Content-Type: application/json' \
+	-H 'Idempotency-Key: cluster-policy-prepare' \
 	--data "$prepare_payload")"
 test "$prepare_code" = 200
 activate_code=400
 for _ in $(seq 1 120); do
 	activate_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((base + 20))/admin/policy/activate" \
 		-H "Authorization: Bearer ${operator_token}" -H 'Content-Type: application/json' \
+		-H 'Idempotency-Key: cluster-policy-activate' \
 		--data '{"reason":"cluster policy canary"}')"
 	if [[ "$activate_code" == "200" ]]; then
 		break
@@ -393,6 +399,7 @@ for port in $((base + 10)) $((base + 11)) $((base + 12)); do
 done
 rollback_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((base + 20))/admin/policy/rollback" \
 	-H "Authorization: Bearer ${operator_token}" -H 'Content-Type: application/json' \
+	-H 'Idempotency-Key: cluster-policy-rollback' \
 	--data '{"revision":1,"reason":"cluster rollback canary"}')"
 test "$rollback_code" = 200
 printf '3\n' >"$policy_epoch_file"

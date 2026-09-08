@@ -4,9 +4,24 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+)
+
+var (
+	// ErrOperationIDRequired is returned by a clustered policy manager when a
+	// lifecycle mutation does not carry a client-owned replay key.
+	ErrOperationIDRequired = errors.New("policy: idempotency key required")
+	// ErrOperationIDUnsupported means the manager was configured to require
+	// replay-safe mutations without an operation-aware durable hook.
+	ErrOperationIDUnsupported = errors.New("policy: idempotency authority unavailable")
+	// ErrOperationNotReplayable is returned by a durable transition hook when
+	// an operation ID was not previously committed and the requested lifecycle
+	// state is no longer applicable. It lets the manager preserve its normal
+	// domain error without hiding authority failures.
+	ErrOperationNotReplayable = errors.New("policy: operation is not replayable")
 )
 
 // Manager owns the policy lifecycle at the control-plane boundary. A policy
@@ -14,25 +29,27 @@ import (
 // activation. The data plane receives immutable CompiledPolicy snapshots and
 // never observes a partially loaded candidate.
 type Manager struct {
-	mu                       sync.Mutex
-	current                  *CompiledPolicy
-	candidate                *CompiledPolicy
-	knownGood                map[int]*CompiledPolicy
-	activationEpoch          uint64
-	persist                  func(Manifest) error
-	persistContext           func(context.Context, Manifest) error
-	audit                    func(Event) error
-	auditContext             func(context.Context, Event) error
-	persistArtifact          func(*CompiledPolicy) error
-	persistArtifactContext   func(context.Context, *CompiledPolicy) error
-	persistTransition        func(Manifest, Event) error
-	persistTransitionContext func(context.Context, Manifest, Event) error
-	loadManifest             func() (Manifest, error)
-	loadManifestContext      func(context.Context) (Manifest, error)
-	loadArtifact             func(PolicyRef) (*CompiledPolicy, error)
-	loadArtifactContext      func(context.Context, PolicyRef) (*CompiledPolicy, error)
-	acknowledgeContext       func(context.Context, Manifest) error
-	lastRevision             int
+	mu                                sync.Mutex
+	current                           *CompiledPolicy
+	candidate                         *CompiledPolicy
+	knownGood                         map[int]*CompiledPolicy
+	activationEpoch                   uint64
+	persist                           func(Manifest) error
+	persistContext                    func(context.Context, Manifest) error
+	audit                             func(Event) error
+	auditContext                      func(context.Context, Event) error
+	persistArtifact                   func(*CompiledPolicy) error
+	persistArtifactContext            func(context.Context, *CompiledPolicy) error
+	persistTransition                 func(Manifest, Event) error
+	persistTransitionContext          func(context.Context, Manifest, Event) error
+	persistTransitionOperationContext func(context.Context, Manifest, Event, string) error
+	requireOperationIDs               bool
+	loadManifest                      func() (Manifest, error)
+	loadManifestContext               func(context.Context) (Manifest, error)
+	loadArtifact                      func(PolicyRef) (*CompiledPolicy, error)
+	loadArtifactContext               func(context.Context, PolicyRef) (*CompiledPolicy, error)
+	acknowledgeContext                func(context.Context, Manifest) error
+	lastRevision                      int
 	// published is the immutable data-plane view. A nil pointer means the
 	// durable authority could not be reconciled and admissions must fail closed.
 	published atomic.Pointer[Snapshot]
@@ -98,6 +115,14 @@ type Options struct {
 	// Persist/Audit remain supported for small integrations and tests.
 	PersistTransition        func(Manifest, Event) error
 	PersistTransitionContext func(context.Context, Manifest, Event) error
+	// PersistTransitionOperationContext is the clustered variant. The
+	// implementation must claim operationID in the same transaction as the
+	// manifest and audit event, returning success for an exact replay.
+	PersistTransitionOperationContext func(context.Context, Manifest, Event, string) error
+	// RequireOperationIDs makes every lifecycle mutation replay-safe. It is
+	// enabled by the PostgreSQL runtime and intentionally off for standalone
+	// compatibility callers.
+	RequireOperationIDs bool
 	// Initialize is a create-only durable hook for the first clustered boot.
 	// It must never replace an existing manifest. NewManager rereads the
 	// manifest after this hook and rejects a different active policy.
@@ -127,23 +152,25 @@ func NewManagerContext(ctx context.Context, initial *Policy, opts Options) (*Man
 		return nil, err
 	}
 	m := &Manager{
-		current:                  compiled,
-		knownGood:                map[int]*CompiledPolicy{compiled.Revision: compiled},
-		persist:                  opts.Persist,
-		persistContext:           opts.PersistContext,
-		audit:                    opts.Audit,
-		auditContext:             opts.AuditContext,
-		persistArtifact:          opts.PersistArtifact,
-		persistArtifactContext:   opts.PersistArtifactContext,
-		persistTransition:        opts.PersistTransition,
-		persistTransitionContext: opts.PersistTransitionContext,
-		loadManifest:             opts.LoadManifest,
-		loadManifestContext:      opts.LoadManifestContext,
-		loadArtifact:             opts.LoadArtifact,
-		loadArtifactContext:      opts.LoadArtifactContext,
-		acknowledgeContext:       opts.AcknowledgeContext,
-		lastRevision:             compiled.Revision,
-		activationEpoch:          1,
+		current:                           compiled,
+		knownGood:                         map[int]*CompiledPolicy{compiled.Revision: compiled},
+		persist:                           opts.Persist,
+		persistContext:                    opts.PersistContext,
+		audit:                             opts.Audit,
+		auditContext:                      opts.AuditContext,
+		persistArtifact:                   opts.PersistArtifact,
+		persistArtifactContext:            opts.PersistArtifactContext,
+		persistTransition:                 opts.PersistTransition,
+		persistTransitionContext:          opts.PersistTransitionContext,
+		persistTransitionOperationContext: opts.PersistTransitionOperationContext,
+		requireOperationIDs:               opts.RequireOperationIDs,
+		loadManifest:                      opts.LoadManifest,
+		loadManifestContext:               opts.LoadManifestContext,
+		loadArtifact:                      opts.LoadArtifact,
+		loadArtifactContext:               opts.LoadArtifactContext,
+		acknowledgeContext:                opts.AcknowledgeContext,
+		lastRevision:                      compiled.Revision,
+		activationEpoch:                   1,
 	}
 	if m.hasManifestLoader() {
 		manifest, loadErr := m.loadManifestWithContext(ctx)
@@ -266,6 +293,14 @@ func NewManagerContext(ctx context.Context, initial *Policy, opts Options) (*Man
 
 func samePolicyRef(a, b PolicyRef) bool {
 	return a.ID == b.ID && a.Revision == b.Revision && a.Digest == b.Digest
+}
+
+func policyRefOf(compiled *CompiledPolicy) PolicyRef {
+	if compiled == nil {
+		return PolicyRef{}
+	}
+	digest, _ := Digest(&compiled.Policy)
+	return PolicyRef{ID: compiled.ID, Revision: compiled.Revision, Digest: digest}
 }
 
 // Ready verifies that this process has a usable policy snapshot and, when a
@@ -588,8 +623,20 @@ func (m *Manager) PrepareContext(ctx context.Context, p *Policy) (*CompiledPolic
 
 // PrepareByContext is the context-aware policy preparation operation.
 func (m *Manager) PrepareByContext(ctx context.Context, p *Policy, actor, reason string) (*CompiledPolicy, error) {
+	return m.PrepareByContextWithOperationID(ctx, p, actor, reason, "")
+}
+
+// PrepareByContextWithOperationID is the replay-safe clustered policy
+// preparation operation. The operation ID is committed with the manifest
+// transition by the configured durable authority.
+func (m *Manager) PrepareByContextWithOperationID(ctx context.Context, p *Policy, actor, reason, operationID string) (*CompiledPolicy, error) {
 	if m == nil {
 		return nil, errors.New("policy: nil manager")
+	}
+	var err error
+	operationID, err = m.normalizeOperationID(operationID)
+	if err != nil {
+		return nil, err
 	}
 	ctx = usableContext(ctx)
 	compiled, err := Compile(p)
@@ -600,6 +647,17 @@ func (m *Manager) PrepareByContext(ctx context.Context, p *Policy, actor, reason
 	defer m.mu.Unlock()
 	if err := m.refreshDurableLocked(ctx); err != nil {
 		return nil, err
+	}
+	if m.candidate != nil && samePolicyRef(policyRefOf(m.candidate), policyRefOf(compiled)) && operationID != "" && m.persistTransitionOperationContext != nil {
+		manifest, err := m.manifestLocked(m.current, m.candidate)
+		if err != nil {
+			return nil, err
+		}
+		event := Event{Action: "prepare", Actor: actor, FromRevision: m.current.Revision, ToRevision: compiled.Revision, FromEpoch: m.activationEpoch, ToEpoch: m.activationEpoch, PolicyID: compiled.ID, Reason: reason, At: manifest.UpdatedAt}
+		if err := m.commitLocked(ctx, manifest, event, operationID); err != nil {
+			return nil, err
+		}
+		return compiled, nil
 	}
 	if compiled.Revision <= m.lastRevision {
 		return nil, fmt.Errorf("policy: revision %d is not newer than %d", compiled.Revision, m.lastRevision)
@@ -614,7 +672,7 @@ func (m *Manager) PrepareByContext(ctx context.Context, p *Policy, actor, reason
 		return nil, err
 	}
 	event := Event{Action: "prepare", Actor: actor, FromRevision: m.current.Revision, ToRevision: compiled.Revision, FromEpoch: m.activationEpoch, ToEpoch: manifest.ActivationEpoch, PolicyID: compiled.ID, Reason: reason, At: manifest.UpdatedAt}
-	if err := m.commitLocked(ctx, manifest, event); err != nil {
+	if err := m.commitLocked(ctx, manifest, event, operationID); err != nil {
 		return nil, err
 	}
 	m.candidate = compiled
@@ -642,8 +700,19 @@ func (m *Manager) ActivateContext(ctx context.Context, reason string) error {
 
 // ActivateByContext is the context-aware operator policy activation operation.
 func (m *Manager) ActivateByContext(ctx context.Context, reason, actor string) error {
+	return m.ActivateByContextWithOperationID(ctx, reason, actor, "")
+}
+
+// ActivateByContextWithOperationID is the replay-safe clustered policy
+// activation operation.
+func (m *Manager) ActivateByContextWithOperationID(ctx context.Context, reason, actor, operationID string) error {
 	if m == nil {
 		return errors.New("policy: nil manager")
+	}
+	var err error
+	operationID, err = m.normalizeOperationID(operationID)
+	if err != nil {
+		return err
 	}
 	ctx = usableContext(ctx)
 	m.mu.Lock()
@@ -652,6 +721,23 @@ func (m *Manager) ActivateByContext(ctx context.Context, reason, actor string) e
 		return err
 	}
 	if m.candidate == nil {
+		// An ambiguous commit can leave the shared manifest activated while
+		// this process still has the old in-memory lifecycle state. Give the
+		// durable operation claim a chance to recognize that exact replay
+		// before returning the misleading "no candidate" error.
+		if operationID != "" && m.persistTransitionOperationContext != nil {
+			manifest, err := m.manifestLocked(m.current, nil)
+			if err != nil {
+				return err
+			}
+			event := Event{Action: "activate", Actor: actor, FromRevision: m.current.Revision, ToRevision: m.current.Revision, FromEpoch: m.activationEpoch, ToEpoch: m.activationEpoch, PolicyID: m.current.ID, Reason: reason, At: manifest.UpdatedAt}
+			if err := m.commitLocked(ctx, manifest, event, operationID); err == nil {
+				m.publishLocked()
+				return nil
+			} else if !errors.Is(err, ErrOperationNotReplayable) {
+				return err
+			}
+		}
 		return errors.New("policy: no prepared candidate")
 	}
 	from, to := m.current, m.candidate
@@ -662,7 +748,7 @@ func (m *Manager) ActivateByContext(ctx context.Context, reason, actor string) e
 	if err := m.advanceManifestEpoch(&manifest); err != nil {
 		return err
 	}
-	if err := m.commitLocked(ctx, manifest, Event{Action: "activate", Actor: actor, FromRevision: from.Revision, ToRevision: to.Revision, FromEpoch: m.activationEpoch, ToEpoch: manifest.ActivationEpoch, PolicyID: to.ID, Reason: reason, At: manifest.UpdatedAt}); err != nil {
+	if err := m.commitLocked(ctx, manifest, Event{Action: "activate", Actor: actor, FromRevision: from.Revision, ToRevision: to.Revision, FromEpoch: m.activationEpoch, ToEpoch: manifest.ActivationEpoch, PolicyID: to.ID, Reason: reason, At: manifest.UpdatedAt}, operationID); err != nil {
 		return err
 	}
 	m.knownGood[to.Revision] = to
@@ -691,11 +777,22 @@ func (m *Manager) RollbackContext(ctx context.Context, revision int, reason stri
 
 // RollbackByContext is the context-aware operator policy rollback operation.
 func (m *Manager) RollbackByContext(ctx context.Context, revision int, reason, actor string) error {
+	return m.RollbackByContextWithOperationID(ctx, revision, reason, actor, "")
+}
+
+// RollbackByContextWithOperationID is the replay-safe clustered policy
+// rollback operation.
+func (m *Manager) RollbackByContextWithOperationID(ctx context.Context, revision int, reason, actor, operationID string) error {
 	if m == nil {
 		return errors.New("policy: nil manager")
 	}
 	if len(reason) == 0 {
 		return errors.New("policy: rollback reason required")
+	}
+	var err error
+	operationID, err = m.normalizeOperationID(operationID)
+	if err != nil {
+		return err
 	}
 	ctx = usableContext(ctx)
 	m.mu.Lock()
@@ -708,6 +805,19 @@ func (m *Manager) RollbackByContext(ctx context.Context, revision int, reason, a
 		return fmt.Errorf("policy: revision %d is not known-good", revision)
 	}
 	if target.Revision == m.current.Revision {
+		if operationID != "" && m.persistTransitionOperationContext != nil {
+			manifest, err := m.manifestLocked(m.current, nil)
+			if err != nil {
+				return err
+			}
+			event := Event{Action: "rollback", Actor: actor, FromRevision: m.current.Revision, ToRevision: m.current.Revision, FromEpoch: m.activationEpoch, ToEpoch: m.activationEpoch, PolicyID: m.current.ID, Reason: reason, At: manifest.UpdatedAt}
+			if err := m.commitLocked(ctx, manifest, event, operationID); err == nil {
+				m.publishLocked()
+				return nil
+			} else if !errors.Is(err, ErrOperationNotReplayable) {
+				return err
+			}
+		}
 		return errors.New("policy: target is already active")
 	}
 	from := m.current
@@ -718,7 +828,7 @@ func (m *Manager) RollbackByContext(ctx context.Context, revision int, reason, a
 	if err := m.advanceManifestEpoch(&manifest); err != nil {
 		return err
 	}
-	if err := m.commitLocked(ctx, manifest, Event{Action: "rollback", Actor: actor, FromRevision: from.Revision, ToRevision: target.Revision, FromEpoch: m.activationEpoch, ToEpoch: manifest.ActivationEpoch, PolicyID: target.ID, Reason: reason, At: manifest.UpdatedAt}); err != nil {
+	if err := m.commitLocked(ctx, manifest, Event{Action: "rollback", Actor: actor, FromRevision: from.Revision, ToRevision: target.Revision, FromEpoch: m.activationEpoch, ToEpoch: manifest.ActivationEpoch, PolicyID: target.ID, Reason: reason, At: manifest.UpdatedAt}, operationID); err != nil {
 		return err
 	}
 	m.current, m.candidate = target, nil
@@ -778,7 +888,27 @@ func (m *Manager) advanceManifestEpoch(manifest *Manifest) error {
 	return nil
 }
 
-func (m *Manager) commitLocked(ctx context.Context, manifest Manifest, event Event) error {
+func (m *Manager) normalizeOperationID(operationID string) (string, error) {
+	operationID = strings.TrimSpace(operationID)
+	if !m.requireOperationIDs {
+		return operationID, nil
+	}
+	if operationID == "" {
+		return "", ErrOperationIDRequired
+	}
+	if m.persistTransitionOperationContext == nil {
+		return "", ErrOperationIDUnsupported
+	}
+	return operationID, nil
+}
+
+func (m *Manager) commitLocked(ctx context.Context, manifest Manifest, event Event, operationID string) error {
+	if operationID != "" && m.persistTransitionOperationContext != nil {
+		if err := m.persistTransitionOperationContext(usableContext(ctx), manifest, event, operationID); err != nil {
+			return fmt.Errorf("policy: persist transition: %w", err)
+		}
+		return nil
+	}
 	if m.persistTransitionContext != nil {
 		if err := m.persistTransitionContext(usableContext(ctx), manifest, event); err != nil {
 			return fmt.Errorf("policy: persist transition: %w", err)

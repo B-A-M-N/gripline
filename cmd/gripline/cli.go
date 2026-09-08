@@ -140,6 +140,7 @@ func runPolicyCLI(args []string) error {
 	filePath := fs.String("file", "", "signed policy envelope (prepare)")
 	reason := fs.String("reason", "", "operator reason")
 	revision := fs.Int("revision", 0, "known-good revision (rollback)")
+	operationID := fs.String("operation-id", "", "stable Idempotency-Key for retrying the lifecycle mutation")
 	token := fs.String("token", "", "operator token (env GRIPLINE_OPERATOR_TOKEN)")
 	tokenFile := fs.String("token-file", "", "read the operator token from this file")
 	if err := fs.Parse(args[1:]); err != nil {
@@ -179,7 +180,7 @@ func runPolicyCLI(args []string) error {
 			return fmt.Errorf("policy prepare: artifact exceeds 4194304 bytes")
 		}
 		var result map[string]any
-		if err := client.request(http.MethodPost, "/admin/policy/prepare", tok, map[string]any{
+		if err := client.requestWithOperationID(http.MethodPost, "/admin/policy/prepare", tok, *operationID, map[string]any{
 			"artifact": json.RawMessage(artifact), "reason": *reason,
 		}, &result); err != nil {
 			return fmt.Errorf("policy prepare: %w", err)
@@ -189,7 +190,7 @@ func runPolicyCLI(args []string) error {
 		if strings.TrimSpace(*reason) == "" {
 			return fmt.Errorf("policy activate: --reason is required")
 		}
-		if err := client.request(http.MethodPost, "/admin/policy/activate", tok, map[string]string{"reason": *reason}, nil); err != nil {
+		if err := client.requestWithOperationID(http.MethodPost, "/admin/policy/activate", tok, *operationID, map[string]string{"reason": *reason}, nil); err != nil {
 			return fmt.Errorf("policy activate: %w", err)
 		}
 		fmt.Println("policy candidate activated")
@@ -197,7 +198,7 @@ func runPolicyCLI(args []string) error {
 		if *revision < 1 || strings.TrimSpace(*reason) == "" {
 			return fmt.Errorf("policy rollback: --revision and --reason are required")
 		}
-		if err := client.request(http.MethodPost, "/admin/policy/rollback", tok, map[string]any{"revision": *revision, "reason": *reason}, nil); err != nil {
+		if err := client.requestWithOperationID(http.MethodPost, "/admin/policy/rollback", tok, *operationID, map[string]any{"revision": *revision, "reason": *reason}, nil); err != nil {
 			return fmt.Errorf("policy rollback: %w", err)
 		}
 		fmt.Printf("policy rolled back to revision %d\n", *revision)

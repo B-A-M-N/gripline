@@ -346,6 +346,14 @@ func (s *Store) PersistPolicyTransition(manifest policy.Manifest, event policy.E
 }
 
 func (s *Store) PersistPolicyTransitionContext(ctx context.Context, manifest policy.Manifest, event policy.Event) error {
+	return s.PersistPolicyTransitionOperationContext(ctx, manifest, event, "")
+}
+
+// PersistPolicyTransitionOperationContext atomically claims operationID,
+// updates the shared policy manifest, and appends its audit event. An exact
+// retry returns nil before revalidating the now-advanced lifecycle state,
+// which is required when the original commit result was ambiguous.
+func (s *Store) PersistPolicyTransitionOperationContext(ctx context.Context, manifest policy.Manifest, event policy.Event, operationID string) error {
 	ctx, cancel := s.operationContext(ctx)
 	defer cancel()
 	if err := validatePolicyManifest(manifest); err != nil {
@@ -370,11 +378,33 @@ func (s *Store) PersistPolicyTransitionContext(ctx context.Context, manifest pol
 		return err
 	}
 	return s.withTransactionRetry(ctx, "policy transition", func() error {
-		return s.persistPolicyTransitionOnce(ctx, manifest, event, rawManifest, rawEvent)
+		return s.persistPolicyTransitionOnce(ctx, manifest, event, rawManifest, rawEvent, operationID)
 	})
 }
 
-func (s *Store) persistPolicyTransitionOnce(ctx context.Context, manifest policy.Manifest, event policy.Event, rawManifest, rawEvent []byte) error {
+func policyTransitionOperationPayload(manifest policy.Manifest, event policy.Event) any {
+	target := manifest.Active
+	if event.Action == "prepare" && manifest.Candidate != nil {
+		target = *manifest.Candidate
+	}
+	// Epochs, source revision, and timestamps describe the state observed by
+	// the first attempt. They may legitimately differ on an exact retry after
+	// that attempt committed, so they are deliberately excluded from the
+	// durable request fingerprint.
+	return struct {
+		Action   string `json:"action"`
+		Actor    string `json:"actor"`
+		PolicyID string `json:"policy_id"`
+		Revision int    `json:"revision"`
+		Digest   string `json:"digest"`
+		Reason   string `json:"reason"`
+	}{
+		Action: event.Action, Actor: event.Actor, PolicyID: target.ID,
+		Revision: target.Revision, Digest: target.Digest, Reason: event.Reason,
+	}
+}
+
+func (s *Store) persistPolicyTransitionOnce(ctx context.Context, manifest policy.Manifest, event policy.Event, rawManifest, rawEvent []byte, operationID string) error {
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return mapDBError(err)
@@ -382,6 +412,20 @@ func (s *Store) persistPolicyTransitionOnce(ctx context.Context, manifest policy
 	defer tx.Rollback(ctx)
 	if err := s.requireNodeOwnership(ctx, tx, false); err != nil {
 		return err
+	}
+	if operationID != "" {
+		now, err := dbNow(ctx, tx)
+		if err != nil {
+			return err
+		}
+		replayed, err := claimControlOperation(ctx, tx, operationID, "policy."+event.Action,
+			policyTransitionOperationPayload(manifest, event), now)
+		if err != nil {
+			return err
+		}
+		if replayed {
+			return nil
+		}
 	}
 	var previousRaw []byte
 	err = tx.QueryRow(ctx, `SELECT manifest FROM gripline_policy_manifest WHERE singleton=TRUE FOR UPDATE`).Scan(&previousRaw)
@@ -409,13 +453,20 @@ func (s *Store) persistPolicyTransitionOnce(ctx context.Context, manifest policy
 				return errors.New("statepg: another policy candidate is already prepared")
 			}
 		case "activate":
-			if epochAware && (previous.Candidate == nil || previous.Candidate.Revision != event.ToRevision || previous.Candidate.ID != event.PolicyID) {
+			if epochAware && previous.Candidate == nil {
+				return fmt.Errorf("%w: policy activation has no shared candidate", policy.ErrOperationNotReplayable)
+			}
+			if epochAware && (previous.Candidate.Revision != event.ToRevision || previous.Candidate.ID != event.PolicyID) {
 				return errors.New("statepg: activation does not match the shared candidate")
 			}
 			if previous.Candidate != nil {
 				if err := s.requirePolicyActivationBarrier(ctx, tx, *previous.Candidate); err != nil {
 					return err
 				}
+			}
+		case "rollback":
+			if previous.Active.ID == manifest.Active.ID && previous.Active.Revision == manifest.Active.Revision && previous.Active.Digest == manifest.Active.Digest {
+				return fmt.Errorf("%w: policy rollback target is already active", policy.ErrOperationNotReplayable)
 			}
 		}
 		if epochAware {

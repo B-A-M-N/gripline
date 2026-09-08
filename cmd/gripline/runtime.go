@@ -437,13 +437,15 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		}
 	} else if postgres != nil {
 		policyOptions = policy.Options{
-			PersistContext:           postgres.PersistPolicyManifestContext,
-			InitializeContext:        postgres.InitializePolicyManifestContext,
-			PersistArtifactContext:   postgres.PersistPolicyArtifactContext,
-			PersistTransitionContext: postgres.PersistPolicyTransitionContext,
-			LoadManifestContext:      postgres.LoadPolicyManifestContext,
-			LoadArtifactContext:      postgres.LoadPolicyArtifactContext,
-			AcknowledgeContext:       postgres.AcknowledgePolicyContext,
+			PersistContext:                    postgres.PersistPolicyManifestContext,
+			InitializeContext:                 postgres.InitializePolicyManifestContext,
+			PersistArtifactContext:            postgres.PersistPolicyArtifactContext,
+			PersistTransitionContext:          postgres.PersistPolicyTransitionContext,
+			PersistTransitionOperationContext: postgres.PersistPolicyTransitionOperationContext,
+			RequireOperationIDs:               true,
+			LoadManifestContext:               postgres.LoadPolicyManifestContext,
+			LoadArtifactContext:               postgres.LoadPolicyArtifactContext,
+			AcknowledgeContext:                postgres.AcknowledgePolicyContext,
 		}
 	}
 	policyCtx, policyCancel := context.WithTimeout(context.Background(), operationTimeout)

@@ -275,3 +275,40 @@ func TestManagerContextHooksReceiveCallerContext(t *testing.T) {
 		t.Fatal("policy persistence did not receive the caller context")
 	}
 }
+
+func TestManagerClusterLifecycleRequiresAndReplaysOperationID(t *testing.T) {
+	var transitions int
+	m, err := NewManager(Default(), Options{
+		RequireOperationIDs: true,
+		PersistTransitionOperationContext: func(context.Context, Manifest, Event, string) error {
+			transitions++
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := Default()
+	next.Revision = 2
+	if _, err := m.PrepareByContext(context.Background(), next, "operator", "prepare"); !errors.Is(err, ErrOperationIDRequired) {
+		t.Fatalf("missing prepare operation ID error=%v, want ErrOperationIDRequired", err)
+	}
+	if _, err := m.PrepareByContextWithOperationID(context.Background(), next, "operator", "prepare", "policy-prepare-1"); err != nil {
+		t.Fatalf("prepare with operation ID: %v", err)
+	}
+	if err := m.ActivateByContextWithOperationID(context.Background(), "activate", "operator", "policy-activate-1"); err != nil {
+		t.Fatalf("activate with operation ID: %v", err)
+	}
+	if err := m.ActivateByContextWithOperationID(context.Background(), "activate", "operator", "policy-activate-1"); err != nil {
+		t.Fatalf("replay activation: %v", err)
+	}
+	if err := m.RollbackByContextWithOperationID(context.Background(), 1, "rollback", "operator", "policy-rollback-1"); err != nil {
+		t.Fatalf("rollback with operation ID: %v", err)
+	}
+	if err := m.RollbackByContextWithOperationID(context.Background(), 1, "rollback", "operator", "policy-rollback-1"); err != nil {
+		t.Fatalf("replay rollback: %v", err)
+	}
+	if transitions != 5 {
+		t.Fatalf("transition hook calls=%d, want prepare, activate x2, rollback x2", transitions)
+	}
+}

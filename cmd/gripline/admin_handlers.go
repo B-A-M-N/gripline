@@ -102,7 +102,7 @@ func adminPolicyPrepare(svc *control.Service, manager *policy.Manager, verifier 
 			writePolicyAdminError(w, err)
 			return
 		}
-		prepared, err := manager.PrepareByContext(r.Context(), &compiled.Policy, id.Name, body.Reason)
+		prepared, err := manager.PrepareByContextWithOperationID(r.Context(), &compiled.Policy, id.Name, body.Reason, adminOperationID(r))
 		if err != nil {
 			writePolicyAdminError(w, err)
 			return
@@ -132,7 +132,7 @@ func adminPolicyActivate(svc *control.Service, manager *policy.Manager) http.Han
 			writeAdminError(w, control.ErrReasonRequired)
 			return
 		}
-		if err := manager.ActivateByContext(r.Context(), body.Reason, id.Name); err != nil {
+		if err := manager.ActivateByContextWithOperationID(r.Context(), body.Reason, id.Name, adminOperationID(r)); err != nil {
 			writePolicyAdminError(w, err)
 			return
 		}
@@ -167,7 +167,7 @@ func adminPolicyRollback(svc *control.Service, manager *policy.Manager) http.Han
 			writePolicyAdminError(w, errors.New("policy rollback requires a positive revision and reason"))
 			return
 		}
-		if err := manager.RollbackByContext(r.Context(), body.Revision, body.Reason, id.Name); err != nil {
+		if err := manager.RollbackByContextWithOperationID(r.Context(), body.Revision, body.Reason, id.Name, adminOperationID(r)); err != nil {
 			writePolicyAdminError(w, err)
 			return
 		}
@@ -181,7 +181,10 @@ func adminPolicyRollback(svc *control.Service, manager *policy.Manager) http.Han
 }
 
 func writePolicyAdminError(w http.ResponseWriter, err error) {
-	if errors.Is(err, control.ErrUnauthenticated) || errors.Is(err, control.ErrUnauthorized) || errors.Is(err, control.ErrReasonRequired) {
+	if errors.Is(err, control.ErrUnauthenticated) || errors.Is(err, control.ErrUnauthorized) || errors.Is(err, control.ErrReasonRequired) ||
+		errors.Is(err, control.ErrOperationIDRequired) || errors.Is(err, control.ErrOperationIDInvalid) ||
+		errors.Is(err, control.ErrOperationConflict) || errors.Is(err, control.ErrOperationIDUnsupported) ||
+		errors.Is(err, policy.ErrOperationIDRequired) || errors.Is(err, policy.ErrOperationIDUnsupported) {
 		writeAdminError(w, err)
 		return
 	}
@@ -594,11 +597,11 @@ func writeAdminError(w http.ResponseWriter, err error) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 	case errors.Is(err, control.ErrReasonRequired):
 		http.Error(w, "reason required", http.StatusBadRequest)
-	case errors.Is(err, control.ErrOperationIDRequired), errors.Is(err, control.ErrOperationIDInvalid):
+	case errors.Is(err, control.ErrOperationIDRequired), errors.Is(err, control.ErrOperationIDInvalid), errors.Is(err, policy.ErrOperationIDRequired):
 		http.Error(w, "valid Idempotency-Key required", http.StatusBadRequest)
 	case errors.Is(err, control.ErrOperationConflict):
 		http.Error(w, "Idempotency-Key was already used for another operation", http.StatusConflict)
-	case errors.Is(err, control.ErrOperationIDUnsupported):
+	case errors.Is(err, control.ErrOperationIDUnsupported), errors.Is(err, policy.ErrOperationIDUnsupported):
 		http.Error(w, "idempotency authority unavailable", http.StatusServiceUnavailable)
 	case errors.Is(err, credential.ErrNotFound), errors.Is(err, lane.ErrLaneNotFound):
 		http.Error(w, "not found", http.StatusNotFound)

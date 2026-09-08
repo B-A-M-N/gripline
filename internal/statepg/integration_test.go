@@ -628,6 +628,92 @@ func TestPostgresPolicyActivationRequiresLiveNodeAcknowledgements(t *testing.T) 
 	}
 }
 
+func TestPostgresPolicyTransitionOperationReplayIsAtomic(t *testing.T) {
+	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("GRIPLINE_TEST_POSTGRES_DSN is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resetIntegrationAuthority(t, ctx, dsn)
+	store := openIntegrationStore(t, ctx, dsn, "policy-operation-replay")
+	defer store.Close()
+	if _, err := store.SynchronizeCrypto(ctx, CryptoIdentity{
+		SignerActiveKID: 1, SignerFingerprint: "policy-operation-signer",
+		PepperActiveVersion: 1, PepperFingerprint: "policy-operation-pepper",
+		PseudonymVersion: 0, PseudonymFingerprint: "disabled",
+	}); err != nil {
+		t.Fatalf("synchronize crypto: %v", err)
+	}
+
+	first, err := policy.Compile(policy.Default())
+	if err != nil {
+		t.Fatalf("compile initial policy: %v", err)
+	}
+	candidatePolicy := *policy.Default()
+	candidatePolicy.Revision = 2
+	candidate, err := policy.Compile(&candidatePolicy)
+	if err != nil {
+		t.Fatalf("compile candidate policy: %v", err)
+	}
+	firstRef := policyRefForTest(t, first)
+	candidateRef := policyRefForTest(t, candidate)
+	if err := store.PersistPolicyArtifact(first); err != nil {
+		t.Fatalf("persist initial artifact: %v", err)
+	}
+	if err := store.PersistPolicyArtifact(candidate); err != nil {
+		t.Fatalf("persist candidate artifact: %v", err)
+	}
+	initial := policy.Manifest{SchemaVersion: 1, ActivationEpoch: 1, Active: firstRef, UpdatedAt: time.Now().UTC()}
+	if err := store.InitializePolicyManifest(initial); err != nil {
+		t.Fatalf("initialize policy: %v", err)
+	}
+
+	prepareAt := time.Now().UTC()
+	prepared := policy.Manifest{SchemaVersion: 1, ActivationEpoch: 1, Active: firstRef, Candidate: &candidateRef, UpdatedAt: prepareAt}
+	prepareEvent := policy.Event{Action: "prepare", Actor: "operator", FromRevision: 1, ToRevision: 2, FromEpoch: 1, ToEpoch: 1, PolicyID: candidate.ID, Reason: "replay-safe prepare", At: prepareAt}
+	const prepareOperation = "policy-prepare-replay"
+	if err := store.PersistPolicyTransitionOperationContext(ctx, prepared, prepareEvent, prepareOperation); err != nil {
+		t.Fatalf("persist policy prepare: %v", err)
+	}
+	if err := store.PersistPolicyTransitionOperationContext(ctx, prepared, prepareEvent, prepareOperation); err != nil {
+		t.Fatalf("replay policy prepare: %v", err)
+	}
+	conflictingPrepare := prepareEvent
+	conflictingPrepare.Reason = "different payload"
+	if err := store.PersistPolicyTransitionOperationContext(ctx, prepared, conflictingPrepare, prepareOperation); !errors.Is(err, control.ErrOperationConflict) {
+		t.Fatalf("conflicting prepare error=%v, want operation conflict", err)
+	}
+
+	activateAt := prepareAt.Add(time.Second)
+	activated := policy.Manifest{SchemaVersion: 1, ActivationEpoch: 2, Active: candidateRef, Previous: &firstRef, UpdatedAt: activateAt}
+	activateEvent := policy.Event{Action: "activate", Actor: "operator", FromRevision: 1, ToRevision: 2, FromEpoch: 1, ToEpoch: 2, PolicyID: candidate.ID, Reason: "replay-safe activation", At: activateAt}
+	const activateOperation = "policy-activate-replay"
+	if err := store.PersistPolicyTransitionOperationContext(ctx, activated, activateEvent, activateOperation); err != nil {
+		t.Fatalf("persist policy activation: %v", err)
+	}
+	if err := store.PersistPolicyTransitionOperationContext(ctx, activated, activateEvent, activateOperation); err != nil {
+		t.Fatalf("replay policy activation: %v", err)
+	}
+
+	var auditCount int
+	if err := store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_policy_audit`).Scan(&auditCount); err != nil {
+		t.Fatalf("count policy audit: %v", err)
+	}
+	if auditCount != 2 {
+		t.Fatalf("policy audit rows=%d, want exactly prepare and activate", auditCount)
+	}
+}
+
+func policyRefForTest(t *testing.T, compiled *policy.CompiledPolicy) policy.PolicyRef {
+	t.Helper()
+	digest, err := policy.Digest(&compiled.Policy)
+	if err != nil {
+		t.Fatalf("digest policy %s/%d: %v", compiled.ID, compiled.Revision, err)
+	}
+	return policy.PolicyRef{ID: compiled.ID, Revision: compiled.Revision, Digest: digest}
+}
+
 func TestPostgresResourceAdmissionRejectsStalePolicyObservation(t *testing.T) {
 	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
 	if dsn == "" {
