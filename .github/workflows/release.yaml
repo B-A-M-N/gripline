@@ -13,6 +13,20 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: gripline
+          POSTGRES_PASSWORD: gripline
+          POSTGRES_DB: gripline
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U gripline -d gripline"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
@@ -38,6 +52,7 @@ jobs:
           go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
           go build ./...
           go test ./...
+          GRIPLINE_TEST_POSTGRES_DSN=postgres://gripline:gripline@localhost:5432/gripline?sslmode=disable go test -v ./internal/statepg -run '^TestPostgresAuthorityIntegration$'
           go test -race ./...
           go test -run TestGate -v ./internal/gates/
           go test -v ./internal/observability/

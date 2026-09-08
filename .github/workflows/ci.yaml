@@ -12,6 +12,20 @@ jobs:
   testify:
     name: vet + staticcheck + race + gates
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: gripline
+          POSTGRES_PASSWORD: gripline
+          POSTGRES_DB: gripline
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U gripline -d gripline"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -45,6 +59,11 @@ jobs:
 
       - name: go build
         run: go build ./...
+
+      - name: PostgreSQL authority integration
+        env:
+          GRIPLINE_TEST_POSTGRES_DSN: postgres://gripline:gripline@localhost:5432/gripline?sslmode=disable
+        run: go test -v ./internal/statepg -run '^TestPostgresAuthorityIntegration$'
 
       - name: definitive causal demo
         run: go run ./cmd/gripline-demo --headless
