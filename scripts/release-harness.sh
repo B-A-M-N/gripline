@@ -90,11 +90,16 @@ fi
 # Provision the credential through the authenticated operator surface. The
 # persistent fixture has no bootstrap-secret escape hatch; restart must reuse
 # the state database rather than recreate authority from environment input.
-printf '%s\n' "$secret" | GRIPLINE_OPERATOR_TOKEN="$operator_token" \
+if ! printf '%s\n' "$secret" | GRIPLINE_OPERATOR_TOKEN="$operator_token" \
 	"$harness_dir/gripline" credential add --config "$harness_dir/config.json" \
 	--id harness-credential --account harness-account --policy gripline-default-v1 \
 	--plan harness-plan --reason "release harness seed" --secret-stdin \
-	>"$harness_dir/provision.log" 2>&1
+	>"$harness_dir/provision.log" 2>&1; then
+	# Preserve the actionable operator error without allowing a future CLI
+	# diagnostic to echo a bearer or credential value into CI logs.
+	sed -E 's/[A-Za-z0-9+\/_=-]{32,}/[redacted]/g' "$harness_dir/provision.log" >&2
+	exit 1
+fi
 
 "$harness_dir/backend" -listen "127.0.0.1:${backend_port}" -keys "$harness_dir/keys.json" -audience "$audience" -capture "$harness_dir/backend-capture.log" >"$harness_dir/backend.log" 2>&1 &
 backend_pid=$!

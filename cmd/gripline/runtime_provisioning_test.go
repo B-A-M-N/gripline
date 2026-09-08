@@ -63,6 +63,26 @@ func TestActiveCredentialPepperRejectsMissingSharedGeneration(t *testing.T) {
 	}
 }
 
+func TestActiveCredentialPepperUsesStandaloneRingWithoutAuthority(t *testing.T) {
+	ring, err := credential.NewPepperRing(
+		&credential.PepperKey{Version: 1, Key: []byte("pepper-generation-one")},
+		&credential.PepperKey{Version: 2, Key: []byte("pepper-generation-two")},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ring.SetActiveVersion(1); err != nil {
+		t.Fatal(err)
+	}
+	version, err := activeCredentialPepperVersion(context.Background(), ring, nil)
+	if err != nil {
+		t.Fatalf("resolve standalone pepper: %v", err)
+	}
+	if version != 1 {
+		t.Fatalf("resolved pepper version=%d, want selected standalone version 1", version)
+	}
+}
+
 func TestActiveCredentialPolicyBindsAndRejectsStaleRequest(t *testing.T) {
 	manager, err := policy.NewManager(policy.Default(), policy.Options{})
 	if err != nil {

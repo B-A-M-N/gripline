@@ -321,7 +321,14 @@ func adminCredentialAdd(svc *control.Service, state adminStateAuthority, peppers
 		if req.VerifierVersion == 0 {
 			req.VerifierVersion = 1
 		}
-		activePepperVersion, err := activeCredentialPepperVersion(r.Context(), peppers, cryptoAuthority)
+		// Avoid converting a nil *statepg.Store into a non-nil interface in
+		// standalone mode. A typed-nil authority would make the local ring look
+		// like an unavailable clustered authority and reject provisioning.
+		var cryptoStatus cryptoStatusReader
+		if cryptoAuthority != nil {
+			cryptoStatus = cryptoAuthority
+		}
+		activePepperVersion, err := activeCredentialPepperVersion(r.Context(), peppers, cryptoStatus)
 		if err != nil {
 			http.Error(w, "verifier pepper authority unavailable", http.StatusServiceUnavailable)
 			return
