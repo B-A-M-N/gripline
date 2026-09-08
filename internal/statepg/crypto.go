@@ -5,7 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
+	"time"
 
+	"github.com/B-A-M-N/gripline/internal/control"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -23,6 +26,23 @@ type CryptoGeneration struct {
 	Generation  int
 	Fingerprint string
 }
+
+// CryptoActivationRequest is the operator-approved request to make one
+// staged generation active for new cluster data. The operation ID is
+// mandatory: activation changes shared security authority, so an ambiguous
+// commit must be safely retryable rather than repeated.
+type CryptoActivationRequest struct {
+	Kind        string
+	Generation  int
+	Fingerprint string
+	OperationID string
+	Actor       string
+	Reason      string
+}
+
+// ErrCryptoActivationBarrier means one or more live nodes have not loaded
+// and acknowledged the exact generation being activated.
+var ErrCryptoActivationBarrier = errors.New("statepg: crypto activation barrier not satisfied")
 
 // CryptoIdentity is the public cluster-binding metadata for one node. The
 // fingerprints are digests of loaded material, never the material itself.
@@ -161,6 +181,209 @@ func (s *Store) SynchronizeCrypto(ctx context.Context, local CryptoIdentity) (Cr
 		}
 	}
 	return CryptoIdentity{}, errors.New("statepg: crypto identity remained conflicted after retries")
+}
+
+// ActivateCryptoGeneration atomically advances one shared active generation.
+// Every live membership epoch must have acknowledged the exact target
+// fingerprint before the active singleton is changed. The operation claim
+// and operator audit are committed in the same transaction as the activation.
+// This is the authority-side half of rotation; callers must separately prove
+// that their signer/verifier or secret-ring implementation can apply the
+// returned generation before serving it.
+func (s *Store) ActivateCryptoGeneration(ctx context.Context, req CryptoActivationRequest) (CryptoIdentity, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := validateCryptoActivationRequest(req); err != nil {
+		return CryptoIdentity{}, err
+	}
+	returnCrypto := CryptoIdentity{}
+	err := withTransactionRetry(ctx, "crypto generation activation", func() error {
+		var err error
+		returnCrypto, err = s.activateCryptoGenerationOnce(ctx, req)
+		return err
+	})
+	if err != nil {
+		return CryptoIdentity{}, err
+	}
+	return returnCrypto, nil
+}
+
+func validateCryptoActivationRequest(req CryptoActivationRequest) error {
+	if req.Kind != CryptoKindSigner && req.Kind != CryptoKindPepper && req.Kind != CryptoKindPseudonym {
+		return fmt.Errorf("statepg: unknown crypto activation kind %q", req.Kind)
+	}
+	if req.Generation < 1 || strings.TrimSpace(req.Fingerprint) == "" {
+		return errors.New("statepg: crypto activation requires a positive generation and fingerprint")
+	}
+	if strings.TrimSpace(req.OperationID) == "" {
+		return control.ErrOperationIDRequired
+	}
+	if strings.TrimSpace(req.Actor) == "" {
+		return errors.New("statepg: crypto activation actor required")
+	}
+	if strings.TrimSpace(req.Reason) == "" {
+		return control.ErrReasonRequired
+	}
+	return nil
+}
+
+func (s *Store) activateCryptoGenerationOnce(ctx context.Context, req CryptoActivationRequest) (CryptoIdentity, error) {
+	tx, err := begin(ctx, s.pool)
+	if err != nil {
+		return CryptoIdentity{}, mapDBError(err)
+	}
+	defer tx.Rollback(ctx)
+	if err := s.requireNodeOwnership(ctx, tx, false); err != nil {
+		return CryptoIdentity{}, err
+	}
+	now, err := dbNow(ctx, tx)
+	if err != nil {
+		return CryptoIdentity{}, err
+	}
+	replayed, err := claimControlOperation(ctx, tx, req.OperationID, "crypto.activate",
+		struct {
+			Kind        string `json:"kind"`
+			Generation  int    `json:"generation"`
+			Fingerprint string `json:"fingerprint"`
+			Actor       string `json:"actor"`
+			Reason      string `json:"reason"`
+		}{req.Kind, req.Generation, req.Fingerprint, req.Actor, req.Reason}, now)
+	if err != nil {
+		return CryptoIdentity{}, err
+	}
+	shared, err := lockCryptoIdentity(ctx, tx)
+	if err != nil {
+		return CryptoIdentity{}, err
+	}
+	if replayed {
+		if err := mapDBError(tx.Commit(ctx)); err != nil {
+			return CryptoIdentity{}, err
+		}
+		return shared, nil
+	}
+
+	var storedFingerprint, state string
+	err = tx.QueryRow(ctx, `SELECT fingerprint, state FROM gripline_cluster_crypto_generations
+		WHERE kind=$1 AND generation=$2 FOR UPDATE`, req.Kind, req.Generation).Scan(&storedFingerprint, &state)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return CryptoIdentity{}, fmt.Errorf("statepg: crypto generation %s/%d is not loaded", req.Kind, req.Generation)
+	}
+	if err != nil {
+		return CryptoIdentity{}, mapDBError(err)
+	}
+	if storedFingerprint != req.Fingerprint {
+		return CryptoIdentity{}, fmt.Errorf("statepg: crypto generation %s/%d fingerprint mismatch", req.Kind, req.Generation)
+	}
+	if state == "retired" {
+		return CryptoIdentity{}, fmt.Errorf("statepg: crypto generation %s/%d is retired", req.Kind, req.Generation)
+	}
+	if err := requireCryptoActivationBarrier(ctx, tx, s.leaseTTL, req); err != nil {
+		return CryptoIdentity{}, err
+	}
+	if shared.GenerationEpoch == ^uint64(0) || shared.GenerationEpoch >= uint64(1<<63-1) {
+		return CryptoIdentity{}, errors.New("statepg: crypto generation epoch exhausted")
+	}
+	newEpoch := shared.GenerationEpoch + 1
+	active := shared
+	active.GenerationEpoch = newEpoch
+	switch req.Kind {
+	case CryptoKindSigner:
+		active.SignerActiveKID = req.Generation
+		active.SignerActiveFingerprint = req.Fingerprint
+	case CryptoKindPepper:
+		active.PepperActiveVersion = req.Generation
+		active.PepperActiveFingerprint = req.Fingerprint
+	case CryptoKindPseudonym:
+		active.PseudonymVersion = req.Generation
+		active.PseudonymActiveFingerprint = req.Fingerprint
+	}
+	if _, err := tx.Exec(ctx, `UPDATE gripline_cluster_crypto SET
+		signer_active_kid=$1, signer_active_fingerprint=$2,
+		pepper_active_version=$3, pepper_active_fingerprint=$4,
+		pseudonym_version=$5, pseudonym_active_fingerprint=$6,
+		generation_epoch=$7, updated_at=$8 WHERE singleton=TRUE`,
+		active.SignerActiveKID, active.SignerActiveFingerprint,
+		active.PepperActiveVersion, active.PepperActiveFingerprint,
+		active.PseudonymVersion, active.PseudonymActiveFingerprint,
+		int64(newEpoch), now); err != nil {
+		return CryptoIdentity{}, mapDBError(err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE gripline_cluster_crypto_generations
+		SET state=CASE WHEN kind=$1 AND generation=$2 THEN 'active'
+			WHEN kind=$1 AND state='active' THEN 'loaded' ELSE state END,
+		updated_at=$3 WHERE kind=$1`, req.Kind, req.Generation, now); err != nil {
+		return CryptoIdentity{}, mapDBError(err)
+	}
+	posture, err := loadPostureForAudit(ctx, tx)
+	if err != nil {
+		return CryptoIdentity{}, err
+	}
+	if err := appendOperator(ctx, tx, control.OperatorRecord{
+		At: now, Actor: req.Actor, Action: "crypto.activate", Target: fmt.Sprintf("%s/%d", req.Kind, req.Generation),
+		Reason: req.Reason, Posture: posture.String(), Committed: true,
+	}); err != nil {
+		return CryptoIdentity{}, mapDBError(err)
+	}
+	if err := mapDBError(tx.Commit(ctx)); err != nil {
+		return CryptoIdentity{}, err
+	}
+	return active, nil
+}
+
+func lockCryptoIdentity(ctx context.Context, tx pgx.Tx) (CryptoIdentity, error) {
+	var shared CryptoIdentity
+	err := tx.QueryRow(ctx, `SELECT signer_active_kid, signer_fingerprint, signer_active_fingerprint,
+		pepper_active_version, pepper_fingerprint, pepper_active_fingerprint, pseudonym_version,
+		pseudonym_fingerprint, pseudonym_active_fingerprint, generation_epoch
+		FROM gripline_cluster_crypto WHERE singleton=TRUE FOR UPDATE`).Scan(
+		&shared.SignerActiveKID, &shared.SignerFingerprint, &shared.SignerActiveFingerprint,
+		&shared.PepperActiveVersion, &shared.PepperFingerprint, &shared.PepperActiveFingerprint,
+		&shared.PseudonymVersion, &shared.PseudonymFingerprint, &shared.PseudonymActiveFingerprint,
+		&shared.GenerationEpoch)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return CryptoIdentity{}, errors.New("statepg: cluster crypto identity is not initialized")
+	}
+	if err != nil {
+		return CryptoIdentity{}, mapDBError(err)
+	}
+	if shared.GenerationEpoch < 1 {
+		return CryptoIdentity{}, errors.New("statepg: invalid cluster crypto generation epoch")
+	}
+	return shared, nil
+}
+
+func requireCryptoActivationBarrier(ctx context.Context, tx pgx.Tx, leaseTTL time.Duration, req CryptoActivationRequest) error {
+	var lagging int
+	err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_membership m
+		LEFT JOIN gripline_cluster_crypto_acks a
+			ON a.node_id=m.node_id AND a.node_epoch=m.node_epoch
+			AND a.kind=$1 AND a.generation=$2 AND a.fingerprint=$3
+		WHERE m.state IN ('ready','draining')
+		  AND m.last_seen_at > CURRENT_TIMESTAMP - ($4::double precision * interval '1 second')
+		  AND a.node_id IS NULL`, req.Kind, req.Generation, req.Fingerprint, leaseTTL.Seconds()).Scan(&lagging)
+	if err != nil {
+		return mapDBError(err)
+	}
+	if lagging != 0 {
+		return fmt.Errorf("%w: %d live node(s) have not acknowledged %s/%d", ErrCryptoActivationBarrier, lagging, req.Kind, req.Generation)
+	}
+	return nil
+}
+
+func loadPostureForAudit(ctx context.Context, tx pgx.Tx) (control.Posture, error) {
+	var raw int
+	err := tx.QueryRow(ctx, `SELECT COALESCE(posture,0) FROM gripline_operator_posture WHERE singleton=TRUE`).Scan(&raw)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return control.Normal, nil
+	}
+	if err != nil {
+		return control.Normal, mapDBError(err)
+	}
+	if raw < int(control.Normal) || raw > int(control.EmergencyLockdown) {
+		return control.Normal, fmt.Errorf("statepg: unknown persisted posture %d", raw)
+	}
+	return control.Posture(raw), nil
 }
 
 func (s *Store) synchronizeCryptoOnce(ctx context.Context, local CryptoIdentity) (CryptoIdentity, bool, error) {

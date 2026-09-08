@@ -393,6 +393,84 @@ func TestPostgresPolicyActivationRequiresLiveNodeAcknowledgements(t *testing.T) 
 	}
 }
 
+func TestPostgresCryptoActivationRequiresLiveNodeAcknowledgements(t *testing.T) {
+	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("GRIPLINE_TEST_POSTGRES_DSN is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resetIntegrationAuthority(t, ctx, dsn)
+	a := openIntegrationStore(t, ctx, dsn, "crypto-activation-a")
+	b := openIntegrationStore(t, ctx, dsn, "crypto-activation-b")
+	defer a.Close()
+	defer b.Close()
+	base := CryptoIdentity{
+		SignerActiveKID: 1, SignerFingerprint: "crypto-activation-signer",
+		PepperActiveVersion: 1, PepperFingerprint: "crypto-activation-pepper",
+		PseudonymVersion: 0, PseudonymFingerprint: "disabled",
+	}
+	if _, err := a.SynchronizeCrypto(ctx, base); err != nil {
+		t.Fatalf("synchronize crypto node A: %v", err)
+	}
+	if _, err := b.SynchronizeCrypto(ctx, base); err != nil {
+		t.Fatalf("synchronize crypto node B: %v", err)
+	}
+	staged := base
+	staged.Loaded = []CryptoGeneration{
+		{Kind: CryptoKindSigner, Generation: 1, Fingerprint: base.SignerFingerprint},
+		{Kind: CryptoKindPepper, Generation: 1, Fingerprint: base.PepperFingerprint},
+		{Kind: CryptoKindPepper, Generation: 2, Fingerprint: "crypto-activation-pepper-2"},
+	}
+	if _, err := a.SynchronizeCrypto(ctx, staged); err != nil {
+		t.Fatalf("stage pepper on node A: %v", err)
+	}
+	request := CryptoActivationRequest{
+		Kind: CryptoKindPepper, Generation: 2, Fingerprint: "crypto-activation-pepper-2",
+		OperationID: "crypto-activation-operation", Actor: "integration-operator", Reason: "rotate pepper",
+	}
+	if _, err := a.ActivateCryptoGeneration(ctx, request); !errors.Is(err, ErrCryptoActivationBarrier) {
+		t.Fatalf("activation before node B acknowledgement error=%v, want barrier", err)
+	}
+	if _, err := b.SynchronizeCrypto(ctx, staged); err != nil {
+		t.Fatalf("stage pepper on node B: %v", err)
+	}
+	active, err := a.ActivateCryptoGeneration(ctx, request)
+	if err != nil {
+		t.Fatalf("activation after all nodes acknowledged: %v", err)
+	}
+	if active.PepperActiveVersion != 2 || active.PepperActiveFingerprint != request.Fingerprint || active.GenerationEpoch != 2 {
+		t.Fatalf("activated crypto identity=%+v, want pepper 2 at epoch 2", active)
+	}
+	var state string
+	if err := a.pool.QueryRow(ctx, `SELECT state FROM gripline_cluster_crypto_generations
+		WHERE kind=$1 AND generation=$2`, CryptoKindPepper, 2).Scan(&state); err != nil {
+		t.Fatalf("load activated generation state: %v", err)
+	}
+	if state != "active" {
+		t.Fatalf("activated pepper state=%q, want active", state)
+	}
+	if err := a.pool.QueryRow(ctx, `SELECT state FROM gripline_cluster_crypto_generations
+		WHERE kind=$1 AND generation=$2`, CryptoKindPepper, 1).Scan(&state); err != nil {
+		t.Fatalf("load previous generation state: %v", err)
+	}
+	if state != "loaded" {
+		t.Fatalf("previous pepper state=%q, want loaded", state)
+	}
+	replayed, err := b.ActivateCryptoGeneration(ctx, request)
+	if err != nil {
+		t.Fatalf("exact activation retry on node B: %v", err)
+	}
+	if replayed.GenerationEpoch != active.GenerationEpoch || replayed.PepperActiveVersion != active.PepperActiveVersion {
+		t.Fatalf("activation retry identity=%+v differs from committed identity=%+v", replayed, active)
+	}
+	conflict := request
+	conflict.Reason = "different reason"
+	if _, err := b.ActivateCryptoGeneration(ctx, conflict); !errors.Is(err, control.ErrOperationConflict) {
+		t.Fatalf("reused activation operation error=%v, want conflict", err)
+	}
+}
+
 func TestPostgresFencedNodeCannotMutateAuthority(t *testing.T) {
 	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
 	if dsn == "" {
