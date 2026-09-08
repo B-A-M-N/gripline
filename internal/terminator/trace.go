@@ -30,6 +30,7 @@ type DecisionTrace struct {
 	// most needs to attribute to a policy revision.
 	PolicyID       string `json:"policy_id"`
 	PolicyRevision int    `json:"policy_revision"`
+	PolicyEpoch    uint64 `json:"policy_epoch"`
 
 	// Credential state, before → after the observation transaction.
 	CredentialID            string `json:"credential_id"`

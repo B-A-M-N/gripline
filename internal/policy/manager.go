@@ -16,6 +16,7 @@ type Manager struct {
 	current           *CompiledPolicy
 	candidate         *CompiledPolicy
 	knownGood         map[int]*CompiledPolicy
+	activationEpoch   uint64
 	persist           func(Manifest) error
 	audit             func(Event) error
 	persistArtifact   func(*CompiledPolicy) error
@@ -29,11 +30,12 @@ type Manager struct {
 // with a temp-file/fsync/rename sequence; Manager calls persist before changing
 // its in-memory pointer, so a failed durable write cannot activate a policy.
 type Manifest struct {
-	SchemaVersion int        `json:"schema_version"`
-	Active        PolicyRef  `json:"active"`
-	Candidate     *PolicyRef `json:"candidate,omitempty"`
-	Previous      *PolicyRef `json:"previous,omitempty"`
-	UpdatedAt     time.Time  `json:"updated_at"`
+	SchemaVersion   int        `json:"schema_version"`
+	ActivationEpoch uint64     `json:"activation_epoch"`
+	Active          PolicyRef  `json:"active"`
+	Candidate       *PolicyRef `json:"candidate,omitempty"`
+	Previous        *PolicyRef `json:"previous,omitempty"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 }
 
 type PolicyRef struct {
@@ -50,9 +52,21 @@ type Event struct {
 	Actor        string    `json:"actor,omitempty"`
 	FromRevision int       `json:"from_revision"`
 	ToRevision   int       `json:"to_revision"`
+	FromEpoch    uint64    `json:"from_epoch,omitempty"`
+	ToEpoch      uint64    `json:"to_epoch,omitempty"`
 	PolicyID     string    `json:"policy_id"`
 	Reason       string    `json:"reason,omitempty"`
 	At           time.Time `json:"at"`
+}
+
+// Snapshot is the immutable policy view used by the data plane. The compiled
+// policy pointer is never mutated by Manager after publication; callers that
+// need a defensive copy should use Current instead. ActivationEpoch is
+// monotonic even when the active artifact revision moves backwards during an
+// explicit rollback.
+type Snapshot struct {
+	Policy          *CompiledPolicy
+	ActivationEpoch uint64
 }
 
 // Options supplies durable manifest and audit hooks. Both are optional for
@@ -88,12 +102,20 @@ func NewManager(initial *Policy, opts Options) (*Manager, error) {
 		loadManifest:      opts.LoadManifest,
 		loadArtifact:      opts.LoadArtifact,
 		lastRevision:      compiled.Revision,
+		activationEpoch:   1,
 	}
 	if opts.LoadManifest != nil {
 		manifest, loadErr := opts.LoadManifest()
 		if loadErr != nil {
 			return nil, loadErr
 		}
+		if manifest.ActivationEpoch == 0 {
+			// Epoch-less manifests predate cluster freshness. Treat the existing
+			// active artifact as epoch 1; the next lifecycle mutation will
+			// publish a monotonic epoch-bearing manifest.
+			manifest.ActivationEpoch = 1
+		}
+		m.activationEpoch = manifest.ActivationEpoch
 		if manifest.Active.Revision != 0 {
 			activeDigest, digestErr := Digest(&compiled.Policy)
 			if digestErr != nil {
@@ -179,6 +201,34 @@ func (m *Manager) Current() *CompiledPolicy {
 	return cloneCompiled(m.current)
 }
 
+// Snapshot returns the currently active immutable policy pointer and its
+// cluster activation epoch. This is the hot data-plane path: it performs the
+// durable refresh check but does not deep-recompile the policy on every
+// request. Manager lifecycle methods publish a newly compiled pointer before
+// changing the epoch, so one admission observes one coherent pair.
+func (m *Manager) Snapshot() *Snapshot {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.refreshDurableLocked(); err != nil || m.current == nil {
+		return nil
+	}
+	return &Snapshot{Policy: m.current, ActivationEpoch: m.activationEpoch}
+}
+
+// PolicyEpoch returns the active policy activation epoch for downstream
+// freshness verifiers. The boolean is false when the durable policy cannot be
+// refreshed or no active policy is available.
+func (m *Manager) PolicyEpoch() (uint64, bool) {
+	snapshot := m.Snapshot()
+	if snapshot == nil || snapshot.ActivationEpoch == 0 {
+		return 0, false
+	}
+	return snapshot.ActivationEpoch, true
+}
+
 // Candidate returns the prepared but not yet active snapshot, if any.
 func (m *Manager) Candidate() *CompiledPolicy {
 	if m == nil {
@@ -208,6 +258,10 @@ func (m *Manager) refreshDurableLocked() error {
 	if manifest.Active.Revision == 0 {
 		return nil
 	}
+	if manifest.ActivationEpoch == 0 {
+		manifest.ActivationEpoch = 1
+	}
+	m.activationEpoch = manifest.ActivationEpoch
 	if m.current == nil {
 		return errors.New("policy: current policy is nil")
 	}
@@ -327,7 +381,7 @@ func (m *Manager) PrepareBy(p *Policy, actor, reason string) (*CompiledPolicy, e
 	if err != nil {
 		return nil, err
 	}
-	event := Event{Action: "prepare", Actor: actor, FromRevision: m.current.Revision, ToRevision: compiled.Revision, PolicyID: compiled.ID, Reason: reason, At: manifest.UpdatedAt}
+	event := Event{Action: "prepare", Actor: actor, FromRevision: m.current.Revision, ToRevision: compiled.Revision, FromEpoch: m.activationEpoch, ToEpoch: manifest.ActivationEpoch, PolicyID: compiled.ID, Reason: reason, At: manifest.UpdatedAt}
 	if err := m.commitLocked(manifest, event); err != nil {
 		return nil, err
 	}
@@ -361,11 +415,15 @@ func (m *Manager) ActivateBy(reason, actor string) error {
 	if err != nil {
 		return err
 	}
-	if err := m.commitLocked(manifest, Event{Action: "activate", Actor: actor, FromRevision: from.Revision, ToRevision: to.Revision, PolicyID: to.ID, Reason: reason, At: manifest.UpdatedAt}); err != nil {
+	if err := m.advanceManifestEpoch(&manifest); err != nil {
+		return err
+	}
+	if err := m.commitLocked(manifest, Event{Action: "activate", Actor: actor, FromRevision: from.Revision, ToRevision: to.Revision, FromEpoch: m.activationEpoch, ToEpoch: manifest.ActivationEpoch, PolicyID: to.ID, Reason: reason, At: manifest.UpdatedAt}); err != nil {
 		return err
 	}
 	m.knownGood[to.Revision] = to
 	m.current, m.candidate = to, nil
+	m.activationEpoch = manifest.ActivationEpoch
 	return nil
 }
 
@@ -401,19 +459,31 @@ func (m *Manager) RollbackBy(revision int, reason, actor string) error {
 	if err != nil {
 		return err
 	}
-	if err := m.commitLocked(manifest, Event{Action: "rollback", Actor: actor, FromRevision: from.Revision, ToRevision: target.Revision, PolicyID: target.ID, Reason: reason, At: manifest.UpdatedAt}); err != nil {
+	if err := m.advanceManifestEpoch(&manifest); err != nil {
+		return err
+	}
+	if err := m.commitLocked(manifest, Event{Action: "rollback", Actor: actor, FromRevision: from.Revision, ToRevision: target.Revision, FromEpoch: m.activationEpoch, ToEpoch: manifest.ActivationEpoch, PolicyID: target.ID, Reason: reason, At: manifest.UpdatedAt}); err != nil {
 		return err
 	}
 	m.current, m.candidate = target, nil
+	m.activationEpoch = manifest.ActivationEpoch
 	return nil
 }
 
 func (m *Manager) manifestLocked(active *CompiledPolicy, candidate *CompiledPolicy) (Manifest, error) {
-	return manifestForAt(active, candidate, nil, time.Now().UTC())
+	manifest, err := manifestForAt(active, candidate, nil, time.Now().UTC())
+	if err == nil {
+		manifest.ActivationEpoch = m.activationEpoch
+	}
+	return manifest, err
 }
 
 func (m *Manager) manifestWithPrevious(active, candidate, previous *CompiledPolicy) (Manifest, error) {
-	return manifestForAt(active, candidate, previous, time.Now().UTC())
+	manifest, err := manifestForAt(active, candidate, previous, time.Now().UTC())
+	if err == nil {
+		manifest.ActivationEpoch = m.activationEpoch
+	}
+	return manifest, err
 }
 
 func manifestFor(active *CompiledPolicy, candidate *CompiledPolicy) (Manifest, error) {
@@ -425,7 +495,7 @@ func manifestForAt(active *CompiledPolicy, candidate, previous *CompiledPolicy, 
 	if err != nil {
 		return Manifest{}, err
 	}
-	manifest := Manifest{SchemaVersion: 1, Active: PolicyRef{ID: active.ID, Revision: active.Revision, Digest: activeDigest}, UpdatedAt: at}
+	manifest := Manifest{SchemaVersion: 1, ActivationEpoch: 1, Active: PolicyRef{ID: active.ID, Revision: active.Revision, Digest: activeDigest}, UpdatedAt: at}
 	if candidate != nil {
 		digest, err := Digest(&candidate.Policy)
 		if err != nil {
@@ -441,6 +511,14 @@ func manifestForAt(active *CompiledPolicy, candidate, previous *CompiledPolicy, 
 		manifest.Previous = &PolicyRef{ID: previous.ID, Revision: previous.Revision, Digest: digest}
 	}
 	return manifest, nil
+}
+
+func (m *Manager) advanceManifestEpoch(manifest *Manifest) error {
+	if manifest == nil || m.activationEpoch == ^uint64(0) {
+		return errors.New("policy: activation epoch exhausted")
+	}
+	manifest.ActivationEpoch = m.activationEpoch + 1
+	return nil
 }
 
 func (m *Manager) commitLocked(manifest Manifest, event Event) error {

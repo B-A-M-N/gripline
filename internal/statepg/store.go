@@ -45,10 +45,11 @@ type Store struct {
 
 // Schema version 1 is the original clustered-authority layout. Version 2
 // adds request-correlated resource leases, credential transition receipts,
-// and the shared audit/state tables now used by the runtime. Keep the marker
-// versioned even though the DDL below is idempotent: CREATE TABLE IF NOT
-// EXISTS cannot add columns to an already initialized database.
-const currentSchemaVersion = 2
+// and the shared audit/state tables now used by the runtime. Version 3 binds
+// a request id to its resource payload. Keep the marker versioned even though
+// the DDL below is idempotent: CREATE TABLE IF NOT EXISTS cannot add columns
+// to an already initialized database.
+const currentSchemaVersion = 3
 
 var ErrMigrationRequired = errors.New("statepg: database schema requires migration")
 var ErrDSNRequired = errors.New("statepg: DSN required")
@@ -288,6 +289,7 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS gripline_resource_leases (
 			lease_id TEXT PRIMARY KEY,
 			request_id TEXT NOT NULL UNIQUE,
+			request_fingerprint TEXT NOT NULL DEFAULT '',
 			node_id TEXT NOT NULL,
 			state TEXT NOT NULL,
 			expires_at TIMESTAMPTZ NOT NULL,
@@ -382,9 +384,19 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 				return fmt.Errorf("statepg: migrate resource leases: %w", mapDBError(err))
 			}
 		}
-		if _, err := tx.Exec(ctx, `UPDATE gripline_schema SET version=$1 WHERE singleton=TRUE`, currentSchemaVersion); err != nil {
-			return fmt.Errorf("statepg: record schema version: %w", mapDBError(err))
+		version = 2
+	}
+	if version == 2 {
+		if _, err := tx.Exec(ctx, `ALTER TABLE gripline_resource_leases ADD COLUMN IF NOT EXISTS request_fingerprint TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("statepg: migrate resource request fingerprint: %w", mapDBError(err))
 		}
+		version = 3
+	}
+	if version != currentSchemaVersion {
+		return fmt.Errorf("%w: unsupported migration state %d", ErrMigrationRequired, version)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE gripline_schema SET version=$1 WHERE singleton=TRUE`, currentSchemaVersion); err != nil {
+		return fmt.Errorf("statepg: record schema version: %w", mapDBError(err))
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("statepg: commit schema migration: %w", mapDBError(err))

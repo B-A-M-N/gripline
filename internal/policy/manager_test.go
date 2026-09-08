@@ -21,6 +21,9 @@ func TestManagerPrepareActivateRollback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if epoch, ok := m.PolicyEpoch(); !ok || epoch != 1 {
+		t.Fatalf("initial policy epoch: %d, %v", epoch, ok)
+	}
 	next := Default()
 	next.Revision = 2
 	prepared, err := m.Prepare(next)
@@ -36,11 +39,17 @@ func TestManagerPrepareActivateRollback(t *testing.T) {
 	if m.Current().Revision != 2 || len(manifests) != 2 || len(events) != 2 {
 		t.Fatalf("activation state: rev=%d manifests=%d events=%d", m.Current().Revision, len(manifests), len(events))
 	}
+	if epoch, ok := m.PolicyEpoch(); !ok || epoch != 2 || events[1].FromEpoch != 1 || events[1].ToEpoch != 2 {
+		t.Fatalf("activation epoch: %d, %v event=%+v", epoch, ok, events[1])
+	}
 	if err := m.Rollback(1, "failed canary"); err != nil {
 		t.Fatal(err)
 	}
 	if m.Current().Revision != 1 || events[2].Action != "rollback" {
 		t.Fatalf("rollback state: rev=%d events=%+v", m.Current().Revision, events)
+	}
+	if epoch, ok := m.PolicyEpoch(); !ok || epoch != 3 || events[2].FromEpoch != 2 || events[2].ToEpoch != 3 {
+		t.Fatalf("rollback epoch: %d, %v event=%+v", epoch, ok, events[2])
 	}
 }
 
@@ -116,5 +125,34 @@ func TestManagerRefreshesCommittedSharedPolicy(t *testing.T) {
 	}
 	if got := m.Current(); got == nil || got.Revision != 2 {
 		t.Fatalf("manager did not refresh shared active policy: %+v", got)
+	}
+	if epoch, ok := m.PolicyEpoch(); !ok || epoch != 1 {
+		t.Fatalf("shared policy epoch: %d, %v", epoch, ok)
+	}
+}
+
+func TestManagerRefreshesSharedPolicyEpochWithoutArtifactChange(t *testing.T) {
+	active, err := Compile(Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := manifestFor(active, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.ActivationEpoch = 7
+	m, err := NewManager(Default(), Options{
+		LoadManifest: func() (Manifest, error) { return manifest, nil },
+		LoadArtifact: func(ref PolicyRef) (*CompiledPolicy, error) { return active, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if epoch, ok := m.PolicyEpoch(); !ok || epoch != 7 {
+		t.Fatalf("loaded policy epoch: %d, %v", epoch, ok)
+	}
+	manifest.ActivationEpoch = 8
+	if epoch, ok := m.PolicyEpoch(); !ok || epoch != 8 {
+		t.Fatalf("refreshed policy epoch: %d, %v", epoch, ok)
 	}
 }

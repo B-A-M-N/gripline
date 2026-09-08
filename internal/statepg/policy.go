@@ -24,6 +24,9 @@ func validatePolicyManifest(manifest policy.Manifest) error {
 	if manifest.SchemaVersion != policyManifestSchemaVersion {
 		return errors.New("statepg: invalid policy manifest schema")
 	}
+	if manifest.ActivationEpoch == 0 {
+		return errors.New("statepg: invalid policy activation epoch")
+	}
 	if err := validatePolicyRef(manifest.Active); err != nil {
 		return fmt.Errorf("active policy: %w", err)
 	}
@@ -53,10 +56,18 @@ func (s *Store) LoadPolicyManifest() (policy.Manifest, error) {
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return out, fmt.Errorf("statepg: decode policy manifest: %w", err)
 	}
+	if out.ActivationEpoch == 0 {
+		// Manifests written before activation epochs are treated as epoch 1;
+		// lifecycle writes thereafter must carry the field explicitly.
+		out.ActivationEpoch = 1
+	}
 	return out, validatePolicyManifest(out)
 }
 
 func (s *Store) PersistPolicyManifest(manifest policy.Manifest) error {
+	if manifest.ActivationEpoch == 0 {
+		manifest.ActivationEpoch = 1
+	}
 	if err := validatePolicyManifest(manifest); err != nil {
 		return err
 	}
@@ -148,21 +159,43 @@ func (s *Store) PersistPolicyTransition(manifest policy.Manifest, event policy.E
 	err = tx.QueryRow(ctx, `SELECT manifest FROM gripline_policy_manifest WHERE singleton=TRUE FOR UPDATE`).Scan(&previousRaw)
 	if err == nil {
 		var previous policy.Manifest
-		if json.Unmarshal(previousRaw, &previous) != nil || validatePolicyManifest(previous) != nil {
+		if json.Unmarshal(previousRaw, &previous) != nil {
+			return errors.New("statepg: corrupt previous policy manifest")
+		}
+		if previous.ActivationEpoch == 0 {
+			previous.ActivationEpoch = 1
+		}
+		if validatePolicyManifest(previous) != nil {
 			return errors.New("statepg: corrupt previous policy manifest")
 		}
 		if event.FromRevision != previous.Active.Revision {
 			return fmt.Errorf("statepg: stale policy transition from revision %d; active is %d", event.FromRevision, previous.Active.Revision)
 		}
+		if event.FromEpoch != 0 && event.FromEpoch != previous.ActivationEpoch {
+			return fmt.Errorf("statepg: stale policy transition from epoch %d; active is %d", event.FromEpoch, previous.ActivationEpoch)
+		}
+		epochAware := event.FromEpoch != 0 || event.ToEpoch != 0
 		switch event.Action {
 		case "prepare":
 			if previous.Candidate != nil {
 				return errors.New("statepg: another policy candidate is already prepared")
 			}
 		case "activate":
-			if previous.Candidate == nil || previous.Candidate.Revision != event.ToRevision || previous.Candidate.ID != event.PolicyID {
+			if epochAware && (previous.Candidate == nil || previous.Candidate.Revision != event.ToRevision || previous.Candidate.ID != event.PolicyID) {
 				return errors.New("statepg: activation does not match the shared candidate")
 			}
+		}
+		if epochAware {
+			if event.Action == "prepare" {
+				if manifest.ActivationEpoch != previous.ActivationEpoch {
+					return errors.New("statepg: prepare changes policy activation epoch")
+				}
+			} else if manifest.ActivationEpoch != previous.ActivationEpoch+1 {
+				return errors.New("statepg: policy activation epoch is not monotonic")
+			}
+		}
+		if event.ToEpoch != 0 && event.ToEpoch != manifest.ActivationEpoch {
+			return fmt.Errorf("statepg: transition event epoch %d does not match manifest epoch %d", event.ToEpoch, manifest.ActivationEpoch)
 		}
 		if event.Action != "rollback" && previous.Active.Revision > manifest.Active.Revision {
 			return errors.New("statepg: policy transition moves active revision backwards")

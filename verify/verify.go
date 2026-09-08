@@ -36,18 +36,19 @@ const (
 
 // Claims is the authenticated, non-secret principal passed to the provider.
 type Claims struct {
-	Issuer    string   `json:"iss"`
-	Subject   string   `json:"sub"`
-	CredID    string   `json:"cid"`
-	LaneID    string   `json:"ctx"`
-	Audience  string   `json:"aud"`
-	IssuedAt  int64    `json:"iat"`
-	ExpiresAt int64    `json:"exp"`
-	JTI       string   `json:"jti"`
-	PolicyRev int      `json:"policy_rev"`
-	CredRev   int      `json:"cred_rev"`
-	Scope     []string `json:"scope"`
-	KeyID     int      `json:"kid"`
+	Issuer      string   `json:"iss"`
+	Subject     string   `json:"sub"`
+	CredID      string   `json:"cid"`
+	LaneID      string   `json:"ctx"`
+	Audience    string   `json:"aud"`
+	IssuedAt    int64    `json:"iat"`
+	ExpiresAt   int64    `json:"exp"`
+	JTI         string   `json:"jti"`
+	PolicyRev   int      `json:"policy_rev"`
+	PolicyEpoch uint64   `json:"policy_epoch,omitempty"`
+	CredRev     int      `json:"cred_rev"`
+	Scope       []string `json:"scope"`
+	KeyID       int      `json:"kid"`
 }
 
 // KeyMaterial is one public key entry from `gripline keys export`.
@@ -153,6 +154,26 @@ type RevisionSource interface {
 	CredentialRevision(credentialID string) (int, bool)
 }
 
+// ContextRevisionSource is the context-aware form of RevisionSource. When
+// configured, the verifier uses it so an authority lookup cannot outlive the
+// request being authenticated.
+type ContextRevisionSource interface {
+	CredentialRevisionContext(context.Context, string) (int, error)
+}
+
+// PolicyEpochSource supplies the current activation epoch from the policy
+// authority. A verifier configured with this source rejects assertions from a
+// prior activation, including assertions whose policy revision is lower but
+// whose artifact is otherwise known-good after a rollback.
+type PolicyEpochSource interface {
+	PolicyEpoch() (uint64, bool)
+}
+
+// ContextPolicyEpochSource is the context-aware form of PolicyEpochSource.
+type ContextPolicyEpochSource interface {
+	PolicyEpochContext(context.Context) (uint64, error)
+}
+
 // TransportTrust proves the request arrived over the provider's trusted
 // private transport. It must inspect connection identity, not application
 // headers.
@@ -163,12 +184,14 @@ type TransportTrust interface {
 // Verifier validates the short-lived assertion and provides middleware for a
 // protected HTTP handler.
 type Verifier struct {
-	keys         map[int]ed25519.PublicKey
-	audience     string
-	now          func() time.Time
-	revisions    RevisionSource
-	minPolicyRev int
-	transport    TransportTrust
+	keys           map[int]ed25519.PublicKey
+	audience       string
+	now            func() time.Time
+	revisions      RevisionSource
+	minPolicyRev   int
+	policyEpochs   PolicyEpochSource
+	minPolicyEpoch uint64
+	transport      TransportTrust
 }
 
 // New constructs a verifier bound to one exact audience.
@@ -202,6 +225,13 @@ func (v *Verifier) WithRevisionChecks(src RevisionSource, minPolicyRev int) *Ver
 	return v
 }
 
+// WithPolicyEpochChecks enables exact activation-epoch freshness checks. The
+// source is optional; when nil, minEpoch still provides a lower-bound check.
+func (v *Verifier) WithPolicyEpochChecks(src PolicyEpochSource, minEpoch uint64) *Verifier {
+	v.policyEpochs, v.minPolicyEpoch = src, minEpoch
+	return v
+}
+
 func (v *Verifier) RequireTransportTrust(trust TransportTrust) *Verifier {
 	v.transport = trust
 	return v
@@ -209,8 +239,17 @@ func (v *Verifier) RequireTransportTrust(trust TransportTrust) *Verifier {
 
 // Verify authenticates an assertion without mutating the request.
 func (v *Verifier) Verify(r *http.Request) (*Claims, error) {
+	return v.VerifyContext(context.Background(), r)
+}
+
+// VerifyContext authenticates an assertion while carrying ctx into
+// authoritative freshness lookups.
+func (v *Verifier) VerifyContext(ctx context.Context, r *http.Request) (*Claims, error) {
 	if v == nil || r == nil {
 		return nil, ErrBadAssertion
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	if v.transport != nil && !v.transport.Trusted(r) {
 		return nil, ErrUntrustedTransport
@@ -222,14 +261,20 @@ func (v *Verifier) Verify(r *http.Request) (*Claims, error) {
 	if len(values) != 1 {
 		return nil, ErrDuplicateAssertion
 	}
-	return v.verifyEncoded(values[0])
+	return v.verifyEncodedContext(ctx, values[0])
 }
 
 // VerifyAndStrip authenticates the request and removes the assertion only
 // after successful verification. The returned Claims are the replacement
 // principal representation for downstream code.
 func (v *Verifier) VerifyAndStrip(r *http.Request) (*Claims, error) {
-	claims, err := v.Verify(r)
+	return v.VerifyAndStripContext(context.Background(), r)
+}
+
+// VerifyAndStripContext authenticates and strips an assertion using ctx for
+// authoritative freshness lookups.
+func (v *Verifier) VerifyAndStripContext(ctx context.Context, r *http.Request) (*Claims, error) {
+	claims, err := v.VerifyContext(ctx, r)
 	if err != nil {
 		return nil, err
 	}
@@ -242,7 +287,7 @@ type claimsContextKey struct{}
 // Middleware verifies and strips the assertion before invoking next.
 func (v *Verifier) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		claims, err := v.VerifyAndStrip(r)
+		claims, err := v.VerifyAndStripContext(r.Context(), r)
 		if err != nil {
 			http.Error(w, "assertion required", http.StatusUnauthorized)
 			return
@@ -257,7 +302,7 @@ func ClaimsFromContext(ctx context.Context) (*Claims, bool) {
 	return claims, ok
 }
 
-func (v *Verifier) verifyEncoded(encoded string) (*Claims, error) {
+func (v *Verifier) verifyEncodedContext(ctx context.Context, encoded string) (*Claims, error) {
 	if encoded == "" || len(encoded) > maxTokenBytes {
 		return nil, ErrBadAssertion
 	}
@@ -323,12 +368,46 @@ func (v *Verifier) verifyEncoded(encoded string) (*Claims, error) {
 		return nil, ErrNotYetValid
 	}
 	if v.revisions != nil {
-		current, exists := v.revisions.CredentialRevision(c.CredID)
-		if !exists || current != c.CredRev {
-			return nil, ErrStaleCredentialRevision
+		if contextSource, ok := v.revisions.(ContextRevisionSource); ok {
+			current, err := contextSource.CredentialRevisionContext(ctx, c.CredID)
+			if err != nil {
+				return nil, ErrCredentialRevisionUnavailable
+			}
+			if current != c.CredRev {
+				return nil, ErrStaleCredentialRevision
+			}
+		} else {
+			current, exists := v.revisions.CredentialRevision(c.CredID)
+			if !exists || current != c.CredRev {
+				return nil, ErrStaleCredentialRevision
+			}
 		}
 		if c.PolicyRev < v.minPolicyRev {
 			return nil, ErrStalePolicyRevision
+		}
+	}
+	if v.policyEpochs != nil || v.minPolicyEpoch > 0 {
+		if c.PolicyEpoch == 0 || c.PolicyEpoch < v.minPolicyEpoch {
+			return nil, ErrStalePolicyEpoch
+		}
+		if v.policyEpochs != nil {
+			var current uint64
+			var err error
+			if contextSource, ok := v.policyEpochs.(ContextPolicyEpochSource); ok {
+				current, err = contextSource.PolicyEpochContext(ctx)
+			} else {
+				var exists bool
+				current, exists = v.policyEpochs.PolicyEpoch()
+				if !exists {
+					err = ErrPolicyEpochUnavailable
+				}
+			}
+			if err != nil {
+				return nil, ErrPolicyEpochUnavailable
+			}
+			if current == 0 || c.PolicyEpoch != current {
+				return nil, ErrStalePolicyEpoch
+			}
 		}
 	}
 	return &c, nil
@@ -402,16 +481,19 @@ func requiresLane(scopes []string) bool {
 }
 
 var (
-	ErrMissingAssertion        = errors.New("gripline verify: missing assertion")
-	ErrDuplicateAssertion      = errors.New("gripline verify: duplicate assertion")
-	ErrBadAssertion            = errors.New("gripline verify: bad assertion")
-	ErrBadSignature            = errors.New("gripline verify: bad signature")
-	ErrUnknownKey              = errors.New("gripline verify: unknown signing key")
-	ErrWrongIssuer             = errors.New("gripline verify: wrong issuer")
-	ErrWrongAudience           = errors.New("gripline verify: wrong audience")
-	ErrExpired                 = errors.New("gripline verify: assertion expired")
-	ErrNotYetValid             = errors.New("gripline verify: assertion not yet valid")
-	ErrStaleCredentialRevision = errors.New("gripline verify: stale credential revision")
-	ErrStalePolicyRevision     = errors.New("gripline verify: stale policy revision")
-	ErrUntrustedTransport      = errors.New("gripline verify: untrusted transport")
+	ErrMissingAssertion              = errors.New("gripline verify: missing assertion")
+	ErrDuplicateAssertion            = errors.New("gripline verify: duplicate assertion")
+	ErrBadAssertion                  = errors.New("gripline verify: bad assertion")
+	ErrBadSignature                  = errors.New("gripline verify: bad signature")
+	ErrUnknownKey                    = errors.New("gripline verify: unknown signing key")
+	ErrWrongIssuer                   = errors.New("gripline verify: wrong issuer")
+	ErrWrongAudience                 = errors.New("gripline verify: wrong audience")
+	ErrExpired                       = errors.New("gripline verify: assertion expired")
+	ErrNotYetValid                   = errors.New("gripline verify: assertion not yet valid")
+	ErrStaleCredentialRevision       = errors.New("gripline verify: stale credential revision")
+	ErrCredentialRevisionUnavailable = errors.New("gripline verify: credential revision unavailable")
+	ErrStalePolicyRevision           = errors.New("gripline verify: stale policy revision")
+	ErrStalePolicyEpoch              = errors.New("gripline verify: stale policy activation epoch")
+	ErrPolicyEpochUnavailable        = errors.New("gripline verify: policy activation epoch unavailable")
+	ErrUntrustedTransport            = errors.New("gripline verify: untrusted transport")
 )

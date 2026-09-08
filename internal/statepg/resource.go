@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -12,11 +13,13 @@ import (
 
 	"github.com/B-A-M-N/gripline/internal/resource"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 var (
-	ErrLeaseExpired = errors.New("statepg: resource lease expired")
-	ErrLeaseOwner   = errors.New("statepg: resource lease owned by another node")
+	ErrLeaseExpired    = errors.New("statepg: resource lease expired")
+	ErrLeaseOwner      = errors.New("statepg: resource lease owned by another node")
+	ErrRequestConflict = errors.New("statepg: request id payload conflict")
 )
 
 const (
@@ -50,6 +53,20 @@ func (s *Store) provisionDistributed(ctx context.Context, requestID string, scop
 	if len(scopes) == 0 {
 		return nil, errors.New("resource: no scopes to provision")
 	}
+	fingerprint, err := resourceRequestFingerprint(scopes, estimate)
+	if err != nil {
+		return nil, err
+	}
+	for attempt := 0; attempt < 3; attempt++ {
+		reservation, err := s.provisionDistributedOnce(ctx, requestID, fingerprint, scopes, estimate)
+		if err == nil || !retryableTransactionError(err) || ctx.Err() != nil {
+			return reservation, err
+		}
+	}
+	return nil, errors.New("statepg: resource admission remained conflicted after retries")
+}
+
+func (s *Store) provisionDistributedOnce(ctx context.Context, requestID, fingerprint string, scopes []resource.ScopeSpec, estimate resource.UsageEstimate) (resource.UsageReservation, error) {
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return nil, mapDBError(err)
@@ -67,10 +84,13 @@ func (s *Store) provisionDistributed(ctx context.Context, requestID string, scop
 	if requestID == "" {
 		requestID = leaseID
 	} else {
-		var existingID, existingNode, existingState string
+		var existingID, existingNode, existingState, existingFingerprint string
 		var existingExpiry time.Time
-		err := tx.QueryRow(ctx, `SELECT lease_id, node_id, state, expires_at FROM gripline_resource_leases WHERE request_id=$1`, requestID).Scan(&existingID, &existingNode, &existingState, &existingExpiry)
+		err := tx.QueryRow(ctx, `SELECT lease_id, node_id, state, expires_at, request_fingerprint FROM gripline_resource_leases WHERE request_id=$1`, requestID).Scan(&existingID, &existingNode, &existingState, &existingExpiry, &existingFingerprint)
 		if err == nil {
+			if existingFingerprint != "" && existingFingerprint != fingerprint {
+				return nil, ErrRequestConflict
+			}
 			if existingNode != s.nodeID {
 				return nil, ErrLeaseOwner
 			}
@@ -83,7 +103,7 @@ func (s *Store) provisionDistributed(ctx context.Context, requestID string, scop
 			return nil, mapDBError(err)
 		}
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO gripline_resource_leases (lease_id, request_id, node_id, state, expires_at, created_at) VALUES ($1,$2,$3,$4,$5,$6)`, leaseID, requestID, s.nodeID, leaseReserved, expiresAt, now); err != nil {
+	if _, err := tx.Exec(ctx, `INSERT INTO gripline_resource_leases (lease_id, request_id, request_fingerprint, node_id, state, expires_at, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7)`, leaseID, requestID, fingerprint, s.nodeID, leaseReserved, expiresAt, now); err != nil {
 		return nil, mapDBError(err)
 	}
 	for _, original := range scopes {
@@ -117,6 +137,24 @@ func (s *Store) provisionDistributed(ctx context.Context, requestID string, scop
 		return nil, mapDBError(err)
 	}
 	return &distributedReservation{store: s, leaseID: leaseID, expiresAt: expiresAt}, nil
+}
+
+func resourceRequestFingerprint(scopes []resource.ScopeSpec, estimate resource.UsageEstimate) (string, error) {
+	payload := struct {
+		Scopes   []resource.ScopeSpec   `json:"scopes"`
+		Estimate resource.UsageEstimate `json:"estimate"`
+	}{Scopes: scopes, Estimate: estimate}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("statepg: fingerprint resource request: %w", err)
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func retryableTransactionError(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && (pgErr.Code == "40001" || pgErr.Code == "23505")
 }
 
 func shouldReserveConcurrency(spec resource.BucketSpec) bool {

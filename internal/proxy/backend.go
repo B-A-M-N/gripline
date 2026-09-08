@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"crypto/ed25519"
 	"fmt"
 	"net/http"
@@ -35,8 +36,10 @@ type BackendVerifier struct {
 	// stale; minPolicyRev rejects assertions minted under an older policy
 	// revision. Stateless TTL-only verifiers leave both zero (their service
 	// class: TTL is the freshness bound — ≤30s INV-10).
-	rev          RevisionSource
-	minPolicyRev int
+	rev            RevisionSource
+	minPolicyRev   int
+	policyEpochs   PolicyEpochSource
+	minPolicyEpoch uint64
 	// transport is the P0.53 gate: required network/service identity, proven
 	// below the assertion. Nil = not enforced (tests, non-sensitive hop).
 	transport TransportIdentity
@@ -49,6 +52,24 @@ type RevisionSource interface {
 	CredentialRevision(credID string) (int, bool)
 }
 
+// ContextRevisionSource is the request-aware form of RevisionSource. It lets
+// a distributed backend authority stop an in-flight lookup when the request
+// is canceled.
+type ContextRevisionSource interface {
+	CredentialRevisionContext(context.Context, string) (int, error)
+}
+
+// PolicyEpochSource supplies the exact active policy activation epoch. Unlike
+// a policy revision, this remains fresh across rollback to an older artifact.
+type PolicyEpochSource interface {
+	PolicyEpoch() (uint64, bool)
+}
+
+// ContextPolicyEpochSource is the request-aware form of PolicyEpochSource.
+type ContextPolicyEpochSource interface {
+	PolicyEpochContext(context.Context) (uint64, error)
+}
+
 // WithRevisionChecks enables P0.19 enforcement: assertions whose cred_rev is
 // behind the authoritative current revision, or whose policy_rev is below
 // minPolicyRev, are rejected even while cryptographically valid. High-value
@@ -56,6 +77,14 @@ type RevisionSource interface {
 func (b *BackendVerifier) WithRevisionChecks(src RevisionSource, minPolicyRev int) *BackendVerifier {
 	b.rev = src
 	b.minPolicyRev = minPolicyRev
+	return b
+}
+
+// WithPolicyEpochChecks enables exact activation-epoch checks for sensitive
+// backend routes. A nil source still permits a lower-bound-only check.
+func (b *BackendVerifier) WithPolicyEpochChecks(src PolicyEpochSource, minEpoch uint64) *BackendVerifier {
+	b.policyEpochs = src
+	b.minPolicyEpoch = minEpoch
 	return b
 }
 
@@ -88,6 +117,18 @@ func (b *BackendVerifier) WithClock(now func() time.Time) *BackendVerifier {
 // when revision checks are enabled), or a forged/invalid carrier. It never
 // touches the external secret headers.
 func (b *BackendVerifier) Verify(r *http.Request) (*terminator.Claims, error) {
+	return b.VerifyContext(context.Background(), r)
+}
+
+// VerifyContext is Verify with request context propagated to authoritative
+// freshness lookups.
+func (b *BackendVerifier) VerifyContext(ctx context.Context, r *http.Request) (*terminator.Claims, error) {
+	if r == nil {
+		return nil, fmt.Errorf("backend: nil request")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	vals := r.Header.Values(assertionHeader)
 	if len(vals) == 0 {
 		return nil, fmt.Errorf("backend: missing internal assertion (INV-11)")
@@ -119,11 +160,37 @@ func (b *BackendVerifier) Verify(r *http.Request) (*terminator.Claims, error) {
 	// P0.19: authoritative revision freshness for sensitive backends. The
 	// lookup failing is stale-by-unknown → deny (fail closed).
 	if b.rev != nil {
-		if cur, ok := b.rev.CredentialRevision(claims.CredID); !ok || cur != claims.CredRev {
+		var cur int
+		var ok bool
+		if contextSource, implements := b.rev.(ContextRevisionSource); implements {
+			value, lookupErr := contextSource.CredentialRevisionContext(ctx, claims.CredID)
+			cur, ok = value, lookupErr == nil
+		} else {
+			cur, ok = b.rev.CredentialRevision(claims.CredID)
+		}
+		if !ok || cur != claims.CredRev {
 			return nil, fmt.Errorf("backend: assertion cred_rev %d stale (current %v) (P0.19)", claims.CredRev, cur)
 		}
 		if claims.PolicyRev < b.minPolicyRev {
 			return nil, fmt.Errorf("backend: assertion policy_rev %d below minimum %d (P0.19)", claims.PolicyRev, b.minPolicyRev)
+		}
+	}
+	if b.policyEpochs != nil || b.minPolicyEpoch > 0 {
+		if claims.PolicyEpoch == 0 || claims.PolicyEpoch < b.minPolicyEpoch {
+			return nil, fmt.Errorf("backend: assertion policy epoch %d is stale (P0.19)", claims.PolicyEpoch)
+		}
+		if b.policyEpochs != nil {
+			var current uint64
+			var ok bool
+			if contextSource, implements := b.policyEpochs.(ContextPolicyEpochSource); implements {
+				value, lookupErr := contextSource.PolicyEpochContext(ctx)
+				current, ok = value, lookupErr == nil
+			} else {
+				current, ok = b.policyEpochs.PolicyEpoch()
+			}
+			if !ok || current == 0 || claims.PolicyEpoch != current {
+				return nil, fmt.Errorf("backend: assertion policy epoch %d stale (current %v) (P0.19)", claims.PolicyEpoch, current)
+			}
 		}
 	}
 	return claims, nil

@@ -222,7 +222,15 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		return nil, fmt.Errorf("gripline: GRIPLINE_BOOTSTRAP_CREDENTIAL is permitted only with deployment.allow_ephemeral_state=true; provision credentials before starting the persistent deployment")
 	}
 
-	signer, err := terminator.LoadOrCreateKeyring(cfg.Paths.SignerKeyring)
+	var signer *terminator.Keyring
+	if postgres != nil {
+		// A clustered node must use the pre-provisioned signer identity. Creating
+		// a keyring locally would mint a node-specific authority and make the
+		// cluster's assertion identity split-brain.
+		signer, err = terminator.LoadExistingKeyring(cfg.Paths.SignerKeyring)
+	} else {
+		signer, err = terminator.LoadOrCreateKeyring(cfg.Paths.SignerKeyring)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("gripline: signer: %w", err)
 	}
@@ -663,12 +671,17 @@ func (rt *Runtime) Close() error {
 }
 
 type adminPolicySnapshot struct {
-	ID       string `json:"id"`
-	Revision int    `json:"revision"`
-	Digest   string `json:"digest"`
+	ID              string `json:"id"`
+	Revision        int    `json:"revision"`
+	Digest          string `json:"digest"`
+	ActivationEpoch uint64 `json:"activation_epoch,omitempty"`
 }
 
 func adminPolicySnapshotOf(compiled *policy.CompiledPolicy) *adminPolicySnapshot {
+	return adminPolicySnapshotOfWithEpoch(compiled, 0)
+}
+
+func adminPolicySnapshotOfWithEpoch(compiled *policy.CompiledPolicy, epoch uint64) *adminPolicySnapshot {
 	if compiled == nil {
 		return nil
 	}
@@ -676,7 +689,7 @@ func adminPolicySnapshotOf(compiled *policy.CompiledPolicy) *adminPolicySnapshot
 	if err != nil {
 		return nil
 	}
-	return &adminPolicySnapshot{ID: compiled.ID, Revision: compiled.Revision, Digest: digest}
+	return &adminPolicySnapshot{ID: compiled.ID, Revision: compiled.Revision, Digest: digest, ActivationEpoch: epoch}
 }
 
 // adminPolicyStatus exposes only immutable policy identity metadata. The
@@ -691,8 +704,13 @@ func adminPolicyStatus(svc *control.Service, manager *policy.Manager) http.Handl
 			writeAdminError(w, err)
 			return
 		}
+		active := manager.Snapshot()
+		var activeView *adminPolicySnapshot
+		if active != nil {
+			activeView = adminPolicySnapshotOfWithEpoch(active.Policy, active.ActivationEpoch)
+		}
 		writeAdminJSON(w, map[string]any{
-			"active":    adminPolicySnapshotOf(manager.Current()),
+			"active":    activeView,
 			"candidate": adminPolicySnapshotOf(manager.Candidate()),
 		})
 	}
@@ -764,7 +782,12 @@ func adminPolicyActivate(svc *control.Service, manager *policy.Manager) http.Han
 			writePolicyAdminError(w, err)
 			return
 		}
-		writeAdminJSON(w, map[string]any{"active": adminPolicySnapshotOf(manager.Current())})
+		active := manager.Snapshot()
+		if active == nil {
+			writeAdminJSON(w, map[string]any{"active": nil})
+			return
+		}
+		writeAdminJSON(w, map[string]any{"active": adminPolicySnapshotOfWithEpoch(active.Policy, active.ActivationEpoch)})
 	}
 }
 
@@ -794,7 +817,12 @@ func adminPolicyRollback(svc *control.Service, manager *policy.Manager) http.Han
 			writePolicyAdminError(w, err)
 			return
 		}
-		writeAdminJSON(w, map[string]any{"active": adminPolicySnapshotOf(manager.Current())})
+		active := manager.Snapshot()
+		if active == nil {
+			writeAdminJSON(w, map[string]any{"active": nil})
+			return
+		}
+		writeAdminJSON(w, map[string]any{"active": adminPolicySnapshotOfWithEpoch(active.Policy, active.ActivationEpoch)})
 	}
 }
 

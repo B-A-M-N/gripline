@@ -97,17 +97,18 @@ var (
 
 // Claims is the internal-identity payload (§20).
 type Claims struct {
-	Issuer    string   `json:"iss"`
-	Subject   string   `json:"sub"` // account id
-	CredID    string   `json:"cid"` // credential id
-	LaneID    string   `json:"ctx"` // lane context
-	Audience  string   `json:"aud"`
-	IssuedAt  int64    `json:"iat"`
-	ExpiresAt int64    `json:"exp"`
-	JTI       string   `json:"jti"` // unique per-request id
-	PolicyRev int      `json:"policy_rev"`
-	CredRev   int      `json:"cred_rev"`
-	Scope     []string `json:"scope"`
+	Issuer      string   `json:"iss"`
+	Subject     string   `json:"sub"` // account id
+	CredID      string   `json:"cid"` // credential id
+	LaneID      string   `json:"ctx"` // lane context
+	Audience    string   `json:"aud"`
+	IssuedAt    int64    `json:"iat"`
+	ExpiresAt   int64    `json:"exp"`
+	JTI         string   `json:"jti"` // unique per-request id
+	PolicyRev   int      `json:"policy_rev"`
+	PolicyEpoch uint64   `json:"policy_epoch,omitempty"`
+	CredRev     int      `json:"cred_rev"`
+	Scope       []string `json:"scope"`
 	// KeyID is the signer generation (kid). The verifier selects its public key
 	// by this id, enabling key rotation with overlap (P0.59).
 	KeyID int `json:"kid"`

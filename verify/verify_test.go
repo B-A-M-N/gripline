@@ -1,6 +1,7 @@
 package verify
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
@@ -115,5 +116,64 @@ func TestLoadKeySetRejectsDuplicatesAndBadFingerprint(t *testing.T) {
 				t.Fatal("invalid key set accepted")
 			}
 		})
+	}
+}
+
+type epochSource uint64
+
+func (e epochSource) PolicyEpoch() (uint64, bool) { return uint64(e), true }
+
+type contextEpochSource struct {
+	epoch uint64
+	seen  context.Context
+}
+
+func (s *contextEpochSource) PolicyEpoch() (uint64, bool) { return s.epoch, true }
+
+func (s *contextEpochSource) PolicyEpochContext(ctx context.Context) (uint64, error) {
+	s.seen = ctx
+	return s.epoch, nil
+}
+
+func TestPolicyEpochChecksRejectRollbackStaleAssertions(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	set, _ := NewKeySet(map[int]ed25519.PublicKey{1: pub}, 1)
+	v, _ := New(set, "provider")
+	now := time.Unix(1_700_000_000, 0)
+	v.WithClock(func() time.Time { return now }).WithPolicyEpochChecks(epochSource(3), 1)
+	c := testClaims(now)
+	c.PolicyRev = 1 // rollback can lower artifact revision
+	c.PolicyEpoch = 3
+	r := httptest.NewRequest("POST", "http://backend", nil)
+	r.Header.Set(AssertionHeader, testToken(t, priv, c))
+	if _, err := v.Verify(r); err != nil {
+		t.Fatalf("current epoch should accept assertion: %v", err)
+	}
+	c.PolicyEpoch = 2
+	r.Header.Set(AssertionHeader, testToken(t, priv, c))
+	if _, err := v.Verify(r); err != ErrStalePolicyEpoch {
+		t.Fatalf("stale epoch: %v", err)
+	}
+}
+
+func TestVerifyContextPropagatesToPolicyEpochSource(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	set, _ := NewKeySet(map[int]ed25519.PublicKey{1: pub}, 1)
+	source := &contextEpochSource{epoch: 1}
+	v, _ := New(set, "provider")
+	v.WithPolicyEpochChecks(source, 1)
+	now := time.Unix(1_700_000_000, 0)
+	v.WithClock(func() time.Time { return now })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r := httptest.NewRequest("POST", "http://backend", nil).WithContext(ctx)
+	c := testClaims(now)
+	c.PolicyEpoch = 1
+	r.Header.Set(AssertionHeader, testToken(t, priv, c))
+	if _, err := v.VerifyContext(ctx, r); err != nil {
+		t.Fatalf("context verification: %v", err)
+	}
+	if source.seen != ctx {
+		t.Fatal("policy epoch source did not receive request context")
 	}
 }

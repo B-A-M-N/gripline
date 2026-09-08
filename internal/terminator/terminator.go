@@ -318,6 +318,13 @@ type PolicyProvider interface {
 	Current() *policy.CompiledPolicy
 }
 
+// PolicySnapshotProvider is an optional hot-path extension. Snapshot returns
+// the immutable compiled policy together with the activation epoch that makes
+// policy freshness explicit across nodes.
+type PolicySnapshotProvider interface {
+	Snapshot() *policy.Snapshot
+}
+
 // Terminator is the credential-termination admission engine.
 type Terminator struct {
 	dep  Dependencies
@@ -329,8 +336,9 @@ type Terminator struct {
 	// re-configuration (New). The old shallow struct copy shared the evidence
 	// map: a caller writing dep.Policy.EvidenceRules["NEW_LANE"] after
 	// construction rewrote live enforcement.
-	policies PolicyProvider
-	pol      *policy.CompiledPolicy
+	policies    PolicyProvider
+	pol         *policy.CompiledPolicy
+	policyEpoch uint64
 	// pruneCounter triggers pruning every N admissions (optimization only).
 	pruneCounter *atomic.Int64
 }
@@ -339,6 +347,7 @@ type Terminator struct {
 // Mode (P0.6): security-critical dependencies are mandatory per mode, and a
 // missing one fails construction instead of degrading enforcement silently.
 func New(dep Dependencies) (*Terminator, error) {
+	initialPolicyEpoch := uint64(1)
 	if dep.Registry == nil {
 		return nil, errors.New("terminator: registry required")
 	}
@@ -349,11 +358,22 @@ func New(dep Dependencies) (*Terminator, error) {
 		if dep.Policies == nil {
 			return nil, errors.New("terminator: policy required")
 		}
-		current := dep.Policies.Current()
-		if current == nil {
-			return nil, errors.New("terminator: policy required")
+		if snapshots, ok := dep.Policies.(PolicySnapshotProvider); ok {
+			snapshot := snapshots.Snapshot()
+			if snapshot == nil || snapshot.Policy == nil {
+				return nil, errors.New("terminator: policy required")
+			}
+			dep.Policy = &snapshot.Policy.Policy
+			if snapshot.ActivationEpoch > 0 {
+				initialPolicyEpoch = snapshot.ActivationEpoch
+			}
+		} else {
+			current := dep.Policies.Current()
+			if current == nil {
+				return nil, errors.New("terminator: policy required")
+			}
+			dep.Policy = &current.Policy
 		}
-		dep.Policy = &current.Policy
 	}
 	if dep.Signer == nil {
 		return nil, errors.New("terminator: signer required")
@@ -400,21 +420,39 @@ func New(dep Dependencies) (*Terminator, error) {
 		policies:     dep.Policies,
 		rand:         newRequestID,
 		pol:          compiled,
+		policyEpoch:  initialPolicyEpoch,
 		pruneCounter: &atomic.Int64{},
 	}, nil
 }
 
-func (t *Terminator) currentPolicy() *policy.CompiledPolicy {
+func (t *Terminator) currentPolicySnapshot() (*policy.CompiledPolicy, uint64) {
 	if t == nil {
-		return nil
+		return nil, 0
 	}
 	compiled := t.pol
+	epoch := t.policyEpoch
 	if t.policies != nil {
-		if current := t.policies.Current(); current != nil {
+		if snapshots, ok := t.policies.(PolicySnapshotProvider); ok {
+			snapshot := snapshots.Snapshot()
+			if snapshot == nil || snapshot.Policy == nil {
+				return nil, 0
+			}
+			compiled = snapshot.Policy
+			if snapshot.ActivationEpoch > 0 {
+				epoch = snapshot.ActivationEpoch
+			}
+		} else {
+			current := t.policies.Current()
+			if current == nil {
+				return nil, 0
+			}
 			compiled = current
 		}
 	}
-	return compiled
+	if epoch == 0 {
+		epoch = 1
+	}
+	return compiled, epoch
 }
 
 func lanePolicyContext(compiled *policy.CompiledPolicy) lane.PolicyContext {
@@ -555,14 +593,14 @@ func (t *Terminator) AdmitUsageContext(ctx context.Context, reqID string, header
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	compiled := t.currentPolicy()
+	compiled, policyEpoch := t.currentPolicySnapshot()
 	if compiled == nil {
 		return &Outcome{RequestID: reqID, Authorized: false, Reason: "policy_unavailable", DenialErr: errors.New("terminator: live policy unavailable")}
 	}
 	// Keep the existing implementation's receiver-local policy references while
 	// ensuring every request uses the one snapshot selected above. The view
 	// shares mutable counters and dependencies but has no independent authority.
-	view := &Terminator{dep: t.dep, rand: t.rand, pol: compiled, pruneCounter: t.pruneCounter}
+	view := &Terminator{dep: t.dep, rand: t.rand, pol: compiled, policyEpoch: policyEpoch, pruneCounter: t.pruneCounter}
 	out := view.admitUsageWithRequestID(ctx, reqID, headers, feat, src, est)
 	if out.Baseline != nil || out.Completion != nil {
 		runtimeCtx, _ := boundedRuntimeContext(ctx)
@@ -598,6 +636,7 @@ func (t *Terminator) admitUsageWithRequestID(ctx context.Context, reqID string, 
 		At:                     now.UTC().Format(time.RFC3339Nano),
 		PolicyID:               t.pol.ID,
 		PolicyRevision:         t.pol.Revision,
+		PolicyEpoch:            t.policyEpoch,
 		CredentialSnapshotOK:   t.dep.Evidence == nil,
 		LaneSnapshotOK:         t.dep.Evidence == nil,
 		SourcePseudonym:        src.sourceID(),
@@ -2080,14 +2119,15 @@ func safeReason(err error) string {
 func (t *Terminator) issueAssertion(ctx principal.AuthorizedContext, reqID string, cred *credential.Credential) (*Assertion, error) {
 	ttl := time.Duration(t.pol.MaxIdentityTTLSeconds()) * time.Second
 	return t.dep.Signer.Issue(Claims{
-		Subject:   ctx.Principal.AccountID,
-		CredID:    ctx.Principal.CredentialID,
-		LaneID:    ctx.LaneID,
-		Audience:  t.dep.Audience,
-		JTI:       reqID,
-		PolicyRev: t.pol.Revision,
-		CredRev:   cred.Revision,
-		Scope:     []string{"inference"},
+		Subject:     ctx.Principal.AccountID,
+		CredID:      ctx.Principal.CredentialID,
+		LaneID:      ctx.LaneID,
+		Audience:    t.dep.Audience,
+		JTI:         reqID,
+		PolicyRev:   t.pol.Revision,
+		PolicyEpoch: t.policyEpoch,
+		CredRev:     cred.Revision,
+		Scope:       []string{"inference"},
 	}, ttl)
 }
 
