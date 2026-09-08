@@ -31,13 +31,13 @@ func (s *Store) ObserveWindow(ctx context.Context, obs adaptive.WindowObservatio
 	if obs.MaxKeys <= 0 {
 		obs.MaxKeys = defaultAdaptiveMaxKeys
 	}
-	for attempt := 0; attempt < 3; attempt++ {
-		emitted, err := s.observeWindowOnce(ctx, obs)
-		if err == nil || !retryableTransactionError(err) || ctx.Err() != nil {
-			return emitted, err
-		}
-	}
-	return false, errors.New("statepg: adaptive window remained conflicted after retries")
+	var emitted bool
+	err := withTransactionRetry(ctx, "adaptive window observation", func() error {
+		var err error
+		emitted, err = s.observeWindowOnce(ctx, obs)
+		return err
+	})
+	return emitted, err
 }
 
 func (s *Store) observeWindowOnce(ctx context.Context, obs adaptive.WindowObservation) (bool, error) {
@@ -139,13 +139,13 @@ func (s *Store) ObserveBaseline(ctx context.Context, obs adaptive.BaselineObserv
 	if obs.Detector == "" || obs.Subject == "" || obs.Metric == "" || math.IsNaN(obs.Value) || math.IsInf(obs.Value, 0) || obs.Value < 0 || obs.Alpha <= 0 || obs.Alpha > 1 || obs.Cooldown < 0 {
 		return "", errors.New("statepg: invalid adaptive baseline observation")
 	}
-	for attempt := 0; attempt < 3; attempt++ {
-		signal, err := s.observeBaselineOnce(ctx, obs)
-		if err == nil || !retryableTransactionError(err) || ctx.Err() != nil {
-			return signal, err
-		}
-	}
-	return "", errors.New("statepg: adaptive baseline remained conflicted after retries")
+	var signal string
+	err := withTransactionRetry(ctx, "adaptive baseline observation", func() error {
+		var err error
+		signal, err = s.observeBaselineOnce(ctx, obs)
+		return err
+	})
+	return signal, err
 }
 
 func (s *Store) observeBaselineOnce(ctx context.Context, obs adaptive.BaselineObservation) (string, error) {

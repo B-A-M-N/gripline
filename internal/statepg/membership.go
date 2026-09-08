@@ -19,19 +19,20 @@ var (
 )
 
 func (s *Store) registerNode(ctx context.Context) error {
-	for attempt := 0; attempt < 3; attempt++ {
-		instanceID, epoch, err := s.registerNodeOnce(ctx)
-		if err == nil {
-			s.instanceID = instanceID
-			s.nodeEpoch = epoch
-			s.fenced.Store(false)
-			return nil
-		}
-		if !retryableTransactionError(err) || ctx.Err() != nil {
-			return err
-		}
+	var instanceID string
+	var epoch int64
+	err := withTransactionRetry(ctx, "node registration", func() error {
+		var err error
+		instanceID, epoch, err = s.registerNodeOnce(ctx)
+		return err
+	})
+	if err != nil {
+		return err
 	}
-	return errors.New("statepg: node registration remained conflicted after retries")
+	s.instanceID = instanceID
+	s.nodeEpoch = epoch
+	s.fenced.Store(false)
+	return nil
 }
 
 func (s *Store) registerNodeOnce(ctx context.Context) (string, int64, error) {

@@ -65,13 +65,13 @@ func (s *Store) provisionDistributed(ctx context.Context, requestID string, scop
 	if err != nil {
 		return nil, err
 	}
-	for attempt := 0; attempt < 3; attempt++ {
-		reservation, err := s.provisionDistributedOnce(ctx, requestID, fingerprint, scopes, estimate)
-		if err == nil || !retryableTransactionError(err) || ctx.Err() != nil {
-			return reservation, err
-		}
-	}
-	return nil, errors.New("statepg: resource admission remained conflicted after retries")
+	var reservation resource.UsageReservation
+	err = withTransactionRetry(ctx, "resource admission", func() error {
+		var err error
+		reservation, err = s.provisionDistributedOnce(ctx, requestID, fingerprint, scopes, estimate)
+		return err
+	})
+	return reservation, err
 }
 
 func (s *Store) provisionDistributedOnce(ctx context.Context, requestID, fingerprint string, scopes []resource.ScopeSpec, estimate resource.UsageEstimate) (resource.UsageReservation, error) {

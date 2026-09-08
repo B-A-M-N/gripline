@@ -200,6 +200,11 @@ func (s *Store) SynchronizeCrypto(ctx context.Context, local CryptoIdentity) (Cr
 		if !retry || ctx.Err() != nil {
 			return CryptoIdentity{}, err
 		}
+		if attempt+1 < maxTransactionAttempts {
+			if waitErr := waitTransactionRetry(ctx, attempt); waitErr != nil {
+				return CryptoIdentity{}, waitErr
+			}
+		}
 	}
 	return CryptoIdentity{}, errors.New("statepg: crypto identity remained conflicted after retries")
 }
