@@ -14,6 +14,11 @@ import (
 
 const policyManifestSchemaVersion = 1
 
+// ErrPolicyActivationBarrier means one or more live nodes have not loaded and
+// acknowledged the exact candidate policy. The shared manifest remains on
+// the currently active policy until every live node catches up.
+var ErrPolicyActivationBarrier = errors.New("statepg: policy activation barrier not satisfied")
+
 func validatePolicyRef(ref policy.PolicyRef) error {
 	if strings.TrimSpace(ref.ID) == "" || ref.Revision < 1 || len(ref.Digest) != 64 {
 		return errors.New("statepg: invalid policy reference")
@@ -234,6 +239,92 @@ func (s *Store) LoadPolicyArtifactContext(ctx context.Context, ref policy.Policy
 	return compiled, nil
 }
 
+// AcknowledgePolicyContext records the exact policy state this node has loaded
+// and validated. The node epoch is part of the key so a replacement instance
+// cannot inherit an old process's acknowledgement.
+func (s *Store) AcknowledgePolicyContext(ctx context.Context, manifest policy.Manifest) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if manifest.ActivationEpoch == 0 {
+		manifest.ActivationEpoch = 1
+	}
+	if err := validatePolicyManifest(manifest); err != nil {
+		return err
+	}
+	if manifest.ActivationEpoch > uint64(1<<63-1) {
+		return errors.New("statepg: policy activation epoch exceeds database range")
+	}
+	return withTransactionRetry(ctx, "policy observation", func() error {
+		return s.acknowledgePolicyOnce(ctx, manifest)
+	})
+}
+
+func (s *Store) acknowledgePolicyOnce(ctx context.Context, manifest policy.Manifest) error {
+	tx, err := begin(ctx, s.pool)
+	if err != nil {
+		return mapDBError(err)
+	}
+	defer tx.Rollback(ctx)
+	now, err := dbNow(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if err := s.requireNodeOwnership(ctx, tx, true); err != nil {
+		return err
+	}
+	candidateID, candidateDigest := "", ""
+	candidateRevision := 0
+	if manifest.Candidate != nil {
+		candidateID = manifest.Candidate.ID
+		candidateRevision = manifest.Candidate.Revision
+		candidateDigest = manifest.Candidate.Digest
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO gripline_policy_node_state
+		(node_id, node_epoch, observed_policy_epoch, observed_policy_id,
+		 observed_policy_revision, observed_policy_digest, candidate_policy_id,
+		 candidate_policy_revision, candidate_policy_digest, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+		ON CONFLICT (node_id,node_epoch) DO UPDATE SET
+		 observed_policy_epoch=EXCLUDED.observed_policy_epoch,
+		 observed_policy_id=EXCLUDED.observed_policy_id,
+		 observed_policy_revision=EXCLUDED.observed_policy_revision,
+		 observed_policy_digest=EXCLUDED.observed_policy_digest,
+		 candidate_policy_id=EXCLUDED.candidate_policy_id,
+		 candidate_policy_revision=EXCLUDED.candidate_policy_revision,
+		 candidate_policy_digest=EXCLUDED.candidate_policy_digest,
+		 updated_at=EXCLUDED.updated_at`,
+		s.nodeID, s.nodeEpoch, int64(manifest.ActivationEpoch), manifest.Active.ID,
+		manifest.Active.Revision, manifest.Active.Digest, candidateID, candidateRevision,
+		candidateDigest, now)
+	if err != nil {
+		return mapDBError(err)
+	}
+	return mapDBError(tx.Commit(ctx))
+}
+
+func (s *Store) requirePolicyActivationBarrier(ctx context.Context, tx pgx.Tx, target policy.PolicyRef) error {
+	var lagging int
+	err := tx.QueryRow(ctx, `SELECT COUNT(*)
+		FROM gripline_membership m
+		LEFT JOIN gripline_policy_node_state p
+			ON p.node_id=m.node_id AND p.node_epoch=m.node_epoch
+		WHERE m.state IN ('ready','draining')
+		  AND m.last_seen_at > CURRENT_TIMESTAMP - ($1::double precision * interval '1 second')
+		  AND (p.node_id IS NULL
+		       OR p.candidate_policy_id <> $2
+		       OR p.candidate_policy_revision <> $3
+		       OR p.candidate_policy_digest <> $4)`,
+		s.leaseTTL.Seconds(), target.ID, target.Revision, target.Digest).Scan(&lagging)
+	if err != nil {
+		return mapDBError(err)
+	}
+	if lagging != 0 {
+		return fmt.Errorf("%w: %d live node(s) have not acknowledged policy %s/%d", ErrPolicyActivationBarrier, lagging, target.ID, target.Revision)
+	}
+	return nil
+}
+
 func (s *Store) PersistPolicyTransition(manifest policy.Manifest, event policy.Event) error {
 	return s.PersistPolicyTransitionContext(context.Background(), manifest, event)
 }
@@ -305,6 +396,11 @@ func (s *Store) persistPolicyTransitionOnce(ctx context.Context, manifest policy
 		case "activate":
 			if epochAware && (previous.Candidate == nil || previous.Candidate.Revision != event.ToRevision || previous.Candidate.ID != event.PolicyID) {
 				return errors.New("statepg: activation does not match the shared candidate")
+			}
+			if previous.Candidate != nil {
+				if err := s.requirePolicyActivationBarrier(ctx, tx, *previous.Candidate); err != nil {
+					return err
+				}
 			}
 		}
 		if epochAware {

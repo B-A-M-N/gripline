@@ -57,10 +57,11 @@ type Store struct {
 // and baselines. Version 6 adds the cluster crypto identity record. Version 7
 // adds durable control-operation claims. Version 8 adds evidence subject
 // guards for deterministic first-write locking. Version 9 adds staged
-// cluster-crypto generations and per-node capability acknowledgements. Keep
+// cluster-crypto generations and per-node capability acknowledgements. Version
+// 10 adds per-node policy observations used as an activation barrier. Keep
 // the marker versioned even though the DDL below is idempotent: CREATE TABLE
 // IF NOT EXISTS cannot add columns to an already initialized database.
-const currentSchemaVersion = 9
+const currentSchemaVersion = 10
 
 const maxTransactionAttempts = 3
 
@@ -414,6 +415,20 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			acknowledged_at TIMESTAMPTZ NOT NULL,
 			PRIMARY KEY (node_id, node_epoch, kind, generation)
 		)`,
+		`CREATE TABLE IF NOT EXISTS gripline_policy_node_state (
+			node_id TEXT NOT NULL,
+			node_epoch BIGINT NOT NULL,
+			observed_policy_epoch BIGINT NOT NULL,
+			observed_policy_id TEXT NOT NULL,
+			observed_policy_revision INTEGER NOT NULL,
+			observed_policy_digest TEXT NOT NULL,
+			candidate_policy_id TEXT NOT NULL DEFAULT '',
+			candidate_policy_revision INTEGER NOT NULL DEFAULT 0,
+			candidate_policy_digest TEXT NOT NULL DEFAULT '',
+			updated_at TIMESTAMPTZ NOT NULL,
+			PRIMARY KEY (node_id, node_epoch)
+		)`,
+		`CREATE INDEX IF NOT EXISTS gripline_policy_node_state_updated_idx ON gripline_policy_node_state (updated_at)`,
 		`CREATE TABLE IF NOT EXISTS gripline_evidence (
 			scope TEXT NOT NULL,
 			subject_id TEXT NOT NULL,
@@ -524,6 +539,11 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 		// Version 9's staged crypto capability tables and generation epoch
 		// column are created by the idempotent DDL above.
 		version = 9
+	}
+	if version == 9 {
+		// Version 10's policy observation table is created by the idempotent
+		// DDL above; advancing the marker is sufficient for existing databases.
+		version = 10
 	}
 	if version != currentSchemaVersion {
 		return fmt.Errorf("%w: unsupported migration state %d", ErrMigrationRequired, version)

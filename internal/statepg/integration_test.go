@@ -305,6 +305,94 @@ func TestPostgresAuthorityIntegration(t *testing.T) {
 	}
 }
 
+func TestPostgresPolicyActivationRequiresLiveNodeAcknowledgements(t *testing.T) {
+	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("GRIPLINE_TEST_POSTGRES_DSN is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resetIntegrationAuthority(t, ctx, dsn)
+	a := openIntegrationStore(t, ctx, dsn, "policy-barrier-a")
+	b := openIntegrationStore(t, ctx, dsn, "policy-barrier-b")
+	defer a.Close()
+	defer b.Close()
+	identity := CryptoIdentity{
+		SignerActiveKID: 1, SignerFingerprint: "policy-signer",
+		PepperActiveVersion: 1, PepperFingerprint: "policy-pepper",
+		PseudonymVersion: 0, PseudonymFingerprint: "disabled",
+	}
+	if _, err := a.SynchronizeCrypto(ctx, identity); err != nil {
+		t.Fatalf("synchronize policy node A: %v", err)
+	}
+	if _, err := b.SynchronizeCrypto(ctx, identity); err != nil {
+		t.Fatalf("synchronize policy node B: %v", err)
+	}
+
+	first := policy.Default()
+	compiledFirst, err := policy.Compile(first)
+	if err != nil {
+		t.Fatalf("compile initial policy: %v", err)
+	}
+	firstDigest, err := policy.Digest(&compiledFirst.Policy)
+	if err != nil {
+		t.Fatalf("digest initial policy: %v", err)
+	}
+	firstRef := policy.PolicyRef{ID: compiledFirst.ID, Revision: compiledFirst.Revision, Digest: firstDigest}
+	candidate := *policy.Default()
+	candidate.Revision = 2
+	compiledCandidate, err := policy.Compile(&candidate)
+	if err != nil {
+		t.Fatalf("compile candidate policy: %v", err)
+	}
+	candidateDigest, err := policy.Digest(&compiledCandidate.Policy)
+	if err != nil {
+		t.Fatalf("digest candidate policy: %v", err)
+	}
+	candidateRef := policy.PolicyRef{ID: compiledCandidate.ID, Revision: compiledCandidate.Revision, Digest: candidateDigest}
+	if err := a.PersistPolicyArtifact(compiledFirst); err != nil {
+		t.Fatalf("persist initial policy artifact: %v", err)
+	}
+	if err := a.PersistPolicyArtifact(compiledCandidate); err != nil {
+		t.Fatalf("persist candidate policy artifact: %v", err)
+	}
+	if err := a.InitializePolicyManifest(policy.Manifest{SchemaVersion: 1, ActivationEpoch: 1, Active: firstRef}); err != nil {
+		t.Fatalf("initialize policy manifest: %v", err)
+	}
+	now := time.Now().UTC()
+	prepared := policy.Manifest{SchemaVersion: 1, ActivationEpoch: 1, Active: firstRef, Candidate: &candidateRef, UpdatedAt: now}
+	if err := a.PersistPolicyTransition(prepared, policy.Event{
+		Action: "prepare", FromRevision: 1, ToRevision: 2, FromEpoch: 1, ToEpoch: 1,
+		PolicyID: candidateRef.ID, Reason: "barrier test", At: now,
+	}); err != nil {
+		t.Fatalf("persist policy prepare: %v", err)
+	}
+	if err := a.AcknowledgePolicyContext(ctx, prepared); err != nil {
+		t.Fatalf("acknowledge candidate on node A: %v", err)
+	}
+	activated := policy.Manifest{SchemaVersion: 1, ActivationEpoch: 2, Active: candidateRef, Previous: &firstRef, UpdatedAt: now.Add(time.Second)}
+	activation := policy.Event{
+		Action: "activate", FromRevision: 1, ToRevision: 2, FromEpoch: 1, ToEpoch: 2,
+		PolicyID: candidateRef.ID, Reason: "barrier test", At: activated.UpdatedAt,
+	}
+	if err := a.PersistPolicyTransition(activated, activation); !errors.Is(err, ErrPolicyActivationBarrier) {
+		t.Fatalf("activation without node B acknowledgement error=%v, want barrier", err)
+	}
+	if err := b.AcknowledgePolicyContext(ctx, prepared); err != nil {
+		t.Fatalf("acknowledge candidate on node B: %v", err)
+	}
+	if err := a.PersistPolicyTransition(activated, activation); err != nil {
+		t.Fatalf("activation after all live nodes acknowledged: %v", err)
+	}
+	manifest, err := b.LoadPolicyManifestContext(ctx)
+	if err != nil {
+		t.Fatalf("load activated manifest: %v", err)
+	}
+	if manifest.Active != candidateRef || manifest.ActivationEpoch != 2 {
+		t.Fatalf("activated manifest=%+v, want candidate epoch 2", manifest)
+	}
+}
+
 func TestPostgresFencedNodeCannotMutateAuthority(t *testing.T) {
 	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
 	if dsn == "" {
@@ -609,6 +697,7 @@ func resetIntegrationAuthority(t *testing.T, ctx context.Context, dsn string) {
 		gripline_cluster_crypto,
 		gripline_cluster_crypto_generations,
 		gripline_cluster_crypto_acks,
+		gripline_policy_node_state,
 		gripline_membership`
 	if _, err := pool.Exec(ctx, "TRUNCATE TABLE "+tables+" RESTART IDENTITY CASCADE"); err != nil {
 		t.Fatalf("reset integration authority: %v", err)

@@ -31,6 +31,7 @@ type Manager struct {
 	loadManifestContext      func(context.Context) (Manifest, error)
 	loadArtifact             func(PolicyRef) (*CompiledPolicy, error)
 	loadArtifactContext      func(context.Context, PolicyRef) (*CompiledPolicy, error)
+	acknowledgeContext       func(context.Context, Manifest) error
 	lastRevision             int
 	// published is the immutable data-plane view. A nil pointer means the
 	// durable authority could not be reconciled and admissions must fail closed.
@@ -106,6 +107,10 @@ type Options struct {
 	LoadManifestContext func(context.Context) (Manifest, error)
 	LoadArtifact        func(PolicyRef) (*CompiledPolicy, error)
 	LoadArtifactContext func(context.Context, PolicyRef) (*CompiledPolicy, error)
+	// AcknowledgeContext records that this node has loaded and validated the
+	// active policy and any prepared candidate. Durable clustered authorities
+	// use it as the activation barrier; in-process callers may leave it nil.
+	AcknowledgeContext func(context.Context, Manifest) error
 }
 
 // NewManager validates the initial policy and starts with it as known-good.
@@ -136,6 +141,7 @@ func NewManagerContext(ctx context.Context, initial *Policy, opts Options) (*Man
 		loadManifestContext:      opts.LoadManifestContext,
 		loadArtifact:             opts.LoadArtifact,
 		loadArtifactContext:      opts.LoadArtifactContext,
+		acknowledgeContext:       opts.AcknowledgeContext,
 		lastRevision:             compiled.Revision,
 		activationEpoch:          1,
 	}
@@ -433,21 +439,25 @@ func (m *Manager) refreshDurableLocked(ctx context.Context) error {
 			m.lastRevision = candidate.Revision
 		}
 	}
-	if manifest.Previous == nil {
-		return nil
+	if manifest.Previous != nil {
+		if _, ok := m.knownGood[manifest.Previous.Revision]; !ok {
+			if !m.hasArtifactLoader() {
+				return errors.New("policy: shared previous policy exists and no artifact loader is configured")
+			}
+			previous, err := m.loadArtifactWithContext(ctx, *manifest.Previous)
+			if err != nil {
+				return fmt.Errorf("policy: refresh previous artifact: %w", err)
+			}
+			if err := validateCompiledRef(previous, *manifest.Previous); err != nil {
+				return err
+			}
+			m.knownGood[previous.Revision] = previous
+		}
 	}
-	if _, ok := m.knownGood[manifest.Previous.Revision]; !ok {
-		if !m.hasArtifactLoader() {
-			return errors.New("policy: shared previous policy exists and no artifact loader is configured")
+	if m.acknowledgeContext != nil {
+		if err := m.acknowledgeContext(usableContext(ctx), manifest); err != nil {
+			return fmt.Errorf("policy: acknowledge shared state: %w", err)
 		}
-		previous, err := m.loadArtifactWithContext(ctx, *manifest.Previous)
-		if err != nil {
-			return fmt.Errorf("policy: refresh previous artifact: %w", err)
-		}
-		if err := validateCompiledRef(previous, *manifest.Previous); err != nil {
-			return err
-		}
-		m.knownGood[previous.Revision] = previous
 	}
 	return nil
 }

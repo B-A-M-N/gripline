@@ -208,9 +208,16 @@ prepare_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((bas
 	-H "Authorization: Bearer ${operator_token}" -H 'Content-Type: application/json' \
 	--data "$prepare_payload")"
 test "$prepare_code" = 200
-activate_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((base + 20))/admin/policy/activate" \
-	-H "Authorization: Bearer ${operator_token}" -H 'Content-Type: application/json' \
-	--data '{"reason":"cluster policy canary"}')"
+activate_code=400
+for _ in $(seq 1 120); do
+	activate_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((base + 20))/admin/policy/activate" \
+		-H "Authorization: Bearer ${operator_token}" -H 'Content-Type: application/json' \
+		--data '{"reason":"cluster policy canary"}')"
+	if [[ "$activate_code" == "200" ]]; then
+		break
+	fi
+	sleep 0.1
+done
 test "$activate_code" = 200
 for port in $((base + 10)) $((base + 11)) $((base + 12)); do
 	for _ in $(seq 1 50); do

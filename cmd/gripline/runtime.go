@@ -407,6 +407,7 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 			PersistTransitionContext: postgres.PersistPolicyTransitionContext,
 			LoadManifestContext:      postgres.LoadPolicyManifestContext,
 			LoadArtifactContext:      postgres.LoadPolicyArtifactContext,
+			AcknowledgeContext:       postgres.AcknowledgePolicyContext,
 		}
 	}
 	policyCtx, policyCancel := context.WithTimeout(context.Background(), operationTimeout)
