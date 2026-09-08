@@ -524,7 +524,7 @@ func adminSecurityEvents(svc *control.Service, state adminStateAuthority) http.H
 	}
 }
 
-func adminMetrics(svc *control.Service, dp *proxy.DataPlane, governor resource.Authority, state *statebolt.Store, spray *anomaly.Detector, observer *jsonlObserver, policyManager *policy.Manager, signer *terminator.Keyring, adaptiveHealth []terminator.AdaptivePersistenceHealth) http.HandlerFunc {
+func adminMetrics(svc *control.Service, dp *proxy.DataPlane, governor resource.Authority, state *statebolt.Store, postgres *statepg.Store, spray *anomaly.Detector, observer *jsonlObserver, policyManager *policy.Manager, signer *terminator.Keyring, adaptiveHealth []terminator.AdaptivePersistenceHealth) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			adminMethodNotAllowed(w)
@@ -602,6 +602,19 @@ func adminMetrics(svc *control.Service, dp *proxy.DataPlane, governor resource.A
 			writeMetric("bbolt_transactions_total", tx.Transactions)
 			writeMetric("bbolt_transaction_errors_total", tx.TransactionErrors)
 			writeMetric("bbolt_transaction_nanos_total", tx.TransactionNanos)
+		}
+		if postgres != nil {
+			m := postgres.PoolStats()
+			writeMetric("postgres_pool_total_conns", m.TotalConns)
+			writeMetric("postgres_pool_idle_conns", m.IdleConns)
+			writeMetric("postgres_pool_acquired_conns", m.AcquiredConns)
+			writeMetric("postgres_pool_constructing_conns", m.ConstructingConns)
+			writeMetric("postgres_pool_max_conns", m.MaxConns)
+			writeMetric("postgres_pool_acquires_total", m.AcquireCount)
+			writeMetric("postgres_pool_acquire_duration_seconds", m.AcquireDuration.Seconds())
+			writeMetric("postgres_pool_empty_acquires_total", m.EmptyAcquireCount)
+			writeMetric("postgres_pool_empty_acquire_wait_seconds", m.EmptyAcquireWait.Seconds())
+			writeMetric("postgres_pool_canceled_acquires_total", m.CanceledAcquireCount)
 		}
 		if spray != nil {
 			writeMetric("detector_drops_total", spray.Stats().Dropped)

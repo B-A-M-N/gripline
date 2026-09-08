@@ -628,7 +628,7 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		mux.HandleFunc("/admin/crypto", adminClusterStatus(svc, postgres))
 		mux.HandleFunc("/admin/crypto/activate", adminCryptoActivate(svc, postgres, signer, peppers, pseudonyms, cfg.Paths.SignerKeyring, verifierAcceptor))
 		mux.HandleFunc("/admin/crypto/retire", adminCryptoRetire(svc, postgres, signer, peppers, pseudonyms, cfg.Paths.SignerKeyring, verifierAcceptor))
-		mux.HandleFunc("/admin/metrics", adminMetrics(svc, dp, governor, state, spray, decisionObserver, policyManager, signer, adaptiveHealth))
+		mux.HandleFunc("/admin/metrics", adminMetrics(svc, dp, governor, state, postgres, spray, decisionObserver, policyManager, signer, adaptiveHealth))
 		adminSrv = &http.Server{
 			Addr:              cfg.Admin.Listen,
 			Handler:           mux,
