@@ -47,9 +47,9 @@ Phase 7 Hardened auth  sender-constrained (DPoP / mTLS / platform keys)
 The supported clustered shape is:
 
 ```text
-                         ┌─ Gripline A ─┐
-client ─ load balancer ──┼─ Gripline B ─┼── private verifier backend
-                         └─ Gripline C ─┘
+                         ┌─ Gripline A ─┐──── inference identity ────> private inference listener
+client ─ load balancer ──┼─ Gripline B ─┤
+                         └─ Gripline C ─┘──── control identity ───────> private verifier-management listener
                                   │
                            PostgreSQL authority
 ```
@@ -82,6 +82,14 @@ activate through the authenticated control plane, and wait for every node to
 reconcile before relying on the new generation. Signer activation requires a
 backend canary acceptance; retirement waits for the assertion TTL plus clock
 skew and verifies that old pepper credentials/source scopes are gone.
+
+Verifier-management traffic is a separate trust boundary from inference
+traffic. Configure `backend.verifier_control.url` with a dedicated control
+certificate identity (or a dedicated control token only for a loopback control
+sidecar/test fixture). Do not multiplex the endpoint onto a listener that
+accepts the inference client identity. The public data plane rejects the
+configured control path even when an operator accidentally includes it in its
+endpoint list.
 
 ## 4. Dependency failure semantics
 

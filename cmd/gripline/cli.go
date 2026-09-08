@@ -465,7 +465,7 @@ func operatorTokenFromFile(flagValue, path string) (string, error) {
 		return flagValue, nil
 	}
 	if path != "" {
-		b, err := os.ReadFile(path)
+		b, err := os.ReadFile(path) // #nosec G304 -- token file path is an explicit operator input.
 		if err != nil {
 			return "", fmt.Errorf("read operator token file: %w", err)
 		}
@@ -927,7 +927,7 @@ func runStateCLI(args []string) error {
 		if closeErr != nil {
 			return fmt.Errorf("state restore: close source authority: %w", closeErr)
 		}
-		manifestData, err := os.ReadFile(manifest)
+		manifestData, err := os.ReadFile(manifest) // #nosec G304 -- manifest path is an explicit operator input.
 		if err != nil {
 			return err
 		}

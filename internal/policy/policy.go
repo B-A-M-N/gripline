@@ -158,7 +158,7 @@ func LoadVerifierKeyFile(path string) (ed25519.PublicKey, error) {
 	if err := validatePolicyFile(path); err != nil {
 		return nil, fmt.Errorf("policy: verifier key: %w", err)
 	}
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 -- policy path is operator-owned configuration.
 	if err != nil {
 		return nil, fmt.Errorf("policy: read verifier key: %w", err)
 	}
@@ -198,7 +198,7 @@ func readArtifact(path string) ([]byte, error) {
 	if err := validatePolicyFile(path); err != nil {
 		return nil, err
 	}
-	f, err := os.Open(path)
+	f, err := os.Open(path) // #nosec G304 -- policy path is operator-owned configuration.
 	if err != nil {
 		return nil, fmt.Errorf("policy: open artifact: %w", err)
 	}

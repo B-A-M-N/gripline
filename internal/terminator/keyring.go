@@ -409,7 +409,7 @@ func loadKeyringFile(path string) (*Keyring, error) {
 	if err := validateKeyringFile(path, false); err != nil {
 		return nil, err
 	}
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 -- keyring path is operator-owned configuration validated before load.
 	if err != nil {
 		return nil, err
 	}

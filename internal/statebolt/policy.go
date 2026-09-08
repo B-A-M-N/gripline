@@ -216,7 +216,7 @@ func (s *Store) ListPolicyAudit(after uint64, limit int) ([]policy.Event, error)
 			if string(key) == string(keyPolicySequence) {
 				continue
 			}
-			seq := uint64(btoi(key))
+			seq := btoi(key)
 			if seq <= after {
 				continue
 			}
@@ -233,7 +233,7 @@ func (s *Store) ListPolicyAudit(after uint64, limit int) ([]policy.Event, error)
 
 func appendPolicyEventTx(tx *bolt.Tx, data []byte) error {
 	bucket := tx.Bucket(bucketPolicyAudit)
-	sequence := uint64(btoi(bucket.Get(keyPolicySequence))) + 1
+	sequence := btoi(bucket.Get(keyPolicySequence)) + 1
 	if err := bucket.Put(itob(sequence), data); err != nil {
 		return err
 	}

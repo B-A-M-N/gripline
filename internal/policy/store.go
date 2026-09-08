@@ -251,7 +251,7 @@ func atomicWrite(path string, data []byte) (err error) {
 		return err
 	}
 	name = ""
-	d, err := os.Open(dir)
+	d, err := os.Open(dir) // #nosec G304 -- policy directory is operator-owned configuration.
 	if err != nil {
 		return err
 	}

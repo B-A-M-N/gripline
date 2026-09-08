@@ -9,6 +9,7 @@ package verify
 
 import (
 	"bytes"
+	"container/heap"
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
@@ -183,6 +184,159 @@ type TransportTrust interface {
 	Trusted(*http.Request) bool
 }
 
+// ReplayGuard is an optional, atomic assertion-use record. Accept must return
+// true exactly once for a JTI until expiresAt. A distributed backend should
+// implement this against its shared authority; a local guard only protects
+// one verifier instance.
+type ReplayGuard interface {
+	Accept(context.Context, ReplayClaim) (bool, error)
+}
+
+// ReplayClaim gives a shared replay authority an explicit namespace. A JTI is
+// only unique within its issuer/audience domain; keeping those fields in the
+// public contract prevents cross-service collisions in one shared store.
+type ReplayClaim struct {
+	Issuer    string
+	Audience  string
+	JTI       string
+	ExpiresAt time.Time
+}
+
+// MemoryReplayGuard is a bounded single-process replay guard. It fails closed
+// when its live table is full rather than evicting unexpired JTIs. Use a
+// shared ReplayGuard for active/active backend instances.
+type MemoryReplayGuard struct {
+	mu       sync.Mutex
+	max      int
+	now      func() time.Time
+	entries  map[string]time.Time
+	expiries replayExpiryHeap
+}
+
+type replayExpiry struct {
+	key     string
+	expires time.Time
+}
+
+type replayExpiryHeap []replayExpiry
+
+func (h replayExpiryHeap) Len() int           { return len(h) }
+func (h replayExpiryHeap) Less(i, j int) bool { return h[i].expires.Before(h[j].expires) }
+func (h replayExpiryHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *replayExpiryHeap) Push(x any)        { *h = append(*h, x.(replayExpiry)) }
+func (h *replayExpiryHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
+}
+
+// NewMemoryReplayGuard constructs a bounded local replay guard. A non-positive
+// capacity selects a conservative 100,000-entry default.
+func NewMemoryReplayGuard(maxEntries int) *MemoryReplayGuard {
+	if maxEntries <= 0 {
+		maxEntries = 100000
+	}
+	return &MemoryReplayGuard{max: maxEntries, now: time.Now, entries: make(map[string]time.Time, maxEntries)}
+}
+
+// Accept atomically claims a namespaced JTI until expiry. Expired claims are
+// removed from a min-heap, so cleanup is proportional to claims that actually
+// expired rather than to the full live table on every request.
+func (g *MemoryReplayGuard) Accept(ctx context.Context, claim ReplayClaim) (bool, error) {
+	if err := contextErr(ctx); err != nil {
+		return false, err
+	}
+	if g == nil || strings.TrimSpace(claim.Issuer) == "" || strings.TrimSpace(claim.Audience) == "" || strings.TrimSpace(claim.JTI) == "" || claim.ExpiresAt.IsZero() {
+		return false, ErrReplayGuardUnavailable
+	}
+	now := g.now()
+	if !now.Before(claim.ExpiresAt) {
+		return false, ErrReplayGuardUnavailable
+	}
+	key := replayKey(claim)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for len(g.expiries) > 0 && !now.Before(g.expiries[0].expires) {
+		item := heap.Pop(&g.expiries).(replayExpiry)
+		if expiry, exists := g.entries[item.key]; exists && !now.Before(expiry) {
+			delete(g.entries, item.key)
+		}
+	}
+	if _, exists := g.entries[key]; exists {
+		return false, nil
+	}
+	if len(g.entries) >= g.max {
+		return false, ErrReplayGuardCapacity
+	}
+	g.entries[key] = claim.ExpiresAt
+	heap.Push(&g.expiries, replayExpiry{key: key, expires: claim.ExpiresAt})
+	return true, nil
+}
+
+func replayKey(claim ReplayClaim) string {
+	data := strings.Join([]string{claim.Issuer, claim.Audience, claim.JTI}, "\x00")
+	sum := sha256.Sum256([]byte(data))
+	return string(sum[:])
+}
+
+func contextErr(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	return ctx.Err()
+}
+
+// MTLSOptions describes the provider-side service identities accepted on the
+// trusted hop. At least one exact SPIFFE ID or DNS name must be configured;
+// accepting any client certificate would turn mTLS into encryption-only.
+type MTLSOptions struct {
+	AllowedSPIFFEIDs []string
+	AllowedDNSNames  []string
+}
+
+type mtlsTrust struct {
+	spiffe map[string]struct{}
+	dns    map[string]struct{}
+}
+
+// RequireMTLS returns a concrete TransportTrust implementation for HTTP
+// servers using verified client certificates. It checks the TLS connection's
+// verified peer identity, never application headers. Use a different
+// certificate identity for verifier-management traffic than for inference.
+func RequireMTLS(opts MTLSOptions) TransportTrust {
+	t := &mtlsTrust{spiffe: make(map[string]struct{}), dns: make(map[string]struct{})}
+	for _, id := range opts.AllowedSPIFFEIDs {
+		if id = strings.TrimSpace(id); id != "" {
+			t.spiffe[id] = struct{}{}
+		}
+	}
+	for _, name := range opts.AllowedDNSNames {
+		if name = strings.TrimSpace(name); name != "" {
+			t.dns[name] = struct{}{}
+		}
+	}
+	return t
+}
+
+func (t *mtlsTrust) Trusted(r *http.Request) bool {
+	if t == nil || r == nil || r.TLS == nil || !r.TLS.HandshakeComplete || len(r.TLS.PeerCertificates) == 0 || len(r.TLS.VerifiedChains) == 0 {
+		return false
+	}
+	for _, uri := range r.TLS.PeerCertificates[0].URIs {
+		if _, ok := t.spiffe[uri.String()]; ok {
+			return true
+		}
+	}
+	for _, name := range r.TLS.PeerCertificates[0].DNSNames {
+		if _, ok := t.dns[name]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 // Verifier validates the short-lived assertion and provides middleware for a
 // protected HTTP handler.
 type Verifier struct {
@@ -197,6 +351,7 @@ type Verifier struct {
 	contextPolicyEpochs ContextPolicyEpochSource
 	minPolicyEpoch      uint64
 	transport           TransportTrust
+	replay              ReplayGuard
 }
 
 // PublishKey installs one public signer generation for the verifier overlap
@@ -306,6 +461,14 @@ func (v *Verifier) WithContextPolicyEpochChecks(src ContextPolicyEpochSource, mi
 
 func (v *Verifier) RequireTransportTrust(trust TransportTrust) *Verifier {
 	v.transport = trust
+	return v
+}
+
+// WithReplayGuard enables atomic JTI claims after signature, freshness, and
+// transport checks succeed. It is opt-in for compatibility with bearer-style
+// deployments; sensitive backends should configure a local or shared guard.
+func (v *Verifier) WithReplayGuard(guard ReplayGuard) *Verifier {
+	v.replay = guard
 	return v
 }
 
@@ -485,6 +648,18 @@ func (v *Verifier) verifyEncodedContext(ctx context.Context, encoded string) (*C
 			}
 		}
 	}
+	if v.replay != nil {
+		accepted, err := v.replay.Accept(ctx, ReplayClaim{
+			Issuer: c.Issuer, Audience: c.Audience, JTI: c.JTI,
+			ExpiresAt: time.Unix(c.ExpiresAt, 0),
+		})
+		if err != nil {
+			return nil, ErrReplayGuardUnavailable
+		}
+		if !accepted {
+			return nil, ErrReplayDetected
+		}
+	}
 	return &c, nil
 }
 
@@ -571,4 +746,7 @@ var (
 	ErrStalePolicyEpoch              = errors.New("gripline verify: stale policy activation epoch")
 	ErrPolicyEpochUnavailable        = errors.New("gripline verify: policy activation epoch unavailable")
 	ErrUntrustedTransport            = errors.New("gripline verify: untrusted transport")
+	ErrReplayDetected                = errors.New("gripline verify: assertion replay detected")
+	ErrReplayGuardUnavailable        = errors.New("gripline verify: replay guard unavailable")
+	ErrReplayGuardCapacity           = errors.New("gripline verify: replay guard capacity exhausted")
 )

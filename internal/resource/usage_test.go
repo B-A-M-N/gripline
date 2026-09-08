@@ -1,6 +1,7 @@
 package resource
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -153,5 +154,29 @@ func TestReleaseWithoutSettleCancelsFullHold(t *testing.T) {
 	}
 	if inUse := p.InUse(); inUse != 0 {
 		t.Fatalf("abandoned reservation must release concurrency, inUse = %d", inUse)
+	}
+}
+
+func TestReleaseAfterForwardConsumesUnsettledEstimate(t *testing.T) {
+	base := time.Now()
+	g := NewGovernor(func() time.Time { return base })
+	specs := []ScopeSpec{{Scope: ScopeCredential, ID: "forwarded", Buckets: BucketSpec{
+		ConcurrencyCap: 2,
+		TokensBurst:    BucketConfig{Capacity: 100, RefillPer: 1, RefillIn: time.Hour},
+	}}}
+	r, err := g.ProvisionUsage(specs, UsageEstimate{CombinedTokens: 40})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.MarkForwarded(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	r.Release()
+	avail, ok := g.AvailableFor(DimCombinedTokens, ScopeCredential, "forwarded")
+	if !ok || avail != 60 {
+		t.Fatalf("forwarded unsettled estimate must be consumed, available=%v ok=%v want=60", avail, ok)
+	}
+	if inUse := g.InUseFor(ScopeCredential, "forwarded"); inUse != 0 {
+		t.Fatalf("forwarded release must still return concurrency, in_use=%d", inUse)
 	}
 }

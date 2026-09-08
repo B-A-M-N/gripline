@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/B-A-M-N/gripline/internal/config"
 	"github.com/B-A-M-N/gripline/internal/proxy"
@@ -22,21 +23,35 @@ import (
 // reach the adapter and appear in low-cardinality runtime counters.
 func TestAcceptanceBuiltInUsageAdapters(t *testing.T) {
 	for _, tt := range []struct {
-		name   string
-		mode   string
-		stream string
+		name, mode, method, path, stream string
+		input, output, combined, cost    uint64
 	}{
 		{
-			name:   "openai",
-			mode:   "openai",
+			name: "openai", mode: "openai", method: http.MethodPost, path: "/v1/chat/completions",
 			stream: "data: {\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":5,\"total_tokens\":8}}\n\n",
+			input:  3, output: 5, combined: 8, cost: 21,
 		},
 		{
-			name: "anthropic",
-			mode: "anthropic",
+			name: "anthropic", mode: "anthropic", method: http.MethodPost, path: "/v1/messages",
 			stream: "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3}}}\n\n" +
 				"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n" +
 				"data: {\"type\":\"message_stop\"}\n\n",
+			input: 3, output: 5, combined: 8, cost: 21,
+		},
+		{
+			name: "openai-responses", mode: "openai", method: http.MethodPost, path: "/v1/responses",
+			stream: "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":4,\"output_tokens\":6,\"total_tokens\":10}}}\n\n",
+			input:  4, output: 6, combined: 10, cost: 26,
+		},
+		{
+			name: "openai-embeddings", mode: "openai", method: http.MethodPost, path: "/v1/embeddings",
+			stream: `{"usage":{"prompt_tokens":4,"total_tokens":4}}`,
+			input:  4, output: 0, combined: 4, cost: 8,
+		},
+		{
+			name: "openai-models", mode: "openai", method: http.MethodGet, path: "/v1/models",
+			stream: `{"data":[{"id":"model"}]}`,
+			input:  0, output: 0, combined: 0, cost: 0,
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -84,7 +99,11 @@ func TestAcceptanceBuiltInUsageAdapters(t *testing.T) {
 			go srv.Serve(ln)
 			defer srv.Close()
 
-			req, err := http.NewRequest(http.MethodPost, "http://"+ln.Addr().String()+"/v1/messages", strings.NewReader(`{"prompt":"usage"}`))
+			body := io.Reader(strings.NewReader(`{"prompt":"usage"}`))
+			if tt.method == http.MethodGet {
+				body = nil
+			}
+			req, err := http.NewRequest(tt.method, "http://"+ln.Addr().String()+tt.path, body)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -106,9 +125,17 @@ func TestAcceptanceBuiltInUsageAdapters(t *testing.T) {
 			if !ok {
 				t.Fatalf("runtime data plane type=%T, want *proxy.DataPlane", rt.DataPlane)
 			}
-			metrics := dp.Metrics()
-			if metrics.UsageSessions != 1 || metrics.UsageInputTokens != 3 || metrics.UsageOutputTokens != 5 || metrics.UsageCombinedTokens != 8 || metrics.UsageCostMicrounits != 21 {
-				t.Fatalf("%s usage metrics=%+v, want one session input=3 output=5 combined=8 cost=21", tt.mode, metrics)
+			var metrics proxy.MetricsSnapshot
+			deadline := time.Now().Add(time.Second)
+			for {
+				metrics = dp.Metrics()
+				if metrics.UsageSessions == 1 || time.Now().After(deadline) {
+					break
+				}
+				time.Sleep(time.Millisecond)
+			}
+			if metrics.UsageSessions != 1 || metrics.UsageInputTokens != tt.input || metrics.UsageOutputTokens != tt.output || metrics.UsageCombinedTokens != tt.combined || metrics.UsageCostMicrounits != tt.cost {
+				t.Fatalf("%s usage metrics=%+v, want one session input=%d output=%d combined=%d cost=%d", tt.mode, metrics, tt.input, tt.output, tt.combined, tt.cost)
 			}
 		})
 	}

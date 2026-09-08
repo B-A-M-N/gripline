@@ -1,0 +1,42 @@
+services:
+  primary:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: gripline
+      POSTGRES_PASSWORD: gripline
+      POSTGRES_DB: gripline
+      POSTGRES_HOST_AUTH_METHOD: trust
+    command: ["postgres", "-c", "wal_level=replica", "-c", "max_wal_senders=10", "-c", "max_replication_slots=10", "-c", "hot_standby=on"]
+    ports:
+      - "${GRIPLINE_HA_PRIMARY_PORT:-25432}:5432"
+    volumes:
+      - primary-data:/var/lib/postgresql/data
+      - ./primary-init.sql:/docker-entrypoint-initdb.d/010-replication.sql:ro
+      - ./primary-init.sh:/docker-entrypoint-initdb.d/020-replication-hba.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gripline -d gripline"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  replica:
+    image: postgres:16
+    environment:
+      PGDATA: /var/lib/postgresql/data
+      PGPASSWORD: gripline
+    command: ["/usr/local/bin/gripline-replica-entrypoint.sh"]
+    ports:
+      - "${GRIPLINE_HA_REPLICA_PORT:-25433}:5432"
+    volumes:
+      - replica-data:/var/lib/postgresql/data
+      - ./replica-entrypoint.sh:/usr/local/bin/gripline-replica-entrypoint.sh:ro
+    depends_on:
+      primary:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gripline -d gripline"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+volumes:
+  primary-data:
+  replica-data:

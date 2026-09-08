@@ -27,29 +27,34 @@ type httpVerifierControl struct {
 	client   *http.Client
 	endpoint *url.URL
 	audience string
+	token    string
 }
 
 func newHTTPVerifierControl(cfg *config.Config, transport http.RoundTripper, timeout time.Duration) (*httpVerifierControl, error) {
-	if cfg == nil || strings.TrimSpace(cfg.Backend.VerifierControlURL) == "" {
+	if cfg == nil || strings.TrimSpace(cfg.Backend.VerifierControl.URL) == "" {
 		return nil, nil
 	}
-	endpoint, err := url.Parse(cfg.Backend.VerifierControlURL)
+	endpoint, err := url.Parse(cfg.Backend.VerifierControl.URL)
 	if err != nil || endpoint.Scheme == "" || endpoint.Host == "" {
 		return nil, fmt.Errorf("gripline: verifier control URL is invalid")
 	}
-	backend, err := url.Parse(cfg.Backend.URL)
-	if err != nil || backend.Scheme == "" || backend.Host == "" ||
-		!strings.EqualFold(endpoint.Scheme, backend.Scheme) ||
-		!strings.EqualFold(endpoint.Host, backend.Host) {
-		return nil, fmt.Errorf("gripline: verifier control URL must use the backend's exact origin")
+	if endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" {
+		return nil, fmt.Errorf("gripline: verifier control URL must not contain userinfo, query, or fragment")
 	}
 	if timeout <= 0 {
 		timeout = 2 * time.Second
 	}
 	return &httpVerifierControl{
 		client: &http.Client{Transport: transport, Timeout: timeout}, endpoint: endpoint,
-		audience: cfg.Identity.Audience,
+		audience: cfg.Identity.Audience, token: cfg.Backend.VerifierControl.Token,
 	}, nil
+}
+
+func (c *httpVerifierControl) authenticate(req *http.Request) {
+	if c == nil || req == nil || c.token == "" {
+		return
+	}
+	req.Header.Set("X-Gripline-Verifier-Control", c.token)
 }
 
 type verifierControlRequest struct {
@@ -100,6 +105,7 @@ func (c *httpVerifierControl) AcceptPrepared(ctx context.Context, signer *termin
 		return fmt.Errorf("build verifier control request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	c.authenticate(req)
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("backend verifier control request: %w", err)
@@ -139,6 +145,7 @@ func (c *httpVerifierControl) RetireKey(ctx context.Context, kid int, fingerprin
 		return fmt.Errorf("build verifier retirement request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	c.authenticate(req)
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("backend verifier retirement request: %w", err)

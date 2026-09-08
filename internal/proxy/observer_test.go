@@ -75,6 +75,31 @@ func (r *recordingObserver) ObserveAdmission(ev *observability.DecisionRecord) {
 	r.admissions = append(r.admissions, ev)
 }
 
+func TestEndpointDenialAdmissionObserverSeesFinalDecision(t *testing.T) {
+	signer, _ := terminator.GenerateSigner()
+	obs := &recordingObserver{}
+	dp, err := New(Config{
+		Terminator: buildTerminator(t, signer),
+		BackendURL: &url.URL{Scheme: "http", Host: "backend.internal"},
+		Audience:   testAudience, Admission: obs,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "http://gripline.local/v1/not-allowed", nil)
+	req.Header.Set("Authorization", "Bearer "+dpRaw())
+	rec := httptest.NewRecorder()
+	dp.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown endpoint status=%d, want 404", rec.Code)
+	}
+	obs.mu.Lock()
+	defer obs.mu.Unlock()
+	if len(obs.admissions) != 1 || obs.admissions[0].Authorized || obs.admissions[0].Reason != "unsupported_endpoint" {
+		t.Fatalf("observer must see the final endpoint denial: %+v", obs.admissions)
+	}
+}
+
 // P0.9: the proxy must not silently discard the Outcome.Complete result. When
 // completion evidence cannot be persisted, the configured DecisionObserver sees
 // the failure (codes, Persisted=false, Err) while the client response is

@@ -45,6 +45,9 @@ jobs:
         run: go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
       - name: Verify release tree
         run: |
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          go run github.com/securego/gosec/v2/cmd/gosec@v2.22.8 -quiet ./...
+          GRIPLINE_FUZZ_TIME=2s bash scripts/fuzz-smoke.sh
           go vet ./...
           go mod tidy -diff
           git diff --check
@@ -63,6 +66,17 @@ jobs:
           go run ./cmd/gripline-demo --headless
           bash scripts/release-harness.sh
           bash scripts/chaos-smoke.sh
+      - name: Run repository-owned reference qualification lab
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes nghttp2-client
+          bash scripts/qualification/ha.sh
+          bash scripts/qualification/pitr.sh
+          bash scripts/qualification/perimeter.sh
+          bash scripts/qualification/replay.sh
+          bash scripts/qualification/http2.sh
+          bash scripts/qualification/sdk.sh
+          bash scripts/qualification/soak.sh --duration 30s --workers 8
       - name: Build and smoke-test release container
         run: |
           docker build \

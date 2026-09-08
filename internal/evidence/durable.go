@@ -220,7 +220,7 @@ func (d *durableStore) flushLocked() error {
 		return err
 	}
 	tmp := d.cfg.Path + ".tmp"
-	if err := os.WriteFile(tmp, buf.Bytes(), 0o640); err != nil {
+	if err := os.WriteFile(tmp, buf.Bytes(), 0o600); err != nil {
 		return err
 	}
 	return os.Rename(tmp, d.cfg.Path)

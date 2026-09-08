@@ -1,0 +1,40 @@
+name: security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '17 3 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  gosec:
+    name: Go security static analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gosec
+        # Intentional exceptions use line-local #nosec comments with rationale;
+        # a new finding remains blocking.
+        run: go run github.com/securego/gosec/v2/cmd/gosec@v2.22.8 -quiet ./...
+
+  fuzz:
+    name: Parser fuzz smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: fuzz smoke
+        env:
+          GRIPLINE_FUZZ_TIME: ${{ github.event_name == 'schedule' && '30s' || '2s' }}
+        run: bash scripts/fuzz-smoke.sh

@@ -13,7 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-var credentialColumns = `credential_id, account_id, verifier, verifier_version, pepper_version, status, security, policy_id, plan_id, created_at, expires_at, rotated_at, last_seen_at, revision`
+var credentialColumns = `credential_id, account_id, verifier, verifier_version, pepper_version, status, security, policy_id, plan_id, created_at, expires_at, rotated_at, last_seen_at, revision` // #nosec G101 -- SQL column identifiers are not credentials.
 
 func encodeSecurity(state credential.SecurityState) ([]byte, error) {
 	b, err := json.Marshal(state)

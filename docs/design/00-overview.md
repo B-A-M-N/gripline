@@ -69,8 +69,10 @@ IP anomaly scoring · API rate limiting · WAF rules
 behavioral fraud detection · header redaction
 ```
 
-These may be used as inputs/adjacent controls but are not Gripline by
-themselves.
+These refer to edge/provider controls, not Gripline's internal resource
+governor or invalid-auth pre-auth guard. They may be used as inputs/adjacent
+controls but are not Gripline by themselves; their absence remains a release
+qualification concern for deployments that need those protections.
 
 ### Non-goals
 

@@ -31,7 +31,7 @@ const (
 	demoAudience = "gripline-demo-backend"
 	// This value exists only inside the local demonstration. It is never
 	// serialized into the UI, timeline, assertion, evidence, or backend hop.
-	demoRawCredential = "demo-reusable-credential-7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c"
+	demoRawCredential = "demo-reusable-credential-7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c" // #nosec G101 -- intentionally local demo fixture.
 )
 
 type Scenario struct {
@@ -137,7 +137,13 @@ func (s *Scenario) build() error {
 		return fmt.Errorf("protected listener: %w", err)
 	}
 	s.protectedURL = "http://" + s.protectedListener.Addr().String()
-	s.protected = &http.Server{Handler: dp}
+	s.protected = &http.Server{
+		Handler:           dp,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
 	protectedServer, protectedListener := s.protected, s.protectedListener
 	go func() { _ = protectedServer.Serve(protectedListener) }()
 	s.clients["legit"], s.clients["attacker"] = demoClient("127.0.0.2"), demoClient("127.0.0.3")

@@ -47,6 +47,20 @@ func (s *IngressSourceResolver) ResolveSourceContext(ctx context.Context, obs Ob
 	}, nil
 }
 
+// ResolvePreAuthSource is the cheap trusted-proxy-aware source seam used
+// before credential authentication. It returns a canonical raw IP only; no
+// pseudonym or authority lookup is performed on this path.
+func (s *IngressSourceResolver) ResolvePreAuthSource(obs Observation) (string, error) {
+	if s == nil || s.inner == nil {
+		return "", nil
+	}
+	ip, err := ingress.CanonicalClientIP(obs.RemoteAddr, obs.Header, s.inner.TrustedProxies)
+	if err != nil {
+		return "", err
+	}
+	return ip.WithZone("").String(), nil
+}
+
 // MergeSourceIntoFeatures overrides the feature resolver's network provenance
 // with the trusted source's values (P0.6B). Trusted ingress metadata is the
 // authority; the generic feature resolver's values are spoofable HTTP headers

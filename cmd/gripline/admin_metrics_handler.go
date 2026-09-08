@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"net/http"
+	"runtime"
 	"strings"
 
 	"github.com/B-A-M-N/gripline/internal/anomaly"
@@ -30,6 +31,10 @@ func adminMetrics(svc *control.Service, dp *proxy.DataPlane, governor resource.A
 		}
 		var b strings.Builder
 		writeMetric := func(name string, value any) { fmt.Fprintf(&b, "gripline_%s %v\n", name, value) }
+		var mem runtime.MemStats
+		runtime.ReadMemStats(&mem)
+		writeMetric("runtime_goroutines", runtime.NumGoroutine())
+		writeMetric("runtime_heap_alloc_bytes", mem.HeapAlloc)
 		if dp != nil {
 			m := dp.Metrics()
 			writeMetric("admissions_total", m.Admissions)
@@ -52,6 +57,7 @@ func adminMetrics(svc *control.Service, dp *proxy.DataPlane, governor resource.A
 			writeMetric("usage_output_tokens_total", m.UsageOutputTokens)
 			writeMetric("usage_combined_tokens_total", m.UsageCombinedTokens)
 			writeMetric("usage_cost_microunits_total", m.UsageCostMicrounits)
+			writeMetric("http2_errors_total", m.HTTP2Errors)
 			for i, count := range m.ResourceDenialsByScope {
 				writeMetric("resource_denials_scope_"+strings.ToLower(resource.Scope(i).String())+"_total", count)
 			}

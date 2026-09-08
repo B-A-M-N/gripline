@@ -9,6 +9,9 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
+	"crypto/subtle"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -26,16 +29,24 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/B-A-M-N/gripline/internal/replay"
 	"github.com/B-A-M-N/gripline/verify"
 )
 
 func main() {
 	listen := flag.String("listen", "127.0.0.1:18081", "private backend listen address")
+	tlsCert := flag.String("tls-cert", "", "optional TLS serving certificate PEM path")
+	tlsKey := flag.String("tls-key", "", "optional TLS serving private key PEM path")
+	clientCA := flag.String("client-ca", "", "optional CA PEM path for required client certificates")
+	requireClientDNS := flag.String("require-client-dns", "", "require this exact verified client-certificate DNS identity")
 	keysPath := flag.String("keys", "", "public Gripline key-set JSON path")
 	audience := flag.String("audience", "", "expected assertion audience")
 	minPolicyRev := flag.Int("min-policy-rev", 0, "minimum accepted policy revision for test freshness checks")
 	policyEpochFile := flag.String("policy-epoch-file", "", "optional file containing the current accepted policy activation epoch")
 	verifierControlPath := flag.String("verifier-control", "", "optional private path for candidate verifier publication and canary acceptance")
+	verifierControlToken := flag.String("verifier-control-token", "", "optional dedicated control-plane token for verifier publication")
+	replayDSN := flag.String("replay-dsn", "", "optional shared PostgreSQL replay-guard DSN")
+	controlOnly := flag.Bool("control-only", false, "serve only the verifier-control path (plus healthz)")
 	capturePath := flag.String("capture", "", "optional accepted-request header capture path")
 	assertionPath := flag.String("assertion-path", "", "optional path receiving the latest assertion for test inspection")
 	workDelay := flag.Duration("work-delay", 0, "duration for /v1/work before completing")
@@ -58,12 +69,40 @@ func main() {
 	if err != nil {
 		log.Fatalf("construct verifier: %v", err)
 	}
+	var transportTrust verify.TransportTrust
+	if strings.TrimSpace(*requireClientDNS) != "" {
+		if *tlsCert == "" || *tlsKey == "" || *clientCA == "" {
+			log.Fatal("-require-client-dns requires -tls-cert, -tls-key, and -client-ca")
+		}
+		transportTrust = verify.RequireMTLS(verify.MTLSOptions{
+			AllowedDNSNames: []string{*requireClientDNS},
+		})
+		verifier.RequireTransportTrust(transportTrust)
+	}
+	if *verifierControlPath != "" && strings.TrimSpace(*verifierControlToken) == "" && transportTrust == nil {
+		log.Fatal("-verifier-control requires -verifier-control-token or -require-client-dns")
+	}
+	// The fixture defaults to bounded local replay protection, but the
+	// qualification lab can point independent backend processes at one shared
+	// PostgreSQL guard to prove active/active exactly-once claims.
+	verifier.WithReplayGuard(verify.NewMemoryReplayGuard(100000))
+	if strings.TrimSpace(*replayDSN) != "" {
+		sharedGuard, err := replay.OpenPostgresGuard(context.Background(), *replayDSN)
+		if err != nil {
+			log.Fatalf("open shared replay guard: %v", err)
+		}
+		defer sharedGuard.Close()
+		verifier.WithReplayGuard(sharedGuard)
+	}
 	// The verifier-control canary proves signer-key acceptance, not policy
 	// freshness. Keep a separate verifier without the workload's policy epoch
 	// check so a key rotation cannot be blocked by an unrelated policy rollout.
 	controlVerifier, err := verify.New(keySet, *audience)
 	if err != nil {
 		log.Fatalf("construct verifier control: %v", err)
+	}
+	if transportTrust != nil {
+		controlVerifier.RequireTransportTrust(transportTrust)
 	}
 	if *policyEpochFile != "" {
 		verifier.WithPolicyEpochChecks(policyEpochFileSource{path: *policyEpochFile}, 1)
@@ -118,11 +157,26 @@ func main() {
 			log.Printf("capture: %v", err)
 			return
 		}
-		_, _ = fmt.Fprintf(f, "%s %s headers=%v\n", r.Method, r.URL.RequestURI(), r.Header)
+		_, _ = fmt.Fprintf(f, "%s %s host=%s headers=%v\n", r.Method, r.URL.RequestURI(), r.Host, r.Header)
 		_ = f.Close()
 	}
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Reject an untrusted mTLS identity before parsing a verifier-control
+		// mutation. TLS chain verification alone is not enough: inference and
+		// verifier-management listeners must authorize different identities.
+		if transportTrust != nil && !transportTrust.Trusted(r) {
+			http.Error(w, "untrusted backend transport identity", http.StatusForbidden)
+			return
+		}
+		if *controlOnly && r.URL.Path != "/healthz" && (*verifierControlPath == "" || r.URL.Path != *verifierControlPath) {
+			http.NotFound(w, r)
+			return
+		}
 		if *verifierControlPath != "" && r.URL.Path == *verifierControlPath {
+			if *verifierControlToken != "" && !validVerifierControlToken(r.Header, *verifierControlToken) {
+				http.Error(w, "verifier control authentication required", http.StatusForbidden)
+				return
+			}
 			if r.Method != http.MethodPost {
 				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 				return
@@ -285,9 +339,33 @@ func main() {
 			"policy_epoch":    claims.PolicyEpoch,
 		})
 	})
+	if (*tlsCert == "") != (*tlsKey == "") {
+		log.Fatal("-tls-cert and -tls-key must be supplied together")
+	}
 	server := &http.Server{Addr: *listen, Handler: handler, ReadHeaderTimeout: 5 * time.Second}
+	if *clientCA != "" {
+		caPEM, err := os.ReadFile(*clientCA)
+		if err != nil {
+			log.Fatalf("read client CA: %v", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(caPEM) {
+			log.Fatal("client CA contains no certificates")
+		}
+		server.TLSConfig = &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			ClientAuth: tls.RequireAndVerifyClientCert,
+			ClientCAs:  pool,
+		}
+	}
 	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		var err error
+		if *tlsCert != "" {
+			err = server.ListenAndServeTLS(*tlsCert, *tlsKey)
+		} else {
+			err = server.ListenAndServe()
+		}
+		if err != nil && err != http.ErrServerClosed {
 			log.Fatalf("backend: %v", err)
 		}
 	}()
@@ -298,6 +376,19 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = server.Shutdown(ctx)
+}
+
+func validVerifierControlToken(headers http.Header, expected string) bool {
+	if strings.TrimSpace(expected) == "" {
+		return false
+	}
+	var values []string
+	for name, headerValues := range headers {
+		if strings.EqualFold(name, "X-Gripline-Verifier-Control") {
+			values = append(values, headerValues...)
+		}
+	}
+	return len(values) == 1 && subtle.ConstantTimeCompare([]byte(values[0]), []byte(expected)) == 1
 }
 
 type policyEpochFileSource struct{ path string }

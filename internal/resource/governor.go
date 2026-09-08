@@ -411,11 +411,13 @@ type ProvisionAmt struct {
 // SETTLED with the actual usage after execution — refunding only reserved-
 // but-unused amounts (P0.36: ownership-complete settlement).
 type UsageEstimate struct {
-	Requests       int64
-	InputTokens    int64
-	OutputTokens   int64
-	CombinedTokens int64
-	CostMicrounits int64
+	Requests                 int64
+	InputTokens              int64
+	OutputTokens             int64
+	CombinedTokens           int64
+	CacheReadInputTokens     int64
+	CacheCreationInputTokens int64
+	CostMicrounits           int64
 }
 
 // amountFor returns the reserved amount for one gauge dimension.
@@ -583,11 +585,23 @@ type singleAcquired struct {
 }
 
 func (a *singleAcquired) release() {
+	a.releaseForwarded(false)
+}
+
+func (a *singleAcquired) releaseForwarded(forwarded bool) {
 	switch a.kind {
 	case acquPool:
 		a.lease.Release()
 	case acquBucket:
-		a.res.Cancel()
+		if forwarded {
+			// Once the request was handed to the backend, a lost response cannot
+			// prove that the provider did not execute it. Consume the estimate
+			// conservatively instead of refunding capacity that may already have
+			// been spent upstream.
+			a.res.Settle(a.res.Amount())
+		} else {
+			a.res.Cancel()
+		}
 	}
 }
 
@@ -596,11 +610,12 @@ func (a *singleAcquired) release() {
 // the caller Release()s the shared lease; token reservations are consumed).
 // Release returns all concurrency to their pools (idempotent across copies).
 type MultiReservation struct {
-	now      func() time.Time
-	mu       sync.Mutex
-	acquired []*singleAcquired
-	settled  bool
-	released bool
+	now       func() time.Time
+	mu        sync.Mutex
+	acquired  []*singleAcquired
+	settled   bool
+	forwarded bool
+	released  bool
 }
 
 // Settle commits every dimension reservation against the ACTUAL usage.
@@ -623,13 +638,24 @@ func (r *MultiReservation) Settle(actual UsageEstimate) {
 	r.settled = true
 }
 
-// MarkForwarded satisfies the distributed reservation contract. An in-process
-// reservation is already authoritative at provision time, so forwarding is a
-// lifecycle no-op apart from honoring cancellation.
+// MarkForwarded records the point after which a transport error is ambiguous:
+// the backend may have accepted the request even if no response reaches the
+// gateway. Release therefore consumes unsettled estimates after this point.
 func (r *MultiReservation) MarkForwarded(ctx context.Context) error {
 	if ctx != nil {
-		return ctx.Err()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 	}
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.released {
+		return errors.New("resource: reservation already released")
+	}
+	r.forwarded = true
 	return nil
 }
 
@@ -680,7 +706,7 @@ func (r *MultiReservation) Release() {
 	}
 	r.released = true
 	for _, a := range r.acquired {
-		a.release()
+		a.releaseForwarded(r.forwarded && !r.settled)
 	}
 }
 

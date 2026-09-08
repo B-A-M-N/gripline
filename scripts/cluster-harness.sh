@@ -4,7 +4,9 @@ set -euo pipefail
 # Multi-process PostgreSQL acceptance gate. The database is supplied by CI (or
 # GRIPLINE_TEST_POSTGRES_DSN); three separately running gateways receive only
 # shared authority state, and every client request enters through the compiled
-# round-robin load balancer.
+# round-robin load balancer. The inference and verifier-control backends are
+# separate processes/listeners so the lifecycle proof cannot accidentally rely
+# on a multiplexed data-plane identity.
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 harness_dir="$(mktemp -d)"
@@ -29,6 +31,7 @@ dsn="${GRIPLINE_TEST_POSTGRES_DSN:-postgres://gripline:gripline@127.0.0.1:5432/g
 base=$((19000 + ($$ % 800) * 10))
 lb_port=$base
 backend_port=$((base + 1))
+control_backend_port=$((base + 2))
 audience="gripline-cluster-harness"
 operator_token="operator-cluster-harness-0123456789abcdef0123456789"
 secret_one="cluster-secret-one-0123456789"
@@ -40,6 +43,62 @@ pseudonym_one_b64="$(openssl rand -base64 32 | tr -d '\n')"
 pseudonym_two_b64="$(openssl rand -base64 32 | tr -d '\n')"
 policy_epoch_file="$harness_dir/policy-epoch"
 printf '1\n' >"$policy_epoch_file"
+
+write_artifact() {
+	if [[ -n "${GRIPLINE_CLUSTER_HARNESS_ARTIFACT_FILE:-}" ]]; then
+		cat >"$GRIPLINE_CLUSTER_HARNESS_ARTIFACT_FILE" <<EOF
+base=${base}
+lb_port=${lb_port}
+node_a_port=$((base + 10))
+node_b_port=$((base + 11))
+node_c_port=$((base + 12))
+admin_a_port=$((base + 20))
+admin_b_port=$((base + 21))
+admin_c_port=$((base + 22))
+node_a_pid=${pids[0]:-}
+node_b_pid=${pids[1]:-}
+node_c_pid=${pids[2]:-}
+operator_token=${operator_token}
+EOF
+	fi
+}
+
+ca_key="$harness_dir/backend-ca.key"
+ca_cert="$harness_dir/backend-ca.pem"
+backend_key="$harness_dir/backend-server.key"
+backend_csr="$harness_dir/backend-server.csr"
+backend_cert="$harness_dir/backend-server.pem"
+inference_client_key="$harness_dir/inference-client.key"
+inference_client_csr="$harness_dir/inference-client.csr"
+inference_client_cert="$harness_dir/inference-client.pem"
+control_client_key="$harness_dir/verifier-control-client.key"
+control_client_csr="$harness_dir/verifier-control-client.csr"
+control_client_cert="$harness_dir/verifier-control-client.pem"
+
+# The cluster fixture uses distinct verified client identities for inference
+# and verifier management. Both listeners trust the private CA, but each
+# verifier accepts only its own exact DNS identity.
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+	-keyout "$ca_key" -out "$ca_cert" -subj "/CN=Gripline cluster harness CA" \
+	>/dev/null 2>&1
+openssl req -newkey rsa:2048 -nodes \
+	-keyout "$backend_key" -out "$backend_csr" -subj "/CN=backend.internal" \
+	-addext "subjectAltName=DNS:backend.internal,DNS:control.internal" >/dev/null 2>&1
+openssl x509 -req -days 1 -sha256 -copy_extensions copy \
+	-in "$backend_csr" -CA "$ca_cert" -CAkey "$ca_key" -CAcreateserial \
+	-out "$backend_cert" >/dev/null 2>&1
+openssl req -newkey rsa:2048 -nodes \
+	-keyout "$inference_client_key" -out "$inference_client_csr" -subj "/CN=gripline-inference.internal" \
+	-addext "subjectAltName=DNS:gripline-inference.internal" >/dev/null 2>&1
+openssl x509 -req -days 1 -sha256 -copy_extensions copy \
+	-in "$inference_client_csr" -CA "$ca_cert" -CAkey "$ca_key" -CAserial "$harness_dir/backend-ca.srl" \
+	-out "$inference_client_cert" >/dev/null 2>&1
+openssl req -newkey rsa:2048 -nodes \
+	-keyout "$control_client_key" -out "$control_client_csr" -subj "/CN=gripline-verifier-control.internal" \
+	-addext "subjectAltName=DNS:gripline-verifier-control.internal" >/dev/null 2>&1
+openssl x509 -req -days 1 -sha256 -copy_extensions copy \
+	-in "$control_client_csr" -CA "$ca_cert" -CAkey "$ca_key" -CAserial "$harness_dir/backend-ca.srl" \
+	-out "$control_client_cert" >/dev/null 2>&1
 
 go build -trimpath -o "$harness_dir/gripline" ./cmd/gripline
 go build -trimpath -o "$harness_dir/backend" ./cmd/gripline-test-backend
@@ -64,9 +123,18 @@ for node in a b c; do
 	esac
 	cat >"$harness_dir/config-${node}.json" <<EOF
 {
-  "listen": "127.0.0.1:${node_port}",
-  "tls": {"terminate_tls_upstream": true},
-  "backend": {"url": "http://127.0.0.1:${backend_port}", "verifier_control_url": "http://127.0.0.1:${backend_port}/v1/verifier/rotate", "timeout": "5s"},
+	"listen": "127.0.0.1:${node_port}",
+	"tls": {"terminate_tls_upstream": true},
+	"backend": {
+	    "url": "https://127.0.0.1:${backend_port}",
+	    "tls": {"ca_file": "${ca_cert}", "client_cert_file": "${inference_client_cert}", "client_key_file": "${inference_client_key}", "server_name": "backend.internal", "min_version": "1.2"},
+	    "verifier_control": {"url": "https://127.0.0.1:${control_backend_port}/v1/verifier/rotate", "ca_file": "${ca_cert}", "client_cert_file": "${control_client_cert}", "client_key_file": "${control_client_key}", "server_name": "control.internal", "min_version": "1.2"},
+    "timeout": "5s",
+    "allowed_endpoints": [
+      {"method": "GET", "path": "/v1/messages"},
+      {"method": "GET", "path": "/v1/work"}
+    ]
+  },
   "server": {
     "read_timeout": "10s", "write_timeout": "10s", "idle_timeout": "10s",
     "read_header_timeout": "5s", "stream_write_idle_timeout": "1s", "max_body_bytes": 1048576,
@@ -102,19 +170,34 @@ for node in a b c; do
 	"$harness_dir/gripline" -config "$harness_dir/config-${node}.json" >"$harness_dir/gripline-${node}.log" 2>&1 &
 	pids+=("$!")
 done
+write_artifact
 
 "$harness_dir/gripline" keys export --config "$harness_dir/config-a.json" >"$harness_dir/keys.json"
 "$harness_dir/backend" \
 	-listen "127.0.0.1:${backend_port}" \
+	-tls-cert "$backend_cert" -tls-key "$backend_key" -client-ca "$ca_cert" \
+	-require-client-dns "gripline-inference.internal" \
 	-keys "$harness_dir/keys.json" \
 	-audience "$audience" \
 	-work-delay 2s \
-	-verifier-control "/v1/verifier/rotate" \
 	-active "$harness_dir/backend-active" \
 	-peak "$harness_dir/backend-peak" \
 	-policy-epoch-file "$policy_epoch_file" \
 	-assertion-path "$harness_dir/latest-assertion" \
 	-capture "$harness_dir/backend-capture.log" >"$harness_dir/backend.log" 2>&1 &
+pids+=("$!")
+
+# Verifier-management is a distinct listener and process. It receives only the
+# dedicated verifier-control mTLS identity and never serves inference traffic.
+"$harness_dir/backend" \
+	-listen "127.0.0.1:${control_backend_port}" \
+	-tls-cert "$backend_cert" -tls-key "$backend_key" -client-ca "$ca_cert" \
+	-require-client-dns "gripline-verifier-control.internal" \
+	-keys "$harness_dir/keys.json" \
+	-audience "$audience" \
+	-verifier-control "/v1/verifier/rotate" \
+	-control-only \
+	>"$harness_dir/verifier-control-backend.log" 2>&1 &
 pids+=("$!")
 
 "$harness_dir/lb" \
@@ -135,6 +218,55 @@ wait_status() {
 	return 1
 }
 
+backend_curl() {
+	curl --cacert "$ca_cert" --cert "$inference_client_cert" --key "$inference_client_key" \
+		--resolve "backend.internal:${backend_port}:127.0.0.1" "$@"
+}
+
+control_curl() {
+	curl --cacert "$ca_cert" --cert "$control_client_cert" --key "$control_client_key" \
+		--resolve "control.internal:${control_backend_port}:127.0.0.1" "$@"
+}
+
+inference_control_curl() {
+	curl --cacert "$ca_cert" --cert "$inference_client_cert" --key "$inference_client_key" \
+		--resolve "control.internal:${control_backend_port}:127.0.0.1" "$@"
+}
+
+control_data_curl() {
+	curl --cacert "$ca_cert" --cert "$control_client_cert" --key "$control_client_key" \
+		--resolve "backend.internal:${backend_port}:127.0.0.1" "$@"
+}
+
+load_seconds="${GRIPLINE_CLUSTER_HARNESS_LOAD_SECONDS:-5}"
+load_workers="${GRIPLINE_CLUSTER_HARNESS_LOAD_WORKERS:-12}"
+load_p95_limit_ms="${GRIPLINE_CLUSTER_HARNESS_LOAD_P95_LIMIT_MS:-5000}"
+if ! [[ "$load_seconds" =~ ^[0-9]+$ && "$load_workers" =~ ^[1-9][0-9]*$ && "$load_p95_limit_ms" =~ ^[1-9][0-9]*$ ]]; then
+	echo "cluster harness: load seconds/workers/p95 limit must be non-negative/positive integers" >&2
+	exit 2
+fi
+load_p95_limit_ns=$((load_p95_limit_ms * 1000000))
+
+wait_backend() {
+	for _ in $(seq 1 120); do
+		if [[ "$(backend_curl -sS -o /dev/null -w '%{http_code}' "https://backend.internal:${backend_port}/healthz" 2>/dev/null || true)" == "401" ]]; then
+			return 0
+		fi
+		sleep 0.1
+	done
+	return 1
+}
+
+wait_control_backend() {
+	for _ in $(seq 1 120); do
+		if [[ "$(control_curl -sS -o /dev/null -w '%{http_code}' "https://control.internal:${control_backend_port}/healthz" 2>/dev/null || true)" == "401" ]]; then
+			return 0
+		fi
+		sleep 0.1
+	done
+	return 1
+}
+
 for node in a b c; do
 	case "$node" in
 		a) node_port=$((base + 10));;
@@ -147,7 +279,8 @@ for node in a b c; do
 	fi
 done
 wait_status "http://127.0.0.1:${lb_port}/readyz"
-wait_status "http://127.0.0.1:${backend_port}/healthz" 401
+wait_backend
+wait_control_backend
 
 provision() {
 	local id=$1 secret=$2
@@ -159,6 +292,22 @@ provision() {
 }
 provision cluster-credential-one "$secret_one"
 provision cluster-credential-two "$secret_two"
+
+# The public data plane must not expose the verifier-management path, and the
+# backend must reject a direct unauthenticated control mutation before parsing
+# its payload. The inference identity is valid for the data listener but must
+# also be rejected by the verifier-management listener. The later crypto
+# activation calls the same path with the dedicated control identity.
+external_control_code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${lb_port}/v1/verifier/rotate" -H "Authorization: Bearer ${secret_one}" -d '{}')"
+test "$external_control_code" = 404
+no_cert_control_code="$(curl --cacert "$ca_cert" --resolve "control.internal:${control_backend_port}:127.0.0.1" -sS -o /dev/null -w '%{http_code}' -X POST "https://control.internal:${control_backend_port}/v1/verifier/rotate" -d '{}' 2>/dev/null || true)"
+test "$no_cert_control_code" = 000
+direct_control_code="$(inference_control_curl -sS -o /dev/null -w '%{http_code}' -X POST "https://control.internal:${control_backend_port}/v1/verifier/rotate" -d '{}' 2>/dev/null || true)"
+test "$direct_control_code" = 403
+control_data_code="$(control_curl -sS -o /dev/null -w '%{http_code}' "https://control.internal:${control_backend_port}/v1/messages")"
+test "$control_data_code" = 404
+control_to_data_code="$(control_data_curl -sS -o /dev/null -w '%{http_code}' "https://backend.internal:${backend_port}/v1/messages" 2>/dev/null || true)"
+test "$control_to_data_code" = 403
 
 # Capture an assertion signed by the original key before rotation. Retirement
 # below must make this assertion unverifiable at the backend after its TTL
@@ -202,7 +351,7 @@ fi
 for port in $((base + 10)) $((base + 11)) $((base + 12)); do
 	wait_status "http://127.0.0.1:${port}/readyz"
 done
-old_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${backend_port}/v1/messages" -H "X-Gripline-Assertion: ${old_assertion}")"
+old_code="$(backend_curl -sS -o /dev/null -w '%{http_code}' "https://backend.internal:${backend_port}/v1/messages" -H "X-Gripline-Assertion: ${old_assertion}")"
 test "$old_code" = 401
 
 curl_data_code() {
@@ -317,6 +466,61 @@ fi
 if [[ "$(awk '$1 == 200 {n++} END {print n+0}' "$harness_dir/codes"/*)" -lt 1 ]]; then
 	echo "cluster harness: no work request completed through the LB" >&2
 	exit 1
+fi
+
+# Short sustained qualification: exercise the shared authority through all
+# three nodes while recording only bounded status/latency data. This is a CI
+# smoke gate for pool/serialization regressions, not a substitute for the
+# hosted 24-72 hour soak and HA workload matrix.
+if [[ "$load_seconds" -gt 0 ]]; then
+	load_dir="$harness_dir/cluster-load"
+	mkdir -p "$load_dir"
+	load_end_epoch=$(( $(date +%s) + load_seconds ))
+	load_secrets=("$secret_one" "$secret_two" "$secret_three")
+	load_worker() {
+		local worker=$1 result_file="$load_dir/worker-${1}.tsv"
+		local secret_index=$(( (worker - 1) % ${#load_secrets[@]} ))
+		local load_secret="${load_secrets[$secret_index]}"
+		local started ended code
+		: >"$result_file"
+		while [[ "$(date +%s)" -lt "$load_end_epoch" ]]; do
+			started="$(date +%s%N)"
+			code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${lb_port}/v1/messages" \
+				-H "Authorization: Bearer ${load_secret}" 2>/dev/null || true)"
+			ended="$(date +%s%N)"
+			printf '%s\t%s\n' "${code:-000}" "$((ended - started))" >>"$result_file"
+		done
+	}
+	load_pids=()
+	for worker in $(seq 1 "$load_workers"); do
+		load_worker "$worker" &
+		load_pids+=("$!")
+	done
+	for pid in "${load_pids[@]}"; do
+		wait "$pid" || true
+	done
+	cat "$load_dir"/*.tsv >"$load_dir/results.tsv"
+	load_samples="$(wc -l <"$load_dir/results.tsv")"
+	if [[ "$load_samples" -lt 1 ]]; then
+		echo "cluster harness: sustained load produced no samples" >&2
+		exit 1
+	fi
+	load_successes="$(awk -F '\t' '$1 == 200 {n++} END {print n+0}' "$load_dir/results.tsv")"
+	awk -F '\t' '$1 == 200 {print $2}' "$load_dir/results.tsv" | sort -n >"$load_dir/success-latencies.ns"
+	success_count="$(wc -l <"$load_dir/success-latencies.ns")"
+	if [[ "$load_successes" -lt 1 ]]; then
+		echo "cluster harness: sustained load had no successful requests" >&2
+		exit 1
+	fi
+	load_p50_ns="$(awk -v n="$success_count" 'NR == int((n * 50 + 99) / 100) {print; exit}' "$load_dir/success-latencies.ns")"
+	load_p95_ns="$(awk -v n="$success_count" 'NR == int((n * 95 + 99) / 100) {print; exit}' "$load_dir/success-latencies.ns")"
+	load_success_rate="$(awk -v successes="$load_successes" -v seconds="$load_seconds" 'BEGIN {printf "%.2f", successes / seconds}')"
+	printf 'cluster harness: sustained load samples=%s successes=%s success_per_sec=%s p50_ns=%s p95_ns=%s workers=%s seconds=%s\n' \
+		"$load_samples" "$load_successes" "$load_success_rate" "$load_p50_ns" "$load_p95_ns" "$load_workers" "$load_seconds"
+	if [[ "$load_p95_ns" -gt "$load_p95_limit_ns" ]]; then
+		echo "cluster harness: sustained-load p95 ${load_p95_ns}ns exceeded ${load_p95_limit_ms}ms limit" >&2
+		exit 1
+	fi
 fi
 
 # A revoke committed through A must deny on the other two authorities.

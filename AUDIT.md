@@ -67,7 +67,7 @@ single-node/out-of-scope wording.
 | P0.24 | RESOLVED | Denying scope named via `ScopeLimitError{Scope}` at both failure points; rollback releases upstream holds. |
 | P0.25 | RESOLVED | `resourceScopeReason`/`resourceScopeErr` map SOURCE→source_restricted, LANE→lane_restricted, CREDENTIAL→credential_restricted, ACCOUNT→rate_limit. `TestM3MultiscopeDeniesWhenScopeSaturated`. |
 | P0.26 | RESOLVED | `ConcurrencyPool` mutex-guarded balance; `AcquireN` decrements only when `balance >= n`; never negative (INV-15). `TestConcurrencyNeverNegative`. |
-| P0.27 | RESOLVED | `Reserve` all-or-nothing; `Settle`/`Cancel` idempotent + mutually exclusive via shared `reservationState`; `Cancel` refunds exactly its own amount clamped ≥0; `MultiReservation.Release` cancels unsettled. `TestGovernorTokenSettleConsumesCancelRefunds`. |
+| P0.27 | RESOLVED | `Reserve` all-or-nothing; `Settle`/`Cancel` idempotent + mutually exclusive via shared `reservationState`; `Cancel` refunds exactly its own amount clamped ≥0; standalone `MultiReservation.Release` cancels pre-forward holds and conservatively consumes forwarded-but-unsettled estimates. `TestGovernorTokenSettleConsumesCancelRefunds` and `TestReleaseAfterForwardConsumesUnsettledEstimate`. |
 
 ## Identity trust boundary + source (P0.28–P0.38)
 
@@ -115,10 +115,10 @@ single-node/out-of-scope wording.
 | P0.63 | RESOLVED (standalone and clustered) | bbolt and PostgreSQL both implement the lane authority; the resident lane store remains the explicit ephemeral implementation. |
 | P0.64 | RESOLVED (standalone and clustered) | bbolt and PostgreSQL both implement the evidence authority; the legacy Gob store is compatibility-only and not a production authority. |
 | P0.65 | RESOLVED (standalone and clustered) | Credential/lane/evidence/security state and resource accounting use the selected durable authority; only standalone in-flight leases are process-local. |
-| P0.66 | RESOLVED for supported authorities | bbolt supplies standalone transactional durability and PostgreSQL supplies shared transactional durability; PostgreSQL WAL/replication/PITR remain infrastructure responsibilities. |
+| P0.66 | RESOLVED for supported authorities | bbolt supplies standalone transactional durability and PostgreSQL supplies shared transactional durability; the repository-owned HA/PITR lab exercises WAL, replication, backup, restore, and security-state recovery. Actual managed-service configuration remains deployment evidence. |
 | P0.67 | RESOLVED | Source-spray anomaly detector: `anomaly.Detector` wired via `Dependencies.Spray`; `internal/anomaly/spray.go` + `m6_test.go`. |
-| P0.68 | RESOLVED (single-node and clustered harnesses) | `scripts/chaos-smoke.sh` covers local failure seams and `scripts/cluster-harness.sh` covers three-node PostgreSQL state, fencing, crypto rollout, authority outage/recovery, and killed-node behavior. Environment-specific network isolation and third-party SDK evidence remain deployment gates. |
-| P0.69 | RESOLVED (release and cluster proof) | The compiled release harness proves the single-node gateway/backend path; the PostgreSQL cluster harness proves active/active resource and authority invariants. Network isolation and provider SDKs remain hosting evidence. |
+| P0.68 | RESOLVED (single-node, clustered, and reference labs) | `scripts/chaos-smoke.sh` covers local failure seams, `scripts/cluster-harness.sh` covers three-node PostgreSQL state, and the owned HA/PITR/perimeter labs cover reference production failure and boundary behavior. Cloud network policy and managed-service behavior remain deployment evidence. |
+| P0.69 | RESOLVED (release, cluster, and reference proof) | The compiled release harness proves the single-node gateway/backend path, the PostgreSQL cluster harness proves active/active resource and authority invariants, and the owned SDK/perimeter/HTTP2 labs exercise the provider-shaped and transport boundaries. Provider-account settlement and operator infrastructure remain deployment evidence. |
 
 ---
 
@@ -151,9 +151,11 @@ authorization engine, proxy trust boundary, durable bbolt authority,
 PostgreSQL active/active authority, source-spray detector, operator control
 plane, crypto lifecycle, and causal demo are implemented and tested. The
 repository includes single-node release/chaos and three-node PostgreSQL
-harnesses. Stable-release qualification still requires hosted provenance,
-production network-perimeter verification, PostgreSQL HA/PITR evidence, and a
-provider SDK/usage integration matrix.
+harnesses plus a reference production qualification lab. Stable software
+qualification requires exact-commit provenance and the repository-owned
+Layer 1/Layer 2 evidence; cloud network policy, managed PostgreSQL behavior,
+issued PKI, and provider-account settlement remain operator deployment
+evidence.
 
 ## Production gaps (not P0 defects; architecture recommendations)
 
@@ -161,18 +163,21 @@ provider SDK/usage integration matrix.
 > `cmd/gripline` is the deployable executable with boot-validated config.
 > (2) LARGELY RESOLVED — credentials, lanes, evidence, operator audit, and
 > posture are durable in one transactional bbolt database
-> (`internal/statebolt`); restart containment is acceptance-proven. (3) STILL
-> OUT OF BETA SCOPE — multi-node coordination/TTL leases, network-isolation
-> proof, SDK matrix, metrics export integration, and KMS/HSM. (4) PARTIAL —
-> source-identity
-> attribution remains the provider-adapter seam.
+> (`internal/statebolt`); restart containment is acceptance-proven. (3) The
+> repository-owned reference lab now covers multi-node coordination/TTL leases,
+> network isolation, PITR, official SDK behavior, HTTP/2, replay, and soak;
+> metrics export integration, KMS/HSM, and operator infrastructure remain
+> deployment concerns. (4) PARTIAL — source-identity attribution remains the
+> provider-adapter seam.
 
 ## Open / partial work queue (ordered by what blocks the e2e goal)
 
 1. Release provenance — push the exact audited tree, pass hosted CI, cut a
    stable tag, and retain checksum/signature/build-provenance evidence.
-2. Deployment evidence — PostgreSQL HA/PITR, network isolation, external
-   telemetry, and provider SDK/usage semantics remain hosting gates.
+2. Reference lab and deployment evidence — the repository-owned HA/PITR,
+   network, SDK, replay, HTTP/2, and soak labs are Layer 2 gates; external
+   telemetry, cloud perimeter, managed database, and provider-account
+   semantics are Layer 3 hosting evidence.
 3. Provider adapters — `usage.mode=none` is request/concurrency accounting
    only; production integrations must supply authoritative token/cost usage and
    source metadata for their provider.
@@ -316,9 +321,9 @@ not claim the excluded deployment capability.
 | 22 | VERIFIED | Ordered statebolt migrations create pre-migration backups, run transactionally, validate schema post-open, and expose backup/restore tooling. |
 | 23 | VERIFIED | The compiled backend fixture and demo use the public verify key-set acceptance path, not the private signer. |
 | 24 | VERIFIED | Wire format is versioned v1 with immutable payload/signature vectors in verify/testdata. |
-| 25 | VERIFIED for claimed surface | Compiled release harness uses separate gateway/backend processes and real TCP HTTP cases for direct denial, forged claims, revision freshness, query/gzip/chunked/SSE/oversized/cancel/restart/status behavior; third-party SDKs remain hosting-side evidence. |
+| 25 | VERIFIED for claimed surface | Compiled release harness uses separate gateway/backend processes and real TCP HTTP cases for direct denial, forged claims, revision freshness, query/gzip/chunked/SSE/oversized/cancel/restart/status behavior; the repository SDK lab covers official OpenAI/Anthropic clients against a local provider-shaped backend. |
 | 26 | VERIFIED | Exact harness credential is scanned across generated config, provision output, logs, backend captures, telemetry, audit, and artifacts before release proof passes. |
-| 27 | VERIFIED for repository fault matrix | Chaos smoke covers local failures; the three-node PostgreSQL harness covers authority outage/recovery, fencing, killed-node leases, backend cancellation, and shared-state faults. ENOSPC/network-namespace and production HA remain hosting gates. |
+| 27 | VERIFIED for repository fault matrix | Chaos smoke covers local failures; the three-node PostgreSQL harness covers authority outage/recovery, fencing, killed-node leases, backend cancellation, and shared-state faults; owned HA/PITR and perimeter labs cover the reference topology. Cloud/managed-service behavior remains hosting evidence. |
 | 28 | VERIFIED | Durable state-backed proxy benchmark reports p50/p95/p99 and throughput under concurrent request pressure. |
 | 29 | VERIFIED | Admin metrics expose low-cardinality admission, denial, degraded, resource scope/dimension, source saturation/eviction, spool, evidence, bbolt, stream, backend, telemetry, policy, and signer counters. |
 | 30 | VERIFIED | status reports active durable policy ID/revision/digest, actual signer KID state, resource persistence boundary, source bound, spool limits, and pepper/pseudonym versions. |
@@ -326,7 +331,7 @@ not claim the excluded deployment capability.
 | 32 | VERIFIED | Generic policy naming is the default and the legacy provider alias remains accepted for compatibility. |
 | 33 | VERIFIED | CI/release pin action SHAs and tool versions, fail on toolchain/vulnerability/static checks, publish checksums, cosign signatures, SBOM/provenance, and attestations. |
 | 34 | VERIFIED | README and design docs describe standalone/bbolt and clustered/PostgreSQL authority modes, crypto rollout, fencing, migration, leases, and deployment boundaries. |
-| 35 | VERIFIED | README and value visual distinguish implemented clustered authority from remaining hosted SDK, perimeter, HA, and provenance qualification. |
+| 35 | VERIFIED | README and value visual distinguish the repository-owned reference lab from remaining operator cloud, managed-database, PKI, observability, and provenance evidence. |
 | 36 | VERIFIED | The causal demo uses the configured ingress/network adapter and a separate public verify-backed protected backend; headless proof is executable. |
 | 37 | VERIFIED as deployment gate | Backend integration docs require private reachability/mTLS and raw-key denial; the release harness directly proves the backend rejects raw credentials. |
 | 38 | VERIFIED | README, design docs, status, benchmark, and audit state both topology boundaries and the distinct standalone versus PostgreSQL resource semantics. |
@@ -351,9 +356,28 @@ stub:
   local `paths.state`, `paths.evidence`, and `paths.audit_log` are deliberately
   absent because PostgreSQL is the authority.
 
-The production-stable verdict remains **NO-GO until hosted release
-qualification completes**. The remaining evidence is outside what this local
-tree can prove: exact-commit hosted CI/release provenance, PostgreSQL HA/PITR
-and failover operations, production network isolation/mTLS, and the provider
-SDK plus authoritative token/cost usage matrix. `usage.mode=none` intentionally
-enforces requests/concurrency only.
+The production-stable verdict is gated by two repository-owned layers: exact-
+commit correctness gates and the reference production qualification lab. The
+operator-specific deployment record is separate. The lab entrypoints are
+`scripts/qualification/ha.sh`, `pitr.sh`, `perimeter.sh`, `sdk.sh`, `http2.sh`,
+`replay.sh`, and `soak.sh`; they provide local HA/PITR, mTLS/network, official
+SDK, direct HTTP/2, shared replay, and active/active soak evidence. Managed
+PostgreSQL behavior, cloud network policy/PKI, edge DDoS, observability, and
+provider-account settlement remain operator deployment evidence.
+
+## Security qualification addendum (2026-09-08)
+
+The current tree additionally contains executable evidence for the review's
+security gaps: a separate verifier-control process/listener with a distinct
+private-CA mTLS client identity in the cluster harness, exact
+endpoint/method authorization before body spooling, conservative
+forwarded-but-unsettled resource consumption, bounded pre-auth flood
+protection, a bounded TCP listener with explicit direct-TLS HTTP/2 settings,
+optional atomic assertion `ReplayGuard`, a private-CA mTLS backend fixture with
+an exact inference-client identity, hostile response-header coverage, raw
+HTTP/1.1 close/keep-alive desynchronization cases in the compiled release
+harness, parser fuzz smoke targets, a scheduled gosec workflow, and a
+repository-owned qualification lab. The lab covers direct HTTP/2 churn, shared
+replay state, HA/PITR, provider SDK/metering fixtures, mTLS/network isolation,
+and configurable 24-72-hour active/active soak load; cloud/provider-specific
+capacity and deployment controls remain outside the generic software claim.

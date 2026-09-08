@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -239,7 +240,7 @@ func TestDataPlaneDenialMapsStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	req := httptest.NewRequest("GET", "http://backend.example/", nil)
+	req := httptest.NewRequest("POST", "http://backend.example/v1/messages", nil)
 	rec := httptest.NewRecorder()
 	dp.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
@@ -250,6 +251,148 @@ func TestDataPlaneDenialMapsStatus(t *testing.T) {
 	}
 	if rec.Header().Get("X-Gripline-Request-ID") == "" {
 		t.Fatal("denial must carry a request id")
+	}
+}
+
+func TestDataPlaneEndpointContractRejectsUnknownAndWrongMethods(t *testing.T) {
+	signer, _ := terminator.GenerateSigner()
+	dp, err := New(Config{
+		Terminator: buildTerminator(t, signer),
+		BackendURL: &url.URL{Scheme: "http", Host: "backend.internal"},
+		Audience:   testAudience,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status, _ := dp.routeStatus(http.MethodPost, "/v1/private-admin"); status != http.StatusNotFound {
+		t.Fatalf("unknown endpoint status=%d, want 404", status)
+	}
+	if status, allow := dp.routeStatus(http.MethodDelete, "/v1/messages"); status != http.StatusMethodNotAllowed || allow != http.MethodPost {
+		t.Fatalf("wrong method status=%d allow=%q, want 405/POST", status, allow)
+	}
+}
+
+type bodyReadProbe struct{ reads atomic.Int32 }
+
+func (p *bodyReadProbe) Read([]byte) (int, error) {
+	p.reads.Add(1)
+	return 0, io.ErrUnexpectedEOF
+}
+
+func TestDataPlaneRejectsUnknownEndpointBeforeSpooling(t *testing.T) {
+	signer, _ := terminator.GenerateSigner()
+	dp, err := New(Config{
+		Terminator:   buildTerminator(t, signer),
+		BackendURL:   &url.URL{Scheme: "http", Host: "backend.internal"},
+		Audience:     testAudience,
+		MaxBodyBytes: 1024,
+		SpoolDir:     t.TempDir(), SpoolMaxBytes: 1024, SpoolMaxFiles: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	probe := &bodyReadProbe{}
+	req := httptest.NewRequest(http.MethodPost, "http://gripline.local/v1/private-admin", probe)
+	req.Header.Set("Authorization", "Bearer "+dpRaw())
+	rec := httptest.NewRecorder()
+	dp.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown endpoint status=%d, want 404", rec.Code)
+	}
+	if got := probe.reads.Load(); got != 0 {
+		t.Fatalf("unsupported endpoint read %d body chunks before denial", got)
+	}
+	if stats := dp.Metrics().Spool; stats.Bytes != 0 || stats.Files != 0 {
+		t.Fatalf("unsupported endpoint consumed spool budget: %+v", stats)
+	}
+}
+
+func TestDataPlaneRejectsConfiguredVerifierControlPath(t *testing.T) {
+	signer, _ := terminator.GenerateSigner()
+	var backendRequests atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backendRequests.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+	bu, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dp, err := New(Config{
+		Terminator:    buildTerminator(t, signer),
+		BackendURL:    bu,
+		Audience:      testAudience,
+		ForbiddenPath: "/v1/verifier/rotate",
+		EndpointRules: []EndpointRule{{Method: http.MethodPost, Path: "/v1/verifier/rotate"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "http://gripline.local/v1/verifier/rotate", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer "+dpRaw())
+	rec := httptest.NewRecorder()
+	dp.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound || backendRequests.Load() != 0 {
+		t.Fatalf("control path must be rejected before forwarding: status=%d backend=%d", rec.Code, backendRequests.Load())
+	}
+}
+
+func TestDataPlaneRejectsCompressedRequestsByDefault(t *testing.T) {
+	signer, _ := terminator.GenerateSigner()
+	var backendRequests atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backendRequests.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+	bu, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dp, err := New(Config{Terminator: buildTerminator(t, signer), BackendURL: bu, Audience: testAudience})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "http://gripline.local/v1/messages", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer "+dpRaw())
+	req.Header.Set("Content-Encoding", "gzip")
+	rec := httptest.NewRecorder()
+	dp.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnsupportedMediaType || backendRequests.Load() != 0 {
+		t.Fatalf("compressed request must be rejected before forwarding: status=%d backend=%d", rec.Code, backendRequests.Load())
+	}
+}
+
+func TestDataPlaneBoundsBackendResponseHeaders(t *testing.T) {
+	signer, _ := terminator.GenerateSigner()
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Backend-Overflow", strings.Repeat("x", 4096))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+	backendURL, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport := &http.Transport{MaxResponseHeaderBytes: 512}
+	defer transport.CloseIdleConnections()
+	dp, err := New(Config{
+		Terminator: buildTerminator(t, signer), BackendURL: backendURL,
+		Audience: testAudience, Transport: transport,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "http://gripline.local/v1/messages", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer "+dpRaw())
+	rec := httptest.NewRecorder()
+	dp.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("oversized backend response headers status=%d, want 502", rec.Code)
+	}
+	if got := rec.Header().Get("X-Backend-Overflow"); got != "" {
+		t.Fatalf("oversized backend response header leaked to client: %d bytes", len(got))
 	}
 }
 
@@ -313,9 +456,9 @@ func TestDataPlaneClientCannotSelectUpstreamHost(t *testing.T) {
 	}
 
 	raw := dpRaw()
-	// The attacker addresses the proxy at an "upstream-looking" origin and a
-	// traversal-flavored path; neither may influence where the request lands.
-	req := httptest.NewRequest("POST", "http://evil.example/../../v1/messages", strings.NewReader(`{}`))
+	// The attacker addresses the proxy at an "upstream-looking" origin; the
+	// client-supplied host must not influence where the request lands.
+	req := httptest.NewRequest("POST", "http://evil.example/v1/messages", strings.NewReader(`{}`))
 	req.Header.Set("Authorization", "Bearer "+raw)
 	rec := httptest.NewRecorder()
 	dp.ServeHTTP(rec, req)
@@ -328,6 +471,33 @@ func TestDataPlaneClientCannotSelectUpstreamHost(t *testing.T) {
 	}
 	if gotPath != "/v1/messages" {
 		t.Fatalf("upstream path = %q, want cleaned /v1/messages (no traversal)", gotPath)
+	}
+}
+
+func TestDataPlaneRejectsTraversalBeforeBackend(t *testing.T) {
+	signer, _ := terminator.GenerateSigner()
+	var backendRequests atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backendRequests.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+	bu, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dp, err := New(Config{Terminator: buildTerminator(t, signer), BackendURL: bu, Audience: testAudience})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rawPath := range []string{"/v1/%2e%2e/private", "/v1/%2e%2e%2fprivate", "/../../v1/messages"} {
+		req := httptest.NewRequest(http.MethodPost, "http://gripline.local"+rawPath, strings.NewReader(`{}`))
+		req.Header.Set("Authorization", "Bearer "+dpRaw())
+		rec := httptest.NewRecorder()
+		dp.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound || backendRequests.Load() != 0 {
+			t.Fatalf("traversal path %q must be rejected before forwarding: status=%d backend=%d", rawPath, rec.Code, backendRequests.Load())
+		}
 	}
 }
 

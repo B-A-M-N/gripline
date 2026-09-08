@@ -25,6 +25,7 @@ import (
 	"github.com/B-A-M-N/gripline/internal/keyexport"
 	"github.com/B-A-M-N/gripline/internal/policy"
 	"github.com/B-A-M-N/gripline/internal/terminator"
+	"golang.org/x/net/http2"
 )
 
 // errSubcommand is a sentinel signaling that the invocation requested a
@@ -238,13 +239,34 @@ func run(cfgPath string) (retErr error) {
 		MaxHeaderBytes:    cfg.Server.MaxHeaderBytes,
 	}
 	if minV, enabled := cfg.TLSConfig(); enabled {
-		srv.TLSConfig = &tls.Config{MinVersion: minV}
+		srv.TLSConfig = &tls.Config{MinVersion: minV} // #nosec G402 -- config validation enforces TLS 1.2+ and production examples require TLS 1.3.
+		h2ErrorRecorder, _ := rt.DataPlane.(interface{ RecordHTTP2Error(string) })
+		if err := http2.ConfigureServer(srv, &http2.Server{
+			MaxConcurrentStreams:         uint32(cfg.Server.HTTP2MaxConcurrentStreams),        // #nosec G115 -- config.Validate caps this at 10000.
+			MaxDecoderHeaderTableSize:    uint32(cfg.Server.HTTP2HeaderTableBytes),            // #nosec G115 -- config.Validate caps this at 4 MiB.
+			MaxEncoderHeaderTableSize:    uint32(cfg.Server.HTTP2HeaderTableBytes),            // #nosec G115 -- config.Validate caps this at 4 MiB.
+			MaxReadFrameSize:             uint32(cfg.Server.HTTP2MaxReadFrameBytes),           // #nosec G115 -- config.Validate caps this at 16 MiB.
+			MaxUploadBufferPerConnection: int32(cfg.Server.HTTP2MaxUploadBufferPerConnection), // #nosec G115 -- config.Validate caps this at 16 MiB.
+			MaxUploadBufferPerStream:     int32(cfg.Server.HTTP2MaxUploadBufferPerStream),     // #nosec G115 -- config.Validate caps this at 4 MiB.
+			IdleTimeout:                  cfg.Server.IdleTimeout.D(),
+			ReadIdleTimeout:              cfg.Server.ReadHeaderTimeout.D(),
+			PingTimeout:                  cfg.Server.ReadHeaderTimeout.D(),
+			WriteByteTimeout:             cfg.Server.StreamWriteIdleTimeout.D(),
+			CountError: func(errType string) {
+				if h2ErrorRecorder != nil {
+					h2ErrorRecorder.RecordHTTP2Error(errType)
+				}
+			},
+		}); err != nil {
+			return fmt.Errorf("gripline: configure HTTP/2: %w", err)
+		}
 	}
 
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		return fmt.Errorf("gripline: listen %s: %w", cfg.Listen, err)
 	}
+	ln = newLimitedListener(ln, cfg.Server.MaxConnections)
 	log.Printf("gripline: data plane listening on %s (tls=%v) → backend %s",
 		cfg.Listen, srv.TLSConfig != nil, cfg.Backend.URL)
 
@@ -270,6 +292,7 @@ func run(cfgPath string) (retErr error) {
 			_ = ln.Close()
 			return fmt.Errorf("gripline: admin listen %s: %w", cfg.Admin.Listen, err)
 		}
+		adminLn = newLimitedListener(adminLn, cfg.Server.MaxConnections)
 		go func() {
 			log.Printf("gripline: admin control plane listening on %s", cfg.Admin.Listen)
 			if serveErr := rt.Admin.Serve(adminLn); serveErr != nil && serveErr != http.ErrServerClosed {

@@ -28,7 +28,8 @@ func (p publicUsageProvider) Estimate(obs Observation) resource.UsageEstimate {
 	})
 	return resource.UsageEstimate{
 		Requests: e.Requests, InputTokens: e.InputTokens, OutputTokens: e.OutputTokens,
-		CombinedTokens: e.CombinedTokens, CostMicrounits: e.CostMicrounits,
+		CombinedTokens: e.CombinedTokens, CacheReadInputTokens: e.CacheReadInputTokens,
+		CacheCreationInputTokens: e.CacheCreationInputTokens, CostMicrounits: e.CostMicrounits,
 	}
 }
 
@@ -47,7 +48,8 @@ func (s publicUsageSession) Finish(err error) resource.UsageEstimate {
 	e := s.session.Finish(err)
 	return resource.UsageEstimate{
 		Requests: e.Requests, InputTokens: e.InputTokens, OutputTokens: e.OutputTokens,
-		CombinedTokens: e.CombinedTokens, CostMicrounits: e.CostMicrounits,
+		CombinedTokens: e.CombinedTokens, CacheReadInputTokens: e.CacheReadInputTokens,
+		CacheCreationInputTokens: e.CacheCreationInputTokens, CostMicrounits: e.CostMicrounits,
 	}
 }
 

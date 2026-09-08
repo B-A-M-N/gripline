@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Repository-owned PostgreSQL streaming-replication qualification. This is a
+# reference lab: the replica is built with pg_basebackup, the primary is
+# stopped, the replica is promoted, and the failed node is re-seeded as a
+# standby from the promoted authority.
+
+repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+fixture_dir="$repo_dir/scripts/qualification/fixtures/postgres-ha"
+project="gripline-ha-${$}"
+work_dir="$(mktemp -d)"
+keep="${GRIPLINE_QUALIFICATION_KEEP:-0}"
+cleanup() {
+	rm -rf "$work_dir"
+	if [[ "$keep" == 1 ]]; then
+		echo "HA lab retained: docker compose -p $project -f $fixture_dir/compose.yaml" >&2
+	else
+		docker compose -p "$project" -f "$fixture_dir/compose.yaml" down -v --remove-orphans >/dev/null 2>&1 || true
+	fi
+}
+trap cleanup EXIT
+
+command -v docker >/dev/null || { echo "ha qualification: docker is required" >&2; exit 2; }
+docker compose version >/dev/null || { echo "ha qualification: docker compose is required" >&2; exit 2; }
+command -v go >/dev/null || { echo "ha qualification: go is required" >&2; exit 2; }
+command -v openssl >/dev/null || { echo "ha qualification: openssl is required" >&2; exit 2; }
+
+compose=(docker compose -p "$project" -f "$fixture_dir/compose.yaml")
+
+"${compose[@]}" up -d
+for _ in $(seq 1 90); do
+	if "${compose[@]}" exec -T primary pg_isready -U gripline -d gripline >/dev/null 2>&1 && \
+		"${compose[@]}" exec -T replica pg_isready -U gripline -d gripline >/dev/null 2>&1; then
+		break
+	fi
+	sleep 2
+done
+"${compose[@]}" exec -T primary pg_isready -U gripline -d gripline >/dev/null
+"${compose[@]}" exec -T replica pg_isready -U gripline -d gripline >/dev/null
+
+dsn="postgres://gripline:gripline@127.0.0.1:${GRIPLINE_HA_PRIMARY_PORT:-25432}/gripline?sslmode=disable"
+pepper_one="$(openssl rand -base64 32 | tr -d '\n')"
+pepper_two="$(openssl rand -base64 32 | tr -d '\n')"
+pseudonym_one="$(openssl rand -base64 32 | tr -d '\n')"
+pseudonym_two="$(openssl rand -base64 32 | tr -d '\n')"
+GOCACHE="${GOCACHE:-/tmp/gripline-go-cache}" go run ./cmd/gripline-test-cluster-setup \
+	-reset-dsn "$dsn" \
+	-keyring "$work_dir/keyring.json" \
+	-policy "$work_dir/policy.json" \
+	-verifier "$work_dir/verifier.key" \
+	-seed-reference-state \
+	-pepper-one "$pepper_one" -pepper-two "$pepper_two" \
+	-pseudonym-one "$pseudonym_one" -pseudonym-two "$pseudonym_two"
+
+sql() {
+	local service=$1 query=$2
+	"${compose[@]}" exec -T "$service" psql -U gripline -d gripline -X -v ON_ERROR_STOP=1 -Atqc "$query"
+}
+
+[[ "$(sql primary 'SELECT pg_is_in_recovery()')" == f ]] || { echo "ha qualification: primary is not writable" >&2; exit 1; }
+[[ "$(sql replica 'SELECT pg_is_in_recovery()')" == t ]] || { echo "ha qualification: replica is not in recovery" >&2; exit 1; }
+for table in gripline_policy_manifest gripline_cluster_crypto gripline_credentials; do
+	[[ "$(sql primary "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='${table}')")" == t ]] || {
+		echo "ha qualification: missing security table $table" >&2
+		exit 1
+	}
+done
+
+for _ in $(seq 1 60); do
+	if [[ "$(sql replica 'SELECT COUNT(*) FROM gripline_cluster_crypto' 2>/dev/null || true)" -ge 1 && "$(sql replica 'SELECT singleton FROM gripline_policy_manifest WHERE singleton=TRUE' 2>/dev/null || true)" == t ]]; then
+		break
+	fi
+	sleep 1
+done
+[[ "$(sql replica 'SELECT COUNT(*) FROM gripline_cluster_crypto')" -ge 1 ]] || { echo "ha qualification: replica did not catch up security state" >&2; exit 1; }
+
+state_fingerprint() {
+	local service=$1
+	sql "$service" "SELECT concat_ws('|',
+		(SELECT manifest->'active'->>'id' FROM gripline_policy_manifest WHERE singleton=TRUE),
+		(SELECT manifest->'active'->>'revision' FROM gripline_policy_manifest WHERE singleton=TRUE),
+		(SELECT manifest->'active'->>'digest' FROM gripline_policy_manifest WHERE singleton=TRUE),
+		(SELECT manifest->>'activation_epoch' FROM gripline_policy_manifest WHERE singleton=TRUE),
+		(SELECT signer_active_kid || ':' || signer_fingerprint || ':' || pepper_active_version || ':' || pepper_fingerprint || ':' || pseudonym_version || ':' || pseudonym_fingerprint || ':' || generation_epoch FROM gripline_cluster_crypto WHERE singleton=TRUE),
+		(SELECT count(*) FROM gripline_credentials WHERE status=0),
+		(SELECT count(*) FROM gripline_credentials WHERE status=4),
+		(SELECT count(*) FROM gripline_lanes WHERE credential_id='qualification-active'),
+		(SELECT count(*) FROM gripline_evidence WHERE subject_id='qualification-active'),
+		(SELECT posture FROM gripline_operator_posture WHERE singleton=TRUE),
+		(SELECT count(*) FROM gripline_control_operations WHERE operation_id='qualification-seed-operation'),
+		(SELECT count(*) FROM gripline_credential_receipts WHERE request_id='qualification-seed-request'),
+		(SELECT count(*) FROM gripline_resource_leases WHERE lease_id='qualification-seed-lease' AND state='reserved'),
+		(SELECT count(*) FROM gripline_resource_holds WHERE lease_id='qualification-seed-lease'),
+		(SELECT concurrency_used FROM gripline_resource_buckets WHERE scope=2 AND scope_id='qualification-active' AND dimension=1),
+		(SELECT count(*) FROM gripline_policy_artifacts WHERE policy_id='gripline-default-v1' AND revision=1),
+		(SELECT count(*) FROM gripline_cluster_crypto_generations),
+		(SELECT count(*) FROM gripline_operator_audit WHERE target='qualification-active'),
+		(SELECT count(*) FROM gripline_admission_audit WHERE request_id='qualification-seed-request'))"
+}
+
+expected_state="$(state_fingerprint primary)"
+[[ "$expected_state" == *"|1|1|1|1|0|1|1|1|1|1|1|5|1|1"* ]] || {
+	echo "ha qualification: reference state seed is incomplete: $expected_state" >&2
+	exit 1
+}
+for _ in $(seq 1 60); do
+	if [[ "$(state_fingerprint replica 2>/dev/null || true)" == "$expected_state" ]]; then
+		break
+	fi
+	sleep 1
+done
+[[ "$(state_fingerprint replica)" == "$expected_state" ]] || {
+	echo "ha qualification: replica did not preserve complete reference state" >&2
+	exit 1
+}
+
+echo "ha qualification: stopping primary and promoting replica"
+"${compose[@]}" stop primary >/dev/null
+"${compose[@]}" exec -T replica gosu postgres pg_ctl promote -D /var/lib/postgresql/data >/dev/null
+for _ in $(seq 1 60); do
+	if [[ "$(sql replica 'SELECT pg_is_in_recovery()' 2>/dev/null || true)" == f ]]; then
+		break
+	fi
+	sleep 1
+done
+[[ "$(sql replica 'SELECT pg_is_in_recovery()')" == f ]] || { echo "ha qualification: replica did not promote" >&2; exit 1; }
+[[ "$(state_fingerprint replica)" == "$expected_state" ]] || {
+	echo "ha qualification: promoted authority lost reference security state" >&2
+	exit 1
+}
+
+# Rejoin the failed node from the promoted authority. pg_basebackup -R writes
+# standby.signal and primary_conninfo, proving the node came back as a
+# follower instead of silently forking a second authority.
+"${compose[@]}" run --rm --no-deps --entrypoint bash primary -ceu \
+	'rm -rf -- /var/lib/postgresql/data/*; PGPASSWORD=gripline pg_basebackup -h replica -U replicator -D /var/lib/postgresql/data -Fp -Xs -P -R; chown -R postgres:postgres /var/lib/postgresql/data; chmod 0700 /var/lib/postgresql/data' \
+	>/dev/null
+"${compose[@]}" up -d primary >/dev/null
+for _ in $(seq 1 60); do
+	if [[ "$(sql primary 'SELECT pg_is_in_recovery()' 2>/dev/null || true)" == t ]]; then
+		break
+	fi
+	sleep 1
+done
+[[ "$(sql primary 'SELECT pg_is_in_recovery()')" == t ]] || { echo "ha qualification: failed node did not rejoin as standby" >&2; exit 1; }
+[[ "$(state_fingerprint primary)" == "$expected_state" ]] || {
+	echo "ha qualification: rejoined standby lost complete reference state" >&2
+	exit 1
+}
+echo "ha qualification: primary/replica promotion, security-state preservation, and rejoin passed"

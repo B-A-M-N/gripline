@@ -75,18 +75,9 @@ func (r *Resolver) ResolveContext(ctx context.Context, remoteAddr string, header
 		return TrustedSource{}, nil
 	}
 
-	peer, err := ExtractPeer(remoteAddr)
+	canonical, err := CanonicalClientIP(remoteAddr, headers, r.TrustedProxies)
 	if err != nil {
-		return TrustedSource{}, fmt.Errorf("ingress: extract peer: %w", err)
-	}
-
-	canonical := peer.IP
-
-	// If the direct peer is a trusted proxy, parse the forwarding chain.
-	if r.isTrustedProxy(peer.IP) {
-		if clientIP := r.parseForwardingChain(headers); clientIP.IsValid() && !clientIP.IsUnspecified() {
-			canonical = clientIP
-		}
+		return TrustedSource{}, fmt.Errorf("ingress: canonical client IP: %w", err)
 	}
 
 	// Normalize a link-local zone off the canonical address (netip keeps it in
@@ -123,9 +114,46 @@ func (r *Resolver) ResolveContext(ctx context.Context, remoteAddr string, header
 	return src, nil
 }
 
-// isTrustedProxy reports whether the given IP is within a trusted-proxy CIDR.
-func (r *Resolver) isTrustedProxy(ip netip.Addr) bool {
-	for _, prefix := range r.TrustedProxies {
+// CanonicalClientIP derives the cheap, raw source key used before credential
+// authentication. It deliberately performs no pseudonym, database, or ASN
+// work. Forwarding headers are considered only when the direct TCP peer is in
+// trusted; malformed trusted-proxy chains fall back to that direct peer.
+func CanonicalClientIP(remoteAddr string, headers http.Header, trusted []netip.Prefix) (netip.Addr, error) {
+	peer, err := ExtractPeer(remoteAddr)
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("extract peer: %w", err)
+	}
+	canonical := peer.IP
+	if !prefixContains(trusted, peer.IP) {
+		return canonical.WithZone(""), nil
+	}
+	hops := forwardingHops(headers)
+	if len(hops) == 0 {
+		return canonical.WithZone(""), nil
+	}
+	for _, hop := range hops {
+		if hop == "" {
+			return canonical.WithZone(""), nil
+		}
+	}
+	parsed := make([]netip.Addr, 0, len(hops))
+	for _, raw := range hops {
+		ip, err := netip.ParseAddr(raw)
+		if err != nil || ip.IsUnspecified() {
+			return canonical.WithZone(""), nil
+		}
+		parsed = append(parsed, ip)
+	}
+	for i := len(parsed) - 1; i >= 0; i-- {
+		if !prefixContains(trusted, parsed[i]) {
+			return parsed[i].WithZone(""), nil
+		}
+	}
+	return parsed[0].WithZone(""), nil
+}
+
+func prefixContains(prefixes []netip.Prefix, ip netip.Addr) bool {
+	for _, prefix := range prefixes {
 		if prefix.Contains(ip) {
 			return true
 		}
@@ -133,35 +161,16 @@ func (r *Resolver) isTrustedProxy(ip netip.Addr) bool {
 	return false
 }
 
-// parseForwardingChain extracts the client IP from forwarding headers.
-// It walks X-Forwarded-For right-to-left, stopping at the first IP that
-// is NOT a trusted proxy — that is the client IP as seen by the trusted edge.
-// If every hop is a trusted proxy, the leftmost (original) is used.
-func (r *Resolver) parseForwardingChain(headers http.Header) netip.Addr {
-	// X-Forwarded-For: client, proxy1, proxy2
-	xff := headers.Get("X-Forwarded-For")
-	if xff == "" {
-		return netip.Addr{}
+func forwardingHops(headers http.Header) []string {
+	values := headers.Values("X-Forwarded-For")
+	if len(values) == 0 {
+		return nil
 	}
-
-	hops := strings.Split(xff, ",")
-	for i := len(hops) - 1; i >= 0; i-- {
-		ipStr := strings.TrimSpace(hops[i])
-		ip, err := netip.ParseAddr(ipStr)
-		if err != nil || ip.IsUnspecified() {
-			continue
-		}
-		// If this hop is not a trusted proxy, it's the client.
-		if !r.isTrustedProxy(ip) {
-			return ip
+	var hops []string
+	for _, value := range values {
+		for _, raw := range strings.Split(value, ",") {
+			hops = append(hops, strings.TrimSpace(raw))
 		}
 	}
-	// All hops are trusted proxies — use the leftmost (original client).
-	for _, hop := range hops {
-		ipStr := strings.TrimSpace(hop)
-		if ip, err := netip.ParseAddr(ipStr); err == nil && !ip.IsUnspecified() {
-			return ip
-		}
-	}
-	return netip.Addr{}
+	return hops
 }

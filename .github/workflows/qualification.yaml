@@ -1,0 +1,49 @@
+name: reference qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      soak_duration:
+        description: "Reference soak duration (use 24h or 72h for long qualification)"
+        required: false
+        default: "30s"
+        type: string
+  schedule:
+    - cron: '17 3 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  reference-smoke:
+    name: repository-owned qualification lab
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Assert SDK runtimes
+        run: |
+          python3 --version
+          node --version
+          npm --version
+      - name: Install HTTP/2 clients
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes nghttp2-client
+      - name: HA promotion and rejoin
+        run: bash scripts/qualification/ha.sh
+      - name: PITR target-time restore
+        run: bash scripts/qualification/pitr.sh
+      - name: Network perimeter and mTLS
+        run: bash scripts/qualification/perimeter.sh
+      - name: Shared replay across processes
+        run: bash scripts/qualification/replay.sh
+      - name: Direct TLS and HTTP/2
+        run: bash scripts/qualification/http2.sh
+      - name: Official SDK compatibility
+        run: bash scripts/qualification/sdk.sh
+      - name: Active/active short soak
+        run: bash scripts/qualification/soak.sh --duration "${{ inputs.soak_duration || '30s' }}" --workers 8

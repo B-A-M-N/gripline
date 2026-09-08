@@ -184,6 +184,7 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 	transport.DialContext = (&net.Dialer{Timeout: dialTimeout}).DialContext
 	transport.TLSHandshakeTimeout = tlsHandshakeTimeout
 	transport.ResponseHeaderTimeout = respHeaderTimeout
+	transport.MaxResponseHeaderBytes = int64(cfg.Backend.MaxResponseHeaderBytes)
 	if backend.Scheme == "https" {
 		tlsConfig, err := cfg.BackendTLSConfig()
 		if err != nil {
@@ -227,7 +228,35 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		return nil, fmt.Errorf("gripline: signer: %w", err)
 	}
 	if postgres != nil {
-		verifierAcceptor, err = newHTTPVerifierControl(cfg, transport, operationTimeout)
+		var controlTransport http.RoundTripper
+		if strings.TrimSpace(cfg.Backend.VerifierControl.URL) != "" {
+			controlTimeout := cfg.Backend.VerifierControl.Timeout.D()
+			if controlTimeout <= 0 {
+				controlTimeout = operationTimeout
+			}
+			controlTransport = &http.Transport{
+				MaxIdleConnsPerHost:    2,
+				IdleConnTimeout:        cfg.Server.IdleTimeout.D(),
+				DisableCompression:     true,
+				MaxResponseHeaderBytes: int64(cfg.Backend.MaxResponseHeaderBytes),
+			}
+			controlDialTimeout := controlTimeout
+			controlTransport.(*http.Transport).DialContext = (&net.Dialer{Timeout: controlDialTimeout}).DialContext
+			controlTransport.(*http.Transport).TLSHandshakeTimeout = controlTimeout
+			controlTransport.(*http.Transport).ResponseHeaderTimeout = controlTimeout
+			controlURL, parseErr := urlFrom(cfg.Backend.VerifierControl.URL)
+			if parseErr != nil {
+				return nil, fmt.Errorf("gripline: verifier control URL: %w", parseErr)
+			}
+			if controlURL.Scheme == "https" {
+				tlsConfig, tlsErr := cfg.VerifierControlTLSConfig()
+				if tlsErr != nil {
+					return nil, fmt.Errorf("gripline: verifier control tls: %w", tlsErr)
+				}
+				controlTransport.(*http.Transport).TLSClientConfig = tlsConfig
+			}
+		}
+		verifierAcceptor, err = newHTTPVerifierControl(cfg, controlTransport, operationTimeout)
 		if err != nil {
 			return nil, err
 		}
@@ -496,12 +525,30 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		// re-armed per chunk); main.go must then run the server with
 		// WriteTimeout 0 so the per-request deadlines govern instead of the
 		// blanket one that would kill long-lived SSE streams.
-		WriteTimeout:           cfg.Server.WriteTimeout.D(),
-		StreamWriteIdleTimeout: cfg.Server.StreamWriteIdleTimeout.D(),
-		SpoolDir:               cfg.Server.SpoolDir,
-		SpoolMaxBytes:          cfg.Server.SpoolMaxBytes,
-		SpoolMaxFiles:          cfg.Server.SpoolMaxFiles,
-		ReservationRenewEvery:  cfg.Authority.RenewEvery.D(),
+		WriteTimeout:                   cfg.Server.WriteTimeout.D(),
+		StreamWriteIdleTimeout:         cfg.Server.StreamWriteIdleTimeout.D(),
+		SpoolDir:                       cfg.Server.SpoolDir,
+		SpoolMaxBytes:                  cfg.Server.SpoolMaxBytes,
+		SpoolMaxFiles:                  cfg.Server.SpoolMaxFiles,
+		ReservationRenewEvery:          cfg.Authority.RenewEvery.D(),
+		PreAuthMaxConcurrent:           cfg.Server.PreAuthMaxConcurrent,
+		PreAuthRequestsPerSecond:       cfg.Server.PreAuthRequestsPerSecond,
+		PreAuthSourceRequestsPerSecond: cfg.Server.PreAuthSourceRequestsPerSecond,
+		PreAuthMaxSources:              cfg.Server.PreAuthMaxSources,
+		PreAuthSourceIdle:              cfg.Server.SourceScopeIdle.D(),
+	}
+	if cfg.Backend.AllowedEndpoints != nil {
+		proxyCfg.EndpointRules = make([]proxy.EndpointRule, 0, len(cfg.Backend.AllowedEndpoints))
+		for _, rule := range cfg.Backend.AllowedEndpoints {
+			proxyCfg.EndpointRules = append(proxyCfg.EndpointRules, proxy.EndpointRule{
+				Method: rule.Method, Path: rule.Path, RequiredScope: rule.RequiredScope,
+			})
+		}
+	}
+	if controlURL := strings.TrimSpace(cfg.Backend.VerifierControl.URL); controlURL != "" {
+		if parsed, parseErr := urlFrom(controlURL); parseErr == nil {
+			proxyCfg.ForbiddenPath = parsed.Path
+		}
 	}
 	if cfg.Usage.Mode == "openai" || cfg.Usage.Mode == "anthropic" {
 		format := publicusage.FormatOpenAI
@@ -509,8 +556,10 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 			format = publicusage.FormatAnthropic
 		}
 		provider, err := publicusage.NewJSONProvider(format, publicusage.Pricing{
-			InputMicrounitsPerToken:  cfg.Usage.InputMicrounitsPerToken,
-			OutputMicrounitsPerToken: cfg.Usage.OutputMicrounitsPerToken,
+			InputMicrounitsPerToken:         cfg.Usage.InputMicrounitsPerToken,
+			OutputMicrounitsPerToken:        cfg.Usage.OutputMicrounitsPerToken,
+			CacheReadMicrounitsPerToken:     cfg.Usage.CacheReadMicrounitsPerToken,
+			CacheCreationMicrounitsPerToken: cfg.Usage.CacheCreationMicrounitsPerToken,
 		}, cfg.Usage.DefaultOutputTokens)
 		if err != nil {
 			return nil, fmt.Errorf("gripline: usage adapter: %w", err)
@@ -529,6 +578,7 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 	// Sources nil defaults to NoSource (source-scoped features inert).
 	if srcResolver != nil {
 		proxyCfg.Sources = srcResolver
+		proxyCfg.PreAuthSource = srcResolver
 	}
 	dp, err := proxy.New(proxyCfg)
 	if err != nil {

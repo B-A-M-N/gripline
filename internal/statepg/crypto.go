@@ -587,7 +587,7 @@ func (s *Store) activateCryptoGenerationOnce(ctx context.Context, req CryptoActi
 		active.SignerActiveKID, active.SignerActiveFingerprint,
 		active.PepperActiveVersion, active.PepperActiveFingerprint,
 		active.PseudonymVersion, active.PseudonymActiveFingerprint,
-		int64(newEpoch), now); err != nil {
+		postgresEpoch(newEpoch), now); err != nil {
 		return CryptoIdentity{}, mapDBError(err)
 	}
 	if _, err := tx.Exec(ctx, `UPDATE gripline_cluster_crypto_generations
@@ -688,7 +688,7 @@ func (s *Store) retireCryptoGenerationOnce(ctx context.Context, req CryptoRetire
 		return CryptoIdentity{}, errors.New("statepg: crypto generation epoch exhausted")
 	}
 	newEpoch := shared.GenerationEpoch + 1
-	if _, err := tx.Exec(ctx, `UPDATE gripline_cluster_crypto SET generation_epoch=$1, updated_at=$2 WHERE singleton=TRUE`, int64(newEpoch), now); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE gripline_cluster_crypto SET generation_epoch=$1, updated_at=$2 WHERE singleton=TRUE`, postgresEpoch(newEpoch), now); err != nil {
 		return CryptoIdentity{}, mapDBError(err)
 	}
 	if _, err := tx.Exec(ctx, `UPDATE gripline_cluster_crypto_generations SET state='retired', updated_at=$1

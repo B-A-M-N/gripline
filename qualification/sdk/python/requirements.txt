@@ -1,0 +1,3 @@
+# Exact SDK versions keep the qualification protocol matrix reproducible.
+openai==1.109.1
+anthropic==0.69.0

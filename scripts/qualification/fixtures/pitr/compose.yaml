@@ -1,0 +1,42 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: gripline
+      POSTGRES_PASSWORD: gripline
+      POSTGRES_DB: gripline
+      POSTGRES_HOST_AUTH_METHOD: trust
+    command: ["postgres", "-c", "wal_level=replica", "-c", "archive_mode=on", "-c", "archive_timeout=1s", "-c", "archive_command=test ! -f /archive/%f && cp %p /archive/%f"]
+    ports:
+      - "${GRIPLINE_PITR_PORT:-25434}:5432"
+    volumes:
+      - pitr-data:/var/lib/postgresql/data
+      - pitr-archive:/archive
+      - pitr-backup:/backup
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gripline -d gripline"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  restore:
+    image: postgres:16
+    profiles: ["restore"]
+    environment:
+      POSTGRES_USER: gripline
+      POSTGRES_PASSWORD: gripline
+      POSTGRES_DB: gripline
+      PGDATA: /var/lib/postgresql/data
+      GRIPLINE_PITR_TARGET_TIME: ${GRIPLINE_PITR_TARGET_TIME:-}
+    command: ["/usr/local/bin/gripline-pitr-restore-entrypoint.sh"]
+    ports:
+      - "${GRIPLINE_PITR_RESTORE_PORT:-25435}:5432"
+    volumes:
+      - pitr-restore-data:/var/lib/postgresql/data
+      - pitr-archive:/archive
+      - pitr-backup:/backup
+      - ./restore-entrypoint.sh:/usr/local/bin/gripline-pitr-restore-entrypoint.sh:ro
+volumes:
+  pitr-data:
+  pitr-archive:
+  pitr-backup:
+  pitr-restore-data:

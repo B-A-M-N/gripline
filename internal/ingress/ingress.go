@@ -36,7 +36,7 @@ func ExtractPeer(remoteAddr string) (Peer, error) {
 	if portStr != "" {
 		p, err := net.LookupPort("tcp", portStr)
 		if err == nil {
-			port = uint16(p)
+			port = uint16(p) // #nosec G115 -- net.LookupPort returns a valid 0..65535 TCP port.
 		}
 	}
 	return Peer{IP: ip, Port: port}, nil

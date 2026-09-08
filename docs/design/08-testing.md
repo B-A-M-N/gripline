@@ -47,8 +47,12 @@ processes, then proves direct raw-key denial, malformed/forged/wrong
 audience/issuer/KID/revision assertions, query/body fidelity, chunked input,
 gzip, SSE completion, provider statuses and `Retry-After`, oversized bodies,
 upstream dial failure, idle-stream cutting, client cancellation, connection
-reuse, persistent restart, and exact-credential canary absence. The harness is
-not a production network-isolation or third-party SDK proof. `scripts/chaos-smoke.sh`
+reuse, persistent restart, and exact-credential canary absence. The compiled
+release backend now runs behind a private-CA mTLS connection and requires the
+exact inference client identity before assertion verification. The separate
+repository-owned qualification lab supplies the production-shaped
+network-isolation and official SDK proof.
+`scripts/chaos-smoke.sh`
 adds executable state/keyring/backend/spool/telemetry failure seams and runs
 the release harness again. `scripts/cluster-harness.sh` runs three active/active
 gateways against PostgreSQL and proves shared concurrency, revocation,
@@ -56,15 +60,37 @@ posture, policy, crypto rotation, source continuity, fencing, killed-node
 recovery, backend cancellation, and PostgreSQL outage/recovery. CI and release
 jobs require the PostgreSQL outage segment; local runs may skip it only when no
 PostgreSQL service container is available.
+The same harness runs a configurable short sustained load phase
+(`GRIPLINE_CLUSTER_HARNESS_LOAD_SECONDS` and
+`GRIPLINE_CLUSTER_HARNESS_LOAD_WORKERS`, with the optional
+`GRIPLINE_CLUSTER_HARNESS_LOAD_P95_LIMIT_MS`) through the load balancer and
+records sample count, throughput, p50, and successful-request p95 latency.
+This is a pool/serialization regression gate. The repository-owned
+`scripts/qualification/soak.sh` composes the local HA database, runs the
+three-node workload, continuously checks replica/security invariants, bounded
+active leases/holds/source scopes and retention, and records each node's RSS,
+goroutine, and heap samples; it can run the 24-72 hour reference soak.
+Operator-specific capacity remains a separate deployment layer.
+The release harness also invokes `scripts/security-http-harness.sh`, which
+writes raw HTTP/1.1 framing and header cases to a TCP socket and checks that
+parser ambiguity never creates more than one backend request or leaks a
+client-controlled carrier. `scripts/qualification/http2.sh` starts the real
+TLS listener with local PKI and executes the HTTP/2 cases with `nghttp`, the
+repository cancellation/recovery client, and `h2load`; it also checks bounded
+oversized-header rejection and authenticated HTTP/2 error metrics.
+`scripts/security-http2-harness.sh` remains the URL-driven operator
+deployment check. `scripts/fuzz-smoke.sh` runs short parser fuzzing in
+PR/security CI and a longer scheduled budget.
 
 ## 4. Acceptance gates (§111)
 
 - **Gate A** — full test telemetry contains zero raw credentials.
 - **Gate B** — direct public access to the protected backend fails.
-- **Gate C** — supported clients operate unchanged (generic HTTP is exercised
-  here; OpenAI/Anthropic SDKs, Claude Code, and Codex require hosting-side
-  connector evidence), including streaming, non-streaming, large context, tool
-  calls, parallel, cancellation, retry, and long-lived requests.
+- **Gate C** — supported clients operate unchanged. The repository-owned SDK
+  lab exercises the official OpenAI/Anthropic Python and TypeScript clients
+  against a provider-shaped local backend; operator accounts and model quotas
+  remain deployment evidence. Cases include streaming, non-streaming,
+  cancellation bounds, and usage settlement.
 - **Gate D** — no material streaming-semantic regression.
 - **Gate E** — every enforcement action reproducible from explicit state+policy.
 - **Gate F** — adaptive failure neither creates unlimited access nor kills the service.
@@ -82,8 +108,13 @@ backend public paths; 100% deterministic authorization; 0 unsupported streaming 
 mutation. The durable benchmark reports p50/p95/p99 and throughput for the
 state-backed proxy path; clustered qualification must separately measure
 PostgreSQL arbitration, pool waits, lock contention, and three-node p95/p99.
-Security tests cover log-injection, malformed/duplicate Authorization, header
-smuggling, forged forwarding headers, forged Gripline headers, direct backend
-bypass, bearer/proof replay, resource & concurrency races, baseline poisoning,
-lane explosion, source rotation, rotation race, policy rollback, assertion
-algorithm/audience/expiry bypass, and timing analysis.
+Security tests currently cover log-injection, malformed/duplicate Authorization,
+header-map sanitation, forged forwarding headers, forged Gripline headers,
+direct backend bypass, short-lived bearer/proof semantics, resource &
+concurrency races, baseline poisoning, lane explosion, source rotation,
+rotation race, policy rollback, and assertion algorithm/audience/expiry
+bypass. The reference qualification lab (`scripts/qualification/`) now owns
+HTTP/2 connection-load, official SDK compatibility, mTLS/network isolation,
+PostgreSQL HA/PITR, shared replay, and long-duration soak evidence. Cloud
+network policy, managed database behavior, issued PKI, and provider account
+capacity remain operator-specific deployment work.

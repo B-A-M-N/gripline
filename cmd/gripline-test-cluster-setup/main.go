@@ -15,9 +15,14 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/B-A-M-N/gripline/internal/control"
 	"github.com/B-A-M-N/gripline/internal/credential"
+	"github.com/B-A-M-N/gripline/internal/evidence"
+	"github.com/B-A-M-N/gripline/internal/lane"
 	"github.com/B-A-M-N/gripline/internal/policy"
 	"github.com/B-A-M-N/gripline/internal/pseudonym"
+	"github.com/B-A-M-N/gripline/internal/resource"
+	"github.com/B-A-M-N/gripline/internal/secret"
 	"github.com/B-A-M-N/gripline/internal/statepg"
 	"github.com/B-A-M-N/gripline/internal/terminator"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -33,6 +38,7 @@ func main() {
 	pepperTwo := flag.String("pepper-two", "", "optional base64 pepper generation 2 for seeded crypto state")
 	pseudonymOne := flag.String("pseudonym-one", "", "optional base64 pseudonym generation 1 for seeded crypto state")
 	pseudonymTwo := flag.String("pseudonym-two", "", "optional base64 pseudonym generation 2 for seeded crypto state")
+	seedReferenceState := flag.Bool("seed-reference-state", false, "seed valid policy and representative non-secret authority state")
 	flag.Parse()
 	if *keyringPath == "" || *policyPath == "" || *verifierPath == "" {
 		fatal("-keyring, -policy, and -verifier are required")
@@ -82,6 +88,101 @@ func main() {
 		candidate := *configured
 		candidate.Revision = 2
 		writePolicy(*candidatePath, &candidate, private)
+	}
+	if *dsn != "" && *seedReferenceState {
+		seedReferenceAuthority(*dsn, configured, *pepperOne)
+	}
+}
+
+// seedReferenceAuthority creates the state that the HA/PITR labs must carry
+// across a boundary. It intentionally contains only disposable identifiers,
+// verifier bytes, and fingerprints; no raw credential or key material is
+// persisted. The rows use the same JSON/domain types as the live stores so a
+// lab exercises real decoding and readiness paths rather than count-only SQL.
+func seedReferenceAuthority(dsn string, configured *policy.Policy, pepperEncoded string) {
+	digest, err := policy.Digest(configured)
+	if err != nil {
+		fatal("digest reference policy: %v", err)
+	}
+	policyRaw, err := json.Marshal(configured)
+	if err != nil {
+		fatal("encode reference policy: %v", err)
+	}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	securityRaw, err := json.Marshal(credential.SecurityState{LastObservedAt: now, LastStateChangeAt: now})
+	if err != nil {
+		fatal("encode reference credential security: %v", err)
+	}
+	pepper, err := base64.StdEncoding.DecodeString(pepperEncoded)
+	if err != nil || len(pepper) < 32 {
+		fatal("reference state requires a base64 pepper generation 1")
+	}
+	activeSecret := secret.NewFromBytes([]byte("reference-active-secret"))
+	defer activeSecret.Zero()
+	revokedSecret := secret.NewFromBytes([]byte("reference-revoked-secret"))
+	defer revokedSecret.Zero()
+	activeVerifier := credential.Verifier(activeSecret, &credential.PepperKey{Version: 1, Key: pepper})
+	revokedVerifier := credential.Verifier(revokedSecret, &credential.PepperKey{Version: 1, Key: pepper})
+	laneRaw, err := json.Marshal(lane.LaneRecord{
+		LaneID: "qualification-lane", CredentialID: "qualification-active",
+		State: lane.StateEstablished, FirstSeenAt: now.Add(-24 * time.Hour), LastSeenAt: now,
+		Features:   lane.Features{NetworkASN: "AS64500", NetworkType: "residential", RegionClass: "reference", ClientFamily: "qualification", SDKFamily: "local", HTTPVersion: "2", Streaming: "non-streaming", ModelFamily: "local", ConcurrencyPattern: "interactive", EndpointFamily: "messages"},
+		FeatSchema: 1, ClassificationRevision: 1, RequestCount: 12, ActiveDays: 1,
+		LastActiveDay: now.Format("2006-01-02"), EstablishmentScore: 100,
+		Security: lane.SecurityState{LastObservedAt: now}, AuthorizedCleanRequests: 12,
+		CleanActiveDays: 1, LastCleanActiveDay: now.Format("2006-01-02"), CleanSince: now.Add(-24 * time.Hour), Revision: 3,
+	})
+	if err != nil {
+		fatal("encode reference lane: %v", err)
+	}
+	evidenceRaw, err := json.Marshal(evidence.Evidence{
+		EvidenceID: "qualification-evidence", Code: "REFERENCE_SIGNAL", Family: evidence.FamilyClientNovelty,
+		Scope: evidence.ScopeCredential, SubjectID: "qualification-active", Score: 1, Severity: 1,
+		Confidence: 90, CreatedAt: now.Add(-time.Minute), ExpiresAt: now.Add(time.Hour), PolicyRevision: configured.Revision,
+	})
+	if err != nil {
+		fatal("encode reference evidence: %v", err)
+	}
+	beforeRaw, _ := json.Marshal(map[string]any{"status": "NORMAL", "revision": 1})
+	afterRaw, _ := json.Marshal(map[string]any{"status": "WATCH", "revision": 2})
+	manifestRaw, err := json.Marshal(policy.Manifest{
+		SchemaVersion: 1, ActivationEpoch: 1,
+		Active: policy.PolicyRef{ID: configured.ID, Revision: configured.Revision, Digest: digest}, UpdatedAt: now,
+	})
+	if err != nil {
+		fatal("encode reference manifest: %v", err)
+	}
+	pool, err := pgxpool.New(context.Background(), dsn)
+	if err != nil {
+		fatal("connect reference authority: %v", err)
+	}
+	defer pool.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	queries := []struct {
+		query string
+		args  []any
+	}{
+		{`INSERT INTO gripline_policy_artifacts (policy_id, revision, digest, artifact) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING`, []any{configured.ID, configured.Revision, digest, policyRaw}},
+		{`INSERT INTO gripline_policy_manifest (singleton, manifest, updated_at) VALUES (TRUE,$1,$2) ON CONFLICT (singleton) DO UPDATE SET manifest=EXCLUDED.manifest, updated_at=EXCLUDED.updated_at`, []any{manifestRaw, now}},
+		{`INSERT INTO gripline_operator_posture (singleton, posture, updated_at) VALUES (TRUE,$1,$2) ON CONFLICT (singleton) DO UPDATE SET posture=EXCLUDED.posture, updated_at=EXCLUDED.updated_at`, []any{control.Normal, now}},
+		{`INSERT INTO gripline_credentials (credential_id, account_id, verifier, verifier_version, pepper_version, status, security, policy_id, plan_id, created_at, revision) VALUES ('qualification-active','qualification-account',$1,1,1,$2,$3,$4,'qualification-plan',$5,1), ('qualification-revoked','qualification-account',$6,1,1,$7,$3,$4,'qualification-plan',$5,4) ON CONFLICT (credential_id) DO UPDATE SET verifier=EXCLUDED.verifier, status=EXCLUDED.status, security=EXCLUDED.security, policy_id=EXCLUDED.policy_id, plan_id=EXCLUDED.plan_id, revision=EXCLUDED.revision`, []any{activeVerifier, credential.StatusNormal, securityRaw, configured.ID, now, revokedVerifier, credential.StatusRevoked}},
+		{`INSERT INTO gripline_lanes (credential_id, lane_id, record) VALUES ('qualification-active','qualification-lane',$1) ON CONFLICT (credential_id,lane_id) DO UPDATE SET record=EXCLUDED.record`, []any{laneRaw}},
+		{`INSERT INTO gripline_lane_guards (credential_id, created_at) VALUES ('qualification-active',$1) ON CONFLICT DO NOTHING`, []any{now}},
+		{`INSERT INTO gripline_evidence (scope, subject_id, evidence_id, item) VALUES ($1,$2,$3,$4) ON CONFLICT (scope,subject_id,evidence_id) DO UPDATE SET item=EXCLUDED.item`, []any{evidence.ScopeCredential.String(), "qualification-active", "qualification-evidence", evidenceRaw}},
+		{`INSERT INTO gripline_evidence_guards (scope, subject_id, created_at) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING`, []any{evidence.ScopeCredential.String(), "qualification-active", now}},
+		{`INSERT INTO gripline_control_operations (operation_id, action, payload_fingerprint, created_at) VALUES ('qualification-seed-operation','credential.reference-seed','reference-payload-fingerprint',$1) ON CONFLICT DO NOTHING`, []any{now}},
+		{`INSERT INTO gripline_credential_receipts (request_id, credential_id, changed, before_record, after_record, created_at) VALUES ('qualification-seed-request','qualification-active',TRUE,$1,$2,$3) ON CONFLICT DO NOTHING`, []any{beforeRaw, afterRaw, now}},
+		{`INSERT INTO gripline_resource_buckets (scope, scope_id, dimension, capacity, refill_per, refill_in_ns, available, concurrency_used, updated_at) VALUES ($1,'qualification-active',$2,5,0,0,5,1,$3) ON CONFLICT (scope,scope_id,dimension) DO UPDATE SET capacity=EXCLUDED.capacity, available=EXCLUDED.available, concurrency_used=EXCLUDED.concurrency_used, updated_at=EXCLUDED.updated_at`, []any{resource.ScopeCredential, resource.DimConcurrency, now}},
+		{`INSERT INTO gripline_resource_leases (lease_id, request_id, request_fingerprint, node_id, node_epoch, state, expires_at, created_at) VALUES ('qualification-seed-lease','qualification-seed-request','reference-request-fingerprint','qualification-reference-node',1,'reserved',$1,$2) ON CONFLICT (lease_id) DO UPDATE SET state=EXCLUDED.state, expires_at=EXCLUDED.expires_at`, []any{now.Add(time.Hour), now}},
+		{`INSERT INTO gripline_resource_holds (lease_id, scope, scope_id, dimension, amount, settled) VALUES ('qualification-seed-lease',$1,'qualification-active',$2,1,FALSE) ON CONFLICT DO NOTHING`, []any{resource.ScopeCredential, resource.DimConcurrency}},
+		{`INSERT INTO gripline_operator_audit (at, actor, action, target, reason, posture, committed, detail) VALUES ($1,'qualification-fixture','reference.seed','qualification-active','repository-owned reference fixture','NORMAL',TRUE,'non-secret state seed')`, []any{now}},
+		{`INSERT INTO gripline_admission_audit (at, request_id, credential_id, account_id, lane_id, posture, authorized, reason) VALUES ($1,'qualification-seed-request','qualification-active','qualification-account','qualification-lane','NORMAL',TRUE,'reference fixture')`, []any{now}},
+	}
+	for _, item := range queries {
+		if _, err := pool.Exec(ctx, item.query, item.args...); err != nil {
+			fatal("seed reference authority: %v", err)
+		}
 	}
 }
 
@@ -237,6 +338,7 @@ func resetAuthority(dsn string) {
 		gripline_cluster_crypto,
 		gripline_cluster_crypto_generations,
 		gripline_cluster_crypto_acks,
+		gripline_policy_node_state,
 		gripline_membership`
 	if _, err := pool.Exec(ctx, "TRUNCATE TABLE "+tables+" RESTART IDENTITY CASCADE"); err != nil {
 		fatal("reset authority: %v", err)

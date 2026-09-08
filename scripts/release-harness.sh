@@ -30,6 +30,34 @@ audience="gripline-release-harness"
 secret="harness-secret-1234567890"
 operator_token="operator-harness-0123456789abcdef0123456789"
 pepper_b64="$(openssl rand -base64 32 | tr -d '\n')"
+ca_key="$harness_dir/backend-ca.key"
+ca_cert="$harness_dir/backend-ca.pem"
+backend_key="$harness_dir/backend-server.key"
+backend_csr="$harness_dir/backend-server.csr"
+backend_cert="$harness_dir/backend-server.pem"
+client_key="$harness_dir/inference-client.key"
+client_csr="$harness_dir/inference-client.csr"
+client_cert="$harness_dir/inference-client.pem"
+
+# The release fixture uses the same concrete transport-trust shape required by
+# a production private backend: the gateway presents an inference client
+# certificate, the backend verifies it against a private CA, and the public
+# assertion verifier additionally requires the exact client DNS identity.
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+	-keyout "$ca_key" -out "$ca_cert" -subj "/CN=Gripline release harness CA" \
+	>/dev/null 2>&1
+openssl req -newkey rsa:2048 -nodes \
+	-keyout "$backend_key" -out "$backend_csr" -subj "/CN=backend.internal" \
+	-addext "subjectAltName=DNS:backend.internal" >/dev/null 2>&1
+openssl x509 -req -days 1 -sha256 -copy_extensions copy \
+	-in "$backend_csr" -CA "$ca_cert" -CAkey "$ca_key" -CAcreateserial \
+	-out "$backend_cert" >/dev/null 2>&1
+openssl req -newkey rsa:2048 -nodes \
+	-keyout "$client_key" -out "$client_csr" -subj "/CN=gripline-inference.internal" \
+	-addext "subjectAltName=DNS:gripline-inference.internal" >/dev/null 2>&1
+openssl x509 -req -days 1 -sha256 -copy_extensions copy \
+	-in "$client_csr" -CA "$ca_cert" -CAkey "$ca_key" -CAserial "$harness_dir/backend-ca.srl" \
+	-out "$client_cert" >/dev/null 2>&1
 
 go build -trimpath -o "$harness_dir/gripline" ./cmd/gripline
 go build -trimpath -o "$harness_dir/backend" ./cmd/gripline-test-backend
@@ -39,7 +67,27 @@ cat > "$harness_dir/config.json" <<EOF
 {
   "listen": "127.0.0.1:${gateway_port}",
   "tls": {"terminate_tls_upstream": true},
-  "backend": {"url": "http://127.0.0.1:${backend_port}", "timeout": "5s"},
+  "backend": {
+    "url": "https://127.0.0.1:${backend_port}",
+    "tls": {
+      "ca_file": "${ca_cert}",
+      "client_cert_file": "${client_cert}",
+      "client_key_file": "${client_key}",
+      "server_name": "backend.internal",
+      "min_version": "1.2"
+    },
+    "timeout": "5s",
+    "allowed_endpoints": [
+      {"method": "POST", "path": "/v1/messages"},
+      {"method": "GET", "path": "/v1/messages"},
+      {"method": "POST", "path": "/v1/echo"},
+      {"method": "GET", "path": "/v1/gzip"},
+      {"method": "GET", "path": "/v1/stream"},
+      {"method": "GET", "path": "/v1/status/429"},
+      {"method": "GET", "path": "/v1/status/500"},
+      {"method": "GET", "path": "/v1/slow"}
+    ]
+  },
   "server": {
     "read_timeout": "5s", "write_timeout": "5s", "idle_timeout": "5s",
     "read_header_timeout": "5s", "stream_write_idle_timeout": "1s", "max_body_bytes": 1048576,
@@ -101,13 +149,28 @@ if ! printf '%s\n' "$secret" | GRIPLINE_OPERATOR_TOKEN="$operator_token" \
 	exit 1
 fi
 
-"$harness_dir/backend" -listen "127.0.0.1:${backend_port}" -keys "$harness_dir/keys.json" -audience "$audience" -capture "$harness_dir/backend-capture.log" >"$harness_dir/backend.log" 2>&1 &
-backend_pid=$!
+start_backend() {
+	local log_name=$1
+	shift
+	"$harness_dir/backend" -listen "127.0.0.1:${backend_port}" \
+		-tls-cert "$backend_cert" -tls-key "$backend_key" -client-ca "$ca_cert" \
+		-require-client-dns "gripline-inference.internal" \
+		-keys "$harness_dir/keys.json" -audience "$audience" "$@" \
+		>"$harness_dir/${log_name}" 2>&1 &
+	backend_pid=$!
+}
+
+start_backend backend.log -capture "$harness_dir/backend-capture.log"
+
+backend_curl() {
+	curl --cacert "$ca_cert" --cert "$client_cert" --key "$client_key" \
+		--resolve "backend.internal:${backend_port}:127.0.0.1" "$@"
+}
 
 wait_backend() {
 	local backend_ready=""
 	for _ in $(seq 1 50); do
-		backend_ready="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${backend_port}/healthz" 2>/dev/null || true)"
+		backend_ready="$(backend_curl -sS -o /dev/null -w '%{http_code}' "https://backend.internal:${backend_port}/healthz" 2>/dev/null || true)"
 		if [[ "$backend_ready" == "401" ]]; then return 0; fi
 		sleep 0.1
 	done
@@ -115,7 +178,7 @@ wait_backend() {
 }
 
 wait_backend
-direct_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${backend_port}/v1/messages" -H "Authorization: Bearer ${secret}")"
+direct_code="$(backend_curl -sS -o /dev/null -w '%{http_code}' "https://backend.internal:${backend_port}/v1/messages" -H "Authorization: Bearer ${secret}")"
 test "$direct_code" = "403"
 
 response="$(curl -fsS -X POST "http://127.0.0.1:${gateway_port}/v1/messages" \
@@ -124,12 +187,19 @@ response="$(curl -fsS -X POST "http://127.0.0.1:${gateway_port}/v1/messages" \
 echo "$response" | rg -q '"authorized":true'
 echo "$response" | rg -q '"credential_id":"harness-credential"'
 
+# The compiled gateway is now exercised with raw HTTP/1.1 bytes, including
+# ambiguous framing, malformed chunks, duplicate credentials, absolute-form
+# targets, traversal, and reserved trailers. The backend capture counter must
+# never show more than one request per parser input or any client carrier.
+"$repo_dir/scripts/security-http-harness.sh" 127.0.0.1 "$gateway_port" \
+	"$harness_dir/backend-capture.log" "$secret" "127.0.0.1:${backend_port}"
+
 # Negative assertion matrix: a separate process creates malformed, forged,
 # wrong-audience, and unknown-key assertions. The backend imports only the
 # public verify package, so every altered authority is tested at the hop.
 for mode in wrong-audience wrong-issuer wrong-kid forged; do
 	bad_token="$($harness_dir/assertion -keyring "$harness_dir/keyring.json" -audience "$audience" -mode "$mode")"
-	bad_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${backend_port}/v1/messages" -H "X-Gripline-Assertion: ${bad_token}")"
+	bad_code="$(backend_curl -sS -o /dev/null -w '%{http_code}' "https://backend.internal:${backend_port}/v1/messages" -H "X-Gripline-Assertion: ${bad_token}")"
 	test "$bad_code" = "401"
 done
 
@@ -137,17 +207,15 @@ done
 kill -TERM "$backend_pid" >/dev/null 2>&1
 wait "$backend_pid" >/dev/null 2>&1 || true
 backend_pid=""
-"$harness_dir/backend" -listen "127.0.0.1:${backend_port}" -keys "$harness_dir/keys.json" -audience "$audience" -min-policy-rev 2 -capture "$harness_dir/backend-capture.log" >"$harness_dir/backend-revision.log" 2>&1 &
-backend_pid=$!
+start_backend backend-revision.log -min-policy-rev 2 -capture "$harness_dir/backend-capture.log"
 wait_backend
 stale_token="$($harness_dir/assertion -keyring "$harness_dir/keyring.json" -audience "$audience" -mode wrong-revision)"
-stale_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${backend_port}/v1/messages" -H "X-Gripline-Assertion: ${stale_token}")"
+stale_code="$(backend_curl -sS -o /dev/null -w '%{http_code}' "https://backend.internal:${backend_port}/v1/messages" -H "X-Gripline-Assertion: ${stale_token}")"
 test "$stale_code" = "401"
 kill -TERM "$backend_pid" >/dev/null 2>&1
 wait "$backend_pid" >/dev/null 2>&1 || true
 backend_pid=""
-"$harness_dir/backend" -listen "127.0.0.1:${backend_port}" -keys "$harness_dir/keys.json" -audience "$audience" -capture "$harness_dir/backend-capture.log" >"$harness_dir/backend.log" 2>&1 &
-backend_pid=$!
+start_backend backend.log -capture "$harness_dir/backend-capture.log"
 wait_backend
 
 # Query and body fidelity, compressed bytes, SSE/chunk forwarding, provider
@@ -190,8 +258,7 @@ wait "$backend_pid" >/dev/null 2>&1 || true
 backend_pid=""
 down_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${gateway_port}/v1/messages" -H "Authorization: Bearer ${secret}")"
 test "$down_code" = "502"
-"$harness_dir/backend" -listen "127.0.0.1:${backend_port}" -keys "$harness_dir/keys.json" -audience "$audience" -capture "$harness_dir/backend-capture.log" >"$harness_dir/backend.log" 2>&1 &
-backend_pid=$!
+start_backend backend.log -capture "$harness_dir/backend-capture.log"
 wait_backend
 curl -fsS "http://127.0.0.1:${gateway_port}/v1/messages" -H "Authorization: Bearer ${secret}" | rg -q '"authorized":true'
 

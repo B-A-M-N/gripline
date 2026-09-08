@@ -111,3 +111,65 @@ func TestJSONProviderRejectsNegativeAndOverflowUsage(t *testing.T) {
 		t.Fatalf("invalid usage must fall back conservatively: %+v", got)
 	}
 }
+
+func TestJSONProviderUsesEndpointSpecificOpenAIProfiles(t *testing.T) {
+	p, err := NewJSONProvider(FormatOpenAI, Pricing{InputMicrounitsPerToken: 2, OutputMicrounitsPerToken: 3}, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	responses := p.Begin(Observation{URLPath: "/v1/responses", BodySize: 4}, nil)
+	responses.ObserveChunk([]byte(`{"usage":{"input_tokens":4,"output_tokens":6,"total_tokens":10}}`))
+	if got := responses.Finish(nil); got.InputTokens != 4 || got.OutputTokens != 6 || got.CombinedTokens != 10 {
+		t.Fatalf("responses usage=%+v", got)
+	}
+
+	stream := p.Begin(Observation{URLPath: "/v1/responses", BodySize: 4}, nil)
+	stream.ObserveChunk([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"fake usage\"}\n"))
+	stream.ObserveChunk([]byte("data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":7,\"total_tokens\":12}}}\n"))
+	if got := stream.Finish(nil); got.InputTokens != 5 || got.OutputTokens != 7 || got.CombinedTokens != 12 {
+		t.Fatalf("streaming responses usage=%+v", got)
+	}
+
+	embeddings := p.Begin(Observation{URLPath: "/v1/embeddings", BodySize: 12}, nil)
+	embeddings.ObserveChunk([]byte(`{"usage":{"prompt_tokens":5,"total_tokens":5}}`))
+	if got := embeddings.Finish(nil); got.InputTokens != 5 || got.OutputTokens != 0 || got.CombinedTokens != 5 {
+		t.Fatalf("embeddings usage=%+v", got)
+	}
+
+	models := p.Begin(Observation{URLPath: "/v1/models", BodySize: 100}, nil)
+	models.ObserveChunk([]byte(`{"data":[{"id":"model","content":"usage"}]}`))
+	if got := models.Finish(nil); got.Requests != 1 || got.InputTokens != 0 || got.OutputTokens != 0 || got.CombinedTokens != 0 || got.CostMicrounits != 0 {
+		t.Fatalf("models usage=%+v", got)
+	}
+}
+
+func TestJSONProviderChargesAnthropicCacheDimensions(t *testing.T) {
+	p, err := NewJSONProvider(FormatAnthropic, Pricing{
+		InputMicrounitsPerToken: 2, OutputMicrounitsPerToken: 3,
+		CacheReadMicrounitsPerToken: 5, CacheCreationMicrounitsPerToken: 7,
+	}, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := p.Begin(Observation{URLPath: "/v1/messages", BodySize: 10}, nil)
+	s.ObserveChunk([]byte(`data: {"type":"message_start","message":{"usage":{"input_tokens":10,"cache_read_input_tokens":4,"cache_creation_input_tokens":3}}}` + "\n"))
+	s.ObserveChunk([]byte(`data: {"type":"message_delta","usage":{"input_tokens":10,"output_tokens":2,"cache_read_input_tokens":4,"cache_creation_input_tokens":3}}` + "\n"))
+	got := s.Finish(nil)
+	if got.InputTokens != 17 || got.OutputTokens != 2 || got.CombinedTokens != 19 || got.CacheReadInputTokens != 4 || got.CacheCreationInputTokens != 3 || got.CostMicrounits != 67 {
+		t.Fatalf("cached Anthropic usage=%+v", got)
+	}
+}
+
+func TestJSONProviderRejectsPartialEndpointUsage(t *testing.T) {
+	p, err := NewJSONProvider(FormatOpenAI, Pricing{}, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := p.Begin(Observation{URLPath: "/v1/responses", BodySize: 10}, nil)
+	s.ObserveChunk([]byte(`{"usage":{"input_tokens":2,"output_tokens":3}}`))
+	got := s.Finish(nil)
+	if got.InputTokens != 10 || got.OutputTokens != 4 || got.CombinedTokens != 14 {
+		t.Fatalf("partial Responses usage must use conservative estimate: %+v", got)
+	}
+}

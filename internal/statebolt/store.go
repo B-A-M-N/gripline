@@ -50,15 +50,15 @@ var (
 	keyPolicySequence     = []byte("audit_sequence")
 )
 
-const currentSchemaVersion = 3
+const currentSchemaVersion uint64 = 3
 
 // ErrMigrationRequired is returned when a database carries a schema version
 // newer than this build or cannot be migrated safely.
 var ErrMigrationRequired = errors.New("statebolt: database schema version requires migration or is unsupported")
 
 type schemaMigration struct {
-	From  int
-	To    int
+	From  uint64
+	To    uint64
 	Apply func(*bolt.Tx) error
 }
 
@@ -112,7 +112,7 @@ type TransactionStats struct {
 func (s *Store) recordTransaction(start time.Time, err error) {
 	s.txMu.Lock()
 	s.txCount++
-	s.txNanos += uint64(time.Since(start))
+	s.txNanos += uint64(time.Since(start)) // #nosec G115 -- elapsed durations are non-negative and bounded by process lifetime.
 	if err != nil {
 		s.txErrors++
 	}
@@ -168,7 +168,7 @@ func Open(path string, opts Options) (*Store, error) {
 	}
 	s := &Store{db: db, now: opts.Now, lastSeen: make(map[string]time.Time), lastSeenInterval: time.Minute}
 	if err := s.init(); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, err
 	}
 	return s, nil
@@ -255,7 +255,7 @@ func validateStateFile(path string, allowMissing bool) error {
 
 // init creates the schema buckets and stamps/validates the schema version.
 func (s *Store) init() error {
-	var existingVersion int
+	var existingVersion uint64
 	if err := s.view(func(tx *bolt.Tx) error {
 		if meta := tx.Bucket(bucketMeta); meta != nil && meta.Get(keySchemaVersion) != nil {
 			existingVersion = btoi(meta.Get(keySchemaVersion))
@@ -361,10 +361,10 @@ func itob(v uint64) []byte {
 	return b
 }
 
-func btoi(b []byte) int {
+func btoi(b []byte) uint64 {
 	var v uint64
 	for _, c := range b {
 		v = v<<8 | uint64(c)
 	}
-	return int(v)
+	return v
 }

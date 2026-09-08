@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -102,6 +103,14 @@ type ContextSourceResolver interface {
 	ResolveSourceContext(context.Context, Observation) (terminator.TrustedSource, error)
 }
 
+// PreAuthSourceResolver derives only a cheap, raw source key for the
+// pre-authentication limiter. It must not perform pseudonym, database, ASN, or
+// other expensive enrichment work. A failure falls back to the direct peer;
+// the full SourceResolver still fails closed later if configured.
+type PreAuthSourceResolver interface {
+	ResolvePreAuthSource(obs Observation) (string, error)
+}
+
 // Peer is retained for adapter compatibility; resolvers should prefer the
 // Observation.RemoteAddr field.
 type Peer struct {
@@ -160,6 +169,8 @@ func endpointFamily(path string) string {
 	switch path {
 	case "/v1/messages":
 		return "messages"
+	case "/v1/responses":
+		return "responses"
 	case "/v1/chat/completions":
 		return "chat-completions"
 	case "/v1/completions":
@@ -201,9 +212,27 @@ type Config struct {
 	// Sources derives per-request trusted source identity (P0.4/P0.6). Nil
 	// defaults to NoSource (source-scoped features inert).
 	Sources SourceResolver
+	// PreAuthSource derives the trusted-proxy-aware raw source bucket before
+	// credential authentication. Nil uses the direct TCP peer.
+	PreAuthSource PreAuthSourceResolver
 	// Audience must match the terminator's audience, so its assertions verify
 	// at the backend (INV-11 binding).
 	Audience string
+	// EndpointRules is the exact public method/path allowlist. Nil selects the
+	// built-in inference-only contract; a non-nil empty slice denies all paths.
+	EndpointRules []EndpointRule
+	// ForbiddenPath reserves the configured verifier-control path from the
+	// public data plane, even if an operator accidentally includes it in a
+	// custom endpoint contract.
+	ForbiddenPath string
+	// Pre-authentication limits protect HMAC/authority work from invalid-key
+	// floods. They are not authorization policy and are released immediately
+	// after admission returns.
+	PreAuthMaxConcurrent           int
+	PreAuthRequestsPerSecond       int
+	PreAuthSourceRequestsPerSecond int
+	PreAuthMaxSources              int
+	PreAuthSourceIdle              time.Duration
 	// Usage (P0.3) supplies the typed per-dimension usage knowledge: the
 	// ESTIMATE admission reserves before execution, and the streaming METERING
 	// session whose Finish() is what settlement charges. Nil uses the minimal
@@ -335,6 +364,26 @@ type CompletionEvent struct {
 	Err error `json:"-"`
 }
 
+// EndpointRule is an exact public data-plane authorization rule. Endpoint
+// family classification remains telemetry only; a method/path must be
+// explicitly present here before authentication work or backend forwarding.
+type EndpointRule struct {
+	Method        string
+	Path          string
+	RequiredScope string
+}
+
+func defaultEndpointRules() []EndpointRule {
+	return []EndpointRule{
+		{Method: http.MethodPost, Path: "/v1/messages", RequiredScope: "inference"},
+		{Method: http.MethodPost, Path: "/v1/responses", RequiredScope: "inference"},
+		{Method: http.MethodPost, Path: "/v1/chat/completions", RequiredScope: "inference"},
+		{Method: http.MethodPost, Path: "/v1/completions", RequiredScope: "inference"},
+		{Method: http.MethodPost, Path: "/v1/embeddings", RequiredScope: "inference"},
+		{Method: http.MethodGet, Path: "/v1/models", RequiredScope: "inference"},
+	}
+}
+
 // DataPlane is a single terminate-and-forward proxy hop. It is CONCURRENT-SAFE
 // (stateless besides the terminator), so a single instance can serve the whole
 // edge.
@@ -344,7 +393,14 @@ type DataPlane struct {
 	srcs    SourceResolver
 	backend *url.URL
 	spool   *SpoolBudget
+	preAuth *preAuthGuard
+	routes  map[routeKey]EndpointRule
 	metrics proxyMetrics
+}
+
+type routeKey struct {
+	method string
+	path   string
 }
 
 // MetricsSnapshot is a low-cardinality operational view of the data plane.
@@ -371,6 +427,7 @@ type MetricsSnapshot struct {
 	UsageOutputTokens          uint64
 	UsageCombinedTokens        uint64
 	UsageCostMicrounits        uint64
+	HTTP2Errors                uint64
 	ResourceDenialsByScope     [5]uint64
 	ResourceDenialsByDimension [6]uint64
 	Spool                      SpoolStats
@@ -383,6 +440,7 @@ type proxyMetrics struct {
 	backend4xx, backend5xx, activeStreams, evidenceEvents     atomic.Uint64
 	usageSessions, usageInputTokens, usageOutputTokens        atomic.Uint64
 	usageCombinedTokens, usageCostMicrounits                  atomic.Uint64
+	http2Errors                                               atomic.Uint64
 	resourceByScope                                           [5]atomic.Uint64
 	resourceByDim                                             [6]atomic.Uint64
 }
@@ -403,6 +461,7 @@ func (d *DataPlane) Metrics() MetricsSnapshot {
 		UsageSessions:  d.metrics.usageSessions.Load(), UsageInputTokens: d.metrics.usageInputTokens.Load(),
 		UsageOutputTokens: d.metrics.usageOutputTokens.Load(), UsageCombinedTokens: d.metrics.usageCombinedTokens.Load(),
 		UsageCostMicrounits: d.metrics.usageCostMicrounits.Load(),
+		HTTP2Errors:         d.metrics.http2Errors.Load(),
 		Spool:               d.spool.Stats(),
 	}
 	for i := range snapshot.ResourceDenialsByScope {
@@ -412,6 +471,15 @@ func (d *DataPlane) Metrics() MetricsSnapshot {
 		snapshot.ResourceDenialsByDimension[i] = d.metrics.resourceByDim[i].Load()
 	}
 	return snapshot
+}
+
+// RecordHTTP2Error receives the low-cardinality protocol error callback from
+// x/net/http2. The detailed library error string is intentionally not stored
+// as a metric label; only the bounded total is exposed.
+func (d *DataPlane) RecordHTTP2Error(_ string) {
+	if d != nil {
+		d.metrics.http2Errors.Add(1)
+	}
 }
 
 func (d *DataPlane) recordUsage(actual resource.UsageEstimate) {
@@ -461,13 +529,31 @@ func New(cfg Config) (*DataPlane, error) {
 	if cfg.Usage == nil {
 		cfg.Usage = NoUsage{}
 	}
+	if cfg.EndpointRules == nil {
+		cfg.EndpointRules = defaultEndpointRules()
+	}
+	routes := make(map[routeKey]EndpointRule, len(cfg.EndpointRules))
+	for i := range cfg.EndpointRules {
+		rule, err := normalizeEndpointRule(cfg.EndpointRules[i])
+		if err != nil {
+			return nil, fmt.Errorf("proxy: endpoint rule %d: %w", i, err)
+		}
+		key := routeKey{method: rule.Method, path: rule.Path}
+		if _, exists := routes[key]; exists {
+			return nil, fmt.Errorf("proxy: duplicate endpoint rule %s %s", rule.Method, rule.Path)
+		}
+		cfg.EndpointRules[i] = rule
+		routes[key] = rule
+	}
 	bu := *cfg.BackendURL
 	bu.User = nil
 	bu.RawQuery = ""
 	bu.Fragment = ""
 	bu.Path = strings.TrimSuffix(bu.Path, "/") // joined per-request below
-	return &DataPlane{cfg: cfg, feat: cfg.Features, srcs: cfg.Sources, backend: &bu,
-		spool: NewSpoolBudget(cfg.SpoolMaxBytes, cfg.SpoolMaxFiles)}, nil
+	return &DataPlane{cfg: cfg, feat: cfg.Features, srcs: cfg.Sources, backend: &bu, routes: routes,
+		spool: NewSpoolBudget(cfg.SpoolMaxBytes, cfg.SpoolMaxFiles),
+		preAuth: newPreAuthGuard(cfg.PreAuthMaxConcurrent, cfg.PreAuthRequestsPerSecond,
+			cfg.PreAuthSourceRequestsPerSecond, cfg.PreAuthMaxSources, cfg.PreAuthSourceIdle)}, nil
 }
 
 // ServeHTTP implements the data-plane admission. It is safe to use as an
@@ -531,6 +617,40 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			observeAdmission(&terminator.Outcome{RequestID: requestID, Reason: "internal_error"})
 		}
 	}()
+	if unsupportedContentEncoding(r.Header.Values("Content-Encoding")) {
+		observeAdmission(&terminator.Outcome{RequestID: requestID, Authorized: false, Reason: "unsupported_content_encoding"})
+		w.Header().Set("X-Gripline-Reason", "unsupported_content_encoding")
+		http.Error(w, "unsupported content encoding", http.StatusUnsupportedMediaType)
+		return
+	}
+	// Reject unknown methods/paths before credential authentication and full
+	// admission. An endpoint that can never be forwarded must not spend HMAC,
+	// authority, evidence, or resource-reservation work.
+	requestPath := r.URL.EscapedPath()
+	if requestPath == "" {
+		requestPath = "/"
+	}
+	if d.cfg.ForbiddenPath != "" && requestPath == path.Clean(d.cfg.ForbiddenPath) {
+		out := &terminator.Outcome{RequestID: requestID, Authorized: false, Reason: "forbidden_control_endpoint"}
+		observeAdmission(out)
+		w.Header().Set("X-Gripline-Reason", "forbidden_control_endpoint")
+		http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+		return
+	}
+	if status, allow := d.routeStatus(r.Method, requestPath); status != 0 {
+		reason := "unsupported_endpoint"
+		if status == http.StatusMethodNotAllowed {
+			reason = "unsupported_method"
+		}
+		out := &terminator.Outcome{RequestID: requestID, Authorized: false, Reason: reason}
+		observeAdmission(out)
+		if allow != "" {
+			w.Header().Set("Allow", allow)
+		}
+		w.Header().Set("X-Gripline-Reason", reason)
+		http.Error(w, http.StatusText(status), status)
+		return
+	}
 
 	// Copy headers before any body work. Credential parsing and the full
 	// admission pipeline run before unknown-length request bodies can force disk
@@ -556,6 +676,27 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	preAuthKey := canonicalPeer(r.RemoteAddr)
+	if d.cfg.PreAuthSource != nil {
+		preAuthHeaders := copyHeaders(r.Header)
+		terminator.StripSecretHeaders(preAuthHeaders)
+		preAuthObs := Observation{
+			Header: preAuthHeaders, RemoteAddr: r.RemoteAddr,
+			ProtoMajor: r.ProtoMajor, URLPath: r.URL.Path,
+			BodySize: r.ContentLength, MaxBodyBytes: d.cfg.MaxBodyBytes,
+		}
+		if key, err := d.cfg.PreAuthSource.ResolvePreAuthSource(preAuthObs); err == nil && strings.TrimSpace(key) != "" {
+			preAuthKey = key
+		}
+	}
+	preAuthRelease, allowed := d.preAuth.acquireKey(preAuthKey, time.Now())
+	if !allowed {
+		out := &terminator.Outcome{RequestID: requestID, Authorized: false, Reason: "authentication_rate_limited"}
+		observeAdmission(out)
+		d.writeDenial(w, out)
+		return
+	}
+	defer preAuthRelease()
 
 	// 1. Terminate the credential BEFORE any adapter sees the request (P0.6):
 	// the extraction uses the private auth copy, and only the sanitized request
@@ -613,6 +754,7 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	est := d.cfg.Usage.Estimate(obs)
 
 	out := d.cfg.Terminator.AdmitUsageContext(r.Context(), requestID, authHeaders, feat, src, est)
+	preAuthRelease()
 
 	if !out.Authorized {
 		observeAdmission(out)
@@ -627,6 +769,13 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// must run first (P0.3 settle-with-actuals, then release).
 	reservation := out.Reservation()
 	defer reservation.Release()
+
+	if rule, ok := d.routeRule(r.Method, requestPath); ok && rule.RequiredScope != "" && !assertionHasScope(out.Assertion, rule.RequiredScope) {
+		out = &terminator.Outcome{RequestID: requestID, Authorized: false, Reason: "policy_denied"}
+		observeAdmission(out)
+		d.writeDenial(w, out)
+		return
+	}
 
 	// P0-2: only an admitted request may incur body-spooling cost. This keeps
 	// valid-but-contained credentials from consuming one full spool per
@@ -654,7 +803,7 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				d.writeDenial(w, out)
 				return
 			}
-			r.Body.Close()
+			_ = r.Body.Close()
 			if body.tooLarge {
 				_ = body.Close() // closes + removes any temp file
 				out = &terminator.Outcome{RequestID: requestID, Authorized: false, Reason: "payload_too_large"}
@@ -721,10 +870,11 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	resp, err := d.cfg.Transport.RoundTrip(upr)
 	if err != nil {
 		d.metrics.backendFailures.Add(1)
-		// Upstream never accepted the request: no baseline credit (P0.27 — an
-		// admitted request that fails before any useful workload is not clean
-		// trust-building activity). The deferred Release cancels the unsettled
-		// reservation, refunding the full estimate hold (P0.36).
+		// No baseline credit: an admitted request that fails before a successful
+		// response is not clean trust-building activity. MarkForwarded happened
+		// before RoundTrip, so the deferred Release consumes any unsettled usage
+		// estimate conservatively; a transport error cannot prove the backend did
+		// not accept the request.
 		http.Error(w, "backend_error", http.StatusBadGateway)
 		return
 	}
@@ -867,6 +1017,114 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// routeStatus returns 0 for an allowed route, 404 for an unknown path, or
+// 405 for a known path with an unsupported method.
+func (d *DataPlane) routeStatus(method, requestPath string) (int, string) {
+	if d.routes != nil {
+		if _, ok := d.routes[routeKey{method: method, path: requestPath}]; ok {
+			return 0, ""
+		}
+		var methods []string
+		for key := range d.routes {
+			if key.path == requestPath {
+				methods = append(methods, key.method)
+			}
+		}
+		if len(methods) == 0 {
+			return http.StatusNotFound, ""
+		}
+		sort.Strings(methods)
+		return http.StatusMethodNotAllowed, strings.Join(methods, ", ")
+	}
+	pathKnown := false
+	allowed := false
+	var methods []string
+	for _, rule := range d.cfg.EndpointRules {
+		if rule.Path != requestPath {
+			continue
+		}
+		pathKnown = true
+		if !containsString(methods, rule.Method) {
+			methods = append(methods, rule.Method)
+		}
+		if rule.Method == method {
+			allowed = true
+		}
+	}
+	if allowed {
+		return 0, ""
+	}
+	if !pathKnown {
+		return http.StatusNotFound, ""
+	}
+	return http.StatusMethodNotAllowed, strings.Join(methods, ", ")
+}
+
+func (d *DataPlane) routeRule(method, requestPath string) (EndpointRule, bool) {
+	if d.routes != nil {
+		rule, ok := d.routes[routeKey{method: method, path: requestPath}]
+		return rule, ok
+	}
+	for _, rule := range d.cfg.EndpointRules {
+		if rule.Method == method && rule.Path == requestPath {
+			return rule, true
+		}
+	}
+	return EndpointRule{}, false
+}
+
+func normalizeEndpointRule(rule EndpointRule) (EndpointRule, error) {
+	rule.Method = strings.ToUpper(strings.TrimSpace(rule.Method))
+	rule.Path = strings.TrimSpace(rule.Path)
+	rule.RequiredScope = strings.TrimSpace(rule.RequiredScope)
+	if rule.Method == "" || strings.ContainsAny(rule.Method, " \t\r\n") || rule.Path == "" ||
+		!strings.HasPrefix(rule.Path, "/v1/") || strings.ContainsAny(rule.Path, "?#*") {
+		return EndpointRule{}, fmt.Errorf("must contain an exact method and /v1/ path")
+	}
+	if strings.Contains(rule.Path, "//") || path.Clean(rule.Path) != rule.Path || strings.Contains(rule.Path, "%") {
+		return EndpointRule{}, fmt.Errorf("path %q is not canonical", rule.Path)
+	}
+	switch rule.RequiredScope {
+	case "", "inference", "REQUEST", "LANE", "CREDENTIAL", "ACCOUNT":
+	default:
+		return EndpointRule{}, fmt.Errorf("unsupported required scope %q", rule.RequiredScope)
+	}
+	return rule, nil
+}
+
+func assertionHasScope(assertion *terminator.Assertion, required string) bool {
+	if assertion == nil {
+		return false
+	}
+	for _, scope := range assertion.Claims().Scope {
+		if scope == required {
+			return true
+		}
+	}
+	return false
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func unsupportedContentEncoding(values []string) bool {
+	for _, value := range values {
+		for _, encoding := range strings.Split(value, ",") {
+			encoding = strings.ToLower(strings.TrimSpace(encoding))
+			if encoding != "" && encoding != "identity" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func renewReservation(ctx context.Context, reservation resource.UsageReservation, every time.Duration, cancel context.CancelFunc, stop <-chan struct{}) {
 	ticker := time.NewTicker(every)
 	defer ticker.Stop()
@@ -917,7 +1175,7 @@ func (d *DataPlane) writeDenial(w http.ResponseWriter, out *terminator.Outcome) 
 		code = http.StatusTooManyRequests
 	} else {
 		switch out.Reason {
-		case "concurrency_limit", "rate_limit", "temporarily_restricted":
+		case "concurrency_limit", "rate_limit", "temporarily_restricted", "authentication_rate_limited":
 			code = http.StatusTooManyRequests
 		case "invalid_credential", "credential_expired", "bad", "invalid_authentication":
 			code = http.StatusUnauthorized

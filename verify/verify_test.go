@@ -4,15 +4,183 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
-func testToken(t *testing.T, priv ed25519.PrivateKey, c Claims) string {
+func TestRequireMTLSChecksVerifiedServiceIdentity(t *testing.T) {
+	trust := RequireMTLS(MTLSOptions{AllowedDNSNames: []string{"gateway.internal"}})
+	request := httptest.NewRequest("POST", "https://backend/v1/messages", nil)
+	request.TLS = &tls.ConnectionState{
+		HandshakeComplete: true,
+		PeerCertificates:  []*x509.Certificate{{DNSNames: []string{"gateway.internal"}}},
+		VerifiedChains:    [][]*x509.Certificate{{{}}},
+	}
+	if !trust.Trusted(request) {
+		t.Fatal("allow-listed verified SPIFFE identity must be trusted")
+	}
+	request.TLS.PeerCertificates[0].DNSNames = []string{"wrong.internal"}
+	if trust.Trusted(request) {
+		t.Fatal("unallow-listed certificate identity must be rejected")
+	}
+	request.TLS.VerifiedChains = nil
+	if trust.Trusted(request) {
+		t.Fatal("unverified client certificate must be rejected")
+	}
+}
+
+func TestRequireMTLSSeparatesInferenceAndControlIdentities(t *testing.T) {
+	inferenceTrust := RequireMTLS(MTLSOptions{AllowedDNSNames: []string{"inference.internal"}})
+	controlTrust := RequireMTLS(MTLSOptions{AllowedDNSNames: []string{"verifier-control.internal"}})
+	request := httptest.NewRequest("POST", "https://backend/v1/messages", nil)
+	request.TLS = &tls.ConnectionState{
+		HandshakeComplete: true,
+		PeerCertificates:  []*x509.Certificate{{DNSNames: []string{"inference.internal"}}},
+		VerifiedChains:    [][]*x509.Certificate{{{}}},
+	}
+	if !inferenceTrust.Trusted(request) {
+		t.Fatal("inference identity must be trusted by the inference policy")
+	}
+	if controlTrust.Trusted(request) {
+		t.Fatal("inference identity must not be trusted by the verifier-control policy")
+	}
+	request.TLS.PeerCertificates[0].DNSNames = []string{"verifier-control.internal"}
+	if inferenceTrust.Trusted(request) {
+		t.Fatal("verifier-control identity must not be trusted by the inference policy")
+	}
+	if !controlTrust.Trusted(request) {
+		t.Fatal("verifier-control identity must be trusted by the control policy")
+	}
+}
+
+func TestMemoryReplayGuardClaimsAndExpiresJTIs(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	now := time.Unix(1_700_000_000, 0)
+	set, err := NewKeySet(map[int]ed25519.PublicKey{1: pub}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guard := NewMemoryReplayGuard(2)
+	guard.now = func() time.Time { return now }
+	v, err := New(set, "provider")
+	if err != nil {
+		t.Fatal(err)
+	}
+	v.WithClock(func() time.Time { return now }).WithReplayGuard(guard)
+	token := testToken(t, priv, testClaims(now))
+	req := httptest.NewRequest("POST", "http://backend/v1/messages", nil)
+	req.Header.Set(AssertionHeader, token)
+	if _, err := v.Verify(req); err != nil {
+		t.Fatalf("first assertion use rejected: %v", err)
+	}
+	if _, err := v.Verify(req); err != ErrReplayDetected {
+		t.Fatalf("second assertion use error=%v, want ErrReplayDetected", err)
+	}
+
+	if accepted, err := guard.Accept(context.Background(), ReplayClaim{Issuer: "gripline", Audience: "provider", JTI: "expired-jti", ExpiresAt: now.Add(time.Second)}); err != nil || !accepted {
+		t.Fatalf("seed replay entry rejected: accepted=%v err=%v", accepted, err)
+	}
+	guard.now = func() time.Time { return now.Add(21 * time.Second) }
+	if accepted, err := guard.Accept(context.Background(), ReplayClaim{Issuer: "gripline", Audience: "provider", JTI: "new-jti", ExpiresAt: now.Add(22 * time.Second)}); err != nil || !accepted {
+		t.Fatalf("expired entries should be evicted before capacity check: accepted=%v err=%v", accepted, err)
+	}
+}
+
+func TestMemoryReplayGuardSeparatesIssuerAndAudience(t *testing.T) {
+	guard := NewMemoryReplayGuard(2)
+	expires := time.Now().Add(time.Minute)
+	for _, claim := range []ReplayClaim{
+		{Issuer: "issuer-a", Audience: "audience-a", JTI: "same", ExpiresAt: expires},
+		{Issuer: "issuer-a", Audience: "audience-b", JTI: "same", ExpiresAt: expires},
+	} {
+		accepted, err := guard.Accept(context.Background(), claim)
+		if err != nil || !accepted {
+			t.Fatalf("namespaced claim rejected: accepted=%v err=%v", accepted, err)
+		}
+	}
+}
+
+func TestMemoryReplayGuardParallelClaims(t *testing.T) {
+	guard := NewMemoryReplayGuard(100)
+	claim := ReplayClaim{Issuer: "gripline", Audience: "provider", JTI: "parallel", ExpiresAt: time.Now().Add(time.Minute)}
+	var wg sync.WaitGroup
+	var accepted atomic.Int32
+	var rejected atomic.Int32
+	for i := 0; i < 64; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ok, err := guard.Accept(context.Background(), claim)
+			if err != nil {
+				t.Errorf("parallel claim error: %v", err)
+				return
+			}
+			if ok {
+				accepted.Add(1)
+			} else {
+				rejected.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if accepted.Load() != 1 || rejected.Load() != 63 {
+		t.Fatalf("parallel claims accepted=%d rejected=%d, want 1/63", accepted.Load(), rejected.Load())
+	}
+}
+
+func TestMemoryReplayGuardCapacityAndExpiry(t *testing.T) {
+	now := time.Unix(1_700_100_000, 0)
+	guard := NewMemoryReplayGuard(1)
+	guard.now = func() time.Time { return now }
+	claim := func(jti string, expires time.Time) ReplayClaim {
+		return ReplayClaim{Issuer: "gripline", Audience: "provider", JTI: jti, ExpiresAt: expires}
+	}
+	if ok, err := guard.Accept(context.Background(), claim("one", now.Add(time.Second))); err != nil || !ok {
+		t.Fatalf("first claim: ok=%v err=%v", ok, err)
+	}
+	if ok, err := guard.Accept(context.Background(), claim("two", now.Add(time.Second))); err != ErrReplayGuardCapacity || ok {
+		t.Fatalf("capacity result: ok=%v err=%v", ok, err)
+	}
+	guard.now = func() time.Time { return now.Add(2 * time.Second) }
+	if ok, err := guard.Accept(context.Background(), claim("two", now.Add(3*time.Second))); err != nil || !ok {
+		t.Fatalf("expired claim did not restore capacity: ok=%v err=%v", ok, err)
+	}
+}
+
+func BenchmarkMemoryReplayGuard1K(b *testing.B)   { benchmarkMemoryReplayGuard(b, 1_000) }
+func BenchmarkMemoryReplayGuard10K(b *testing.B)  { benchmarkMemoryReplayGuard(b, 10_000) }
+func BenchmarkMemoryReplayGuard100K(b *testing.B) { benchmarkMemoryReplayGuard(b, 100_000) }
+
+func benchmarkMemoryReplayGuard(b *testing.B, capacity int) {
+	guard := NewMemoryReplayGuard(capacity)
+	claims := make([]ReplayClaim, capacity)
+	for i := range claims {
+		claims[i] = ReplayClaim{Issuer: "gripline", Audience: "provider", JTI: fmt.Sprintf("seed-%d", i), ExpiresAt: time.Now().Add(time.Hour)}
+		if _, err := guard.Accept(context.Background(), claims[i]); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ResetTimer()
+	var sequence atomic.Uint64
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			claim := claims[0]
+			claim.JTI = fmt.Sprintf("bench-%d", sequence.Add(1))
+			_, _ = guard.Accept(context.Background(), claim)
+		}
+	})
+}
+
+func testToken(t testing.TB, priv ed25519.PrivateKey, c Claims) string {
 	t.Helper()
 	payload, err := json.Marshal(c)
 	if err != nil {

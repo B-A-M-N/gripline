@@ -84,7 +84,8 @@ func newDurablePath(t testing.TB) *durablePath {
 	}))
 	t.Cleanup(backend.Close)
 	backendURL, _ := url.Parse(backend.URL)
-	dp, err := New(Config{Terminator: term, BackendURL: backendURL, Audience: "durable-benchmark", MaxBodyBytes: 1 << 20})
+	dp, err := New(Config{Terminator: term, BackendURL: backendURL, Audience: "durable-benchmark", MaxBodyBytes: 1 << 20,
+		PreAuthRequestsPerSecond: 10000, PreAuthSourceRequestsPerSecond: 10000})
 	if err != nil {
 		t.Fatal(err)
 	}

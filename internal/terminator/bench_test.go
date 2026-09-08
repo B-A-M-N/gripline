@@ -70,6 +70,9 @@ func TestAdmissionLatencyBudget(t *testing.T) {
 	if testing.Short() {
 		t.Skip("latency budget gate skipped in -short")
 	}
+	if raceDetectorEnabled {
+		t.Skip("latency budget gate runs without race instrumentation")
+	}
 	term, raw := benchTerminator()
 	feat := laneFeatures("AS1")
 	const samples = 2000

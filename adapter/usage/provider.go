@@ -37,7 +37,12 @@ type Estimate struct {
 	InputTokens    int64
 	OutputTokens   int64
 	CombinedTokens int64
-	CostMicrounits int64
+	// CacheReadInputTokens and CacheCreationInputTokens preserve Anthropic's
+	// separately priced input dimensions. InputTokens remains the total input
+	// dimension used for quota accounting.
+	CacheReadInputTokens     int64
+	CacheCreationInputTokens int64
+	CostMicrounits           int64
 }
 
 // Session observes bounded response chunks and returns settled usage exactly
@@ -61,11 +66,27 @@ const (
 	FormatAnthropic Format = "anthropic"
 )
 
+// UsageProfile selects the exact provider usage envelope for one endpoint.
+// Provider-compatible APIs do not share one universal token schema: OpenAI
+// chat/completions, Responses, embeddings, and models each have distinct
+// semantics, as does Anthropic Messages.
+type UsageProfile string
+
+const (
+	ProfileOpenAIChat        UsageProfile = "openai-chat"
+	ProfileOpenAIResponses   UsageProfile = "openai-responses"
+	ProfileOpenAIEmbeddings  UsageProfile = "openai-embeddings"
+	ProfileOpenAIModels      UsageProfile = "openai-models"
+	ProfileAnthropicMessages UsageProfile = "anthropic-messages"
+)
+
 // Pricing is expressed in micro-units per token. Zero pricing is valid when a
 // provider wants token enforcement without cost enforcement.
 type Pricing struct {
-	InputMicrounitsPerToken  int64
-	OutputMicrounitsPerToken int64
+	InputMicrounitsPerToken         int64
+	OutputMicrounitsPerToken        int64
+	CacheReadMicrounitsPerToken     int64
+	CacheCreationMicrounitsPerToken int64
 }
 
 // JSONProvider is a bounded adapter for the usage fields emitted by OpenAI- or
@@ -92,7 +113,8 @@ func NewJSONProvider(format Format, pricing Pricing, defaultOutputTokens int64) 
 	if format != FormatOpenAI && format != FormatAnthropic {
 		return nil, errors.New("usage: format must be openai or anthropic")
 	}
-	if pricing.InputMicrounitsPerToken < 0 || pricing.OutputMicrounitsPerToken < 0 {
+	if pricing.InputMicrounitsPerToken < 0 || pricing.OutputMicrounitsPerToken < 0 ||
+		pricing.CacheReadMicrounitsPerToken < 0 || pricing.CacheCreationMicrounitsPerToken < 0 {
 		return nil, errors.New("usage: pricing must be non-negative")
 	}
 	if defaultOutputTokens < 0 {
@@ -111,6 +133,13 @@ func (p *JSONProvider) Estimate(obs Observation) Estimate {
 	if p == nil {
 		return Estimate{Requests: 1}
 	}
+	return p.estimate(obs, profileFor(p.Format, obs.URLPath))
+}
+
+func (p *JSONProvider) estimate(obs Observation, profile UsageProfile) Estimate {
+	if profile == ProfileOpenAIModels {
+		return Estimate{Requests: 1}
+	}
 	input := int64(0)
 	bodySize := obs.BodySize
 	if bodySize < 0 {
@@ -123,46 +152,58 @@ func (p *JSONProvider) Estimate(obs Observation) Estimate {
 		}
 		input = (bodySize + div - 1) / div
 	}
-	output := p.DefaultOutputTokens
-	if p.MaxOutputTokens > 0 {
-		output = p.MaxOutputTokens
-	} else {
-		for _, name := range []string{"X-Gripline-Max-Output-Tokens", "X-Max-Tokens", "Max-Tokens"} {
-			if raw := strings.TrimSpace(obs.Header.Get(name)); raw != "" {
-				if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n >= 0 {
-					output = n
-					break
+	output := int64(0)
+	if profile != ProfileOpenAIEmbeddings {
+		output = p.DefaultOutputTokens
+		if p.MaxOutputTokens > 0 {
+			output = p.MaxOutputTokens
+		} else {
+			for _, name := range []string{"X-Gripline-Max-Output-Tokens", "X-Max-Tokens", "Max-Tokens"} {
+				if raw := strings.TrimSpace(obs.Header.Get(name)); raw != "" {
+					if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n >= 0 {
+						output = n
+						break
+					}
 				}
 			}
 		}
 	}
 	input, output = p.clamp(input), p.clamp(output)
-	return p.withCost(Estimate{Requests: 1, InputTokens: input, OutputTokens: output, CombinedTokens: safeAdd(input, output)})
+	return p.withCost(Estimate{Requests: 1, InputTokens: input, OutputTokens: output, CombinedTokens: safeAdd(input, output)}, profile, true)
 }
 
 func (p *JSONProvider) Begin(obs Observation, _ *http.Response) Session {
-	return &jsonSession{provider: p, estimate: p.Estimate(obs)}
+	profile := profileFor(p.Format, obs.URLPath)
+	return &jsonSession{provider: p, profile: profile, estimate: p.estimate(obs, profile), knownZero: profile == ProfileOpenAIModels}
 }
 
 type jsonSession struct {
-	provider     *JSONProvider
-	estimate     Estimate
-	input        int64
-	output       int64
-	combined     int64
-	inputSeen    bool
-	outputSeen   bool
-	combinedSeen bool
-	seen         bool
-	carry        []byte
-	overflow     bool
+	provider        *JSONProvider
+	profile         UsageProfile
+	estimate        Estimate
+	input           int64
+	output          int64
+	combined        int64
+	cacheRead       int64
+	cacheCreate     int64
+	inputSeen       bool
+	outputSeen      bool
+	combinedSeen    bool
+	cacheReadSeen   bool
+	cacheCreateSeen bool
+	seen            bool
+	knownZero       bool
+	carry           []byte
+	overflow        bool
 }
 
 const usageCarryBytes = 64 << 10
 
 type usageRecord struct {
 	input, output, combined             int64
+	cacheRead, cacheCreate              int64
 	inputSeen, outputSeen, combinedSeen bool
+	cacheReadSeen, cacheCreateSeen      bool
 }
 
 func (s *jsonSession) ObserveChunk(chunk []byte) {
@@ -181,7 +222,7 @@ func (s *jsonSession) ObserveChunk(chunk []byte) {
 			s.carry = append(s.carry[:0], s.carry[i+1:]...)
 			continue
 		}
-		if rec, ok := parseUsageRecord(s.carry, s.provider.Format); ok {
+		if rec, ok := parseUsageRecord(s.carry, s.profile); ok {
 			s.merge(rec)
 			s.carry = nil
 		} else if bytes.Equal(bytes.TrimSpace(s.carry), []byte("data: [DONE]")) {
@@ -196,7 +237,7 @@ func (s *jsonSession) processRecord(record []byte) {
 	if len(record) == 0 || bytes.Equal(record, []byte("data: [DONE]")) {
 		return
 	}
-	if rec, ok := parseUsageRecord(record, s.provider.Format); ok {
+	if rec, ok := parseUsageRecord(record, s.profile); ok {
 		s.merge(rec)
 	}
 }
@@ -211,17 +252,33 @@ func (s *jsonSession) merge(rec usageRecord) {
 	if rec.combinedSeen && (!s.combinedSeen || rec.combined > s.combined) {
 		s.combined = rec.combined
 	}
+	if rec.cacheReadSeen && (!s.cacheReadSeen || rec.cacheRead > s.cacheRead) {
+		s.cacheRead = rec.cacheRead
+	}
+	if rec.cacheCreateSeen && (!s.cacheCreateSeen || rec.cacheCreate > s.cacheCreate) {
+		s.cacheCreate = rec.cacheCreate
+	}
 	s.inputSeen = s.inputSeen || rec.inputSeen
 	s.outputSeen = s.outputSeen || rec.outputSeen
 	s.combinedSeen = s.combinedSeen || rec.combinedSeen
-	s.seen = s.seen || rec.inputSeen || rec.outputSeen || rec.combinedSeen
+	s.cacheReadSeen = s.cacheReadSeen || rec.cacheReadSeen
+	s.cacheCreateSeen = s.cacheCreateSeen || rec.cacheCreateSeen
+	s.seen = s.seen || rec.inputSeen || rec.outputSeen || rec.combinedSeen || rec.cacheReadSeen || rec.cacheCreateSeen
 }
 
-func (s *jsonSession) Finish(_ error) Estimate {
+func (s *jsonSession) Finish(streamErr error) Estimate {
 	if s == nil {
 		return Estimate{Requests: 1}
 	}
-	if !s.seen || s.overflow || !s.inputSeen || !s.outputSeen {
+	if s.knownZero {
+		return Estimate{Requests: 1}
+	}
+	complete := s.inputSeen && s.outputSeen
+	switch s.profile {
+	case ProfileOpenAIChat, ProfileOpenAIResponses, ProfileOpenAIEmbeddings:
+		complete = complete && s.combinedSeen
+	}
+	if streamErr != nil || !s.seen || s.overflow || !complete {
 		// Missing, malformed, or partial usage never settles below the
 		// admission estimate. Observed fields can only increase an unobserved
 		// dimension, so telemetry cannot turn a request into free usage.
@@ -232,6 +289,14 @@ func (s *jsonSession) Finish(_ error) Estimate {
 		if s.outputSeen && s.output > actual.OutputTokens {
 			actual.OutputTokens = s.output
 		}
+		if s.profile == ProfileAnthropicMessages {
+			if s.cacheReadSeen {
+				actual.CacheReadInputTokens = s.cacheRead
+			}
+			if s.cacheCreateSeen {
+				actual.CacheCreationInputTokens = s.cacheCreate
+			}
+		}
 		actual.CombinedTokens = safeAdd(actual.InputTokens, actual.OutputTokens)
 		if s.combinedSeen && s.combined > actual.CombinedTokens {
 			actual.CombinedTokens = s.combined
@@ -239,16 +304,21 @@ func (s *jsonSession) Finish(_ error) Estimate {
 		actual.InputTokens = s.provider.clamp(actual.InputTokens)
 		actual.OutputTokens = s.provider.clamp(actual.OutputTokens)
 		actual.CombinedTokens = s.provider.clamp(actual.CombinedTokens)
-		return s.provider.withCost(actual)
+		return s.provider.withCost(actual, s.profile, false)
 	}
-	actual := Estimate{Requests: 1, InputTokens: s.input, OutputTokens: s.output, CombinedTokens: s.combined}
+	actualInput := s.input
+	if s.profile == ProfileAnthropicMessages {
+		actualInput = safeAdd(actualInput, safeAdd(s.cacheRead, s.cacheCreate))
+	}
+	actual := Estimate{Requests: 1, InputTokens: actualInput, OutputTokens: s.output, CombinedTokens: s.combined,
+		CacheReadInputTokens: s.cacheRead, CacheCreationInputTokens: s.cacheCreate}
 	if actual.CombinedTokens < safeAdd(actual.InputTokens, actual.OutputTokens) {
 		actual.CombinedTokens = safeAdd(actual.InputTokens, actual.OutputTokens)
 	}
 	actual.InputTokens = s.provider.clamp(actual.InputTokens)
 	actual.OutputTokens = s.provider.clamp(actual.OutputTokens)
 	actual.CombinedTokens = s.provider.clamp(actual.CombinedTokens)
-	return s.provider.withCost(actual)
+	return s.provider.withCost(actual, s.profile, false)
 }
 
 func (p *JSONProvider) clamp(n int64) int64 {
@@ -262,16 +332,64 @@ func (p *JSONProvider) clamp(n int64) int64 {
 	return n
 }
 
-func (p *JSONProvider) withCost(e Estimate) Estimate {
-	e.CostMicrounits = safeMulAdd(e.InputTokens, p.Pricing.InputMicrounitsPerToken,
+func (p *JSONProvider) withCost(e Estimate, profile UsageProfile, conservative bool) Estimate {
+	inputRate := p.Pricing.InputMicrounitsPerToken
+	if conservative && profile == ProfileAnthropicMessages {
+		// Before execution the cache split is unknowable. Reserve the highest
+		// configured input rate against the bounded input estimate so cached
+		// requests cannot become free or under-reserved.
+		inputRate = maxInt64(inputRate, p.Pricing.CacheReadMicrounitsPerToken)
+		inputRate = maxInt64(inputRate, p.Pricing.CacheCreationMicrounitsPerToken)
+	}
+	regularInput := e.InputTokens
+	if !conservative && profile == ProfileAnthropicMessages {
+		cacheTotal := safeAdd(e.CacheReadInputTokens, e.CacheCreationInputTokens)
+		if regularInput >= cacheTotal {
+			regularInput -= cacheTotal
+		} else {
+			regularInput = 0
+		}
+	}
+	e.CostMicrounits = safeMulAdd(regularInput, inputRate,
 		e.OutputTokens, p.Pricing.OutputMicrounitsPerToken)
+	e.CostMicrounits = safeAdd(e.CostMicrounits,
+		safeMulAdd(e.CacheReadInputTokens, p.Pricing.CacheReadMicrounitsPerToken,
+			e.CacheCreationInputTokens, p.Pricing.CacheCreationMicrounitsPerToken))
 	return e
 }
 
-// parseUsageRecord accepts only a complete top-level provider usage envelope.
-// It never searches arbitrary strings, so model-generated content containing
-// token-looking keys cannot control accounting.
-func parseUsageRecord(record []byte, format Format) (usageRecord, bool) {
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func profileFor(format Format, path string) UsageProfile {
+	switch format {
+	case FormatAnthropic:
+		return ProfileAnthropicMessages
+	case FormatOpenAI:
+		switch path {
+		case "/v1/responses":
+			return ProfileOpenAIResponses
+		case "/v1/embeddings":
+			return ProfileOpenAIEmbeddings
+		case "/v1/models":
+			return ProfileOpenAIModels
+		default:
+			return ProfileOpenAIChat
+		}
+	default:
+		return ProfileOpenAIChat
+	}
+}
+
+// parseUsageRecord accepts only the exact documented provider usage path for
+// the endpoint profile. It never recursively searches arbitrary JSON, so
+// model-generated content containing token-looking keys cannot control
+// accounting.
+func parseUsageRecord(record []byte, profile UsageProfile) (usageRecord, bool) {
 	record = bytes.TrimSpace(record)
 	if bytes.HasPrefix(record, []byte("data:")) {
 		record = bytes.TrimSpace(record[len("data:"):])
@@ -283,37 +401,101 @@ func parseUsageRecord(record []byte, format Format) (usageRecord, bool) {
 	if err != nil {
 		return usageRecord{}, false
 	}
-	raw, ok := top["usage"]
-	if !ok && format == FormatAnthropic {
-		// message_start places input usage inside the provider's message
-		// envelope; message_delta places it at top level. Accept only this
-		// documented path, never an arbitrary recursive search.
-		if messageRaw, messageOK := top["message"]; messageOK {
-			if message, messageErr := decodeUniqueObject(messageRaw); messageErr == nil {
-				raw, ok = message["usage"]
-			}
-		}
-	}
+	raw, ok := usageObject(top, profile)
 	if !ok {
 		return usageRecord{}, false
 	}
-	usage, err := decodeUniqueObject(raw)
-	if err != nil {
-		return usageRecord{}, false
-	}
+	usage := raw
 	var out usageRecord
-	switch format {
-	case FormatOpenAI:
-		out.input, out.inputSeen = nonNegativeInt(usage["prompt_tokens"])
-		out.output, out.outputSeen = nonNegativeInt(usage["completion_tokens"])
-	case FormatAnthropic:
-		out.input, out.inputSeen = nonNegativeInt(usage["input_tokens"])
-		out.output, out.outputSeen = nonNegativeInt(usage["output_tokens"])
+	switch profile {
+	case ProfileOpenAIChat:
+		out.input, out.inputSeen = requiredNonNegativeInt(usage, "prompt_tokens")
+		out.output, out.outputSeen = requiredNonNegativeInt(usage, "completion_tokens")
+		out.combined, out.combinedSeen = requiredNonNegativeInt(usage, "total_tokens")
+	case ProfileOpenAIResponses:
+		out.input, out.inputSeen = requiredNonNegativeInt(usage, "input_tokens")
+		out.output, out.outputSeen = requiredNonNegativeInt(usage, "output_tokens")
+		out.combined, out.combinedSeen = requiredNonNegativeInt(usage, "total_tokens")
+	case ProfileOpenAIEmbeddings:
+		out.input, out.inputSeen = requiredNonNegativeInt(usage, "prompt_tokens")
+		out.combined, out.combinedSeen = requiredNonNegativeInt(usage, "total_tokens")
+		// Embeddings have no completion dimension. Mark it seen only when the
+		// complete embedding usage envelope was valid.
+		out.outputSeen = out.inputSeen && out.combinedSeen
+	case ProfileAnthropicMessages:
+		out.input, out.inputSeen = requiredNonNegativeInt(usage, "input_tokens")
+		out.output, out.outputSeen = requiredNonNegativeInt(usage, "output_tokens")
+		if raw, exists := usage["cache_read_input_tokens"]; exists {
+			out.cacheRead, out.cacheReadSeen = optionalNonNegativeInt(raw)
+			if !out.cacheReadSeen {
+				return usageRecord{}, false
+			}
+		}
+		if raw, exists := usage["cache_creation_input_tokens"]; exists {
+			out.cacheCreate, out.cacheCreateSeen = optionalNonNegativeInt(raw)
+			if !out.cacheCreateSeen {
+				return usageRecord{}, false
+			}
+		}
+		// Anthropic's message usage has no total_tokens field; the adapter
+		// derives total input from the three documented input dimensions.
 	default:
 		return usageRecord{}, false
 	}
-	out.combined, out.combinedSeen = nonNegativeInt(usage["total_tokens"])
-	return out, out.inputSeen || out.outputSeen || out.combinedSeen
+	return out, out.inputSeen || out.outputSeen || out.combinedSeen || out.cacheReadSeen || out.cacheCreateSeen
+}
+
+func usageObject(top map[string]json.RawMessage, profile UsageProfile) (map[string]json.RawMessage, bool) {
+	switch profile {
+	case ProfileOpenAIResponses:
+		if typ, ok := stringValue(top["type"]); ok && typ == "response.completed" {
+			response, err := decodeUniqueObject(top["response"])
+			if err != nil {
+				return nil, false
+			}
+			usage, err := decodeUniqueObject(response["usage"])
+			return usage, err == nil
+		}
+		// Non-streaming Responses returns usage at the response top level.
+		usage, ok := top["usage"]
+		if !ok {
+			return nil, false
+		}
+		decoded, err := decodeUniqueObject(usage)
+		return decoded, err == nil
+	case ProfileAnthropicMessages:
+		if typ, ok := stringValue(top["type"]); ok && typ == "message_start" {
+			message, err := decodeUniqueObject(top["message"])
+			if err != nil {
+				return nil, false
+			}
+			usage, err := decodeUniqueObject(message["usage"])
+			return usage, err == nil
+		}
+		// message_delta and non-streaming Messages use the top-level usage
+		// member. No other nested path is accepted.
+		usage, ok := top["usage"]
+		if !ok {
+			return nil, false
+		}
+		decoded, err := decodeUniqueObject(usage)
+		return decoded, err == nil
+	default:
+		usage, ok := top["usage"]
+		if !ok {
+			return nil, false
+		}
+		decoded, err := decodeUniqueObject(usage)
+		return decoded, err == nil
+	}
+}
+
+func stringValue(raw json.RawMessage) (string, bool) {
+	var value string
+	if len(raw) == 0 || json.Unmarshal(raw, &value) != nil {
+		return "", false
+	}
+	return value, true
 }
 
 // decodeUniqueObject is intentionally limited to the small provider envelope
@@ -372,6 +554,21 @@ func nonNegativeInt(raw json.RawMessage) (int64, bool) {
 		return 0, false
 	}
 	return n, true
+}
+
+func requiredNonNegativeInt(values map[string]json.RawMessage, key string) (int64, bool) {
+	raw, ok := values[key]
+	if !ok {
+		return 0, false
+	}
+	return nonNegativeInt(raw)
+}
+
+func optionalNonNegativeInt(raw json.RawMessage) (int64, bool) {
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return 0, true
+	}
+	return nonNegativeInt(raw)
 }
 
 func safeAdd(a, b int64) int64 {

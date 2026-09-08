@@ -21,7 +21,7 @@ const securityTransitionSchemaVersion = 1
 // state change cannot commit without its transition row.
 func appendSecurityTransitionTx(tx *bolt.Tx, rec control.SecurityTransitionRecord) error {
 	b := tx.Bucket(bucketSecurityAudit)
-	seq := uint64(btoi(b.Get(keySecuritySequence))) + 1
+	seq := btoi(b.Get(keySecuritySequence)) + 1
 	rec.Sequence = seq
 	env, err := json.Marshal(persistedSecurityTransition{SchemaVersion: securityTransitionSchemaVersion, Record: rec})
 	if err != nil {
@@ -49,7 +49,7 @@ func (s *Store) ListSecurityTransitions(after uint64, limit int) ([]control.Secu
 			if len(k) != 8 {
 				return fmt.Errorf("statebolt: corrupt security audit key: %w", ErrMigrationRequired)
 			}
-			seq := uint64(btoi(k))
+			seq := btoi(k)
 			if seq <= after {
 				continue
 			}

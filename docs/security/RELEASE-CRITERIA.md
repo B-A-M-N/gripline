@@ -1,0 +1,75 @@
+# Security Release Criteria
+
+Gripline has three qualification layers. The first two are repository-owned;
+the third is specific to the operator's deployment.
+
+```yaml
+repository_status: layer_1_worktree_passed_pending_exact_release_record
+reference_lab_status: local_smoke_passed_pending_tagged_record_and_long_soak
+operator_deployment_status: separate_per_deployment
+production_qualification_status: pending_exact_release_record
+production_stable: false
+production_stable_rule: layers_1_and_2_pass_on_exact_release_sha
+```
+
+## Layer 1 — code correctness
+
+These gates must pass on the exact release commit. The current worktree has
+passed the Go test/race/vet and unexcluded gosec gates; hosted release
+execution remains the authoritative exact-SHA record:
+
+- `go test ./...`
+- `go test -race ./...`
+- `go vet ./...`
+- `staticcheck ./...`
+- `go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...`
+- `go run github.com/securego/gosec/v2/cmd/gosec@v2.22.8 -quiet ./...`
+- `GRIPLINE_FUZZ_TIME=2s bash scripts/fuzz-smoke.sh`
+- `bash scripts/release-harness.sh`
+- `bash scripts/chaos-smoke.sh`
+- PostgreSQL integration and `bash scripts/cluster-harness.sh`
+- exact commit check: `git rev-parse HEAD == GITHUB_SHA`
+
+The workflow must retain the commit, tool versions, test output, vulnerability
+result, and artifact provenance. Gosec has no global exclusions; intentional
+exceptions are line-local and documented in `GOSEC-BASELINE.md`.
+
+## Layer 2 — repository reference production lab
+
+These are reproducible local qualification gates, not placeholders for hosted
+infrastructure. The release workflow runs the short smoke set on the tagged
+SHA; the scheduled/manual qualification record must additionally retain the
+long soak evidence:
+
+| Control | Owned entrypoint | Evidence required |
+|---|---|---|
+| PostgreSQL primary/replica promotion and rejoin | `bash scripts/qualification/ha.sh` | Replica promotion, preserved policy/crypto state, failed-node rejoin |
+| Base-backup/WAL PITR | `bash scripts/qualification/pitr.sh` | Target-time restore returns the pre-mutation security state |
+| Network isolation and mTLS | `bash scripts/qualification/perimeter.sh` | Public attacker cannot reach private backend/control/PostgreSQL; gateway identity succeeds |
+| Official SDK behavior | `bash scripts/qualification/sdk.sh` | OpenAI and Anthropic Python/TypeScript streaming and non-streaming usage, tools, large input, retry/429, 5xx, cancellation, reuse, and parallel calls |
+| Direct TLS/HTTP2 | `bash scripts/qualification/http2.sh` | ALPN, stream/header bounds, CONTINUATION, cancellation/recovery, error metrics, and `h2load` evidence |
+| Shared replay | `bash scripts/qualification/replay.sh` | Two independent processes produce exactly one winner for one claim |
+| Long-running active/active behavior | `bash scripts/qualification/soak.sh --duration 24h` | Replica/policy continuity, bounded active leases/holds/source scopes, retention checks, RSS/goroutine/heap snapshots, outage recovery, post-soak promotion |
+
+The lab uses disposable containers, generated keys, and local
+provider-shaped fixtures; it requires no provider account.
+The qualification workflow's manual `soak_duration` input accepts `24h` or
+`72h` for the long reference record; scheduled and tag-triggered runs use the
+short smoke duration.
+
+## Layer 3 — operator-specific deployment validation
+
+These checks remain necessary before a particular deployment is called
+production-ready, but they do not block the generic software production-stable
+claim once Layers 1 and 2 pass:
+
+- operator AWS/Kubernetes/VPC/network-policy reachability and edge DDoS controls;
+- managed PostgreSQL product failover, backup/PITR, TLS, and restore evidence;
+- issued production PKI, secret delivery, KMS/HSM, and key rotation;
+- provider account/model quotas, authoritative token/cost settlement, and
+  provider-owned object/property authorization;
+- operator observability, alerting, retention, incident response, and capacity.
+
+The release record must label these as `operator_deployment_status`, not as
+missing Gripline implementation. Backend object/property authorization,
+volumetric DDoS, and host/key compromise remain explicit boundary controls.

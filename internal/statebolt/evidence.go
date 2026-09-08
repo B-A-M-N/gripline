@@ -298,8 +298,8 @@ func (s *Store) SweepExpiredEvidence(now time.Time, batch int) (int, error) {
 		if k == nil {
 			s.evidenceSweepAfter = nil
 		}
-		s.evidenceSweepStats.Scanned += uint64(processed)
-		s.evidenceSweepStats.Deleted += uint64(len(remove))
+		s.evidenceSweepStats.Scanned += uint64(processed)   // #nosec G115 -- processed is a non-negative bounded page count.
+		s.evidenceSweepStats.Deleted += uint64(len(remove)) // #nosec G115 -- remove length is a non-negative bounded page count.
 		return nil
 	})
 	if err == nil {

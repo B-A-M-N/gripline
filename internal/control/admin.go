@@ -78,12 +78,12 @@ type FileAuditRepository struct {
 // initial open fsyncs so an empty file's existence is durable before any
 // action can be recorded in it.
 func NewFileAuditRepository(path string) (*FileAuditRepository, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600) // #nosec G304 -- audit path is operator-owned configuration.
 	if err != nil {
 		return nil, fmt.Errorf("control: open audit log: %w", err)
 	}
 	if err := f.Sync(); err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, fmt.Errorf("control: sync audit log: %w", err)
 	}
 	enc := json.NewEncoder(f)
@@ -112,7 +112,7 @@ func (r *FileAuditRepository) Close() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if err := r.f.Sync(); err != nil {
-		r.f.Close()
+		_ = r.f.Close()
 		return err
 	}
 	return r.f.Close()
@@ -132,9 +132,9 @@ type Capability string
 
 const (
 	// CapCredentialLifecycle: revoke / quarantine-release / revision bump.
-	CapCredentialLifecycle Capability = "credential.lifecycle"
+	CapCredentialLifecycle Capability = "credential.lifecycle" // #nosec G101 -- this is an RBAC capability identifier, not a secret.
 	// CapLaneLifecycle: lane block / unblock / force-status.
-	CapLaneLifecycle Capability = "lane.lifecycle"
+	CapLaneLifecycle Capability = "lane.lifecycle" // #nosec G101 -- this is an RBAC capability identifier, not a secret.
 	// CapPosture: the global EMERGENCY_LOCKDOWN switch.
 	CapPosture Capability = "posture.control"
 	// CapEvidence: manual IOC / operator evidence minting.

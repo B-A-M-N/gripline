@@ -46,13 +46,25 @@ In scope:
 - The operator control plane (authentication, authorization, transactional
   mutation + audit).
 
-Out of scope:
+Boundary dependencies (not owned by Gripline code):
 
 - Denial of service via volumetric traffic (the gateway enforces bounded
   resources, but a volumetric DDoS is a network-layer concern).
 - Vulnerabilities in the upstream inference provider behind the gateway.
+- Provider-owned object/property authorization, PostgreSQL HA/PITR
+  operations, and compromise of the host or file-backed signer key.
 - Misdeployment: binding the admin plane public despite validation refusing
   it, disabling TLS postures via config that fails closed at boot, etc.
+
+These are boundary controls rather than accepted security exemptions. They
+are outside Gripline's implementation ownership for vulnerability triage. The
+repository-owned reference lab covers HA/PITR, mTLS/network isolation, SDK
+fixtures, HTTP/2, shared replay, and soak; stable software status follows the
+Layer 1/Layer 2 release criteria. Edge DDoS, provider authorization, managed
+database behavior, issued PKI, and deployment qualification remain Layer 3
+operator evidence. See
+[`docs/security/RELEASE-CRITERIA.md`](docs/security/RELEASE-CRITERIA.md) for
+the distinction between repository gates and deployment gates.
 
 ## Design documentation
 

@@ -55,6 +55,9 @@ func TestLoadValid(t *testing.T) {
 	if c.Backend.Timeout.D() != 30*time.Second || c.Identity.Audience != "fi-inference" {
 		t.Fatalf("fields not parsed: %+v", c)
 	}
+	if c.Server.MaxConnections != 4096 || c.Server.HTTP2MaxConcurrentStreams != 100 || c.Server.HTTP2HeaderTableBytes != 4096 || c.Server.HTTP2MaxReadFrameBytes != 1<<20 {
+		t.Fatalf("HTTP listener defaults not applied: %+v", c.Server)
+	}
 	if v, enabled := c.TLSConfig(); !enabled || v != tlsVersion13 {
 		t.Fatalf("TLS config wrong: %v %v", v, enabled)
 	}
@@ -89,32 +92,76 @@ func TestValidateClusterAuthorityContract(t *testing.T) {
 	}
 }
 
-func TestValidateVerifierControlUsesBackendOrigin(t *testing.T) {
+func TestValidateVerifierControlUsesDedicatedAuthentication(t *testing.T) {
 	c := &Config{
 		Listen: "127.0.0.1:8080",
 		TLS:    TLSSection{TerminateTLSUpstream: true},
 		Backend: BackendSection{
-			URL:                "https://provider.internal:443/v1",
-			VerifierControlURL: "https://provider.internal:443/private/verifier",
-			Timeout:            Duration(time.Second),
+			URL:     "https://provider.internal:443/v1",
+			Timeout: Duration(time.Second),
+			VerifierControl: VerifierControlSection{
+				URL: "https://127.0.0.1:9443/private/verifier", Token: "control-token-0123456789abcdef0123456789abcdef",
+			},
 		},
 		Server:   ServerSection{ReadTimeout: Duration(time.Second), WriteTimeout: Duration(time.Second), IdleTimeout: Duration(time.Second), ReadHeaderTimeout: Duration(time.Second)},
 		Identity: IdentitySection{Audience: "a"},
 	}
 	if err := c.Validate(); err != nil {
-		t.Fatalf("same-origin verifier control endpoint rejected: %v", err)
+		t.Fatalf("dedicated verifier control endpoint rejected: %v", err)
+	}
+	shortToken := *c
+	shortToken.Backend.VerifierControl.Token = "short"
+	if err := shortToken.Validate(); err == nil {
+		t.Fatal("short verifier-control token must be rejected")
 	}
 	for name, endpoint := range map[string]string{
-		"different host":   "https://other.internal/private/verifier",
-		"different scheme": "http://provider.internal:443/private/verifier",
+		"missing authentication": "https://other.internal/private/verifier",
+		"remote token only":      "https://other.internal/private/verifier",
+		"insecure remote":        "http://10.0.0.2:9443/private/verifier",
 	} {
 		t.Run(name, func(t *testing.T) {
 			copy := *c
-			copy.Backend.VerifierControlURL = endpoint
+			copy.Backend.VerifierControl.URL = endpoint
+			if name == "missing authentication" || name == "insecure remote" {
+				copy.Backend.VerifierControl.Token = ""
+			}
 			if err := copy.Validate(); err == nil {
-				t.Fatal("verifier control endpoint must share the backend origin")
+				t.Fatal("verifier control endpoint without dedicated authentication must be rejected")
 			}
 		})
+	}
+}
+
+func TestValidateEndpointRulesCompilesCanonicalRoutes(t *testing.T) {
+	base := &Config{
+		Listen: "127.0.0.1:8080", TLS: TLSSection{TerminateTLSUpstream: true},
+		Backend:  BackendSection{URL: "https://provider.internal", Timeout: Duration(time.Second)},
+		Server:   ServerSection{ReadTimeout: Duration(time.Second), WriteTimeout: Duration(time.Second), IdleTimeout: Duration(time.Second), ReadHeaderTimeout: Duration(time.Second)},
+		Identity: IdentitySection{Audience: "a"},
+	}
+	for name, rules := range map[string][]EndpointRule{
+		"duplicate":     {{Method: "POST", Path: "/v1/messages"}, {Method: "post", Path: "/v1/messages"}},
+		"unknown scope": {{Method: "POST", Path: "/v1/messages", RequiredScope: "infernece"}},
+		"outside v1":    {{Method: "POST", Path: "/admin"}},
+		"dot segment":   {{Method: "POST", Path: "/v1/../admin"}},
+		"double slash":  {{Method: "POST", Path: "/v1//messages"}},
+		"encoded dot":   {{Method: "POST", Path: "/v1/%2e%2e/admin"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			copy := *base
+			copy.Backend.AllowedEndpoints = rules
+			if err := copy.Validate(); err == nil {
+				t.Fatal("invalid endpoint rule must be rejected")
+			}
+		})
+	}
+	valid := *base
+	valid.Backend.AllowedEndpoints = []EndpointRule{{Method: "post", Path: "/v1/messages", RequiredScope: "inference"}}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("canonical endpoint rule rejected: %v", err)
+	}
+	if valid.Backend.AllowedEndpoints[0].Method != "POST" {
+		t.Fatalf("method was not canonicalized: %q", valid.Backend.AllowedEndpoints[0].Method)
 	}
 }
 

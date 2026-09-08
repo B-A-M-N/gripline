@@ -60,8 +60,9 @@ func (ss *scriptedSession) Finish(err error) resource.UsageEstimate {
 
 // P0.3 end-to-end at the proxy: the estimator's Estimate is reserved at
 // admission; after the backend responds, the reservation is settled with the
-// estimator's Actual — the unused remainder returns to the gauge; on a
-// transport error the full hold is cancelled (never settled).
+// estimator's Actual — the unused remainder returns to the gauge. Once the
+// request is marked forwarded, a transport error conservatively consumes the
+// estimate because the backend may have accepted it.
 func TestDataPlaneSettlesReservationWithActualUsage(t *testing.T) {
 	var requestCount int
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -164,7 +165,8 @@ func TestDataPlaneSettlesReservationWithActualUsage(t *testing.T) {
 		t.Fatalf("P0.3: settle(actual 10) must leave 90, got %v", avail)
 	}
 
-	// Transport failure: no settle → deferred Release cancels the full hold.
+	// Transport failure after MarkForwarded: deferred Release consumes the
+	// estimate instead of refunding ambiguous work.
 	fail := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	fail.Close()                              // closed server guarantees a transport error
 	fbu, _ := url.Parse("http://127.0.0.1:1") // nothing listens
@@ -184,8 +186,8 @@ func TestDataPlaneSettlesReservationWithActualUsage(t *testing.T) {
 		t.Fatalf("dead backend must map to 502, got %d", rec2.Code)
 	}
 	avail2, _ := gov.AvailableFor(resource.DimCombinedTokens, resource.ScopeCredential, "cred_pu")
-	if avail2 != 90 {
-		t.Fatalf("P0.36: failed request must refund its full estimate hold; avail = %v, want 90", avail2)
+	if avail2 != 40 {
+		t.Fatalf("P0.36: forwarded failed request must consume its estimate; avail = %v, want 40", avail2)
 	}
 	_ = requestCount
 }

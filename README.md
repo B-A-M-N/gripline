@@ -141,7 +141,9 @@ applying a migration, then start the new binary. Route traffic only to nodes
 whose `/readyz` returns 200. A node that loses its
 membership epoch, shared policy/crypto state, or PostgreSQL connectivity is
 removed from service and fails protected admissions closed. PostgreSQL backup,
-PITR, replication, and failover are infrastructure responsibilities.
+PITR, replication, and failover are exercised by the repository-owned reference
+qualification lab; the operator's managed PostgreSQL product and backup service
+remain deployment responsibilities.
 
 Provider metering overlays are available as separate examples:
 [`deploy/usage.openai.example.json`](deploy/usage.openai.example.json) and
@@ -203,6 +205,14 @@ docker run --user 65532:65532 \
 The state database and signer keyring must be on a persistent volume; the
 gateway refuses to boot in ephemeral mode unless a deployment explicitly opts
 in (`deployment.allow_ephemeral_state`).
+
+The public data plane is an exact method/path allowlist. Configure
+`backend.allowed_endpoints` for the provider surface you intend to expose; the
+stock default permits only inference endpoints and never proxies arbitrary
+`/v1/*` functionality. In clustered mode, configure
+`backend.verifier_control` with a separately authenticated control URL and
+trust identity. The configured verifier-management path is rejected by the
+public data plane.
 
 The configured `server.spool_dir` must be writable. In a read-only-root
 container, use a bounded tmpfs mount such as
@@ -273,8 +283,8 @@ verification. CI/release checks can run the non-interactive proof with:
 go run ./cmd/gripline-demo --headless
 ```
 
-The demo is intentionally local and single-node; it is not a substitute for a
-provider SDK matrix, a distributed resource harness, or production telemetry.
+The demo is intentionally local and single-node; it is not a substitute for
+the repository-owned SDK/cluster qualification labs or operator telemetry.
 
 ## Design
 
@@ -309,13 +319,13 @@ before accepting production traffic.
 
 ## Status
 
-**Phase: production candidate, not yet a stable release.** Standalone/bbolt
-and clustered/PostgreSQL authority paths are implemented and covered by unit,
-integration, and executable acceptance tests. Stable-release qualification
-still requires hosted provenance, PostgreSQL HA/failover evidence, production
-network-perimeter verification, and provider SDK/usage integration evidence.
-`AUDIT.md` is the durable verdict table; the remaining qualification list
-below is the binding honesty surface.
+**Phase: production candidate pending the exact Layer 1/Layer 2 release
+record.** Standalone/bbolt and clustered/PostgreSQL authority paths are
+implemented and covered by unit, integration, executable acceptance tests, and
+the repository-owned reference qualification lab. The generic software
+production-stable rule is Layer 1 correctness plus Layer 2 lab evidence;
+operator cloud/managed-DB/PKI/observability validation is a separate Layer 3
+deployment record. `AUDIT.md` is the durable verdict table.
 
 `✅` = implemented + tested · `◇` = partially / sketched
 
@@ -345,8 +355,8 @@ below is the binding honesty surface.
     (`internal/anomaly`, P0.30–P0.32)
 14. ✅ acceptance proof surface (`internal/gates`, spec §111) — component
     invariants plus compiled single-node and three-node PostgreSQL harnesses.
-    Gate J is executable in CI; network isolation, external telemetry, and
-    provider SDK canaries remain deployment evidence.
+    Gate J is executable in CI; the repository qualification lab also covers
+    network isolation, official SDK canaries, HTTP/2, replay, and soak.
 15. ✅ shadow-first auto-quarantine — `Risk.EnableAutomaticQuarantine=false` default;
     request-level denial still fires, persisted quarantine stays operator-set
 16. ✅ deployable executable — `cmd/gripline` + `internal/config`: boot-validated
@@ -406,15 +416,16 @@ passing repository tests:
 - **One policy per process:** the runtime selects one compiled policy snapshot
   for each process. `PlanID` is required credential metadata, but a multi-plan
   provider policy resolver is not shipped.
-- **Backend and PostgreSQL perimeter:** the verifier backend must be private or
-  mutually authenticated, and remote PostgreSQL must use authenticated TLS.
-  PostgreSQL HA, replication, backup/PITR, failover, and operator secret
-  delivery remain infrastructure responsibilities.
-- **Provider integrations:** public ingress and usage adapter contracts are
-  shipped, with bounded OpenAI/Anthropic reference adapters and static CIDR
-  metadata. `usage.mode=none` is request/concurrency accounting only; real
-  deployments must wire authoritative provider token/cost usage and validate
-  their SDK matrix (including streaming, retries, and cancellation).
+- **Reference qualification lab:** `scripts/qualification/ha.sh`, `pitr.sh`,
+  `perimeter.sh`, `sdk.sh`, `http2.sh`, `replay.sh`, and `soak.sh` own the
+  reproducible PostgreSQL HA/PITR, mTLS/network, official SDK, HTTP/2, shared
+  replay, and active/active soak proofs. These are software-production gates,
+  not permanent external blockers.
+- **Operator deployment:** the actual AWS/Kubernetes/VPC policy, managed
+  PostgreSQL product, issued PKI, secret delivery, edge DDoS controls,
+  observability, and provider account/model quotas remain deployment
+  responsibilities. `usage.mode=none` is request/concurrency accounting only;
+  real deployments must wire authoritative provider token/cost usage.
 - **Stable-release provenance:** this working tree is not itself a hosted
   release. A stable tag must pass hosted CI/release, container smoke, checksum,
   signature, and build-provenance verification from the exact audited commit.

@@ -13,6 +13,11 @@ import (
 )
 
 const policyManifestSchemaVersion = 1
+const maxPostgresInt64 = uint64(1<<63 - 1)
+
+// postgresEpoch converts only after validatePolicyManifest has established
+// the PostgreSQL BIGINT range.
+func postgresEpoch(epoch uint64) int64 { return int64(epoch) } // #nosec G115 -- callers validate the epoch against maxPostgresInt64 first.
 
 // ErrPolicyActivationBarrier means one or more live nodes have not loaded and
 // acknowledged the exact candidate policy. The shared manifest remains on
@@ -38,6 +43,9 @@ func validatePolicyManifest(manifest policy.Manifest) error {
 	}
 	if manifest.ActivationEpoch == 0 {
 		return errors.New("statepg: invalid policy activation epoch")
+	}
+	if manifest.ActivationEpoch > maxPostgresInt64 {
+		return errors.New("statepg: policy activation epoch exceeds database range")
 	}
 	if err := validatePolicyRef(manifest.Active); err != nil {
 		return fmt.Errorf("active policy: %w", err)
@@ -268,9 +276,6 @@ func (s *Store) AcknowledgePolicyContext(ctx context.Context, manifest policy.Ma
 	if err := validatePolicyManifest(manifest); err != nil {
 		return err
 	}
-	if manifest.ActivationEpoch > uint64(1<<63-1) {
-		return errors.New("statepg: policy activation epoch exceeds database range")
-	}
 	return s.withTransactionRetry(ctx, "policy observation", func() error {
 		return s.acknowledgePolicyOnce(ctx, manifest)
 	})
@@ -310,7 +315,8 @@ func (s *Store) acknowledgePolicyOnce(ctx context.Context, manifest policy.Manif
 		 candidate_policy_revision=EXCLUDED.candidate_policy_revision,
 		 candidate_policy_digest=EXCLUDED.candidate_policy_digest,
 		 updated_at=EXCLUDED.updated_at`,
-		s.nodeID, s.nodeEpoch, int64(manifest.ActivationEpoch), manifest.Active.ID,
+		s.nodeID, s.nodeEpoch, postgresEpoch(manifest.ActivationEpoch),
+		manifest.Active.ID,
 		manifest.Active.Revision, manifest.Active.Digest, candidateID, candidateRevision,
 		candidateDigest, now)
 	if err != nil {
@@ -514,6 +520,9 @@ func recordPolicyObservation(ctx context.Context, tx pgx.Tx, s *Store, manifest 
 	if manifest.ActivationEpoch == 0 {
 		manifest.ActivationEpoch = 1
 	}
+	if err := validatePolicyManifest(manifest); err != nil {
+		return err
+	}
 	candidateID, candidateDigest := "", ""
 	candidateRevision := 0
 	if manifest.Candidate != nil {
@@ -535,7 +544,8 @@ func recordPolicyObservation(ctx context.Context, tx pgx.Tx, s *Store, manifest 
 		 candidate_policy_revision=EXCLUDED.candidate_policy_revision,
 		 candidate_policy_digest=EXCLUDED.candidate_policy_digest,
 		 updated_at=EXCLUDED.updated_at`,
-		s.nodeID, s.nodeEpoch, int64(manifest.ActivationEpoch), manifest.Active.ID,
+		s.nodeID, s.nodeEpoch, postgresEpoch(manifest.ActivationEpoch),
+		manifest.Active.ID,
 		manifest.Active.Revision, manifest.Active.Digest, candidateID, candidateRevision,
 		candidateDigest)
 	return mapDBError(err)
@@ -585,7 +595,8 @@ func (s *Store) requireCurrentPolicyObservation(ctx context.Context, tx pgx.Tx) 
 	if err != nil {
 		return mapDBError(err)
 	}
-	if observedEpoch != int64(manifest.ActivationEpoch) || observedID != manifest.Active.ID ||
+	if observedEpoch != postgresEpoch(manifest.ActivationEpoch) ||
+		observedID != manifest.Active.ID ||
 		observedRevision != manifest.Active.Revision || observedDigest != manifest.Active.Digest {
 		return fmt.Errorf("%w: observed %s/%d epoch %d, active %s/%d epoch %d", ErrPolicyObservationStale,
 			observedID, observedRevision, observedEpoch, manifest.Active.ID, manifest.Active.Revision, manifest.ActivationEpoch)

@@ -28,7 +28,12 @@ func TestHTTPVerifierControlPublishesAndVerifiesPreparedSigner(t *testing.T) {
 		t.Fatal(err)
 	}
 	const audience = "verifier-control-test"
+	const controlToken = "dedicated-control-token-0123456789abcdef0123456789abcdef"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-Gripline-Verifier-Control"); got != controlToken {
+			http.Error(w, "missing dedicated control authentication", http.StatusForbidden)
+			return
+		}
 		var body verifierControlRequest
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "bad json", http.StatusBadRequest)
@@ -54,12 +59,26 @@ func TestHTTPVerifierControlPublishesAndVerifiesPreparedSigner(t *testing.T) {
 
 	control, err := newHTTPVerifierControl(&config.Config{
 		Identity: config.IdentitySection{Audience: audience},
-		Backend:  config.BackendSection{URL: server.URL, VerifierControlURL: server.URL},
+		Backend: config.BackendSection{URL: server.URL, VerifierControl: config.VerifierControlSection{
+			URL: server.URL, Token: controlToken,
+		}},
 	}, server.Client().Transport, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := control.AcceptPrepared(context.Background(), signer, candidate.KID, candidate.PublicKey); err != nil {
 		t.Fatal(err)
+	}
+	unauthenticated, err := newHTTPVerifierControl(&config.Config{
+		Identity: config.IdentitySection{Audience: audience},
+		Backend: config.BackendSection{URL: server.URL, VerifierControl: config.VerifierControlSection{
+			URL: server.URL,
+		}},
+	}, server.Client().Transport, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unauthenticated.AcceptPrepared(context.Background(), signer, candidate.KID, candidate.PublicKey); err == nil {
+		t.Fatal("verifier control must reject a caller without the dedicated control credential")
 	}
 }
