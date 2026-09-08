@@ -88,6 +88,17 @@ func (s *Store) BorrowOrCreateWithPolicy(ctx context.Context, credID, candidateI
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
 	}
+	var out *lane.LaneRecord
+	var created bool
+	err := withTransactionRetry(ctx, "lane borrow/create", func() error {
+		var err error
+		out, created, err = s.borrowOrCreateWithPolicyOnce(ctx, credID, candidateID, features, policy)
+		return err
+	})
+	return out, created, err
+}
+
+func (s *Store) borrowOrCreateWithPolicyOnce(ctx context.Context, credID, candidateID string, features lane.Features, policy lane.PolicyContext) (*lane.LaneRecord, bool, error) {
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return nil, false, err
@@ -219,6 +230,16 @@ func (s *Store) ObserveRiskWithPolicy(ctx context.Context, credID, laneID string
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	var out *lane.LaneRecord
+	err := withTransactionRetry(ctx, "lane risk observation", func() error {
+		var err error
+		out, err = s.observeRiskWithPolicyOnce(ctx, credID, laneID, riskScore, now, policy, meta)
+		return err
+	})
+	return out, err
+}
+
+func (s *Store) observeRiskWithPolicyOnce(ctx context.Context, credID, laneID string, riskScore int, now time.Time, policy lane.PolicyContext, meta lane.TransitionMetadata) (*lane.LaneRecord, error) {
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return nil, err
@@ -283,6 +304,17 @@ func (s *Store) RecordCleanAuthorizedAndPromoteWithPolicy(ctx context.Context, c
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
 	}
+	var out *lane.LaneRecord
+	var promoted bool
+	err := withTransactionRetry(ctx, "lane promotion", func() error {
+		var err error
+		out, promoted, err = s.recordCleanAuthorizedAndPromoteOnce(ctx, credID, laneID, riskScore, criteria, now, policy, meta)
+		return err
+	})
+	return out, promoted, err
+}
+
+func (s *Store) recordCleanAuthorizedAndPromoteOnce(ctx context.Context, credID, laneID string, riskScore int, criteria lane.PromotionCriteria, now time.Time, policy lane.PolicyContext, meta lane.TransitionMetadata) (*lane.LaneRecord, bool, error) {
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return nil, false, err

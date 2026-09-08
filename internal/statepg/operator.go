@@ -37,6 +37,12 @@ func (s *Store) AppendOperator(ctx context.Context, rec control.OperatorRecord) 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	return withTransactionRetry(ctx, "operator audit append", func() error {
+		return s.appendOperatorOnce(ctx, rec)
+	})
+}
+
+func (s *Store) appendOperatorOnce(ctx context.Context, rec control.OperatorRecord) error {
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return mapDBError(err)
@@ -144,6 +150,12 @@ func (s *Store) LoadPosture() (control.Posture, error) {
 // SetPostureWithAudit so posture and its audit row are one transaction.
 func (s *Store) SavePosture(posture control.Posture) error {
 	ctx := context.Background()
+	return withTransactionRetry(ctx, "posture mutation", func() error {
+		return s.savePostureOnce(ctx, posture)
+	})
+}
+
+func (s *Store) savePostureOnce(ctx context.Context, posture control.Posture) error {
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return mapDBError(err)
@@ -170,6 +182,12 @@ func (s *Store) AppendAdmission(ctx context.Context, e control.Event) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	return withTransactionRetry(ctx, "admission audit append", func() error {
+		return s.appendAdmissionOnce(ctx, e)
+	})
+}
+
+func (s *Store) appendAdmissionOnce(ctx context.Context, e control.Event) error {
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return mapDBError(err)
@@ -252,6 +270,12 @@ func (s *Store) ProvisionCredentialWithAuditOperation(ctx context.Context, rec c
 	if err != nil {
 		return err
 	}
+	return withTransactionRetry(ctx, "operator credential provision", func() error {
+		return s.provisionCredentialWithAuditOperationOnce(ctx, rec, audit, operationID, security)
+	})
+}
+
+func (s *Store) provisionCredentialWithAuditOperationOnce(ctx context.Context, rec credential.CredentialRecord, audit control.OperatorRecord, operationID string, security []byte) error {
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return mapDBError(err)
@@ -289,6 +313,12 @@ func (s *Store) UnblockLaneWithAuditOperation(ctx context.Context, credID, laneI
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	return withTransactionRetry(ctx, "operator lane unblock", func() error {
+		return s.unblockLaneWithAuditOperationOnce(ctx, credID, laneID, audit, now, operationID)
+	})
+}
+
+func (s *Store) unblockLaneWithAuditOperationOnce(ctx context.Context, credID, laneID string, audit control.OperatorRecord, now time.Time, operationID string) error {
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return mapDBError(err)
@@ -354,6 +384,12 @@ func (s *Store) RevokeCredentialWithAuditOperation(ctx context.Context, credID s
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	return withTransactionRetry(ctx, "operator credential revoke", func() error {
+		return s.revokeCredentialWithAuditOperationOnce(ctx, credID, audit, operationID)
+	})
+}
+
+func (s *Store) revokeCredentialWithAuditOperationOnce(ctx context.Context, credID string, audit control.OperatorRecord, operationID string) error {
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return mapDBError(err)
@@ -404,6 +440,12 @@ func (s *Store) SetPostureWithAuditOperation(ctx context.Context, posture contro
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	return withTransactionRetry(ctx, "operator posture mutation", func() error {
+		return s.setPostureWithAuditOperationOnce(ctx, posture, audit, operationID)
+	})
+}
+
+func (s *Store) setPostureWithAuditOperationOnce(ctx context.Context, posture control.Posture, audit control.OperatorRecord, operationID string) error {
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return mapDBError(err)

@@ -70,6 +70,12 @@ func (s *Store) Insert(rec *credential.CredentialRecord) error {
 		return err
 	}
 	ctx := context.Background()
+	return withTransactionRetry(ctx, "credential insert", func() error {
+		return s.insertCredentialOnce(ctx, rec, security)
+	})
+}
+
+func (s *Store) insertCredentialOnce(ctx context.Context, rec *credential.CredentialRecord, security []byte) error {
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return mapDBError(err)
@@ -99,6 +105,16 @@ func (s *Store) InsertIfAbsent(rec *credential.CredentialRecord) (bool, error) {
 		return false, err
 	}
 	ctx := context.Background()
+	var created bool
+	err = withTransactionRetry(ctx, "credential insert-if-absent", func() error {
+		var err error
+		created, err = s.insertCredentialIfAbsentOnce(ctx, rec, security)
+		return err
+	})
+	return created, err
+}
+
+func (s *Store) insertCredentialIfAbsentOnce(ctx context.Context, rec *credential.CredentialRecord, security []byte) (bool, error) {
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return false, mapDBError(err)
@@ -250,6 +266,16 @@ func (s *Store) TouchLastSeenContext(ctx context.Context, credentialID string, a
 
 func (s *Store) UpdateStatusCAS(credentialID string, expectedRevision int, fromStatus, toStatus credential.Status) (*credential.CredentialRecord, error) {
 	ctx := context.Background()
+	var out *credential.CredentialRecord
+	err := withTransactionRetry(ctx, "credential status transition", func() error {
+		var err error
+		out, err = s.updateStatusCASOnce(ctx, credentialID, expectedRevision, fromStatus, toStatus)
+		return err
+	})
+	return out, err
+}
+
+func (s *Store) updateStatusCASOnce(ctx context.Context, credentialID string, expectedRevision int, fromStatus, toStatus credential.Status) (*credential.CredentialRecord, error) {
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return nil, mapDBError(err)
@@ -296,6 +322,16 @@ func (s *Store) RotateVerifierCASContext(ctx context.Context, credentialID strin
 	if pepperVersion < 1 || len(verifier) == 0 {
 		return nil, errors.New("credential: invalid rotated verifier")
 	}
+	var out *credential.CredentialRecord
+	err := withTransactionRetry(ctx, "credential verifier rotation", func() error {
+		var err error
+		out, err = s.rotateVerifierCASOnce(ctx, credentialID, expectedRevision, pepperVersion, verifier)
+		return err
+	})
+	return out, err
+}
+
+func (s *Store) rotateVerifierCASOnce(ctx context.Context, credentialID string, expectedRevision, pepperVersion int, verifier []byte) (*credential.CredentialRecord, error) {
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return nil, mapDBError(err)
@@ -332,6 +368,12 @@ func (s *Store) RotateVerifierCASContext(ctx context.Context, credentialID strin
 }
 
 func (s *Store) updateCredential(ctx context.Context, id string, mutate func(*credential.CredentialRecord) error) error {
+	return withTransactionRetry(ctx, "credential mutation", func() error {
+		return s.updateCredentialOnce(ctx, id, mutate)
+	})
+}
+
+func (s *Store) updateCredentialOnce(ctx context.Context, id string, mutate func(*credential.CredentialRecord) error) error {
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return mapDBError(err)
@@ -420,6 +462,16 @@ func (s *Store) ObserveAndCommit(ctx context.Context, credentialID string, score
 		return credential.TransitionResult{}, credential.ErrTimeout
 	}
 	meta := credential.TransitionMetadataFromContext(ctx)
+	var out credential.TransitionResult
+	err := withTransactionRetry(ctx, "credential observation", func() error {
+		var err error
+		out, err = s.observeAndCommitOnce(ctx, credentialID, score, hy, now, meta)
+		return err
+	})
+	return out, err
+}
+
+func (s *Store) observeAndCommitOnce(ctx context.Context, credentialID string, score int, hy credential.Hysteresis, now time.Time, meta credential.TransitionMetadata) (credential.TransitionResult, error) {
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return credential.TransitionResult{}, mapDBError(err)

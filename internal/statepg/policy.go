@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/B-A-M-N/gripline/internal/policy"
 	"github.com/jackc/pgx/v5"
@@ -89,6 +90,12 @@ func (s *Store) PersistPolicyManifestContext(ctx context.Context, manifest polic
 	if err != nil {
 		return err
 	}
+	return withTransactionRetry(ctx, "policy manifest persistence", func() error {
+		return s.persistPolicyManifestOnce(ctx, raw, manifest.UpdatedAt)
+	})
+}
+
+func (s *Store) persistPolicyManifestOnce(ctx context.Context, raw []byte, updatedAt time.Time) error {
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return mapDBError(err)
@@ -98,7 +105,7 @@ func (s *Store) PersistPolicyManifestContext(ctx context.Context, manifest polic
 		return err
 	}
 	_, err = tx.Exec(ctx, `INSERT INTO gripline_policy_manifest (singleton, manifest, updated_at)
-		VALUES (TRUE,$1,$2) ON CONFLICT (singleton) DO UPDATE SET manifest=EXCLUDED.manifest, updated_at=EXCLUDED.updated_at`, raw, manifest.UpdatedAt.UTC())
+		VALUES (TRUE,$1,$2) ON CONFLICT (singleton) DO UPDATE SET manifest=EXCLUDED.manifest, updated_at=EXCLUDED.updated_at`, raw, updatedAt.UTC())
 	if err != nil {
 		return mapDBError(err)
 	}
@@ -127,6 +134,12 @@ func (s *Store) InitializePolicyManifestContext(ctx context.Context, manifest po
 	if err != nil {
 		return err
 	}
+	return withTransactionRetry(ctx, "policy manifest initialization", func() error {
+		return s.initializePolicyManifestOnce(ctx, raw, manifest.UpdatedAt)
+	})
+}
+
+func (s *Store) initializePolicyManifestOnce(ctx context.Context, raw []byte, updatedAt time.Time) error {
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return mapDBError(err)
@@ -136,7 +149,7 @@ func (s *Store) InitializePolicyManifestContext(ctx context.Context, manifest po
 		return err
 	}
 	_, err = tx.Exec(ctx, `INSERT INTO gripline_policy_manifest (singleton, manifest, updated_at)
-		VALUES (TRUE,$1,$2) ON CONFLICT (singleton) DO NOTHING`, raw, manifest.UpdatedAt.UTC())
+		VALUES (TRUE,$1,$2) ON CONFLICT (singleton) DO NOTHING`, raw, updatedAt.UTC())
 	if err != nil {
 		return mapDBError(err)
 	}
@@ -165,6 +178,12 @@ func (s *Store) PersistPolicyArtifactContext(ctx context.Context, compiled *poli
 	if err := validatePolicyRef(policy.PolicyRef{ID: compiled.ID, Revision: compiled.Revision, Digest: digest}); err != nil {
 		return err
 	}
+	return withTransactionRetry(ctx, "policy artifact persistence", func() error {
+		return s.persistPolicyArtifactOnce(ctx, compiled.ID, compiled.Revision, digest, raw)
+	})
+}
+
+func (s *Store) persistPolicyArtifactOnce(ctx context.Context, policyID string, revision int, digest string, raw []byte) error {
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return mapDBError(err)
@@ -174,7 +193,7 @@ func (s *Store) PersistPolicyArtifactContext(ctx context.Context, compiled *poli
 		return err
 	}
 	_, err = tx.Exec(ctx, `INSERT INTO gripline_policy_artifacts (policy_id, revision, digest, artifact)
-		VALUES ($1,$2,$3,$4) ON CONFLICT (policy_id, revision, digest) DO NOTHING`, compiled.ID, compiled.Revision, digest, raw)
+		VALUES ($1,$2,$3,$4) ON CONFLICT (policy_id, revision, digest) DO NOTHING`, policyID, revision, digest, raw)
 	if err != nil {
 		return mapDBError(err)
 	}
@@ -244,6 +263,12 @@ func (s *Store) PersistPolicyTransitionContext(ctx context.Context, manifest pol
 	if err != nil {
 		return err
 	}
+	return withTransactionRetry(ctx, "policy transition", func() error {
+		return s.persistPolicyTransitionOnce(ctx, manifest, event, rawManifest, rawEvent)
+	})
+}
+
+func (s *Store) persistPolicyTransitionOnce(ctx context.Context, manifest policy.Manifest, event policy.Event, rawManifest, rawEvent []byte) error {
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return mapDBError(err)
