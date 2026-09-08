@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/B-A-M-N/gripline/internal/resource"
 )
 
 // Ready reports whether the runtime can actually serve: the authorities are
@@ -58,6 +60,16 @@ func (rt *Runtime) Ready() error {
 	for _, health := range rt.adaptiveHealth {
 		if health != nil && health.PersistenceError() != nil {
 			return fmt.Errorf("gripline: adaptive state checkpoint unavailable")
+		}
+	}
+	if rt.Resource != nil {
+		if statsAuthority, ok := rt.Resource.(resource.ContextStatsAuthority); ok {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_, err := statsAuthority.StatsContext(ctx)
+			cancel()
+			if err != nil {
+				return fmt.Errorf("gripline: resource authority not ready: %w", err)
+			}
 		}
 	}
 	return nil
