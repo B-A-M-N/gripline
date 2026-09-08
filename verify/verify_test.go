@@ -135,6 +135,50 @@ func (s *contextEpochSource) PolicyEpochContext(ctx context.Context) (uint64, er
 	return s.epoch, nil
 }
 
+type contextOnlyRevisionSource struct {
+	revision int
+	seen     context.Context
+}
+
+func (s *contextOnlyRevisionSource) CredentialRevisionContext(ctx context.Context, _ string) (int, error) {
+	s.seen = ctx
+	return s.revision, nil
+}
+
+type contextOnlyPolicyEpochSource struct {
+	epoch uint64
+	seen  context.Context
+}
+
+func (s *contextOnlyPolicyEpochSource) PolicyEpochContext(ctx context.Context) (uint64, error) {
+	s.seen = ctx
+	return s.epoch, nil
+}
+
+func TestContextFreshnessChecksAcceptContextOnlyAuthorities(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	set, _ := NewKeySet(map[int]ed25519.PublicKey{1: pub}, 1)
+	now := time.Unix(1_700_000_000, 0)
+	revisions := &contextOnlyRevisionSource{revision: 4}
+	epochs := &contextOnlyPolicyEpochSource{epoch: 7}
+	v, _ := New(set, "provider")
+	v.WithClock(func() time.Time { return now }).
+		WithContextRevisionChecks(revisions, 3).
+		WithContextPolicyEpochChecks(epochs, 1)
+	c := testClaims(now)
+	c.PolicyEpoch = 7
+	r := httptest.NewRequest("POST", "http://backend/v1/messages", nil)
+	r.Header.Set(AssertionHeader, testToken(t, priv, c))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if _, err := v.VerifyContext(ctx, r); err != nil {
+		t.Fatalf("context-only freshness authorities: %v", err)
+	}
+	if revisions.seen != ctx || epochs.seen != ctx {
+		t.Fatal("context-only freshness authorities did not receive request context")
+	}
+}
+
 func TestPolicyEpochChecksRejectRollbackStaleAssertions(t *testing.T) {
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 	set, _ := NewKeySet(map[int]ed25519.PublicKey{1: pub}, 1)

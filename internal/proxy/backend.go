@@ -37,8 +37,10 @@ type BackendVerifier struct {
 	// revision. Stateless TTL-only verifiers leave both zero (their service
 	// class: TTL is the freshness bound — ≤30s INV-10).
 	rev            RevisionSource
+	contextRev     ContextRevisionSource
 	minPolicyRev   int
 	policyEpochs   PolicyEpochSource
+	contextEpochs  ContextPolicyEpochSource
 	minPolicyEpoch uint64
 	// transport is the P0.53 gate: required network/service identity, proven
 	// below the assertion. Nil = not enforced (tests, non-sensitive hop).
@@ -77,6 +79,18 @@ type ContextPolicyEpochSource interface {
 func (b *BackendVerifier) WithRevisionChecks(src RevisionSource, minPolicyRev int) *BackendVerifier {
 	b.rev = src
 	b.minPolicyRev = minPolicyRev
+	b.contextRev = nil
+	if contextSource, ok := src.(ContextRevisionSource); ok {
+		b.contextRev = contextSource
+	}
+	return b
+}
+
+// WithContextRevisionChecks is the cancellable freshness API for distributed
+// backends whose authority intentionally has no context-free lookup method.
+func (b *BackendVerifier) WithContextRevisionChecks(src ContextRevisionSource, minPolicyRev int) *BackendVerifier {
+	b.contextRev, b.rev = src, nil
+	b.minPolicyRev = minPolicyRev
 	return b
 }
 
@@ -84,6 +98,18 @@ func (b *BackendVerifier) WithRevisionChecks(src RevisionSource, minPolicyRev in
 // backend routes. A nil source still permits a lower-bound-only check.
 func (b *BackendVerifier) WithPolicyEpochChecks(src PolicyEpochSource, minEpoch uint64) *BackendVerifier {
 	b.policyEpochs = src
+	b.minPolicyEpoch = minEpoch
+	b.contextEpochs = nil
+	if contextSource, ok := src.(ContextPolicyEpochSource); ok {
+		b.contextEpochs = contextSource
+	}
+	return b
+}
+
+// WithContextPolicyEpochChecks is the cancellable counterpart to
+// WithPolicyEpochChecks.
+func (b *BackendVerifier) WithContextPolicyEpochChecks(src ContextPolicyEpochSource, minEpoch uint64) *BackendVerifier {
+	b.contextEpochs, b.policyEpochs = src, nil
 	b.minPolicyEpoch = minEpoch
 	return b
 }
@@ -159,11 +185,11 @@ func (b *BackendVerifier) VerifyContext(ctx context.Context, r *http.Request) (*
 	}
 	// P0.19: authoritative revision freshness for sensitive backends. The
 	// lookup failing is stale-by-unknown → deny (fail closed).
-	if b.rev != nil {
+	if b.contextRev != nil || b.rev != nil {
 		var cur int
 		var ok bool
-		if contextSource, implements := b.rev.(ContextRevisionSource); implements {
-			value, lookupErr := contextSource.CredentialRevisionContext(ctx, claims.CredID)
+		if b.contextRev != nil {
+			value, lookupErr := b.contextRev.CredentialRevisionContext(ctx, claims.CredID)
 			cur, ok = value, lookupErr == nil
 		} else {
 			cur, ok = b.rev.CredentialRevision(claims.CredID)
@@ -175,15 +201,15 @@ func (b *BackendVerifier) VerifyContext(ctx context.Context, r *http.Request) (*
 			return nil, fmt.Errorf("backend: assertion policy_rev %d below minimum %d (P0.19)", claims.PolicyRev, b.minPolicyRev)
 		}
 	}
-	if b.policyEpochs != nil || b.minPolicyEpoch > 0 {
+	if b.contextEpochs != nil || b.policyEpochs != nil || b.minPolicyEpoch > 0 {
 		if claims.PolicyEpoch == 0 || claims.PolicyEpoch < b.minPolicyEpoch {
 			return nil, fmt.Errorf("backend: assertion policy epoch %d is stale (P0.19)", claims.PolicyEpoch)
 		}
-		if b.policyEpochs != nil {
+		if b.contextEpochs != nil || b.policyEpochs != nil {
 			var current uint64
 			var ok bool
-			if contextSource, implements := b.policyEpochs.(ContextPolicyEpochSource); implements {
-				value, lookupErr := contextSource.PolicyEpochContext(ctx)
+			if b.contextEpochs != nil {
+				value, lookupErr := b.contextEpochs.PolicyEpochContext(ctx)
 				current, ok = value, lookupErr == nil
 			} else {
 				current, ok = b.policyEpochs.PolicyEpoch()

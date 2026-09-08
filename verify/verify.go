@@ -184,14 +184,16 @@ type TransportTrust interface {
 // Verifier validates the short-lived assertion and provides middleware for a
 // protected HTTP handler.
 type Verifier struct {
-	keys           map[int]ed25519.PublicKey
-	audience       string
-	now            func() time.Time
-	revisions      RevisionSource
-	minPolicyRev   int
-	policyEpochs   PolicyEpochSource
-	minPolicyEpoch uint64
-	transport      TransportTrust
+	keys                map[int]ed25519.PublicKey
+	audience            string
+	now                 func() time.Time
+	revisions           RevisionSource
+	contextRevisions    ContextRevisionSource
+	minPolicyRev        int
+	policyEpochs        PolicyEpochSource
+	contextPolicyEpochs ContextPolicyEpochSource
+	minPolicyEpoch      uint64
+	transport           TransportTrust
 }
 
 // New constructs a verifier bound to one exact audience.
@@ -222,6 +224,18 @@ func (v *Verifier) WithClock(now func() time.Time) *Verifier {
 
 func (v *Verifier) WithRevisionChecks(src RevisionSource, minPolicyRev int) *Verifier {
 	v.revisions, v.minPolicyRev = src, minPolicyRev
+	v.contextRevisions = nil
+	if contextSource, ok := src.(ContextRevisionSource); ok {
+		v.contextRevisions = contextSource
+	}
+	return v
+}
+
+// WithContextRevisionChecks is the primary API for distributed authorities
+// that only expose cancellable freshness lookups. It avoids requiring such an
+// authority to implement the legacy context-free interface as well.
+func (v *Verifier) WithContextRevisionChecks(src ContextRevisionSource, minPolicyRev int) *Verifier {
+	v.contextRevisions, v.revisions, v.minPolicyRev = src, nil, minPolicyRev
 	return v
 }
 
@@ -229,6 +243,17 @@ func (v *Verifier) WithRevisionChecks(src RevisionSource, minPolicyRev int) *Ver
 // source is optional; when nil, minEpoch still provides a lower-bound check.
 func (v *Verifier) WithPolicyEpochChecks(src PolicyEpochSource, minEpoch uint64) *Verifier {
 	v.policyEpochs, v.minPolicyEpoch = src, minEpoch
+	v.contextPolicyEpochs = nil
+	if contextSource, ok := src.(ContextPolicyEpochSource); ok {
+		v.contextPolicyEpochs = contextSource
+	}
+	return v
+}
+
+// WithContextPolicyEpochChecks is the cancellable counterpart to
+// WithPolicyEpochChecks for distributed policy authorities.
+func (v *Verifier) WithContextPolicyEpochChecks(src ContextPolicyEpochSource, minEpoch uint64) *Verifier {
+	v.contextPolicyEpochs, v.policyEpochs, v.minPolicyEpoch = src, nil, minEpoch
 	return v
 }
 
@@ -367,9 +392,9 @@ func (v *Verifier) verifyEncodedContext(ctx context.Context, encoded string) (*C
 	if now.Unix() < c.IssuedAt-5 {
 		return nil, ErrNotYetValid
 	}
-	if v.revisions != nil {
-		if contextSource, ok := v.revisions.(ContextRevisionSource); ok {
-			current, err := contextSource.CredentialRevisionContext(ctx, c.CredID)
+	if v.contextRevisions != nil || v.revisions != nil {
+		if v.contextRevisions != nil {
+			current, err := v.contextRevisions.CredentialRevisionContext(ctx, c.CredID)
 			if err != nil {
 				return nil, ErrCredentialRevisionUnavailable
 			}
@@ -386,15 +411,15 @@ func (v *Verifier) verifyEncodedContext(ctx context.Context, encoded string) (*C
 			return nil, ErrStalePolicyRevision
 		}
 	}
-	if v.policyEpochs != nil || v.minPolicyEpoch > 0 {
+	if v.contextPolicyEpochs != nil || v.policyEpochs != nil || v.minPolicyEpoch > 0 {
 		if c.PolicyEpoch == 0 || c.PolicyEpoch < v.minPolicyEpoch {
 			return nil, ErrStalePolicyEpoch
 		}
-		if v.policyEpochs != nil {
+		if v.contextPolicyEpochs != nil || v.policyEpochs != nil {
 			var current uint64
 			var err error
-			if contextSource, ok := v.policyEpochs.(ContextPolicyEpochSource); ok {
-				current, err = contextSource.PolicyEpochContext(ctx)
+			if v.contextPolicyEpochs != nil {
+				current, err = v.contextPolicyEpochs.PolicyEpochContext(ctx)
 			} else {
 				var exists bool
 				current, exists = v.policyEpochs.PolicyEpoch()
