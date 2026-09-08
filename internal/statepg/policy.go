@@ -80,6 +80,26 @@ func (s *Store) PersistPolicyManifest(manifest policy.Manifest) error {
 	return mapDBError(err)
 }
 
+// InitializePolicyManifest publishes the first cluster policy with
+// create-only semantics. A normal lifecycle persistence operation must never
+// be used here: two nodes can boot concurrently with different local policy
+// files, and neither is allowed to overwrite the winner.
+func (s *Store) InitializePolicyManifest(manifest policy.Manifest) error {
+	if manifest.ActivationEpoch == 0 {
+		manifest.ActivationEpoch = 1
+	}
+	if err := validatePolicyManifest(manifest); err != nil {
+		return err
+	}
+	raw, err := json.Marshal(manifest)
+	if err != nil {
+		return err
+	}
+	_, err = s.pool.Exec(context.Background(), `INSERT INTO gripline_policy_manifest (singleton, manifest, updated_at)
+		VALUES (TRUE,$1,$2) ON CONFLICT (singleton) DO NOTHING`, raw, manifest.UpdatedAt.UTC())
+	return mapDBError(err)
+}
+
 func (s *Store) PersistPolicyArtifact(compiled *policy.CompiledPolicy) error {
 	if compiled == nil {
 		return errors.New("statepg: policy artifact required")

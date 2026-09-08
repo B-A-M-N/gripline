@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -82,8 +83,12 @@ type Options struct {
 	// commit the manifest and transition journal as one crash-visible record.
 	// Persist/Audit remain supported for small integrations and tests.
 	PersistTransition func(Manifest, Event) error
-	LoadManifest      func() (Manifest, error)
-	LoadArtifact      func(PolicyRef) (*CompiledPolicy, error)
+	// Initialize is a create-only durable hook for the first clustered boot.
+	// It must never replace an existing manifest. NewManager rereads the
+	// manifest after this hook and rejects a different active policy.
+	Initialize   func(Manifest) error
+	LoadManifest func() (Manifest, error)
+	LoadArtifact func(PolicyRef) (*CompiledPolicy, error)
 }
 
 // NewManager validates the initial policy and starts with it as known-good.
@@ -153,10 +158,34 @@ func NewManager(initial *Policy, opts Options) (*Manager, error) {
 					return nil, fmt.Errorf("policy: persist initial artifact: %w", err)
 				}
 			}
-			if opts.Persist != nil {
+			if opts.Initialize != nil {
+				if err := opts.Initialize(initialManifest); err != nil {
+					return nil, fmt.Errorf("policy: initialize manifest: %w", err)
+				}
+			} else if opts.Persist != nil {
 				if err := opts.Persist(initialManifest); err != nil {
 					return nil, fmt.Errorf("policy: persist initial manifest: %w", err)
 				}
+			}
+			if opts.Initialize != nil || opts.Persist != nil {
+				// A create-only initializer may have lost a concurrent first
+				// boot. Re-read the winner before constructing any lifecycle
+				// state; never let startup policy input overwrite the shared
+				// authority.
+				manifest, loadErr = opts.LoadManifest()
+				if loadErr != nil {
+					return nil, loadErr
+				}
+				if manifest.Active.Revision == 0 {
+					return nil, errors.New("policy: initial manifest was not committed")
+				}
+				if !samePolicyRef(manifest.Active, initialManifest.Active) {
+					return nil, errors.New("policy: configured initial policy conflicts with durable active manifest")
+				}
+				if manifest.ActivationEpoch == 0 {
+					manifest.ActivationEpoch = 1
+				}
+				m.activationEpoch = manifest.ActivationEpoch
 			}
 		}
 		if manifest.Candidate != nil {
@@ -186,6 +215,24 @@ func NewManager(initial *Policy, opts Options) (*Manager, error) {
 		}
 	}
 	return m, nil
+}
+
+func samePolicyRef(a, b PolicyRef) bool {
+	return a.ID == b.ID && a.Revision == b.Revision && a.Digest == b.Digest
+}
+
+// Ready verifies that this process has a usable policy snapshot and, when a
+// durable lifecycle store is configured, that the snapshot can be reconciled
+// with the shared active manifest. It is intentionally separate from the data
+// plane Snapshot method so callers can put a timeout around readiness probes.
+func (m *Manager) Ready(_ context.Context) error {
+	if m == nil {
+		return errors.New("policy: nil manager")
+	}
+	if m.Snapshot() == nil {
+		return errors.New("policy: active snapshot unavailable")
+	}
+	return nil
 }
 
 // Current returns the active immutable snapshot.
@@ -248,7 +295,7 @@ func (m *Manager) Candidate() *CompiledPolicy {
 // an error; Current then returns nil and the data plane fails closed instead of
 // enforcing a potentially stale policy during an authority outage.
 func (m *Manager) refreshDurableLocked() error {
-	if m.loadManifest == nil || m.loadArtifact == nil {
+	if m.loadManifest == nil {
 		return nil
 	}
 	manifest, err := m.loadManifest()
@@ -256,7 +303,7 @@ func (m *Manager) refreshDurableLocked() error {
 		return err
 	}
 	if manifest.Active.Revision == 0 {
-		return nil
+		return errors.New("policy: shared active manifest unavailable")
 	}
 	if manifest.ActivationEpoch == 0 {
 		manifest.ActivationEpoch = 1
@@ -270,6 +317,9 @@ func (m *Manager) refreshDurableLocked() error {
 		return err
 	}
 	if m.current.ID != manifest.Active.ID || m.current.Revision != manifest.Active.Revision || activeDigest != manifest.Active.Digest {
+		if m.loadArtifact == nil {
+			return errors.New("policy: shared active policy differs and no artifact loader is configured")
+		}
 		active, err := m.loadArtifact(manifest.Active)
 		if err != nil {
 			return fmt.Errorf("policy: refresh active artifact: %w", err)
@@ -286,6 +336,9 @@ func (m *Manager) refreshDurableLocked() error {
 	if manifest.Candidate == nil {
 		m.candidate = nil
 	} else if m.candidate == nil || m.candidate.ID != manifest.Candidate.ID || m.candidate.Revision != manifest.Candidate.Revision {
+		if m.loadArtifact == nil {
+			return errors.New("policy: shared candidate exists and no artifact loader is configured")
+		}
 		candidate, err := m.loadArtifact(*manifest.Candidate)
 		if err != nil {
 			return fmt.Errorf("policy: refresh candidate artifact: %w", err)
@@ -305,6 +358,9 @@ func (m *Manager) refreshDurableLocked() error {
 		return nil
 	}
 	if _, ok := m.knownGood[manifest.Previous.Revision]; !ok {
+		if m.loadArtifact == nil {
+			return errors.New("policy: shared previous policy exists and no artifact loader is configured")
+		}
 		previous, err := m.loadArtifact(*manifest.Previous)
 		if err != nil {
 			return fmt.Errorf("policy: refresh previous artifact: %w", err)

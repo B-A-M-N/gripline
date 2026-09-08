@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"context"
 	"errors"
 	"testing"
 )
@@ -154,5 +155,62 @@ func TestManagerRefreshesSharedPolicyEpochWithoutArtifactChange(t *testing.T) {
 	manifest.ActivationEpoch = 8
 	if epoch, ok := m.PolicyEpoch(); !ok || epoch != 8 {
 		t.Fatalf("refreshed policy epoch: %d, %v", epoch, ok)
+	}
+}
+
+func TestManagerInitializesSharedPolicyCreateOnly(t *testing.T) {
+	var shared Manifest
+	var initializeCalls int
+	load := func() func() (Manifest, error) {
+		first := true
+		return func() (Manifest, error) {
+			if first {
+				first = false
+				return Manifest{}, nil
+			}
+			return shared, nil
+		}
+	}
+	initialize := func(manifest Manifest) error {
+		initializeCalls++
+		if shared.Active.Revision == 0 {
+			shared = manifest
+		}
+		return nil
+	}
+
+	if _, err := NewManager(Default(), Options{Initialize: initialize, LoadManifest: load()}); err != nil {
+		t.Fatalf("same-policy first boot: %v", err)
+	}
+	if initializeCalls != 1 || shared.Active.Revision != 1 {
+		t.Fatalf("initialization state: calls=%d manifest=%+v", initializeCalls, shared)
+	}
+
+	conflicting := Default()
+	conflicting.Revision = 2
+	if _, err := NewManager(conflicting, Options{Initialize: initialize, LoadManifest: load()}); err == nil {
+		t.Fatal("conflicting concurrent first boot must fail")
+	}
+	if shared.Active.Revision != 1 {
+		t.Fatalf("conflicting first boot replaced shared policy: %+v", shared.Active)
+	}
+}
+
+func TestManagerReadyFailsWhenSharedPolicyCannotRefresh(t *testing.T) {
+	loadCalls := 0
+	m, err := NewManager(Default(), Options{
+		LoadManifest: func() (Manifest, error) {
+			loadCalls++
+			if loadCalls == 1 {
+				return Manifest{}, nil
+			}
+			return Manifest{}, errors.New("authority unavailable")
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Ready(context.Background()); err == nil {
+		t.Fatal("readiness must fail when the shared policy authority cannot refresh")
 	}
 }

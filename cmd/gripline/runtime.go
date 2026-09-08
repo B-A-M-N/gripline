@@ -63,6 +63,13 @@ type StateHealth interface {
 	Ready(context.Context) error
 }
 
+// PolicyHealth is the policy-specific readiness contract. In clustered mode
+// the manager refreshes the shared manifest and refuses readiness when the
+// current artifact or activation epoch cannot be resolved.
+type PolicyHealth interface {
+	Ready(context.Context) error
+}
+
 // Runtime is the single application composition root (P0.1/P0.2).
 // All security-critical state is instantiated once and shared.
 type Runtime struct {
@@ -87,6 +94,7 @@ type Runtime struct {
 	Policy         *policy.Policy
 	PolicyManager  *policy.Manager
 	StateHealth    StateHealth
+	PolicyHealth   PolicyHealth
 	State          *statebolt.Store // non-nil when backed by the transactional store
 	Postgres       *statepg.Store   // non-nil when backed by the clustered authority
 	Audience       string
@@ -113,6 +121,11 @@ func (rt *Runtime) Ready() error {
 		if err != nil {
 			return fmt.Errorf("gripline: state authority not ready: %w", err)
 		}
+		if rt.PolicyHealth != nil {
+			if err := rt.PolicyHealth.Ready(ctx); err != nil {
+				return fmt.Errorf("gripline: policy authority not ready: %w", err)
+			}
+		}
 	} else {
 		// Compatibility for hand-built Runtime values from older embedders.
 		if rt.State != nil {
@@ -123,6 +136,14 @@ func (rt *Runtime) Ready() error {
 		if rt.Postgres != nil {
 			if err := rt.Postgres.Ready(context.Background()); err != nil {
 				return fmt.Errorf("gripline: postgres authority not ready: %w", err)
+			}
+		}
+		if rt.PolicyHealth != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			err := rt.PolicyHealth.Ready(ctx)
+			cancel()
+			if err != nil {
+				return fmt.Errorf("gripline: policy authority not ready: %w", err)
 			}
 		}
 	}
@@ -368,6 +389,7 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 	} else if postgres != nil {
 		policyOptions = policy.Options{
 			Persist:           postgres.PersistPolicyManifest,
+			Initialize:        postgres.InitializePolicyManifest,
 			PersistArtifact:   postgres.PersistPolicyArtifact,
 			PersistTransition: postgres.PersistPolicyTransition,
 			LoadManifest:      postgres.LoadPolicyManifest,
@@ -660,6 +682,7 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		Policy:         pol,
 		PolicyManager:  policyManager,
 		StateHealth:    stateHealth,
+		PolicyHealth:   policyManager,
 		Authorities:    authorities,
 		State:          state,
 		Postgres:       postgres,
