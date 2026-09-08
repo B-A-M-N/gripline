@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/B-A-M-N/gripline/internal/control"
@@ -239,6 +240,49 @@ func (s *Store) CryptoReady(ctx context.Context) error {
 		return fmt.Errorf("%w: observed epoch %d, authority epoch %d", ErrCryptoIdentityStale, observed.epoch, current.epoch)
 	}
 	return nil
+}
+
+// StartCryptoWatcher periodically checks the shared generation epoch so a
+// node is fenced even when no load balancer readiness probe happens to run.
+// The returned stop function is idempotent and must be joined before the
+// authority pool closes.
+func (s *Store) StartCryptoWatcher(parent context.Context, interval, operationTimeout time.Duration) func() {
+	if s == nil || s.nodeID == "" {
+		return func() {}
+	}
+	if interval <= 0 {
+		interval = time.Second
+	}
+	if operationTimeout <= 0 {
+		operationTimeout = 2 * time.Second
+	}
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				checkCtx, checkCancel := context.WithTimeout(ctx, operationTimeout)
+				_ = s.CryptoReady(checkCtx)
+				checkCancel()
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			cancel()
+			<-done
+		})
+	}
 }
 
 // ActivateCryptoGeneration atomically advances one shared active generation.

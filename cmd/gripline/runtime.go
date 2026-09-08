@@ -514,6 +514,8 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 				return nil, fmt.Errorf("gripline: cluster pseudonym generation: %w", err)
 			}
 		}
+		stopCryptoWatcher := postgres.StartCryptoWatcher(context.Background(), time.Second, operationTimeout)
+		closers = append(closers, func() error { stopCryptoWatcher(); return nil })
 	}
 
 	// Policy reconciliation acknowledges the active shared policy through the
