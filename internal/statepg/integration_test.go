@@ -2,6 +2,7 @@ package statepg
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -361,6 +362,147 @@ func TestPostgresServingOpenRequiresExplicitMigration(t *testing.T) {
 		t.Fatalf("inspect migrated schema: %v", err)
 	} else if !status.Present || status.Version != SupportedSchemaVersion() {
 		t.Fatalf("migrated schema status=%+v, want current version", status)
+	}
+}
+
+func TestPostgresMaintenanceCleansBoundedHistoricalRows(t *testing.T) {
+	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("GRIPLINE_TEST_POSTGRES_DSN is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resetIntegrationAuthority(t, ctx, dsn)
+	retention := time.Hour
+	store, err := Open(ctx, Options{
+		DSN: dsn, NodeID: "maintenance-node", LeaseTTL: 10 * time.Second,
+		RenewEvery: 2 * time.Second, OperationTimeout: 10 * time.Second,
+		Maintenance: MaintenanceOptions{
+			Interval: time.Hour, BatchSize: 16, ReleasedLeaseRetention: retention,
+			CredentialReceiptRetention: retention, ControlOperationRetention: retention,
+			AdmissionAuditRetention: retention, SecurityTransitionRetention: retention,
+			OperatorAuditRetention: retention, PolicyAuditRetention: retention,
+			MembershipRetention: retention, AdaptiveRetention: retention,
+		},
+	})
+	if err != nil {
+		t.Fatalf("open maintenance authority: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC().Add(-2 * time.Hour)
+	if _, err := store.pool.Exec(ctx, `INSERT INTO gripline_resource_leases
+		(lease_id, request_id, request_fingerprint, node_id, node_epoch, state, expires_at, created_at, released_at)
+		VALUES ('maintenance-lease','maintenance-request','fingerprint','maintenance-node',1,'released',$1,$1,$1)`, now); err != nil {
+		t.Fatalf("seed released lease: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO gripline_credential_receipts
+		(request_id, credential_id, changed, before_record, after_record, created_at)
+		VALUES ('maintenance-receipt','maintenance-credential',false,'{}','{}',$1)`, now); err != nil {
+		t.Fatalf("seed credential receipt: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO gripline_control_operations
+		(operation_id, action, payload_fingerprint, created_at)
+		VALUES ('maintenance-operation','test','fingerprint',$1)`, now); err != nil {
+		t.Fatalf("seed control operation: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO gripline_admission_audit
+		(at, request_id, credential_id, account_id, lane_id, posture, authorized, reason)
+		VALUES ($1,'maintenance-request','maintenance-credential','maintenance-account','maintenance-lane','NORMAL',true,'authorized')`, now); err != nil {
+		t.Fatalf("seed admission audit: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO gripline_security_transitions
+		(at, kind, request_id, credential_id, lane_id, before_state, after_state, risk_score, revision, policy_revision, evidence_codes)
+		VALUES ($1,'credential_status','maintenance-request','maintenance-credential','','NORMAL','WATCH',1,1,1,'[]')`, now); err != nil {
+		t.Fatalf("seed security transition: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO gripline_operator_audit
+		(at, actor, action, target, reason, posture, committed, detail)
+		VALUES ($1,'maintenance-operator','test','maintenance-target','test','NORMAL',true,'')`, now); err != nil {
+		t.Fatalf("seed operator audit: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO gripline_policy_audit (event, created_at)
+		VALUES ('{}',$1)`, now); err != nil {
+		t.Fatalf("seed policy audit: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO gripline_membership
+		(node_id, instance_id, node_epoch, protocol_version, schema_version, state, last_seen_at)
+		VALUES ('maintenance-old-node','old-instance',1,1,$1,'stopped',$2)`, SupportedSchemaVersion(), now); err != nil {
+		t.Fatalf("seed stopped membership: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO gripline_adaptive_window_subjects (detector, subject, last_seen_at)
+		VALUES ('maintenance-detector','maintenance-subject',$1)`, now); err != nil {
+		t.Fatalf("seed adaptive subject: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO gripline_adaptive_window_keys (detector, subject, observation_key, observed_at)
+		VALUES ('maintenance-detector','maintenance-subject','maintenance-key',$1)`, now); err != nil {
+		t.Fatalf("seed adaptive key: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO gripline_adaptive_baselines
+		(detector, subject, metric, ema, sample_count, last_seen_at)
+		VALUES ('maintenance-detector','maintenance-subject','requests',1,3,$1)`, now); err != nil {
+		t.Fatalf("seed adaptive baseline: %v", err)
+	}
+
+	expired := evidence.Evidence{
+		EvidenceID: "maintenance-expired", Code: "NEW_SOURCE", Family: evidence.FamilySourceDiscontinuity,
+		Scope: evidence.ScopeCredential, SubjectID: "maintenance-credential", Score: 1, Confidence: 50,
+		CreatedAt: now, ExpiresAt: now.Add(time.Minute),
+	}
+	active := expired
+	active.EvidenceID = "maintenance-active"
+	active.ExpiresAt = time.Now().UTC().Add(time.Hour)
+	for _, item := range []evidence.Evidence{expired, active} {
+		raw, marshalErr := json.Marshal(item)
+		if marshalErr != nil {
+			t.Fatalf("marshal evidence fixture: %v", marshalErr)
+		}
+		if _, err := store.pool.Exec(ctx, `INSERT INTO gripline_evidence
+			(scope, subject_id, evidence_id, item) VALUES ($1,$2,$3,$4)`, item.Scope.String(), item.SubjectID, item.EvidenceID, raw); err != nil {
+			t.Fatalf("seed evidence %s: %v", item.EvidenceID, err)
+		}
+	}
+
+	stats, err := store.RunMaintenance(ctx)
+	if err != nil {
+		t.Fatalf("run maintenance: %v", err)
+	}
+	if stats.ReleasedLeasesDeleted != 1 || stats.CredentialReceiptsDeleted != 1 || stats.ControlOperationsDeleted != 1 || stats.EvidenceDeleted != 1 {
+		t.Fatalf("maintenance stats=%+v, want released lease, receipt, operation, and expired evidence cleanup", stats)
+	}
+	for table := range map[string]struct{}{
+		"gripline_resource_leases":          {},
+		"gripline_credential_receipts":      {},
+		"gripline_control_operations":       {},
+		"gripline_admission_audit":          {},
+		"gripline_security_transitions":     {},
+		"gripline_operator_audit":           {},
+		"gripline_policy_audit":             {},
+		"gripline_adaptive_window_keys":     {},
+		"gripline_adaptive_baselines":       {},
+		"gripline_adaptive_window_subjects": {},
+	} {
+		var count int
+		if err := store.pool.QueryRow(ctx, "SELECT COUNT(*) FROM "+table).Scan(&count); err != nil {
+			t.Fatalf("count %s: %v", table, err)
+		}
+		if count != 0 {
+			t.Errorf("%s count=%d, want 0", table, count)
+		}
+	}
+	var oldMembershipCount int
+	if err := store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_membership WHERE node_id='maintenance-old-node'`).Scan(&oldMembershipCount); err != nil {
+		t.Fatalf("count retired membership: %v", err)
+	}
+	if oldMembershipCount != 0 {
+		t.Fatalf("retired membership count=%d, want 0", oldMembershipCount)
+	}
+	var evidenceCount int
+	if err := store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_evidence WHERE evidence_id='maintenance-active'`).Scan(&evidenceCount); err != nil {
+		t.Fatalf("count retained evidence: %v", err)
+	}
+	if evidenceCount != 1 {
+		t.Fatalf("retained evidence count=%d, want 1", evidenceCount)
 	}
 }
 

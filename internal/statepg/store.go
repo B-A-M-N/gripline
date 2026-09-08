@@ -37,6 +37,7 @@ type Options struct {
 	// default around remote operations. The request context remains the
 	// authoritative upper bound when one is supplied.
 	OperationTimeout time.Duration
+	Maintenance      MaintenanceOptions
 	// Migrate grants this process permission to create or alter the authority
 	// schema. Serving nodes must leave it false and only verify compatibility;
 	// the dedicated migration command sets it true.
@@ -56,8 +57,11 @@ type Store struct {
 	maxSourceScopes  int
 	sourceScopeIdle  time.Duration
 	operationTimeout time.Duration
+	maintenance      MaintenanceOptions
 	leaseStop        chan struct{}
 	leaseDone        chan struct{}
+	maintenanceStop  chan struct{}
+	maintenanceDone  chan struct{}
 	membershipStop   chan struct{}
 	membershipDone   chan struct{}
 	cryptoReady      atomic.Bool
@@ -73,10 +77,12 @@ type Store struct {
 // adds durable control-operation claims. Version 8 adds evidence subject
 // guards for deterministic first-write locking. Version 9 adds staged
 // cluster-crypto generations and per-node capability acknowledgements. Version
-// 10 adds per-node policy observations used as an activation barrier. Keep
-// the marker versioned even though the DDL below is idempotent: CREATE TABLE
-// IF NOT EXISTS cannot add columns to an already initialized database.
-const currentSchemaVersion = 10
+// 10 adds per-node policy observations used as an activation barrier. Version
+// 11 adds explicit creation timestamps to retention-managed receipts and
+// policy audit. Keep the marker versioned even though the DDL below is
+// idempotent: CREATE TABLE IF NOT EXISTS cannot add columns to an already
+// initialized database.
+const currentSchemaVersion = 11
 
 const maxTransactionAttempts = 3
 
@@ -144,7 +150,8 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 	if opts.OperationTimeout <= 0 {
 		opts.OperationTimeout = 2 * time.Second
 	}
-	s := &Store{pool: pool, now: opts.Now, nodeID: opts.NodeID, leaseTTL: opts.LeaseTTL, maxSourceScopes: opts.MaxSourceScopes, sourceScopeIdle: opts.SourceScopeIdle, operationTimeout: opts.OperationTimeout,
+	maintenance := opts.Maintenance.withDefaults()
+	s := &Store{pool: pool, now: opts.Now, nodeID: opts.NodeID, leaseTTL: opts.LeaseTTL, maxSourceScopes: opts.MaxSourceScopes, sourceScopeIdle: opts.SourceScopeIdle, operationTimeout: opts.OperationTimeout, maintenance: maintenance,
 		leaseStop: make(chan struct{}), leaseDone: make(chan struct{})}
 	if err := s.Ping(connectCtx); err != nil {
 		pool.Close()
@@ -166,7 +173,10 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 		}
 		s.membershipStop = make(chan struct{})
 		s.membershipDone = make(chan struct{})
+		s.maintenanceStop = make(chan struct{})
+		s.maintenanceDone = make(chan struct{})
 		go s.membershipHeartbeat()
+		go s.maintenanceLoop()
 	}
 	go s.leaseReaper()
 	return s, nil
@@ -322,6 +332,14 @@ func CheckSchemaCompatibility(ctx context.Context, pool *pgxpool.Pool) error {
 // Close releases the shared connection pool.
 func (s *Store) Close() {
 	if s != nil && s.pool != nil {
+		if s.maintenanceStop != nil {
+			select {
+			case <-s.maintenanceStop:
+			default:
+				close(s.maintenanceStop)
+				<-s.maintenanceDone
+			}
+		}
 		if s.membershipStop != nil {
 			select {
 			case <-s.membershipStop:
@@ -475,7 +493,8 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 		)`,
 		`CREATE TABLE IF NOT EXISTS gripline_policy_audit (
 			sequence BIGSERIAL PRIMARY KEY,
-			event JSONB NOT NULL
+			event JSONB NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`,
 		`CREATE TABLE IF NOT EXISTS gripline_adaptive_state (
 			name TEXT PRIMARY KEY,
@@ -555,6 +574,7 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			changed BOOLEAN NOT NULL,
 			before_record JSONB NOT NULL,
 			after_record JSONB NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			PRIMARY KEY (request_id, credential_id)
 		)`,
 		`CREATE TABLE IF NOT EXISTS gripline_membership (
@@ -731,6 +751,19 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 		// Version 10's policy observation table is created by the idempotent
 		// DDL above; advancing the marker is sufficient for existing databases.
 		version = 10
+	}
+	if version == 10 {
+		for _, statement := range []string{
+			`ALTER TABLE gripline_credential_receipts ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP`,
+			`CREATE INDEX IF NOT EXISTS gripline_credential_receipts_created_idx ON gripline_credential_receipts (created_at)`,
+			`ALTER TABLE gripline_policy_audit ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP`,
+			`CREATE INDEX IF NOT EXISTS gripline_policy_audit_created_idx ON gripline_policy_audit (created_at)`,
+		} {
+			if _, err := tx.Exec(ctx, statement); err != nil {
+				return fmt.Errorf("statepg: migrate retention timestamps: %w", mapDBError(err))
+			}
+		}
+		version = 11
 	}
 	if version != currentSchemaVersion {
 		return fmt.Errorf("%w: unsupported migration state %d", ErrMigrationRequired, version)
