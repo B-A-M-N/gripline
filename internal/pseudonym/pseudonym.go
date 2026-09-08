@@ -12,7 +12,10 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
+	"sort"
+	"strconv"
 )
 
 // Key is a keyed transform key with a version tag.
@@ -56,7 +59,8 @@ const (
 
 // Ring holds the active pseudonym keys by version.
 type Ring struct {
-	active map[int][]byte
+	active        map[int][]byte
+	activeVersion int
 }
 
 // Format implements fmt.Formatter and always redacts (P0.16). VALUE receiver:
@@ -108,6 +112,11 @@ func NewRing(keys ...*Key) (*Ring, error) {
 
 // latest returns the highest configured key version.
 func (r *Ring) latest() int {
+	if r.activeVersion > 0 {
+		if _, ok := r.active[r.activeVersion]; ok {
+			return r.activeVersion
+		}
+	}
 	best := -1
 	for v := range r.active {
 		if v > best {
@@ -115,6 +124,43 @@ func (r *Ring) latest() int {
 		}
 	}
 	return best
+}
+
+// SetActiveVersion selects the cluster-authoritative generation for new
+// pseudonyms. Older loaded generations remain available to Verify.
+func (r *Ring) SetActiveVersion(version int) error {
+	if r == nil {
+		return fmt.Errorf("pseudonym: nil ring")
+	}
+	if _, ok := r.active[version]; !ok {
+		return fmt.Errorf("pseudonym: key version %d is not loaded", version)
+	}
+	r.activeVersion = version
+	return nil
+}
+
+// ActiveVersion returns the generation used for new pseudonyms.
+func (r *Ring) ActiveVersion() int { return r.latest() }
+
+// Fingerprint returns a stable digest of all loaded pseudonym generations.
+// The digest binds cluster configuration without exposing key material.
+func (r *Ring) Fingerprint() string {
+	if r == nil {
+		return ""
+	}
+	versions := make([]int, 0, len(r.active))
+	for version := range r.active {
+		versions = append(versions, version)
+	}
+	sort.Ints(versions)
+	h := sha256.New()
+	for _, version := range versions {
+		_, _ = h.Write([]byte(strconv.Itoa(version)))
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write(r.active[version])
+		_, _ = h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // keyFor returns the key bytes for a version.

@@ -163,6 +163,9 @@ func (s *Store) requireNodeOwnership(ctx context.Context, tx pgx.Tx, allowDraini
 	if s.nodeID == "" {
 		return nil
 	}
+	if !s.cryptoReady.Load() {
+		return errors.New("statepg: cluster crypto identity is not synchronized")
+	}
 	if s.fenced.Load() {
 		return ErrNodeFenced
 	}

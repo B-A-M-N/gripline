@@ -45,6 +45,7 @@ type Store struct {
 	leaseDone       chan struct{}
 	membershipStop  chan struct{}
 	membershipDone  chan struct{}
+	cryptoReady     atomic.Bool
 }
 
 // Schema version 1 is the original clustered-authority layout. Version 2
@@ -52,10 +53,10 @@ type Store struct {
 // and the shared audit/state tables now used by the runtime. Version 3 binds
 // a request id to its resource payload. Version 4 adds node-instance fencing
 // to membership and resource leases. Version 5 adds keyed adaptive windows
-// and baselines. Keep the marker versioned even though
+// and baselines. Version 6 adds the cluster crypto identity record. Keep the marker versioned even though
 // the DDL below is idempotent: CREATE TABLE IF NOT EXISTS cannot add columns
 // to an already initialized database.
-const currentSchemaVersion = 5
+const currentSchemaVersion = 6
 
 var ErrMigrationRequired = errors.New("statepg: database schema requires migration")
 var ErrDSNRequired = errors.New("statepg: DSN required")
@@ -361,6 +362,16 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			last_seen_at TIMESTAMPTZ NOT NULL,
 			drain_until TIMESTAMPTZ
 		)`,
+		`CREATE TABLE IF NOT EXISTS gripline_cluster_crypto (
+			singleton BOOLEAN PRIMARY KEY,
+			signer_active_kid INTEGER NOT NULL,
+			signer_fingerprint TEXT NOT NULL,
+			pepper_active_version INTEGER NOT NULL,
+			pepper_fingerprint TEXT NOT NULL,
+			pseudonym_version INTEGER NOT NULL,
+			pseudonym_fingerprint TEXT NOT NULL,
+			updated_at TIMESTAMPTZ NOT NULL
+		)`,
 		`CREATE TABLE IF NOT EXISTS gripline_evidence (
 			scope TEXT NOT NULL,
 			subject_id TEXT NOT NULL,
@@ -445,6 +456,11 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 		// Version 5's keyed adaptive tables are created by the idempotent DDL
 		// above; advancing the marker is sufficient for existing databases.
 		version = 5
+	}
+	if version == 5 {
+		// Version 6's cluster crypto identity table is created by the idempotent
+		// DDL above; advancing the marker is sufficient for existing databases.
+		version = 6
 	}
 	if version != currentSchemaVersion {
 		return fmt.Errorf("%w: unsupported migration state %d", ErrMigrationRequired, version)

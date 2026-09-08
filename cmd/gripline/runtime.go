@@ -436,6 +436,70 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		}
 	}
 
+	// Build ingress pseudonyms before the terminator so a clustered node can
+	// select the shared active generation before any request is admitted.
+	var srcResolver *proxy.IngressSourceResolver
+	var pseudonyms ingress.PseudonymRing
+	if cfg.Ingress != nil && (cfg.Ingress.PseudonymKey != "" || len(cfg.Ingress.PseudonymKeys) > 0) {
+		pseudonyms, err = pseudonymRingFromConfig(cfg, peppers)
+		if err != nil {
+			return nil, err
+		}
+		prefixes := make([]netip.Prefix, 0, len(cfg.Ingress.TrustedProxies))
+		for _, cidr := range cfg.Ingress.TrustedProxies {
+			p, err := netip.ParsePrefix(cidr)
+			if err != nil {
+				return nil, fmt.Errorf("gripline: ingress trusted proxy %q: %w", cidr, err)
+			}
+			prefixes = append(prefixes, p)
+		}
+		resolver := &ingress.Resolver{
+			Pseudonyms:     pseudonyms,
+			TrustedProxies: prefixes,
+		}
+		if len(cfg.Ingress.Networks) > 0 {
+			networks := make(publicingress.StaticNetworks, 0, len(cfg.Ingress.Networks))
+			for _, network := range cfg.Ingress.Networks {
+				prefix, err := netip.ParsePrefix(network.CIDR)
+				if err != nil {
+					return nil, fmt.Errorf("gripline: ingress network %q: %w", network.CIDR, err)
+				}
+				networks = append(networks, publicingress.NetworkMapping{
+					Prefix: prefix, ASN: network.ASN, NetworkType: network.NetworkType, Region: network.Region,
+				})
+			}
+			resolver.Networks = networks
+		}
+		srcResolver = proxy.NewIngressSourceResolver(resolver)
+	}
+	if postgres != nil {
+		pseudonymVersion := 0
+		pseudonymFingerprint := "disabled"
+		if configured, ok := pseudonyms.(*pseudonymRingAdapter); ok {
+			pseudonymVersion = configured.ActiveVersion()
+			pseudonymFingerprint = configured.Fingerprint()
+		}
+		sharedCrypto, err := postgres.SynchronizeCrypto(context.Background(), statepg.CryptoIdentity{
+			SignerActiveKID:      signer.ActiveKid(),
+			SignerFingerprint:    signer.PublicKeysetFingerprint(),
+			PepperActiveVersion:  peppers.ActiveVersion(),
+			PepperFingerprint:    peppers.Fingerprint(),
+			PseudonymVersion:     pseudonymVersion,
+			PseudonymFingerprint: pseudonymFingerprint,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("gripline: cluster crypto identity: %w", err)
+		}
+		if err := peppers.SetActiveVersion(sharedCrypto.PepperActiveVersion); err != nil {
+			return nil, fmt.Errorf("gripline: cluster pepper generation: %w", err)
+		}
+		if configured, ok := pseudonyms.(*pseudonymRingAdapter); ok {
+			if err := configured.SetActiveVersion(sharedCrypto.PseudonymVersion); err != nil {
+				return nil, fmt.Errorf("gripline: cluster pseudonym generation: %w", err)
+			}
+		}
+	}
+
 	term, err := terminator.New(terminator.Dependencies{
 		Registry:       authorities.Credentials,
 		Peppers:        peppers,
@@ -491,41 +555,6 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 			return nil, fmt.Errorf("gripline: backend tls: %w", err)
 		}
 		transport.TLSClientConfig = tlsConfig
-	}
-
-	// P0.6: Build the trusted ingress source resolver if configured.
-	var srcResolver *proxy.IngressSourceResolver
-	if cfg.Ingress != nil && (cfg.Ingress.PseudonymKey != "" || len(cfg.Ingress.PseudonymKeys) > 0) {
-		pseudonyms, err := pseudonymRingFromConfig(cfg, peppers)
-		if err != nil {
-			return nil, err
-		}
-		prefixes := make([]netip.Prefix, 0, len(cfg.Ingress.TrustedProxies))
-		for _, cidr := range cfg.Ingress.TrustedProxies {
-			p, err := netip.ParsePrefix(cidr)
-			if err != nil {
-				return nil, fmt.Errorf("gripline: ingress trusted proxy %q: %w", cidr, err)
-			}
-			prefixes = append(prefixes, p)
-		}
-		resolver := &ingress.Resolver{
-			Pseudonyms:     pseudonyms,
-			TrustedProxies: prefixes,
-		}
-		if len(cfg.Ingress.Networks) > 0 {
-			networks := make(publicingress.StaticNetworks, 0, len(cfg.Ingress.Networks))
-			for _, network := range cfg.Ingress.Networks {
-				prefix, err := netip.ParsePrefix(network.CIDR)
-				if err != nil {
-					return nil, fmt.Errorf("gripline: ingress network %q: %w", network.CIDR, err)
-				}
-				networks = append(networks, publicingress.NetworkMapping{
-					Prefix: prefix, ASN: network.ASN, NetworkType: network.NetworkType, Region: network.Region,
-				})
-			}
-			resolver.Networks = networks
-		}
-		srcResolver = proxy.NewIngressSourceResolver(resolver)
 	}
 
 	proxyCfg := proxy.Config{
@@ -1568,4 +1597,25 @@ type pseudonymRingAdapter struct {
 
 func (a *pseudonymRingAdapter) Derive(family []byte, raw []byte) (string, error) {
 	return a.ring.Derive(pseudonym.Family(family), raw)
+}
+
+func (a *pseudonymRingAdapter) SetActiveVersion(version int) error {
+	if a == nil || a.ring == nil {
+		return errors.New("gripline: pseudonym ring unavailable")
+	}
+	return a.ring.SetActiveVersion(version)
+}
+
+func (a *pseudonymRingAdapter) ActiveVersion() int {
+	if a == nil || a.ring == nil {
+		return 0
+	}
+	return a.ring.ActiveVersion()
+}
+
+func (a *pseudonymRingAdapter) Fingerprint() string {
+	if a == nil || a.ring == nil {
+		return ""
+	}
+	return a.ring.Fingerprint()
 }

@@ -4,12 +4,16 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -696,6 +700,30 @@ func (k *Keyring) PublicKeys() map[int]ed25519.PublicKey {
 		out[kid] = append(ed25519.PublicKey(nil), pub...)
 	}
 	return out
+}
+
+// PublicKeysetFingerprint returns a stable digest of every retained public
+// signer generation. It is cluster identity metadata only; no private key is
+// included. Equal active kids with unequal fingerprints indicate a
+// misprovisioned signing authority.
+func (k *Keyring) PublicKeysetFingerprint() string {
+	if k == nil {
+		return ""
+	}
+	keys := k.PublicKeys()
+	kids := make([]int, 0, len(keys))
+	for kid := range keys {
+		kids = append(kids, kid)
+	}
+	sort.Ints(kids)
+	h := sha256.New()
+	for _, kid := range kids {
+		_, _ = h.Write([]byte(strconv.Itoa(kid)))
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write(keys[kid])
+		_, _ = h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // PublishVerifier builds the VERIFIER-side keyring (P0.17): a

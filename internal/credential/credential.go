@@ -9,10 +9,13 @@
 package credential
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/B-A-M-N/gripline/internal/secret"
@@ -207,8 +210,9 @@ var (
 // accept the version recorded on each stored verifier even after rotation
 // introduces a newer one.
 type PepperRing struct {
-	active map[int][]byte
-	now    func() time.Time
+	active        map[int][]byte
+	now           func() time.Time
+	activeVersion int
 }
 
 // Format implements fmt.Formatter and always redacts (P0.16). VALUE receiver:
@@ -327,6 +331,11 @@ func (r *PepperRing) DeriveAllActiveVerifiers(presented *secret.SealedSecret) ma
 
 // Latest returns the highest configured version.
 func (r *PepperRing) Latest() int {
+	if r.activeVersion > 0 {
+		if _, ok := r.active[r.activeVersion]; ok {
+			return r.activeVersion
+		}
+	}
 	best := -1
 	for v := range r.active {
 		if v > best {
@@ -334,6 +343,40 @@ func (r *PepperRing) Latest() int {
 		}
 	}
 	return best
+}
+
+// SetActiveVersion selects the cluster-authoritative generation for new
+// verifiers. Retained generations remain valid for authentication; this only
+// changes which already-loaded key is used for new credentials and migration.
+func (r *PepperRing) SetActiveVersion(version int) error {
+	if r == nil {
+		return errors.New("credential: nil pepper ring")
+	}
+	if _, ok := r.active[version]; !ok {
+		return fmt.Errorf("credential: pepper version %d is not loaded", version)
+	}
+	r.activeVersion = version
+	return nil
+}
+
+// ActiveVersion returns the selected generation used for new verifiers.
+func (r *PepperRing) ActiveVersion() int { return r.Latest() }
+
+// Fingerprint returns a stable digest of all loaded pepper generations. It is
+// safe to publish as cluster metadata: it binds node configuration without
+// exposing key material.
+func (r *PepperRing) Fingerprint() string {
+	if r == nil {
+		return ""
+	}
+	h := sha256.New()
+	for _, version := range r.Versions() {
+		_, _ = h.Write([]byte(strconv.Itoa(version)))
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write(r.active[version])
+		_, _ = h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // Versions returns the configured versions in ascending order. Authentication
