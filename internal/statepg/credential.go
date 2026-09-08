@@ -85,8 +85,14 @@ func (s *Store) insertCredentialOnce(ctx context.Context, rec *credential.Creden
 	if err := s.requireNodeOwnership(ctx, tx, false); err != nil {
 		return err
 	}
+	authorityNow, err := dbNow(ctx, tx)
+	if err != nil {
+		return err
+	}
+	record := *rec
+	record.CreatedAt = authorityNow
 	_, err = tx.Exec(ctx, `INSERT INTO gripline_credentials (`+credentialColumns+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-		ON CONFLICT (credential_id) DO UPDATE SET account_id=EXCLUDED.account_id, verifier=EXCLUDED.verifier, verifier_version=EXCLUDED.verifier_version, pepper_version=EXCLUDED.pepper_version, status=EXCLUDED.status, security=EXCLUDED.security, policy_id=EXCLUDED.policy_id, plan_id=EXCLUDED.plan_id, created_at=EXCLUDED.created_at, expires_at=EXCLUDED.expires_at, rotated_at=EXCLUDED.rotated_at, last_seen_at=EXCLUDED.last_seen_at, revision=EXCLUDED.revision`, insertArgs(rec, security)...)
+		ON CONFLICT (credential_id) DO UPDATE SET account_id=EXCLUDED.account_id, verifier=EXCLUDED.verifier, verifier_version=EXCLUDED.verifier_version, pepper_version=EXCLUDED.pepper_version, status=EXCLUDED.status, security=EXCLUDED.security, policy_id=EXCLUDED.policy_id, plan_id=EXCLUDED.plan_id, created_at=EXCLUDED.created_at, expires_at=EXCLUDED.expires_at, rotated_at=EXCLUDED.rotated_at, last_seen_at=EXCLUDED.last_seen_at, revision=EXCLUDED.revision`, insertArgs(&record, security)...)
 	if err != nil {
 		return mapDBError(err)
 	}
@@ -125,8 +131,14 @@ func (s *Store) insertCredentialIfAbsentOnce(ctx context.Context, rec *credentia
 	if err := s.requireNodeOwnership(ctx, tx, false); err != nil {
 		return false, err
 	}
+	authorityNow, err := dbNow(ctx, tx)
+	if err != nil {
+		return false, err
+	}
+	record := *rec
+	record.CreatedAt = authorityNow
 	var id string
-	err = tx.QueryRow(ctx, `INSERT INTO gripline_credentials (`+credentialColumns+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT (credential_id) DO NOTHING RETURNING credential_id`, insertArgs(rec, security)...).Scan(&id)
+	err = tx.QueryRow(ctx, `INSERT INTO gripline_credentials (`+credentialColumns+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT (credential_id) DO NOTHING RETURNING credential_id`, insertArgs(&record, security)...).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, mapDBError(tx.Commit(ctx))
 	}
@@ -243,16 +255,16 @@ func mapCredentialReadError(err error) error {
 }
 
 func (s *Store) Revoke(credentialID string) error {
-	return s.updateCredential(context.Background(), credentialID, func(rec *credential.CredentialRecord) error {
+	return s.updateCredential(context.Background(), credentialID, func(rec *credential.CredentialRecord, now time.Time) error {
 		rec.Status = credential.StatusRevoked
 		rec.Revision++
-		rec.RotatedAt = s.now()
+		rec.RotatedAt = now
 		return nil
 	})
 }
 
 func (s *Store) BumpRevision(credentialID string) error {
-	return s.updateCredential(context.Background(), credentialID, func(rec *credential.CredentialRecord) error {
+	return s.updateCredential(context.Background(), credentialID, func(rec *credential.CredentialRecord, _ time.Time) error {
 		rec.Revision++
 		return nil
 	})
@@ -332,6 +344,10 @@ func (s *Store) updateStatusCASOnce(ctx context.Context, credentialID string, ex
 	if err := s.requireNodeOwnership(ctx, tx, false); err != nil {
 		return nil, err
 	}
+	authorityNow, err := dbNow(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
 	rec, err := scanCredential(tx.QueryRow(ctx, `SELECT `+credentialColumns+` FROM gripline_credentials WHERE credential_id=$1 FOR UPDATE`, credentialID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, credential.ErrNotFound
@@ -347,7 +363,7 @@ func (s *Store) updateStatusCASOnce(ctx context.Context, credentialID string, ex
 	}
 	rec.Status = toStatus
 	rec.Revision++
-	rec.RotatedAt = s.now()
+	rec.RotatedAt = authorityNow
 	if err := updateCredentialRow(ctx, tx, rec); err != nil {
 		return nil, err
 	}
@@ -387,6 +403,10 @@ func (s *Store) rotateVerifierCASOnce(ctx context.Context, credentialID string, 
 	if err := s.requireNodeOwnership(ctx, tx, false); err != nil {
 		return nil, err
 	}
+	authorityNow, err := dbNow(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
 	rec, err := scanCredential(tx.QueryRow(ctx, `SELECT `+credentialColumns+` FROM gripline_credentials WHERE credential_id=$1 FOR UPDATE`, credentialID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, credential.ErrNotFound
@@ -401,7 +421,7 @@ func (s *Store) rotateVerifierCASOnce(ctx context.Context, credentialID string, 
 	rec.VerifierVersion = 1
 	rec.PepperVersion = pepperVersion
 	rec.Revision++
-	rec.RotatedAt = s.now()
+	rec.RotatedAt = authorityNow
 	if err := rec.Validate(); err != nil {
 		return nil, err
 	}
@@ -414,7 +434,7 @@ func (s *Store) rotateVerifierCASOnce(ctx context.Context, credentialID string, 
 	return rec, nil
 }
 
-func (s *Store) updateCredential(ctx context.Context, id string, mutate func(*credential.CredentialRecord) error) error {
+func (s *Store) updateCredential(ctx context.Context, id string, mutate func(*credential.CredentialRecord, time.Time) error) error {
 	ctx, cancel := s.operationContext(ctx)
 	defer cancel()
 	return withTransactionRetry(ctx, "credential mutation", func() error {
@@ -422,13 +442,17 @@ func (s *Store) updateCredential(ctx context.Context, id string, mutate func(*cr
 	})
 }
 
-func (s *Store) updateCredentialOnce(ctx context.Context, id string, mutate func(*credential.CredentialRecord) error) error {
+func (s *Store) updateCredentialOnce(ctx context.Context, id string, mutate func(*credential.CredentialRecord, time.Time) error) error {
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return mapDBError(err)
 	}
 	defer tx.Rollback(ctx)
 	if err := s.requireNodeOwnership(ctx, tx, false); err != nil {
+		return err
+	}
+	authorityNow, err := dbNow(ctx, tx)
+	if err != nil {
 		return err
 	}
 	rec, err := scanCredential(tx.QueryRow(ctx, `SELECT `+credentialColumns+` FROM gripline_credentials WHERE credential_id=$1 FOR UPDATE`, id))
@@ -438,7 +462,7 @@ func (s *Store) updateCredentialOnce(ctx context.Context, id string, mutate func
 	if err != nil {
 		return mapCredentialReadError(err)
 	}
-	if err := mutate(rec); err != nil {
+	if err := mutate(rec, authorityNow); err != nil {
 		return err
 	}
 	if err := updateCredentialRow(ctx, tx, rec); err != nil {
@@ -531,6 +555,11 @@ func (s *Store) observeAndCommitOnce(ctx context.Context, credentialID string, s
 	if err := s.requireNodeOwnership(ctx, tx, false); err != nil {
 		return credential.TransitionResult{}, err
 	}
+	authorityNow, err := dbNow(ctx, tx)
+	if err != nil {
+		return credential.TransitionResult{}, err
+	}
+	now = authorityNow
 	if meta.RequestID != "" {
 		if receipt, ok, err := loadCredentialReceipt(ctx, tx, meta.RequestID, credentialID); err != nil {
 			return credential.TransitionResult{}, err

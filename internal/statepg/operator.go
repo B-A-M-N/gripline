@@ -53,6 +53,11 @@ func (s *Store) appendOperatorOnce(ctx context.Context, rec control.OperatorReco
 	if err := s.requireNodeOwnership(ctx, tx, true); err != nil {
 		return err
 	}
+	authorityNow, err := dbNow(ctx, tx)
+	if err != nil {
+		return err
+	}
+	rec.At = authorityNow
 	if err := appendOperator(ctx, tx, rec); err != nil {
 		return mapDBError(err)
 	}
@@ -168,7 +173,11 @@ func (s *Store) savePostureOnce(ctx context.Context, posture control.Posture) er
 	if err := s.requireNodeOwnership(ctx, tx, false); err != nil {
 		return err
 	}
-	if err := putPosture(ctx, tx, posture, s.now()); err != nil {
+	authorityNow, err := dbNow(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if err := putPosture(ctx, tx, posture, authorityNow); err != nil {
 		return err
 	}
 	return mapDBError(tx.Commit(ctx))
@@ -296,8 +305,14 @@ func (s *Store) provisionCredentialWithAuditOperationOnce(ctx context.Context, r
 	if err := s.requireNodeOwnership(ctx, tx, false); err != nil {
 		return err
 	}
+	authorityNow, err := dbNow(ctx, tx)
+	if err != nil {
+		return err
+	}
+	rec.CreatedAt = authorityNow
+	audit.At = authorityNow
 	replayed, err := claimControlOperation(ctx, tx, operationID, audit.Action,
-		operatorMutationPayload(audit, rec), s.now())
+		operatorMutationPayload(audit, rec), authorityNow)
 	if err != nil {
 		return err
 	}
@@ -341,18 +356,23 @@ func (s *Store) unblockLaneWithAuditOperationOnce(ctx context.Context, credID, l
 	if err := s.requireNodeOwnership(ctx, tx, false); err != nil {
 		return err
 	}
+	now, err = dbNow(ctx, tx)
+	if err != nil {
+		return err
+	}
+	audit.At = now
 	replayed, err := claimControlOperation(ctx, tx, operationID, audit.Action,
 		operatorMutationPayload(audit, struct {
 			CredentialID string `json:"credential_id"`
 			LaneID       string `json:"lane_id"`
-		}{CredentialID: credID, LaneID: laneID}), s.now())
+		}{CredentialID: credID, LaneID: laneID}), now)
 	if err != nil {
 		return err
 	}
 	if replayed {
 		return nil
 	}
-	if err := s.lockLaneGuard(ctx, tx, credID); err != nil {
+	if err := s.lockLaneGuard(ctx, tx, credID, now); err != nil {
 		return mapDBError(err)
 	}
 	var raw []byte
@@ -414,10 +434,15 @@ func (s *Store) revokeCredentialWithAuditOperationOnce(ctx context.Context, cred
 	if err := s.requireNodeOwnership(ctx, tx, false); err != nil {
 		return err
 	}
+	authorityNow, err := dbNow(ctx, tx)
+	if err != nil {
+		return err
+	}
+	audit.At = authorityNow
 	replayed, err := claimControlOperation(ctx, tx, operationID, audit.Action,
 		operatorMutationPayload(audit, struct {
 			CredentialID string `json:"credential_id"`
-		}{CredentialID: credID}), s.now())
+		}{CredentialID: credID}), authorityNow)
 	if err != nil {
 		return err
 	}
@@ -435,7 +460,7 @@ func (s *Store) revokeCredentialWithAuditOperationOnce(ctx context.Context, cred
 	if rec.Status != credential.StatusRevoked {
 		rec.Status = credential.StatusRevoked
 		rec.Revision++
-		rec.RotatedAt = s.now()
+		rec.RotatedAt = authorityNow
 		if err := updateCredentialRow(ctx, tx, rec); err != nil {
 			return err
 		}
@@ -472,17 +497,22 @@ func (s *Store) setPostureWithAuditOperationOnce(ctx context.Context, posture co
 	if err := s.requireNodeOwnership(ctx, tx, false); err != nil {
 		return err
 	}
+	authorityNow, err := dbNow(ctx, tx)
+	if err != nil {
+		return err
+	}
+	audit.At = authorityNow
 	replayed, err := claimControlOperation(ctx, tx, operationID, audit.Action,
 		operatorMutationPayload(audit, struct {
 			Posture control.Posture `json:"posture"`
-		}{Posture: posture}), s.now())
+		}{Posture: posture}), authorityNow)
 	if err != nil {
 		return err
 	}
 	if replayed {
 		return nil
 	}
-	if err := putPosture(ctx, tx, posture, s.now()); err != nil {
+	if err := putPosture(ctx, tx, posture, authorityNow); err != nil {
 		return err
 	}
 	if err := appendOperator(ctx, tx, audit); err != nil {

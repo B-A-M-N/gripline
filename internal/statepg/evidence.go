@@ -82,6 +82,10 @@ func (s *Store) appendContextOnce(ctx context.Context, items []evidence.Evidence
 	if err := s.requireNodeOwnership(ctx, tx, false); err != nil {
 		return err
 	}
+	authorityNow, err := dbNow(ctx, tx)
+	if err != nil {
+		return err
+	}
 	bySubject := make(map[evidence.SubjectKey][]evidence.Evidence)
 	for _, item := range items {
 		key := evidence.SubjectKey{Scope: item.Scope, ID: item.SubjectID}
@@ -99,14 +103,14 @@ func (s *Store) appendContextOnce(ctx context.Context, items []evidence.Evidence
 	})
 	for _, subject := range subjects {
 		incoming := bySubject[subject]
-		if err := s.lockEvidenceGuard(ctx, tx, subject); err != nil {
+		if err := s.lockEvidenceGuard(ctx, tx, subject, authorityNow); err != nil {
 			return err
 		}
 		existing, err := loadEvidenceSubject(ctx, tx, subject, true)
 		if err != nil {
 			return err
 		}
-		merged := evidence.MergeSubject(existing, incoming, s.now())
+		merged := evidence.MergeSubject(existing, incoming, authorityNow)
 		scope, id, err := evidenceSubject(subject)
 		if err != nil {
 			return err
@@ -204,6 +208,11 @@ func (s *Store) pruneContextOnce(ctx context.Context, subjects []evidence.Subjec
 	if err := s.requireNodeOwnership(ctx, tx, true); err != nil {
 		return 0, err
 	}
+	authorityNow, err := dbNow(ctx, tx)
+	if err != nil {
+		return 0, err
+	}
+	now = authorityNow
 	pruned := 0
 	orderedSubjects := append([]evidence.SubjectKey(nil), subjects...)
 	sort.Slice(orderedSubjects, func(i, j int) bool {
@@ -213,7 +222,7 @@ func (s *Store) pruneContextOnce(ctx context.Context, subjects []evidence.Subjec
 		return orderedSubjects[i].ID < orderedSubjects[j].ID
 	})
 	for _, subject := range orderedSubjects {
-		if err := s.lockEvidenceGuard(ctx, tx, subject); err != nil {
+		if err := s.lockEvidenceGuard(ctx, tx, subject, authorityNow); err != nil {
 			return 0, err
 		}
 		items, err := loadEvidenceSubject(ctx, tx, subject, true)
@@ -242,13 +251,13 @@ func (s *Store) pruneContextOnce(ctx context.Context, subjects []evidence.Subjec
 // lockEvidenceGuard gives a first-write subject a durable row to lock. A
 // FOR UPDATE on gripline_evidence cannot serialize two transactions when the
 // subject has no evidence row yet.
-func (s *Store) lockEvidenceGuard(ctx context.Context, tx pgx.Tx, subject evidence.SubjectKey) error {
+func (s *Store) lockEvidenceGuard(ctx context.Context, tx pgx.Tx, subject evidence.SubjectKey, now time.Time) error {
 	scope, id, err := evidenceSubject(subject)
 	if err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO gripline_evidence_guards (scope, subject_id, created_at)
-		VALUES ($1,$2,$3) ON CONFLICT (scope, subject_id) DO NOTHING`, scope, id, s.now().UTC()); err != nil {
+		VALUES ($1,$2,$3) ON CONFLICT (scope, subject_id) DO NOTHING`, scope, id, now.UTC()); err != nil {
 		return err
 	}
 	_, err = tx.Exec(ctx, `SELECT scope, subject_id FROM gripline_evidence_guards

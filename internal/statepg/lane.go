@@ -67,8 +67,8 @@ func putLane(ctx context.Context, tx pgx.Tx, rec *lane.LaneRecord) error {
 // operations that touch different lane rows. Serializable isolation alone can
 // report retryable serialization failures; the explicit guard makes the
 // bounded lane-set reducer's ordering deterministic before it runs.
-func (s *Store) lockLaneGuard(ctx context.Context, tx pgx.Tx, credID string) error {
-	if _, err := tx.Exec(ctx, `INSERT INTO gripline_lane_guards (credential_id, created_at) VALUES ($1,$2) ON CONFLICT (credential_id) DO NOTHING`, credID, s.now().UTC()); err != nil {
+func (s *Store) lockLaneGuard(ctx context.Context, tx pgx.Tx, credID string, now time.Time) error {
+	if _, err := tx.Exec(ctx, `INSERT INTO gripline_lane_guards (credential_id, created_at) VALUES ($1,$2) ON CONFLICT (credential_id) DO NOTHING`, credID, now.UTC()); err != nil {
 		return err
 	}
 	_, err := tx.Exec(ctx, `SELECT credential_id FROM gripline_lane_guards WHERE credential_id=$1 FOR UPDATE`, credID)
@@ -109,7 +109,11 @@ func (s *Store) borrowOrCreateWithPolicyOnce(ctx context.Context, credID, candid
 	if err := s.requireNodeOwnership(ctx, tx, false); err != nil {
 		return nil, false, err
 	}
-	if err := s.lockLaneGuard(ctx, tx, credID); err != nil {
+	authorityNow, err := dbNow(ctx, tx)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := s.lockLaneGuard(ctx, tx, credID, authorityNow); err != nil {
 		return nil, false, err
 	}
 	records, err := loadLanes(ctx, tx, credID, true)
@@ -120,7 +124,7 @@ func (s *Store) borrowOrCreateWithPolicyOnce(ctx context.Context, credID, candid
 	if limits.MaxActiveLanesPerCredential <= 0 {
 		limits = lane.DefaultLimits()
 	}
-	result, domainErr := lane.ApplyBorrowOrCreate(records, credID, candidateID, features, policy.Classification, limits, s.now())
+	result, domainErr := lane.ApplyBorrowOrCreate(records, credID, candidateID, features, policy.Classification, limits, authorityNow)
 	for _, id := range result.Deletes {
 		if _, err := tx.Exec(ctx, `DELETE FROM gripline_lanes WHERE credential_id=$1 AND lane_id=$2`, credID, id); err != nil {
 			return nil, false, err
@@ -258,7 +262,11 @@ func (s *Store) observeRiskWithPolicyOnce(ctx context.Context, credID, laneID st
 	if err := s.requireNodeOwnership(ctx, tx, false); err != nil {
 		return nil, err
 	}
-	if err := s.lockLaneGuard(ctx, tx, credID); err != nil {
+	authorityNow, err := dbNow(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.lockLaneGuard(ctx, tx, credID, authorityNow); err != nil {
 		return nil, err
 	}
 	var raw []byte
@@ -278,6 +286,7 @@ func (s *Store) observeRiskWithPolicyOnce(ctx context.Context, credID, laneID st
 		meta.PolicyRevision = policy.PolicyRevision
 	}
 	before := rec.Security.Status
+	now = authorityNow
 	lane.ApplyRiskObservation(rec, riskScore, security, now)
 	if err := putLane(ctx, tx, rec); err != nil {
 		return nil, err
@@ -335,7 +344,11 @@ func (s *Store) recordCleanAuthorizedAndPromoteOnce(ctx context.Context, credID,
 	if err := s.requireNodeOwnership(ctx, tx, false); err != nil {
 		return nil, false, err
 	}
-	if err := s.lockLaneGuard(ctx, tx, credID); err != nil {
+	authorityNow, err := dbNow(ctx, tx)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := s.lockLaneGuard(ctx, tx, credID, authorityNow); err != nil {
 		return nil, false, err
 	}
 	var raw []byte
@@ -354,6 +367,7 @@ func (s *Store) recordCleanAuthorizedAndPromoteOnce(ctx context.Context, credID,
 		meta.PolicyRevision = policy.PolicyRevision
 	}
 	before := rec.State
+	now = authorityNow
 	promoted := lane.ApplyCleanAuthorizedAndPromote(rec, riskScore, criteria, now)
 	if err := putLane(ctx, tx, rec); err != nil {
 		return nil, false, err
