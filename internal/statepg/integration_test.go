@@ -27,8 +27,10 @@ func TestPostgresAuthorityIntegration(t *testing.T) {
 	prefix := fmt.Sprintf("pg-it-%d", time.Now().UnixNano())
 	a := openIntegrationStore(t, ctx, dsn, prefix+"-a")
 	b := openIntegrationStore(t, ctx, dsn, prefix+"-b")
+	c := openIntegrationStore(t, ctx, dsn, prefix+"-c")
 	defer a.Close()
 	defer b.Close()
+	defer c.Close()
 
 	identity := CryptoIdentity{
 		SignerActiveKID: 1, SignerFingerprint: "integration-signer",
@@ -41,11 +43,17 @@ func TestPostgresAuthorityIntegration(t *testing.T) {
 	if _, err := b.SynchronizeCrypto(ctx, identity); err != nil {
 		t.Fatalf("synchronize node B crypto: %v", err)
 	}
+	if _, err := c.SynchronizeCrypto(ctx, identity); err != nil {
+		t.Fatalf("synchronize node C crypto: %v", err)
+	}
 	if err := a.Ready(ctx); err != nil {
 		t.Fatalf("node A readiness: %v", err)
 	}
 	if err := b.Ready(ctx); err != nil {
 		t.Fatalf("node B readiness: %v", err)
+	}
+	if err := c.Ready(ctx); err != nil {
+		t.Fatalf("node C readiness: %v", err)
 	}
 
 	now := time.Now().UTC()
@@ -63,6 +71,9 @@ func TestPostgresAuthorityIntegration(t *testing.T) {
 	if err != nil || got.AccountID != record.AccountID {
 		t.Fatalf("cross-node credential lookup: record=%+v err=%v", got, err)
 	}
+	if got, err := c.LookupAuthoritative(ctx, credentialID); err != nil || got.AccountID != record.AccountID {
+		t.Fatalf("third-node credential lookup: record=%+v err=%v", got, err)
+	}
 	duplicate := *record
 	duplicate.CredentialID = prefix + "-duplicate"
 	if err := b.Insert(&duplicate); err == nil {
@@ -74,6 +85,9 @@ func TestPostgresAuthorityIntegration(t *testing.T) {
 	got, err = b.LookupAuthoritative(ctx, credentialID)
 	if err != nil || got.Status != credential.StatusRevoked || got.Revision != 2 {
 		t.Fatalf("cross-node revoke: record=%+v err=%v", got, err)
+	}
+	if got, err := c.LookupAuthoritative(ctx, credentialID); err != nil || got.Status != credential.StatusRevoked || got.Revision != 2 {
+		t.Fatalf("third-node revoke: record=%+v err=%v", got, err)
 	}
 
 	policyContext := lane.DefaultPolicyContext()
@@ -106,6 +120,9 @@ func TestPostgresAuthorityIntegration(t *testing.T) {
 	if posture, err := b.LoadPostureContext(ctx); err != nil || posture != control.EmergencyLockdown {
 		t.Fatalf("cross-node posture: posture=%v err=%v", posture, err)
 	}
+	if posture, err := c.LoadPostureContext(ctx); err != nil || posture != control.EmergencyLockdown {
+		t.Fatalf("third-node posture: posture=%v err=%v", posture, err)
+	}
 	if err := a.SavePosture(control.Normal); err != nil {
 		t.Fatalf("restore posture: %v", err)
 	}
@@ -128,11 +145,14 @@ func TestPostgresAuthorityIntegration(t *testing.T) {
 	if manifest, err := b.LoadPolicyManifest(); err != nil || manifest.Active != ref {
 		t.Fatalf("cross-node policy manifest: manifest=%+v err=%v", manifest, err)
 	}
+	if manifest, err := c.LoadPolicyManifest(); err != nil || manifest.Active != ref {
+		t.Fatalf("third-node policy manifest: manifest=%+v err=%v", manifest, err)
+	}
 	if loaded, err := b.LoadPolicyArtifact(ref); err != nil || loaded.ID != compiled.ID {
 		t.Fatalf("cross-node policy artifact: policy=%+v err=%v", loaded, err)
 	}
 
-	window := adaptive.WindowObservation{Detector: "integration-window", Subject: prefix, Threshold: 1, Window: time.Minute, MaxKeys: 8}
+	window := adaptive.WindowObservation{Detector: "integration-window", Subject: prefix, Threshold: 1, Window: time.Minute, Cooldown: time.Hour, MaxKeys: 8}
 	window.Key = "node-a"
 	if emitted, err := a.ObserveWindow(ctx, window); err != nil || emitted {
 		t.Fatalf("first adaptive window observation: emitted=%v err=%v", emitted, err)
@@ -140,6 +160,10 @@ func TestPostgresAuthorityIntegration(t *testing.T) {
 	window.Key = "node-b"
 	if emitted, err := b.ObserveWindow(ctx, window); err != nil || !emitted {
 		t.Fatalf("cross-node adaptive window aggregation: emitted=%v err=%v", emitted, err)
+	}
+	window.Key = "node-c"
+	if emitted, err := c.ObserveWindow(ctx, window); err != nil || emitted {
+		t.Fatalf("third-node adaptive cooldown: emitted=%v err=%v", emitted, err)
 	}
 	baseline := adaptive.BaselineObservation{
 		Detector: "integration-baseline", Subject: prefix, Metric: "latency",
@@ -174,6 +198,9 @@ func TestPostgresAuthorityIntegration(t *testing.T) {
 	if _, err := b.Reserve(ctx, resource.ReserveRequest{RequestID: prefix + "-other", Scopes: []resource.ScopeSpec{scope}}); err == nil {
 		t.Fatal("cross-node concurrency cap must reject the second lease")
 	}
+	if _, err := c.Reserve(ctx, resource.ReserveRequest{RequestID: prefix + "-third", Scopes: []resource.ScopeSpec{scope}}); err == nil {
+		t.Fatal("third-node concurrency cap must reject the second lease")
+	}
 	first.Release()
 	replay.Release()
 	afterRelease, err := b.Reserve(ctx, resource.ReserveRequest{RequestID: prefix + "-after-release", Scopes: []resource.ScopeSpec{scope}})
@@ -197,6 +224,12 @@ func TestPostgresAuthorityIntegration(t *testing.T) {
 	}
 	if err := b.Ready(ctx); err == nil {
 		t.Fatal("draining node must not be ready")
+	}
+	if err := c.MarkDraining(ctx, time.Now().Add(time.Minute)); err != nil {
+		t.Fatalf("mark node C draining: %v", err)
+	}
+	if err := c.Ready(ctx); err == nil {
+		t.Fatal("third draining node must not be ready")
 	}
 }
 
