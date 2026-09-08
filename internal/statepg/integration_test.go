@@ -622,6 +622,9 @@ func TestPostgresCryptoActivationRequiresLiveNodeAcknowledgements(t *testing.T) 
 	if active.PepperActiveVersion != 2 || active.PepperActiveFingerprint != request.Fingerprint || active.GenerationEpoch != 2 {
 		t.Fatalf("activated crypto identity=%+v, want pepper 2 at epoch 2", active)
 	}
+	if a.cryptoReady.Load() {
+		t.Fatal("activating node remained crypto-ready before local generation reconciliation")
+	}
 	var state string
 	if err := a.pool.QueryRow(ctx, `SELECT state FROM gripline_cluster_crypto_generations
 		WHERE kind=$1 AND generation=$2`, CryptoKindPepper, 2).Scan(&state); err != nil {

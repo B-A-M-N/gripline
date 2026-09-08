@@ -432,6 +432,11 @@ func (s *Store) activateCryptoGenerationOnce(ctx context.Context, req CryptoActi
 	if err := mapDBError(tx.Commit(ctx)); err != nil {
 		return CryptoIdentity{}, err
 	}
+	// The authority has advanced before this process has necessarily applied
+	// the corresponding local signer/secret-ring generation. Withdraw this
+	// instance immediately; the crypto reconciler must re-apply the local
+	// generation and call SynchronizeCrypto before it can serve again.
+	s.cryptoReady.Store(false)
 	return active, nil
 }
 
