@@ -638,6 +638,7 @@ func (t *Terminator) admitUsageWithRequestID(ctx context.Context, reqID string, 
 	now := t.dep.RiskNow()
 	out := &Outcome{RequestID: reqID}
 	adaptivePersistenceFailed := t.adaptivePersistenceFailed()
+	resourceDiagnosticsFailed := false
 	// P0.50: the internal decision trace lives for the whole pipeline and is
 	// populated at every gate, so DENIED decisions are as explainable as
 	// authorized ones. P0.51: policy identity is stamped from the COMPILED
@@ -834,7 +835,7 @@ func (t *Terminator) admitUsageWithRequestID(ctx context.Context, reqID string, 
 		}
 	}
 	if lerr == nil {
-		cleanupRemovedLaneResources(t.dep.Resource, lanesBefore, lanesAfter)
+		cleanupRemovedLaneResources(ctx, t.dep.Resource, lanesBefore, lanesAfter)
 	}
 	tr.LaneID = laneID
 	tr.LaneNew = laneNew
@@ -899,7 +900,16 @@ func (t *Terminator) admitUsageWithRequestID(ctx context.Context, reqID string, 
 		}
 	}
 	if len(t.dep.Producers) > 0 {
-		tr.ObservedConcurrency = t.currentConcurrency(laneID)
+		var concurrencyErr error
+		tr.ObservedConcurrency, concurrencyErr = t.currentConcurrency(ctx, laneID)
+		if concurrencyErr != nil {
+			// This is telemetry/adaptive input, not the hard resource gate. Treat
+			// an unavailable reading as UNKNOWN so it cannot manufacture a zero
+			// baseline or promote trust; the request remains subject to the
+			// authoritative reservation below.
+			tr.ObservedConcurrency = 0
+			resourceDiagnosticsFailed = true
+		}
 		admissionBehavior := producers.AdmissionBehavior{
 			Subjects: subjects,
 			Features: producers.Features{
@@ -962,6 +972,9 @@ func (t *Terminator) admitUsageWithRequestID(ctx context.Context, reqID string, 
 	// unavailable history is UNKNOWN, not empty: it must never become risk=0 in
 	// the state machine.
 	adaptive := adaptiveStatus(adaptivePersistenceFailed)
+	if resourceDiagnosticsFailed {
+		adaptive = AdaptiveDegraded
+	}
 	var credentialEvidence, laneEvidence, sourceEvidence []evidence.Evidence
 	credSnapOK := t.dep.Evidence == nil
 	laneSnapOK := t.dep.Evidence == nil
@@ -2031,7 +2044,7 @@ func credFrom(rec *credential.CredentialRecord) *credential.Credential {
 // resource-table lifecycle. Lane rows may be deleted by BorrowOrCreate while
 // resolving an incoming request; their resource objects must be removed only
 // after the row disappears and only when all accounting is idle.
-func cleanupRemovedLaneResources(g resource.Authority, before, after []string) {
+func cleanupRemovedLaneResources(ctx context.Context, g resource.Authority, before, after []string) {
 	if g == nil || len(before) == 0 {
 		return
 	}
@@ -2041,6 +2054,10 @@ func cleanupRemovedLaneResources(g resource.Authority, before, after []string) {
 	}
 	for _, id := range before {
 		if _, ok := remaining[id]; !ok {
+			if diagnostic, ok := g.(resource.ContextDiagnosticsAuthority); ok {
+				_, _ = diagnostic.RemoveScopeContext(ctx, resource.ScopeLane, id)
+				continue
+			}
 			_ = g.RemoveScope(resource.ScopeLane, id)
 		}
 	}
@@ -2207,9 +2224,16 @@ func evCodes(items []evidence.Evidence) []string {
 
 // currentConcurrency returns the live lane concurrency for producer behavior
 // (P0.4B). Returns 0 when no resource governor is configured.
-func (t *Terminator) currentConcurrency(laneID string) int {
+func (t *Terminator) currentConcurrency(ctx context.Context, laneID string) (int, error) {
 	if t.dep.Resource == nil || laneID == "" {
-		return 0
+		return 0, nil
 	}
-	return t.dep.Resource.InUseFor(resource.ScopeLane, laneID) + 1
+	if diagnostic, ok := t.dep.Resource.(resource.ContextDiagnosticsAuthority); ok {
+		used, err := diagnostic.InUseForContext(ctx, resource.ScopeLane, laneID)
+		if err != nil {
+			return 0, err
+		}
+		return used + 1, nil
+	}
+	return t.dep.Resource.InUseFor(resource.ScopeLane, laneID) + 1, nil
 }

@@ -761,42 +761,70 @@ func (s *Store) reapExpired(ctx context.Context) error {
 	return mapDBError(tx.Commit(ctx))
 }
 
-func (s *Store) RemoveScope(scope resource.Scope, id string) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+func (s *Store) RemoveScopeContext(ctx context.Context, scope resource.Scope, id string) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
-		return false
+		return false, mapDBError(err)
 	}
 	defer tx.Rollback(ctx)
 	if err := s.requireNodeOwnership(ctx, tx, true); err != nil {
-		return false
+		return false, err
 	}
 	var active int
-	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_resource_holds h JOIN gripline_resource_leases l ON l.lease_id=h.lease_id WHERE h.scope=$1 AND h.scope_id=$2 AND l.state <> $3`, scope, id, leaseReleased).Scan(&active); err != nil || active != 0 {
-		return false
+	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_resource_holds h JOIN gripline_resource_leases l ON l.lease_id=h.lease_id WHERE h.scope=$1 AND h.scope_id=$2 AND l.state <> $3`, scope, id, leaseReleased).Scan(&active); err != nil {
+		return false, mapDBError(err)
+	}
+	if active != 0 {
+		if err := tx.Commit(ctx); err != nil {
+			return false, mapDBError(err)
+		}
+		return false, nil
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM gripline_resource_buckets WHERE scope=$1 AND scope_id=$2`, scope, id); err != nil {
-		return false
+		return false, mapDBError(err)
 	}
 	if scope == resource.ScopeSource {
 		if _, err := tx.Exec(ctx, `DELETE FROM gripline_resource_source_scopes WHERE scope_id=$1`, id); err != nil {
-			return false
+			return false, mapDBError(err)
 		}
 	}
-	return tx.Commit(ctx) == nil
+	if err := tx.Commit(ctx); err != nil {
+		return false, mapDBError(err)
+	}
+	return true, nil
+}
+
+func (s *Store) RemoveScope(scope resource.Scope, id string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	removed, _ := s.RemoveScopeContext(ctx, scope, id)
+	return removed
+}
+
+func (s *Store) InUseForContext(ctx context.Context, scope resource.Scope, id string) (int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var used int
+	err := s.pool.QueryRow(ctx, `SELECT COALESCE(SUM(concurrency_used),0) FROM gripline_resource_buckets WHERE scope=$1 AND scope_id=$2 AND dimension=$3`, scope, id, resource.DimConcurrency).Scan(&used)
+	if err != nil {
+		return 0, mapDBError(err)
+	}
+	return used, nil
 }
 
 func (s *Store) InUseFor(scope resource.Scope, id string) int {
-	var used int
-	err := s.pool.QueryRow(context.Background(), `SELECT COALESCE(SUM(concurrency_used),0) FROM gripline_resource_buckets WHERE scope=$1 AND scope_id=$2 AND dimension=$3`, scope, id, resource.DimConcurrency).Scan(&used)
-	if err != nil {
-		return 0
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	used, _ := s.InUseForContext(ctx, scope, id)
 	return used
 }
 
 var (
-	_ resource.Authority            = (*Store)(nil)
-	_ resource.DistributedAuthority = (*Store)(nil)
+	_ resource.Authority                   = (*Store)(nil)
+	_ resource.DistributedAuthority        = (*Store)(nil)
+	_ resource.ContextDiagnosticsAuthority = (*Store)(nil)
 )

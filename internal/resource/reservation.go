@@ -56,6 +56,15 @@ type ContextAuthority interface {
 	ProvisionUsageContext(ctx context.Context, scopes []ScopeSpec, estimate UsageEstimate) (*MultiReservation, error)
 }
 
+// ContextDiagnosticsAuthority is the cancellable, error-aware diagnostics
+// extension of Authority. Remote implementations must not collapse an
+// authority outage into a zero-usage reading or an unexplained cleanup miss.
+// The legacy Authority methods remain for source compatibility.
+type ContextDiagnosticsAuthority interface {
+	InUseForContext(context.Context, Scope, string) (int, error)
+	RemoveScopeContext(context.Context, Scope, string) (bool, error)
+}
+
 // DistributedAuthority is implemented by a shared lease authority. The
 // returned reservation owns every scope hold and may be renewed for a stream.
 type DistributedAuthority interface {
