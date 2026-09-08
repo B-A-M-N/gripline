@@ -92,3 +92,17 @@ func TestTransactionRetryHonorsContextDuringBackoff(t *testing.T) {
 		t.Fatalf("retry backoff ignored context: elapsed=%s", time.Since(started))
 	}
 }
+
+func TestOperationContextAppliesStoreTimeout(t *testing.T) {
+	store := &Store{operationTimeout: 5 * time.Millisecond}
+	ctx, cancel := store.operationContext(context.Background())
+	defer cancel()
+	select {
+	case <-ctx.Done():
+		if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			t.Fatalf("operation context error=%v, want deadline exceeded", ctx.Err())
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("operation context did not enforce the configured timeout")
+	}
+}

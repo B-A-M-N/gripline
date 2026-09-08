@@ -70,9 +70,8 @@ func (s *Store) ClusterStatus(ctx context.Context) (ClusterStatus, error) {
 	if s == nil || s.pool == nil {
 		return out, errors.New("statepg: authority is unavailable")
 	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	out.NodeID, out.InstanceID, out.NodeEpoch = s.nodeID, s.instanceID, s.nodeEpoch
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted, AccessMode: pgx.ReadOnly})
 	if err != nil {

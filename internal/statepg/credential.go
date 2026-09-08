@@ -69,7 +69,8 @@ func (s *Store) Insert(rec *credential.CredentialRecord) error {
 	if err != nil {
 		return err
 	}
-	ctx := context.Background()
+	ctx, cancel := s.operationContext(context.Background())
+	defer cancel()
 	return withTransactionRetry(ctx, "credential insert", func() error {
 		return s.insertCredentialOnce(ctx, rec, security)
 	})
@@ -104,7 +105,8 @@ func (s *Store) InsertIfAbsent(rec *credential.CredentialRecord) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	ctx := context.Background()
+	ctx, cancel := s.operationContext(context.Background())
+	defer cancel()
 	var created bool
 	err = withTransactionRetry(ctx, "credential insert-if-absent", func() error {
 		var err error
@@ -143,6 +145,8 @@ func (s *Store) Lookup(credentialID string) (*credential.CredentialRecord, bool)
 }
 
 func (s *Store) LookupAuthoritative(ctx context.Context, credentialID string) (*credential.CredentialRecord, error) {
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	if err := ctx.Err(); err != nil {
 		return nil, credential.ErrLookupTimeout
 	}
@@ -162,6 +166,8 @@ func (s *Store) FindByVerifier(verifier []byte, pepperVersion int) (*credential.
 }
 
 func (s *Store) FindByVerifierContext(ctx context.Context, verifier []byte, pepperVersion int) (*credential.CredentialRecord, error) {
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	if err := ctx.Err(); err != nil {
 		return nil, credential.ErrLookupTimeout
 	}
@@ -181,7 +187,9 @@ func (s *Store) FindByVerifierContext(ctx context.Context, verifier []byte, pepp
 // ListCredentials returns sanitized credential summaries for administrative
 // consumers. Verifier material is intentionally excluded.
 func (s *Store) ListCredentials() ([]credential.Summary, error) {
-	rows, err := s.pool.Query(context.Background(), `SELECT credential_id, account_id,
+	ctx, cancel := s.operationContext(context.Background())
+	defer cancel()
+	rows, err := s.pool.Query(ctx, `SELECT credential_id, account_id,
 		status, policy_id, plan_id, created_at, revision FROM gripline_credentials ORDER BY credential_id`)
 	if err != nil {
 		return nil, mapDBError(err)
@@ -203,7 +211,9 @@ func (s *Store) ListCredentials() ([]credential.Summary, error) {
 // CountCredentialsByPepperVersion is the operator safety check used before a
 // pepper generation is retired.
 func (s *Store) CountCredentialsByPepperVersion() (map[int]int, error) {
-	rows, err := s.pool.Query(context.Background(), `SELECT pepper_version, COUNT(*) FROM gripline_credentials GROUP BY pepper_version ORDER BY pepper_version`)
+	ctx, cancel := s.operationContext(context.Background())
+	defer cancel()
+	rows, err := s.pool.Query(ctx, `SELECT pepper_version, COUNT(*) FROM gripline_credentials GROUP BY pepper_version ORDER BY pepper_version`)
 	if err != nil {
 		return nil, mapDBError(err)
 	}
@@ -257,9 +267,10 @@ func (s *Store) TouchLastSeen(credentialID string, at time.Time) {
 // TouchLastSeenContext is analytics-only and honors the caller's bounded
 // context. It must never be used as an authorization prerequisite.
 func (s *Store) TouchLastSeenContext(ctx context.Context, credentialID string, at time.Time) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
+	ctx, telemetryCancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer telemetryCancel()
 	query := `UPDATE gripline_credentials SET last_seen_at=$2 WHERE credential_id=$1`
 	args := []any{credentialID, at}
 	if s.nodeID != "" {
@@ -301,7 +312,8 @@ func (s *Store) TouchLastSeenContext(ctx context.Context, credentialID string, a
 }
 
 func (s *Store) UpdateStatusCAS(credentialID string, expectedRevision int, fromStatus, toStatus credential.Status) (*credential.CredentialRecord, error) {
-	ctx := context.Background()
+	ctx, cancel := s.operationContext(context.Background())
+	defer cancel()
 	var out *credential.CredentialRecord
 	err := withTransactionRetry(ctx, "credential status transition", func() error {
 		var err error
@@ -352,9 +364,8 @@ func (s *Store) RotateVerifierCAS(credentialID string, expectedRevision, pepperV
 // RotateVerifierCASContext performs the same row-locked atomic migration while
 // honoring the request's cancellation/deadline.
 func (s *Store) RotateVerifierCASContext(ctx context.Context, credentialID string, expectedRevision, pepperVersion int, verifier []byte) (*credential.CredentialRecord, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	if pepperVersion < 1 || len(verifier) == 0 {
 		return nil, errors.New("credential: invalid rotated verifier")
 	}
@@ -404,6 +415,8 @@ func (s *Store) rotateVerifierCASOnce(ctx context.Context, credentialID string, 
 }
 
 func (s *Store) updateCredential(ctx context.Context, id string, mutate func(*credential.CredentialRecord) error) error {
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	return withTransactionRetry(ctx, "credential mutation", func() error {
 		return s.updateCredentialOnce(ctx, id, mutate)
 	})
@@ -494,6 +507,8 @@ func storeCredentialReceipt(ctx context.Context, tx pgx.Tx, requestID, credentia
 
 // ObserveAndCommit serializes the reducer against the shared credential row.
 func (s *Store) ObserveAndCommit(ctx context.Context, credentialID string, score int, hy credential.Hysteresis, now time.Time) (credential.TransitionResult, error) {
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	if err := ctx.Err(); err != nil {
 		return credential.TransitionResult{}, credential.ErrTimeout
 	}

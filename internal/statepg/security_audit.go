@@ -33,7 +33,9 @@ func (s *Store) ListSecurityTransitions(after uint64, limit int) ([]control.Secu
 	if limit <= 0 || limit > 1000 {
 		limit = 1000
 	}
-	rows, err := s.pool.Query(context.Background(), `SELECT sequence, at, kind,
+	ctx, cancel := s.operationContext(context.Background())
+	defer cancel()
+	rows, err := s.pool.Query(ctx, `SELECT sequence, at, kind,
 		request_id, credential_id, lane_id, before_state, after_state, risk_score,
 		revision, policy_revision, evidence_codes
 		FROM gripline_security_transitions WHERE sequence > $1 ORDER BY sequence LIMIT $2`, after, limit)

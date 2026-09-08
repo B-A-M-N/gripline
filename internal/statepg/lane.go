@@ -85,6 +85,8 @@ func (s *Store) BorrowOrCreate(credID, candidateID string, features lane.Feature
 }
 
 func (s *Store) BorrowOrCreateWithPolicy(ctx context.Context, credID, candidateID string, features lane.Features, policy lane.PolicyContext) (*lane.LaneRecord, bool, error) {
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
 	}
@@ -148,6 +150,8 @@ func (s *Store) Get(credID, laneID string) (*lane.LaneRecord, bool) {
 }
 
 func (s *Store) LookupLane(ctx context.Context, credID, laneID string) (*lane.LaneRecord, bool, error) {
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
 	}
@@ -172,6 +176,8 @@ func (s *Store) ListLaneIDs(credID string) []string {
 }
 
 func (s *Store) ListIDs(ctx context.Context, credID string) ([]string, error) {
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -194,7 +200,9 @@ func (s *Store) ListIDs(ctx context.Context, credID string) ([]string, error) {
 // ListLaneRecords returns fully decoded authoritative rows for administrative
 // inspection. Decode failures remain visible to the caller.
 func (s *Store) ListLaneRecords(credID string) ([]*lane.LaneRecord, error) {
-	rows, err := s.pool.Query(context.Background(), `SELECT record FROM gripline_lanes WHERE credential_id=$1 ORDER BY lane_id`, credID)
+	ctx, cancel := s.operationContext(context.Background())
+	defer cancel()
+	rows, err := s.pool.Query(ctx, `SELECT record FROM gripline_lanes WHERE credential_id=$1 ORDER BY lane_id`, credID)
 	if err != nil {
 		return nil, mapDBError(err)
 	}
@@ -227,6 +235,8 @@ func (s *Store) ObserveRiskWithMetadata(credID, laneID string, riskScore int, no
 }
 
 func (s *Store) ObserveRiskWithPolicy(ctx context.Context, credID, laneID string, riskScore int, now time.Time, policy lane.PolicyContext, meta lane.TransitionMetadata) (*lane.LaneRecord, error) {
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -301,6 +311,8 @@ func (s *Store) RecordCleanAuthorizedAndPromoteWithMetadata(credID, laneID strin
 }
 
 func (s *Store) RecordCleanAuthorizedAndPromoteWithPolicy(ctx context.Context, credID, laneID string, riskScore int, criteria lane.PromotionCriteria, now time.Time, policy lane.PolicyContext, meta lane.TransitionMetadata) (*lane.LaneRecord, bool, error) {
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
 	}

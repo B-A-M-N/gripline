@@ -34,6 +34,8 @@ func appendOperator(ctx context.Context, tx pgx.Tx, rec control.OperatorRecord) 
 // context is honored because denied-action audit is best effort but bounded by
 // the caller's detached timeout.
 func (s *Store) AppendOperator(ctx context.Context, rec control.OperatorRecord) error {
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -59,6 +61,8 @@ func (s *Store) appendOperatorOnce(ctx context.Context, rec control.OperatorReco
 
 // LoadPostureContext reads the current cluster-wide operator posture.
 func (s *Store) LoadPostureContext(ctx context.Context) (control.Posture, error) {
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	if err := ctx.Err(); err != nil {
 		return control.Normal, err
 	}
@@ -87,9 +91,8 @@ func (s *Store) PostureContext(ctx context.Context) (control.Posture, error) {
 // during the current lockdown; the posture value remains the authorization
 // authority.
 func (s *Store) PostureSnapshotContext(ctx context.Context) (control.Posture, time.Time, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	if err := ctx.Err(); err != nil {
 		return control.Normal, time.Time{}, err
 	}
@@ -149,7 +152,8 @@ func (s *Store) LoadPosture() (control.Posture, error) {
 // SavePosture is retained for lifecycle tooling. Operator actions should use
 // SetPostureWithAudit so posture and its audit row are one transaction.
 func (s *Store) SavePosture(posture control.Posture) error {
-	ctx := context.Background()
+	ctx, cancel := s.operationContext(context.Background())
+	defer cancel()
 	return withTransactionRetry(ctx, "posture mutation", func() error {
 		return s.savePostureOnce(ctx, posture)
 	})
@@ -179,6 +183,8 @@ func putPosture(ctx context.Context, tx pgx.Tx, posture control.Posture, now tim
 // AppendAdmission records the durable data-plane decision stream used by a
 // clustered ControlPlane recorder. It contains identifiers and reasons only.
 func (s *Store) AppendAdmission(ctx context.Context, e control.Event) error {
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -211,7 +217,9 @@ func (s *Store) ListOperatorAudit(after uint64, limit int) ([]control.OperatorRe
 	if limit <= 0 || limit > 1000 {
 		limit = 1000
 	}
-	rows, err := s.pool.Query(context.Background(), `SELECT sequence, at, actor, action,
+	ctx, cancel := s.operationContext(context.Background())
+	defer cancel()
+	rows, err := s.pool.Query(ctx, `SELECT sequence, at, actor, action,
 		target, reason, posture, committed, detail FROM gripline_operator_audit
 		WHERE sequence > $1 ORDER BY sequence LIMIT $2`, after, limit)
 	if err != nil {
@@ -237,7 +245,9 @@ func (s *Store) ListOperatorAudit(after uint64, limit int) ([]control.OperatorRe
 
 func (s *Store) CountAuditRecords() (int, error) {
 	var count int
-	err := s.pool.QueryRow(context.Background(), `SELECT COUNT(*) FROM gripline_operator_audit`).Scan(&count)
+	ctx, cancel := s.operationContext(context.Background())
+	defer cancel()
+	err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_operator_audit`).Scan(&count)
 	return count, mapDBError(err)
 }
 
@@ -260,6 +270,8 @@ func (s *Store) ProvisionCredentialWithAudit(ctx context.Context, rec credential
 // the credential, and appends its operator audit row. An exact retry returns
 // nil without replaying either mutation or audit.
 func (s *Store) ProvisionCredentialWithAuditOperation(ctx context.Context, rec credential.CredentialRecord, audit control.OperatorRecord, operationID string) error {
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -310,6 +322,8 @@ func (s *Store) UnblockLaneWithAudit(ctx context.Context, credID, laneID string,
 // UnblockLaneWithAuditOperation atomically claims operationID and applies the
 // lane mutation plus both audit records. Exact retries are no-ops.
 func (s *Store) UnblockLaneWithAuditOperation(ctx context.Context, credID, laneID string, audit control.OperatorRecord, now time.Time, operationID string) error {
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -381,6 +395,8 @@ func (s *Store) RevokeCredentialWithAudit(ctx context.Context, credID string, au
 // intentionally a state no-op: operator retries must not keep increasing its
 // revision. Exact operation retries do not append a duplicate audit row.
 func (s *Store) RevokeCredentialWithAuditOperation(ctx context.Context, credID string, audit control.OperatorRecord, operationID string) error {
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -437,6 +453,8 @@ func (s *Store) SetPostureWithAudit(ctx context.Context, posture control.Posture
 // SetPostureWithAuditOperation atomically claims operationID and persists the
 // cluster posture with its operator audit row. Exact retries are no-ops.
 func (s *Store) SetPostureWithAuditOperation(ctx context.Context, posture control.Posture, audit control.OperatorRecord, operationID string) error {
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	if err := ctx.Err(); err != nil {
 		return err
 	}

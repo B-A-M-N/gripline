@@ -52,9 +52,8 @@ func (s *Store) ProvisionDistributedWithRequestID(ctx context.Context, requestID
 }
 
 func (s *Store) provisionDistributed(ctx context.Context, requestID string, scopes []resource.ScopeSpec, estimate resource.UsageEstimate) (resource.UsageReservation, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -765,9 +764,8 @@ func (s *Store) reapExpired(ctx context.Context) error {
 }
 
 func (s *Store) RemoveScopeContext(ctx context.Context, scope resource.Scope, id string) (bool, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return false, mapDBError(err)
@@ -808,9 +806,8 @@ func (s *Store) RemoveScope(scope resource.Scope, id string) bool {
 }
 
 func (s *Store) InUseForContext(ctx context.Context, scope resource.Scope, id string) (int, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	var used int
 	err := s.pool.QueryRow(ctx, `SELECT COALESCE(SUM(concurrency_used),0) FROM gripline_resource_buckets WHERE scope=$1 AND scope_id=$2 AND dimension=$3`, scope, id, resource.DimConcurrency).Scan(&used)
 	if err != nil {

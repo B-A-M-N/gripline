@@ -44,21 +44,22 @@ type Options struct {
 // Store is the shared transactional authority. Credential, lane, and evidence
 // methods are split across files but use this same pool and transaction model.
 type Store struct {
-	pool            *pgxpool.Pool
-	now             func() time.Time
-	nodeID          string
-	instanceID      string
-	nodeEpoch       int64
-	fenced          atomic.Bool
-	leaseTTL        time.Duration
-	maxSourceScopes int
-	sourceScopeIdle time.Duration
-	leaseStop       chan struct{}
-	leaseDone       chan struct{}
-	membershipStop  chan struct{}
-	membershipDone  chan struct{}
-	cryptoReady     atomic.Bool
-	cryptoObserved  atomic.Value // cryptoObservation
+	pool             *pgxpool.Pool
+	now              func() time.Time
+	nodeID           string
+	instanceID       string
+	nodeEpoch        int64
+	fenced           atomic.Bool
+	leaseTTL         time.Duration
+	maxSourceScopes  int
+	sourceScopeIdle  time.Duration
+	operationTimeout time.Duration
+	leaseStop        chan struct{}
+	leaseDone        chan struct{}
+	membershipStop   chan struct{}
+	membershipDone   chan struct{}
+	cryptoReady      atomic.Bool
+	cryptoObserved   atomic.Value // cryptoObservation
 }
 
 // Schema version 1 is the original clustered-authority layout. Version 2
@@ -134,7 +135,10 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 	if opts.RenewEvery <= 0 || opts.RenewEvery >= opts.LeaseTTL/2 {
 		opts.RenewEvery = opts.LeaseTTL / 3
 	}
-	s := &Store{pool: pool, now: opts.Now, nodeID: opts.NodeID, leaseTTL: opts.LeaseTTL, maxSourceScopes: opts.MaxSourceScopes, sourceScopeIdle: opts.SourceScopeIdle,
+	if opts.OperationTimeout <= 0 {
+		opts.OperationTimeout = 2 * time.Second
+	}
+	s := &Store{pool: pool, now: opts.Now, nodeID: opts.NodeID, leaseTTL: opts.LeaseTTL, maxSourceScopes: opts.MaxSourceScopes, sourceScopeIdle: opts.SourceScopeIdle, operationTimeout: opts.OperationTimeout,
 		leaseStop: make(chan struct{}), leaseDone: make(chan struct{})}
 	if err := s.Ping(connectCtx); err != nil {
 		pool.Close()
@@ -160,6 +164,20 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 	}
 	go s.leaseReaper()
 	return s, nil
+}
+
+// operationContext gives every ordinary store operation a finite authority
+// budget. A caller deadline remains authoritative because WithTimeout uses
+// the earlier of the two deadlines. Background maintenance uses its own
+// explicit contexts and does not rely on this helper.
+func (s *Store) operationContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if s == nil || s.operationTimeout <= 0 {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, s.operationTimeout)
 }
 
 // SchemaStatus is the read-only result used by migration planning and

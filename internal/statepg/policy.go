@@ -60,9 +60,8 @@ func (s *Store) LoadPolicyManifest() (policy.Manifest, error) {
 }
 
 func (s *Store) LoadPolicyManifestContext(ctx context.Context) (policy.Manifest, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	var out policy.Manifest
 	var raw []byte
 	err := s.pool.QueryRow(ctx, `SELECT manifest FROM gripline_policy_manifest WHERE singleton=TRUE`).Scan(&raw)
@@ -88,9 +87,8 @@ func (s *Store) PersistPolicyManifest(manifest policy.Manifest) error {
 }
 
 func (s *Store) PersistPolicyManifestContext(ctx context.Context, manifest policy.Manifest) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	if manifest.ActivationEpoch == 0 {
 		manifest.ActivationEpoch = 1
 	}
@@ -139,9 +137,8 @@ func (s *Store) InitializePolicyManifest(manifest policy.Manifest) error {
 }
 
 func (s *Store) InitializePolicyManifestContext(ctx context.Context, manifest policy.Manifest) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	if manifest.ActivationEpoch == 0 {
 		manifest.ActivationEpoch = 1
 	}
@@ -188,9 +185,8 @@ func (s *Store) PersistPolicyArtifact(compiled *policy.CompiledPolicy) error {
 }
 
 func (s *Store) PersistPolicyArtifactContext(ctx context.Context, compiled *policy.CompiledPolicy) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	if compiled == nil {
 		return errors.New("statepg: policy artifact required")
 	}
@@ -232,9 +228,8 @@ func (s *Store) LoadPolicyArtifact(ref policy.PolicyRef) (*policy.CompiledPolicy
 }
 
 func (s *Store) LoadPolicyArtifactContext(ctx context.Context, ref policy.PolicyRef) (*policy.CompiledPolicy, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	if err := validatePolicyRef(ref); err != nil {
 		return nil, err
 	}
@@ -265,9 +260,8 @@ func (s *Store) LoadPolicyArtifactContext(ctx context.Context, ref policy.Policy
 // and validated. The node epoch is part of the key so a replacement instance
 // cannot inherit an old process's acknowledgement.
 func (s *Store) AcknowledgePolicyContext(ctx context.Context, manifest policy.Manifest) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	if manifest.ActivationEpoch == 0 {
 		manifest.ActivationEpoch = 1
 	}
@@ -352,9 +346,8 @@ func (s *Store) PersistPolicyTransition(manifest policy.Manifest, event policy.E
 }
 
 func (s *Store) PersistPolicyTransitionContext(ctx context.Context, manifest policy.Manifest, event policy.Event) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	if err := validatePolicyManifest(manifest); err != nil {
 		return err
 	}
@@ -554,9 +547,8 @@ func (s *Store) ListPolicyAudit(after uint64, limit int) ([]policy.Event, error)
 }
 
 func (s *Store) ListPolicyAuditContext(ctx context.Context, after uint64, limit int) ([]policy.Event, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	if limit <= 0 || limit > 1000 {
 		limit = 1000
 	}

@@ -182,14 +182,13 @@ func sameCryptoIdentity(a, b CryptoIdentity) bool {
 // loaded generations are recorded as staged capabilities and acknowledged by
 // the node, so preloading a future generation does not change active identity.
 func (s *Store) SynchronizeCrypto(ctx context.Context, local CryptoIdentity) (CryptoIdentity, error) {
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	normalized, err := normalizeCryptoIdentity(local)
 	if err != nil {
 		return CryptoIdentity{}, err
 	}
 	local = normalized
-	if ctx == nil {
-		ctx = context.Background()
-	}
 	for attempt := 0; attempt < 3; attempt++ {
 		shared, retry, err := s.synchronizeCryptoOnce(ctx, local)
 		if err == nil {
@@ -226,9 +225,8 @@ func (s *Store) CryptoReady(ctx context.Context) error {
 	if !ok {
 		return ErrCryptoIdentityStale
 	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	var current cryptoObservation
 	err := s.pool.QueryRow(ctx, `SELECT signer_active_kid, signer_active_fingerprint,
 		pepper_active_version, pepper_active_fingerprint, pseudonym_version,
@@ -298,9 +296,8 @@ func (s *Store) StartCryptoWatcher(parent context.Context, interval, operationTi
 // that their signer/verifier or secret-ring implementation can apply the
 // returned generation before serving it.
 func (s *Store) ActivateCryptoGeneration(ctx context.Context, req CryptoActivationRequest) (CryptoIdentity, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	if err := validateCryptoActivationRequest(req); err != nil {
 		return CryptoIdentity{}, err
 	}

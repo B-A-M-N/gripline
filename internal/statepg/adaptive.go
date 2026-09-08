@@ -19,9 +19,8 @@ const (
 // subject/window row set. It intentionally does not read or write the legacy
 // whole-detector snapshot table used by standalone bbolt.
 func (s *Store) ObserveWindow(ctx context.Context, obs adaptive.WindowObservation) (bool, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	if obs.Detector == "" || obs.Subject == "" || obs.Key == "" || obs.Window <= 0 || obs.Cooldown < 0 || obs.Threshold < 0 {
 		return false, errors.New("statepg: invalid adaptive window observation")
 	}
@@ -133,9 +132,8 @@ func (s *Store) observeWindowOnce(ctx context.Context, obs adaptive.WindowObserv
 // when the baseline is still warming, the value is normal, or cooldown/floor
 // policy suppresses emission.
 func (s *Store) ObserveBaseline(ctx context.Context, obs adaptive.BaselineObservation) (string, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	if obs.Detector == "" || obs.Subject == "" || obs.Metric == "" || math.IsNaN(obs.Value) || math.IsInf(obs.Value, 0) || obs.Value < 0 || obs.Alpha <= 0 || obs.Alpha > 1 || obs.Cooldown < 0 {
 		return "", errors.New("statepg: invalid adaptive baseline observation")
 	}

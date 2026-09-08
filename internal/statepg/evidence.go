@@ -55,6 +55,8 @@ func (s *Store) Append(items ...evidence.Evidence) error {
 }
 
 func (s *Store) AppendContext(ctx context.Context, items ...evidence.Evidence) error {
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -130,6 +132,8 @@ func (s *Store) Snapshot(subjects []evidence.SubjectKey, now time.Time) ([]evide
 }
 
 func (s *Store) SnapshotContext(ctx context.Context, subjects []evidence.SubjectKey, now time.Time) ([]evidence.Evidence, error) {
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -172,6 +176,8 @@ func (s *Store) Prune(subjects []evidence.SubjectKey, now time.Time) (int, error
 }
 
 func (s *Store) PruneContext(ctx context.Context, subjects []evidence.SubjectKey, now time.Time) (int, error) {
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
