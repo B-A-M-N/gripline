@@ -42,7 +42,26 @@ type CryptoActivationRequest struct {
 
 // ErrCryptoActivationBarrier means one or more live nodes have not loaded
 // and acknowledged the exact generation being activated.
-var ErrCryptoActivationBarrier = errors.New("statepg: crypto activation barrier not satisfied")
+var (
+	ErrCryptoActivationBarrier = errors.New("statepg: crypto activation barrier not satisfied")
+	ErrCryptoIdentityStale     = errors.New("statepg: local crypto identity is stale")
+)
+
+type cryptoObservation struct {
+	signerKID, pepperVersion, pseudonymVersion int
+	signerFingerprint, pepperFingerprint       string
+	pseudonymFingerprint                       string
+	epoch                                      uint64
+}
+
+func observationFor(identity CryptoIdentity) cryptoObservation {
+	return cryptoObservation{
+		signerKID: identity.SignerActiveKID, signerFingerprint: identity.SignerActiveFingerprint,
+		pepperVersion: identity.PepperActiveVersion, pepperFingerprint: identity.PepperActiveFingerprint,
+		pseudonymVersion: identity.PseudonymVersion, pseudonymFingerprint: identity.PseudonymActiveFingerprint,
+		epoch: identity.GenerationEpoch,
+	}
+}
 
 // CryptoIdentity is the public cluster-binding metadata for one node. The
 // fingerprints are digests of loaded material, never the material itself.
@@ -173,6 +192,7 @@ func (s *Store) SynchronizeCrypto(ctx context.Context, local CryptoIdentity) (Cr
 	for attempt := 0; attempt < 3; attempt++ {
 		shared, retry, err := s.synchronizeCryptoOnce(ctx, local)
 		if err == nil {
+			s.cryptoObserved.Store(observationFor(shared))
 			s.cryptoReady.Store(true)
 			return shared, nil
 		}
@@ -181,6 +201,44 @@ func (s *Store) SynchronizeCrypto(ctx context.Context, local CryptoIdentity) (Cr
 		}
 	}
 	return CryptoIdentity{}, errors.New("statepg: crypto identity remained conflicted after retries")
+}
+
+// CryptoReady verifies that the node is still observing the same shared
+// crypto generation epoch it acknowledged at startup or reconciliation. A
+// live activation elsewhere must withdraw an unreconciled node from service;
+// otherwise it could continue issuing assertions or deriving new verifiers
+// under an old cluster generation.
+func (s *Store) CryptoReady(ctx context.Context) error {
+	if s == nil || s.nodeID == "" {
+		return nil
+	}
+	if !s.cryptoReady.Load() {
+		return ErrCryptoIdentityStale
+	}
+	value := s.cryptoObserved.Load()
+	observed, ok := value.(cryptoObservation)
+	if !ok {
+		return ErrCryptoIdentityStale
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var current cryptoObservation
+	err := s.pool.QueryRow(ctx, `SELECT signer_active_kid, signer_active_fingerprint,
+		pepper_active_version, pepper_active_fingerprint, pseudonym_version,
+		pseudonym_active_fingerprint, generation_epoch
+		FROM gripline_cluster_crypto WHERE singleton=TRUE`).Scan(
+		&current.signerKID, &current.signerFingerprint,
+		&current.pepperVersion, &current.pepperFingerprint,
+		&current.pseudonymVersion, &current.pseudonymFingerprint, &current.epoch)
+	if err != nil {
+		return mapDBError(err)
+	}
+	if current != observed {
+		s.cryptoReady.Store(false)
+		return fmt.Errorf("%w: observed epoch %d, authority epoch %d", ErrCryptoIdentityStale, observed.epoch, current.epoch)
+	}
+	return nil
 }
 
 // ActivateCryptoGeneration atomically advances one shared active generation.

@@ -58,6 +58,7 @@ type Store struct {
 	membershipStop  chan struct{}
 	membershipDone  chan struct{}
 	cryptoReady     atomic.Bool
+	cryptoObserved  atomic.Value // cryptoObservation
 }
 
 // Schema version 1 is the original clustered-authority layout. Version 2

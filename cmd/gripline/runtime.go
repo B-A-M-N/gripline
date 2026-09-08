@@ -121,6 +121,11 @@ func (rt *Runtime) Ready() error {
 		if err != nil {
 			return fmt.Errorf("gripline: state authority not ready: %w", err)
 		}
+		if rt.Postgres != nil {
+			if err := rt.Postgres.CryptoReady(ctx); err != nil {
+				return fmt.Errorf("gripline: cluster crypto not ready: %w", err)
+			}
+		}
 		if rt.PolicyHealth != nil {
 			if err := rt.PolicyHealth.Ready(ctx); err != nil {
 				return fmt.Errorf("gripline: policy authority not ready: %w", err)
@@ -138,6 +143,9 @@ func (rt *Runtime) Ready() error {
 			defer cancel()
 			if err := rt.Postgres.Ready(ctx); err != nil {
 				return fmt.Errorf("gripline: postgres authority not ready: %w", err)
+			}
+			if err := rt.Postgres.CryptoReady(ctx); err != nil {
+				return fmt.Errorf("gripline: cluster crypto not ready: %w", err)
 			}
 		}
 		if rt.PolicyHealth != nil {

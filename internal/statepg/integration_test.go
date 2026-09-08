@@ -641,6 +641,50 @@ func TestPostgresCryptoActivationRequiresLiveNodeAcknowledgements(t *testing.T) 
 	}
 }
 
+func TestPostgresCryptoReadinessRejectsUnreconciledActivation(t *testing.T) {
+	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("GRIPLINE_TEST_POSTGRES_DSN is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resetIntegrationAuthority(t, ctx, dsn)
+	store := openIntegrationStore(t, ctx, dsn, "crypto-readiness-node")
+	defer store.Close()
+	base := CryptoIdentity{
+		SignerActiveKID: 1, SignerFingerprint: "crypto-readiness-signer",
+		PepperActiveVersion: 1, PepperFingerprint: "crypto-readiness-pepper",
+		PseudonymVersion: 0, PseudonymFingerprint: "disabled",
+	}
+	if _, err := store.SynchronizeCrypto(ctx, base); err != nil {
+		t.Fatalf("synchronize base crypto identity: %v", err)
+	}
+	staged := base
+	staged.Loaded = []CryptoGeneration{
+		{Kind: CryptoKindSigner, Generation: 1, Fingerprint: base.SignerFingerprint},
+		{Kind: CryptoKindPepper, Generation: 1, Fingerprint: base.PepperFingerprint},
+		{Kind: CryptoKindPepper, Generation: 2, Fingerprint: "crypto-readiness-pepper-2"},
+	}
+	if _, err := store.SynchronizeCrypto(ctx, staged); err != nil {
+		t.Fatalf("synchronize staged crypto identity: %v", err)
+	}
+	if _, err := store.ActivateCryptoGeneration(ctx, CryptoActivationRequest{
+		Kind: CryptoKindPepper, Generation: 2, Fingerprint: "crypto-readiness-pepper-2",
+		OperationID: "crypto-readiness-activation", Actor: "integration-operator", Reason: "readiness test",
+	}); err != nil {
+		t.Fatalf("activate staged crypto identity: %v", err)
+	}
+	if err := store.CryptoReady(ctx); !errors.Is(err, ErrCryptoIdentityStale) {
+		t.Fatalf("CryptoReady after shared activation = %v, want ErrCryptoIdentityStale", err)
+	}
+	if _, err := store.SynchronizeCrypto(ctx, staged); err != nil {
+		t.Fatalf("reconcile active crypto identity: %v", err)
+	}
+	if err := store.CryptoReady(ctx); err != nil {
+		t.Fatalf("CryptoReady after reconciliation: %v", err)
+	}
+}
+
 func TestPostgresFencedNodeCannotMutateAuthority(t *testing.T) {
 	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
 	if dsn == "" {
