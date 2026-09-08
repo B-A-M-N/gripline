@@ -420,6 +420,8 @@ type distributedReservation struct {
 func (r *distributedReservation) ID() string { return r.leaseID }
 
 func (r *distributedReservation) MarkForwarded(ctx context.Context) error {
+	ctx, cancel := r.store.operationContext(ctx)
+	defer cancel()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.released || r.settled || r.forwarded {
@@ -453,6 +455,8 @@ func (r *distributedReservation) MarkForwarded(ctx context.Context) error {
 }
 
 func (r *distributedReservation) Renew(ctx context.Context) error {
+	ctx, cancel := r.store.operationContext(ctx)
+	defer cancel()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.released || r.settled {
@@ -486,6 +490,8 @@ func (r *distributedReservation) Renew(ctx context.Context) error {
 }
 
 func (r *distributedReservation) SettleContext(ctx context.Context, actual resource.UsageEstimate) error {
+	ctx, cancel := r.store.operationContext(ctx)
+	defer cancel()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.released || r.settled {
@@ -601,7 +607,7 @@ func (r *distributedReservation) Release() {
 	if r.released {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := r.store.operationContext(context.Background())
 	defer cancel()
 	if err := releaseLease(ctx, r.store, r.leaseID, r.store.nodeID, r.store.nodeEpoch); err == nil {
 		r.released = true
