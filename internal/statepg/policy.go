@@ -17,7 +17,13 @@ const policyManifestSchemaVersion = 1
 // ErrPolicyActivationBarrier means one or more live nodes have not loaded and
 // acknowledged the exact candidate policy. The shared manifest remains on
 // the currently active policy until every live node catches up.
-var ErrPolicyActivationBarrier = errors.New("statepg: policy activation barrier not satisfied")
+var (
+	ErrPolicyActivationBarrier = errors.New("statepg: policy activation barrier not satisfied")
+	// ErrPolicyObservationStale means this node has not observed the active
+	// policy manifest it would use to authorize a new request. Callers should
+	// fail closed and let the policy reconciler acknowledge the current epoch.
+	ErrPolicyObservationStale = errors.New("statepg: local policy observation is stale")
+)
 
 func validatePolicyRef(ref policy.PolicyRef) error {
 	if strings.TrimSpace(ref.ID) == "" || ref.Revision < 1 || len(ref.Digest) != 64 {
@@ -114,6 +120,13 @@ func (s *Store) persistPolicyManifestOnce(ctx context.Context, raw []byte, updat
 	if err != nil {
 		return mapDBError(err)
 	}
+	var manifest policy.Manifest
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		return fmt.Errorf("statepg: decode policy manifest for observation: %w", err)
+	}
+	if err := recordPolicyObservation(ctx, tx, s, manifest); err != nil {
+		return err
+	}
 	return mapDBError(tx.Commit(ctx))
 }
 
@@ -153,10 +166,19 @@ func (s *Store) initializePolicyManifestOnce(ctx context.Context, raw []byte, up
 	if err := s.requireNodeMembership(ctx, tx, false, false); err != nil {
 		return err
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO gripline_policy_manifest (singleton, manifest, updated_at)
+	result, err := tx.Exec(ctx, `INSERT INTO gripline_policy_manifest (singleton, manifest, updated_at)
 		VALUES (TRUE,$1,$2) ON CONFLICT (singleton) DO NOTHING`, raw, updatedAt.UTC())
 	if err != nil {
 		return mapDBError(err)
+	}
+	if result.RowsAffected() != 0 {
+		var manifest policy.Manifest
+		if err := json.Unmarshal(raw, &manifest); err != nil {
+			return fmt.Errorf("statepg: decode initial policy manifest for observation: %w", err)
+		}
+		if err := recordPolicyObservation(ctx, tx, s, manifest); err != nil {
+			return err
+		}
 	}
 	return mapDBError(tx.Commit(ctx))
 }
@@ -431,7 +453,100 @@ func (s *Store) persistPolicyTransitionOnce(ctx context.Context, manifest policy
 	if _, err := tx.Exec(ctx, `INSERT INTO gripline_policy_audit (event) VALUES ($1)`, rawEvent); err != nil {
 		return mapDBError(err)
 	}
+	if err := recordPolicyObservation(ctx, tx, s, manifest); err != nil {
+		return err
+	}
 	return mapDBError(tx.Commit(ctx))
+}
+
+// recordPolicyObservation records the active/candidate policy view owned by
+// this node epoch. It is called in the same transaction as an initialization
+// or lifecycle transition, so the writer never publishes a new active epoch
+// while claiming that its own issuer still observes the previous one.
+func recordPolicyObservation(ctx context.Context, tx pgx.Tx, s *Store, manifest policy.Manifest) error {
+	if s == nil || s.nodeID == "" {
+		return nil
+	}
+	if manifest.ActivationEpoch == 0 {
+		manifest.ActivationEpoch = 1
+	}
+	candidateID, candidateDigest := "", ""
+	candidateRevision := 0
+	if manifest.Candidate != nil {
+		candidateID = manifest.Candidate.ID
+		candidateRevision = manifest.Candidate.Revision
+		candidateDigest = manifest.Candidate.Digest
+	}
+	_, err := tx.Exec(ctx, `INSERT INTO gripline_policy_node_state
+		(node_id, node_epoch, observed_policy_epoch, observed_policy_id,
+		 observed_policy_revision, observed_policy_digest, candidate_policy_id,
+		 candidate_policy_revision, candidate_policy_digest, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,CURRENT_TIMESTAMP)
+		ON CONFLICT (node_id,node_epoch) DO UPDATE SET
+		 observed_policy_epoch=EXCLUDED.observed_policy_epoch,
+		 observed_policy_id=EXCLUDED.observed_policy_id,
+		 observed_policy_revision=EXCLUDED.observed_policy_revision,
+		 observed_policy_digest=EXCLUDED.observed_policy_digest,
+		 candidate_policy_id=EXCLUDED.candidate_policy_id,
+		 candidate_policy_revision=EXCLUDED.candidate_policy_revision,
+		 candidate_policy_digest=EXCLUDED.candidate_policy_digest,
+		 updated_at=EXCLUDED.updated_at`,
+		s.nodeID, s.nodeEpoch, int64(manifest.ActivationEpoch), manifest.Active.ID,
+		manifest.Active.Revision, manifest.Active.Digest, candidateID, candidateRevision,
+		candidateDigest)
+	return mapDBError(err)
+}
+
+// requireCurrentPolicyObservation closes the post-activation window in which
+// a node's in-memory policy watcher has not yet caught up. The manifest is
+// locked in shared mode so a concurrent activation cannot commit between this
+// check and the resource lease commit; SERIALIZABLE retry handles any other
+// dependency discovered by PostgreSQL.
+func (s *Store) requireCurrentPolicyObservation(ctx context.Context, tx pgx.Tx) error {
+	if s == nil || s.nodeID == "" {
+		return nil
+	}
+	var raw []byte
+	err := tx.QueryRow(ctx, `SELECT manifest FROM gripline_policy_manifest WHERE singleton=TRUE FOR SHARE`).Scan(&raw)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Direct authority users may provision resources before a policy is
+		// initialized. The production runtime initializes policy before serving;
+		// leaving this compatibility path permissive avoids changing the raw
+		// resource authority contract for those tools.
+		return nil
+	}
+	if err != nil {
+		return mapDBError(err)
+	}
+	var manifest policy.Manifest
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		return fmt.Errorf("statepg: decode active policy manifest: %w", err)
+	}
+	if manifest.ActivationEpoch == 0 {
+		manifest.ActivationEpoch = 1
+	}
+	if err := validatePolicyManifest(manifest); err != nil {
+		return fmt.Errorf("statepg: active policy manifest: %w", err)
+	}
+	var observedEpoch int64
+	var observedID, observedDigest string
+	var observedRevision int
+	err = tx.QueryRow(ctx, `SELECT observed_policy_epoch, observed_policy_id,
+		observed_policy_revision, observed_policy_digest
+		FROM gripline_policy_node_state WHERE node_id=$1 AND node_epoch=$2`, s.nodeID, s.nodeEpoch).
+		Scan(&observedEpoch, &observedID, &observedRevision, &observedDigest)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("%w: node has not acknowledged active policy epoch %d", ErrPolicyObservationStale, manifest.ActivationEpoch)
+	}
+	if err != nil {
+		return mapDBError(err)
+	}
+	if observedEpoch != int64(manifest.ActivationEpoch) || observedID != manifest.Active.ID ||
+		observedRevision != manifest.Active.Revision || observedDigest != manifest.Active.Digest {
+		return fmt.Errorf("%w: observed %s/%d epoch %d, active %s/%d epoch %d", ErrPolicyObservationStale,
+			observedID, observedRevision, observedEpoch, manifest.Active.ID, manifest.Active.Revision, manifest.ActivationEpoch)
+	}
+	return nil
 }
 
 func (s *Store) ListPolicyAudit(after uint64, limit int) ([]policy.Event, error) {

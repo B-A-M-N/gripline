@@ -250,7 +250,17 @@ func NewManagerContext(ctx context.Context, initial *Policy, opts Options) (*Man
 			m.knownGood[previous.Revision] = previous
 		}
 	}
-	m.publishLocked()
+	// A clustered node must publish its initial active/candidate observation
+	// before the runtime can expose a hard resource admission path. This also
+	// prevents the first request from being rejected merely because the watcher
+	// has not completed its first tick.
+	if m.acknowledgeContext != nil && m.hasManifestLoader() {
+		if err := m.Reconcile(ctx); err != nil {
+			return nil, fmt.Errorf("policy: acknowledge initial shared state: %w", err)
+		}
+	} else {
+		m.publishLocked()
+	}
 	return m, nil
 }
 

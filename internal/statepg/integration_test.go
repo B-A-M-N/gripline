@@ -214,6 +214,15 @@ func TestPostgresAuthorityIntegration(t *testing.T) {
 	if err := a.InitializePolicyManifest(policy.Manifest{SchemaVersion: 1, ActivationEpoch: 1, Active: ref}); err != nil {
 		t.Fatalf("initialize policy manifest: %v", err)
 	}
+	initialManifest := policy.Manifest{SchemaVersion: 1, ActivationEpoch: 1, Active: ref}
+	// Resource admission is not allowed to run on a node whose local policy
+	// observation has not caught up with the shared manifest. Acknowledge the
+	// initial epoch for every node before exercising shared resource limits.
+	for name, store := range map[string]*Store{"a": a, "b": b, "c": c} {
+		if err := store.AcknowledgePolicyContext(ctx, initialManifest); err != nil {
+			t.Fatalf("acknowledge initial policy on node %s: %v", name, err)
+		}
+	}
 	if manifest, err := b.LoadPolicyManifest(); err != nil || manifest.Active != ref {
 		t.Fatalf("cross-node policy manifest: manifest=%+v err=%v", manifest, err)
 	}
@@ -390,6 +399,113 @@ func TestPostgresPolicyActivationRequiresLiveNodeAcknowledgements(t *testing.T) 
 	}
 	if manifest.Active != candidateRef || manifest.ActivationEpoch != 2 {
 		t.Fatalf("activated manifest=%+v, want candidate epoch 2", manifest)
+	}
+}
+
+func TestPostgresResourceAdmissionRejectsStalePolicyObservation(t *testing.T) {
+	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("GRIPLINE_TEST_POSTGRES_DSN is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resetIntegrationAuthority(t, ctx, dsn)
+	a := openIntegrationStore(t, ctx, dsn, "policy-resource-a")
+	b := openIntegrationStore(t, ctx, dsn, "policy-resource-b")
+	defer a.Close()
+	defer b.Close()
+	identity := CryptoIdentity{
+		SignerActiveKID: 1, SignerFingerprint: "policy-resource-signer",
+		PepperActiveVersion: 1, PepperFingerprint: "policy-resource-pepper",
+		PseudonymVersion: 0, PseudonymFingerprint: "disabled",
+	}
+	if _, err := a.SynchronizeCrypto(ctx, identity); err != nil {
+		t.Fatalf("synchronize node A: %v", err)
+	}
+	if _, err := b.SynchronizeCrypto(ctx, identity); err != nil {
+		t.Fatalf("synchronize node B: %v", err)
+	}
+
+	first, err := policy.Compile(policy.Default())
+	if err != nil {
+		t.Fatalf("compile initial policy: %v", err)
+	}
+	firstDigest, err := policy.Digest(&first.Policy)
+	if err != nil {
+		t.Fatalf("digest initial policy: %v", err)
+	}
+	firstRef := policy.PolicyRef{ID: first.ID, Revision: first.Revision, Digest: firstDigest}
+	secondPolicy := *policy.Default()
+	secondPolicy.Revision = first.Revision + 1
+	second, err := policy.Compile(&secondPolicy)
+	if err != nil {
+		t.Fatalf("compile candidate policy: %v", err)
+	}
+	secondDigest, err := policy.Digest(&second.Policy)
+	if err != nil {
+		t.Fatalf("digest candidate policy: %v", err)
+	}
+	secondRef := policy.PolicyRef{ID: second.ID, Revision: second.Revision, Digest: secondDigest}
+	if err := a.PersistPolicyArtifact(first); err != nil {
+		t.Fatalf("persist initial artifact: %v", err)
+	}
+	if err := a.PersistPolicyArtifact(second); err != nil {
+		t.Fatalf("persist candidate artifact: %v", err)
+	}
+	initial := policy.Manifest{SchemaVersion: 1, ActivationEpoch: 1, Active: firstRef}
+	if err := a.InitializePolicyManifest(initial); err != nil {
+		t.Fatalf("initialize policy: %v", err)
+	}
+	if err := a.AcknowledgePolicyContext(ctx, initial); err != nil {
+		t.Fatalf("acknowledge initial policy on A: %v", err)
+	}
+	if err := b.AcknowledgePolicyContext(ctx, initial); err != nil {
+		t.Fatalf("acknowledge initial policy on B: %v", err)
+	}
+
+	reserve := func(node *Store, requestID string) error {
+		reservation, err := node.Reserve(ctx, resource.ReserveRequest{
+			RequestID: requestID,
+			Scopes:    []resource.ScopeSpec{{Scope: resource.ScopeCredential, ID: "policy-resource-credential", Buckets: resource.BucketSpec{ConcurrencyCap: 1}}},
+		})
+		if err == nil {
+			reservation.Release()
+		}
+		return err
+	}
+	if err := reserve(b, "policy-resource-initial"); err != nil {
+		t.Fatalf("initial policy should permit resource admission: %v", err)
+	}
+
+	prepared := policy.Manifest{SchemaVersion: 1, ActivationEpoch: 1, Active: firstRef, Candidate: &secondRef, UpdatedAt: time.Now().UTC()}
+	if err := a.PersistPolicyTransition(prepared, policy.Event{
+		Action: "prepare", FromRevision: first.Revision, ToRevision: second.Revision,
+		FromEpoch: 1, ToEpoch: 1, PolicyID: second.ID, Reason: "strict rollout test", At: prepared.UpdatedAt,
+	}); err != nil {
+		t.Fatalf("prepare policy: %v", err)
+	}
+	if err := b.AcknowledgePolicyContext(ctx, prepared); err != nil {
+		t.Fatalf("acknowledge candidate on B: %v", err)
+	}
+	activated := policy.Manifest{SchemaVersion: 1, ActivationEpoch: 2, Active: secondRef, Previous: &firstRef, UpdatedAt: time.Now().UTC()}
+	if err := a.PersistPolicyTransition(activated, policy.Event{
+		Action: "activate", FromRevision: first.Revision, ToRevision: second.Revision,
+		FromEpoch: 1, ToEpoch: 2, PolicyID: second.ID, Reason: "strict rollout test", At: activated.UpdatedAt,
+	}); err != nil {
+		t.Fatalf("activate policy: %v", err)
+	}
+
+	if err := reserve(b, "policy-resource-stale"); !errors.Is(err, ErrPolicyObservationStale) {
+		t.Fatalf("stale node resource admission error=%v, want ErrPolicyObservationStale", err)
+	}
+	if err := reserve(a, "policy-resource-current"); err != nil {
+		t.Fatalf("activating node should remain able to admit: %v", err)
+	}
+	if err := b.AcknowledgePolicyContext(ctx, activated); err != nil {
+		t.Fatalf("acknowledge active policy on B: %v", err)
+	}
+	if err := reserve(b, "policy-resource-reconciled"); err != nil {
+		t.Fatalf("reconciled node should admit: %v", err)
 	}
 }
 

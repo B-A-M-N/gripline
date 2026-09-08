@@ -87,6 +87,9 @@ func (s *Store) provisionDistributedOnce(ctx context.Context, requestID, fingerp
 	if err := s.requireNodeOwnership(ctx, tx, false); err != nil {
 		return nil, err
 	}
+	if err := s.requireCurrentPolicyObservation(ctx, tx); err != nil {
+		return nil, err
+	}
 	leaseID, err := newLeaseID()
 	if err != nil {
 		return nil, err
