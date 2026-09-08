@@ -34,6 +34,8 @@ operator_token="operator-cluster-harness-0123456789abcdef0123456789"
 secret_one="cluster-secret-one-0123456789"
 secret_two="cluster-secret-two-0123456789"
 pepper_b64="$(openssl rand -base64 32 | tr -d '\n')"
+policy_epoch_file="$harness_dir/policy-epoch"
+printf '1\n' >"$policy_epoch_file"
 
 go build -trimpath -o "$harness_dir/gripline" ./cmd/gripline
 go build -trimpath -o "$harness_dir/backend" ./cmd/gripline-test-backend
@@ -89,6 +91,8 @@ done
 	-work-delay 2s \
 	-active "$harness_dir/backend-active" \
 	-peak "$harness_dir/backend-peak" \
+	-policy-epoch-file "$policy_epoch_file" \
+	-assertion-path "$harness_dir/latest-assertion" \
 	-capture "$harness_dir/backend-capture.log" >"$harness_dir/backend.log" 2>&1 &
 pids+=("$!")
 
@@ -203,6 +207,11 @@ test "$unlock_code" = 200
 # Policy activation and rollback through A must propagate to B and C via the
 # watcher; each node's backend-visible assertion revision is checked directly.
 candidate="$(<"$harness_dir/candidate.json")"
+old_response="$(curl -fsS "http://127.0.0.1:${lb_port}/v1/messages" -H "Authorization: Bearer ${secret_two}")"
+printf '%s\n' "$old_response" | rg -q '"policy_revision":1'
+printf '%s\n' "$old_response" | rg -q '"policy_epoch":1'
+old_assertion="$(<"$harness_dir/latest-assertion")"
+test -n "$old_assertion"
 prepare_payload="$(printf '{"artifact":%s,"reason":"cluster policy canary"}' "$candidate")"
 prepare_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((base + 20))/admin/policy/prepare" \
 	-H "Authorization: Bearer ${operator_token}" -H 'Content-Type: application/json' \
@@ -219,19 +228,36 @@ for _ in $(seq 1 120); do
 	sleep 0.1
 done
 test "$activate_code" = 200
+printf '2\n' >"$policy_epoch_file"
 for port in $((base + 10)) $((base + 11)) $((base + 12)); do
 	for _ in $(seq 1 50); do
-		if curl -fsS "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_two}" 2>/dev/null | rg -q '"policy_revision":2'; then
+		if curl -fsS "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_two}" 2>/dev/null | rg -q '"policy_revision":2' && \
+			curl -fsS "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_two}" 2>/dev/null | rg -q '"policy_epoch":2'; then
 			break
 		fi
 		sleep 0.1
 	done
 	curl -fsS "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_two}" | rg -q '"policy_revision":2'
+	curl -fsS "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_two}" | rg -q '"policy_epoch":2'
 done
 rollback_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((base + 20))/admin/policy/rollback" \
 	-H "Authorization: Bearer ${operator_token}" -H 'Content-Type: application/json' \
 	--data '{"revision":1,"reason":"cluster rollback canary"}')"
 test "$rollback_code" = 200
+printf '3\n' >"$policy_epoch_file"
+for port in $((base + 10)) $((base + 11)) $((base + 12)); do
+	for _ in $(seq 1 50); do
+		if curl -fsS "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_two}" 2>/dev/null | rg -q '"policy_revision":1' && \
+			curl -fsS "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_two}" 2>/dev/null | rg -q '"policy_epoch":3'; then
+			break
+		fi
+		sleep 0.1
+	done
+	curl -fsS "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_two}" | rg -q '"policy_revision":1'
+	curl -fsS "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_two}" | rg -q '"policy_epoch":3'
+done
+old_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${backend_port}/v1/messages" -H "X-Gripline-Assertion: ${old_assertion}")"
+test "$old_code" = 401
 
 # A killed replica is absent from readiness and cannot mint a lease. The
 # remaining two nodes continue to enforce the same five-slot authority.

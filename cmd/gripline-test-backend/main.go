@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -29,7 +30,9 @@ func main() {
 	keysPath := flag.String("keys", "", "public Gripline key-set JSON path")
 	audience := flag.String("audience", "", "expected assertion audience")
 	minPolicyRev := flag.Int("min-policy-rev", 0, "minimum accepted policy revision for test freshness checks")
+	policyEpochFile := flag.String("policy-epoch-file", "", "optional file containing the current accepted policy activation epoch")
 	capturePath := flag.String("capture", "", "optional accepted-request header capture path")
+	assertionPath := flag.String("assertion-path", "", "optional path receiving the latest assertion for test inspection")
 	workDelay := flag.Duration("work-delay", 0, "duration for /v1/work before completing")
 	activePath := flag.String("active", "", "optional file containing current accepted backend work")
 	peakPath := flag.String("peak", "", "optional file containing peak accepted backend work")
@@ -50,6 +53,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("construct verifier: %v", err)
 	}
+	if *policyEpochFile != "" {
+		verifier.WithPolicyEpochChecks(policyEpochFileSource{path: *policyEpochFile}, 1)
+	}
 
 	var captureMu sync.Mutex
 	var statsMu sync.Mutex
@@ -63,6 +69,16 @@ func main() {
 		defer statsMu.Unlock()
 		if err := os.WriteFile(path, []byte(strconv.FormatInt(value, 10)), 0o600); err != nil {
 			log.Printf("stats %s: %v", path, err)
+		}
+	}
+	writeAssertion := func(value string) {
+		if *assertionPath == "" || value == "" {
+			return
+		}
+		statsMu.Lock()
+		defer statsMu.Unlock()
+		if err := os.WriteFile(*assertionPath, []byte(value+"\n"), 0o600); err != nil {
+			log.Printf("assertion capture: %v", err)
 		}
 	}
 	beginWork := func() func() {
@@ -101,6 +117,7 @@ func main() {
 			return
 		}
 		capture(r)
+		writeAssertion(r.Header.Get(verify.AssertionHeader))
 		claims, err := verifier.VerifyAndStrip(r)
 		if err != nil {
 			http.Error(w, "assertion required", http.StatusUnauthorized)
@@ -187,6 +204,7 @@ func main() {
 			"authorized":      true,
 			"credential_id":   claims.CredID,
 			"policy_revision": claims.PolicyRev,
+			"policy_epoch":    claims.PolicyEpoch,
 		})
 	})
 	server := &http.Server{Addr: *listen, Handler: handler, ReadHeaderTimeout: 5 * time.Second}
@@ -202,4 +220,32 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = server.Shutdown(ctx)
+}
+
+type policyEpochFileSource struct{ path string }
+
+func (s policyEpochFileSource) PolicyEpoch() (uint64, bool) {
+	epoch, err := s.read()
+	return epoch, err == nil
+}
+
+func (s policyEpochFileSource) PolicyEpochContext(ctx context.Context) (uint64, error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+	}
+	return s.read()
+}
+
+func (s policyEpochFileSource) read() (uint64, error) {
+	raw, err := os.ReadFile(s.path)
+	if err != nil {
+		return 0, err
+	}
+	epoch, err := strconv.ParseUint(strings.TrimSpace(string(raw)), 10, 64)
+	if err != nil || epoch == 0 {
+		return 0, fmt.Errorf("invalid policy epoch")
+	}
+	return epoch, nil
 }
