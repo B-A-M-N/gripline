@@ -1127,7 +1127,8 @@ func runStatusCLI(cfgPath string) error {
 	if err != nil {
 		return err
 	}
-	stateBacked := cfg.Paths.State != ""
+	clustered := strings.EqualFold(strings.TrimSpace(cfg.Authority.Backend), "postgres")
+	stateBacked := cfg.Paths.State != "" || clustered
 	providerSource := cfg.Ingress != nil && (cfg.Ingress.PseudonymKey != "" || len(cfg.Ingress.PseudonymKeys) > 0)
 	networkMetadata := cfg.Ingress != nil && len(cfg.Ingress.Networks) > 0
 	policyDigest, _ := policy.Digest(pol)
@@ -1139,6 +1140,11 @@ func runStatusCLI(cfgPath string) error {
 			}
 			_ = lifecycle.Close()
 		}
+	} else if clustered {
+		// This command is static configuration inspection. Live PostgreSQL
+		// membership, policy epoch, and fencing state belong to `cluster
+		// status`, which uses the authenticated admin plane.
+		policyState = "shared-authority"
 	}
 	usageConfigured := cfg.Usage.Mode == "openai" || cfg.Usage.Mode == "anthropic"
 	activeKID := "unknown"
@@ -1206,12 +1212,14 @@ func runStatusCLI(cfgPath string) error {
 		}
 	}
 	rows := []row{
-		{"credential authority", durab(stateBacked), authorityNote(stateBacked)},
-		{"lane authority", durab(stateBacked), authorityNote(stateBacked)},
-		{"evidence authority", durab(stateBacked), authorityNote(stateBacked)},
+		{"authority backend", authorityBackendState(cfg), authorityNote(cfg)},
+		{"credential authority", durab(stateBacked), authorityNote(cfg)},
+		{"lane authority", durab(stateBacked), authorityNote(cfg)},
+		{"evidence authority", durab(stateBacked), authorityNote(cfg)},
 		{"signer identity", signerState, signerNote(cfg)},
 		{"operator audit", durab(stateBacked || cfg.Paths.AuditLog != ""), auditNote(cfg)},
 		{"operator control plane", onoff(cfg.Admin != nil), adminNote(cfg)},
+		{"node identity", nodeIdentityState(cfg), nodeIdentityNote(cfg)},
 		{"source attribution", onoff(providerSource), sourceNote(cfg)},
 		{"network metadata", onoff(networkMetadata), networkNote(cfg)},
 		{"source blocking", onoff(pol.Risk.SourceMode == policy.SourceEnforce), sourceBlockingNote(pol)},
@@ -1221,7 +1229,7 @@ func runStatusCLI(cfgPath string) error {
 		{"token accounting", onoff(usageConfigured), usageNote(cfg, "tokens")},
 		{"cost accounting", onoff(usageConfigured && (cfg.Usage.InputMicrounitsPerToken > 0 || cfg.Usage.OutputMicrounitsPerToken > 0)), usageNote(cfg, "cost")},
 		{"active policy", policyState, fmt.Sprintf("%s revision=%d digest=%s", pol.ID, pol.Revision, policyDigest)},
-		{"resource persistence", "process-lifetime", "governor windows are volatile; restart-safe credential/lane/evidence state remains durable"},
+		{"resource persistence", resourcePersistenceState(clustered), resourcePersistenceNote(clustered)},
 		{"source-table bound", fmt.Sprintf("%d", maxSourceScopes), "zero resolves to the conservative runtime default; overflow identities are hashed into bounded shared scopes"},
 		{"spool bounds", fmt.Sprintf("%d bytes/%d files", spoolBytes, spoolFiles), "aggregate unknown-length request budget"},
 		{"active signer KID", activeKID, "public key generations are exported separately"},
@@ -1287,11 +1295,52 @@ func sourceBlockingNote(pol *policy.Policy) string {
 	return "shadow-only default: sourceWouldBlock recorded, never denies (P0.7)"
 }
 
-func authorityNote(stateBacked bool) string {
-	if stateBacked {
+func authorityBackendState(cfg *config.Config) string {
+	if cfg != nil && strings.EqualFold(strings.TrimSpace(cfg.Authority.Backend), "postgres") {
+		return "postgres"
+	}
+	if cfg != nil && cfg.Paths.State != "" {
+		return "bbolt"
+	}
+	return "memory"
+}
+
+func authorityNote(cfg *config.Config) string {
+	if cfg != nil && strings.EqualFold(strings.TrimSpace(cfg.Authority.Backend), "postgres") {
+		return "PostgreSQL shared authority; use cluster status for live state"
+	}
+	if cfg != nil && cfg.Paths.State != "" {
 		return "Bolt transactional store"
 	}
 	return "memory store (ephemeral; not for production)"
+}
+
+func nodeIdentityState(cfg *config.Config) string {
+	if cfg != nil && strings.EqualFold(strings.TrimSpace(cfg.Authority.Backend), "postgres") {
+		return "configured"
+	}
+	return "none"
+}
+
+func nodeIdentityNote(cfg *config.Config) string {
+	if cfg != nil && strings.EqualFold(strings.TrimSpace(cfg.Authority.Backend), "postgres") {
+		return fmt.Sprintf("node_id=%s; live instance/epoch are reported by cluster status", cfg.Authority.NodeID)
+	}
+	return "standalone process has no shared membership identity"
+}
+
+func resourcePersistenceState(clustered bool) string {
+	if clustered {
+		return "shared-durable"
+	}
+	return "process-lifetime"
+}
+
+func resourcePersistenceNote(clustered bool) string {
+	if clustered {
+		return "PostgreSQL leases and token/cost buckets are shared across nodes"
+	}
+	return "governor windows are volatile; restart-safe credential/lane/evidence state remains durable"
 }
 
 func signerNote(cfg *config.Config) string {
@@ -1302,6 +1351,9 @@ func signerNote(cfg *config.Config) string {
 }
 
 func auditNote(cfg *config.Config) string {
+	if cfg != nil && strings.EqualFold(strings.TrimSpace(cfg.Authority.Backend), "postgres") {
+		return "PostgreSQL shared audit authority"
+	}
 	if cfg.Paths.State != "" {
 		return "bolt state database (authoritative)"
 	}

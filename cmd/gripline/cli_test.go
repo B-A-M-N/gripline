@@ -59,6 +59,41 @@ func TestCLIStatusCommand(t *testing.T) {
 	}
 }
 
+func TestCLIStatusCommandRecognizesPostgresAuthority(t *testing.T) {
+	dir := t.TempDir()
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }))
+	defer backend.Close()
+	cfgPath := filepath.Join(dir, "config.json")
+	cfgJSON := `{"listen":"127.0.0.1:8080","backend":{"url":"` + backend.URL + `","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"test-audience"},"tls":{"terminate_tls_upstream":true},"authority":{"backend":"postgres","dsn_env":"GRIPLINE_STATUS_DSN","node_id":"status-node","lease_ttl":"10s","renew_every":"2s"}}`
+	if err := os.WriteFile(cfgPath, []byte(cfgJSON), 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	out := captureStdout(t, func() {
+		if err := runStatusCLI(cfgPath); err != nil {
+			t.Fatal(err)
+		}
+	})
+	for _, want := range []string{
+		"authority backend",
+		"postgres",
+		"PostgreSQL shared authority",
+		"resource persistence",
+		"shared-durable",
+		"node identity",
+		"configured",
+		"active policy",
+		"shared-authority",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("cluster status missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "process-lifetime") {
+		t.Fatalf("PostgreSQL status incorrectly reports process-lifetime resources:\n%s", out)
+	}
+}
+
 // TestCLILifecycleUsesLiveAdmin proves the normal lifecycle commands talk to
 // the running private admin listener. The raw-state helpers remain available
 // only behind the explicit --offline flag.
