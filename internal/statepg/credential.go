@@ -260,7 +260,43 @@ func (s *Store) TouchLastSeenContext(ctx context.Context, credentialID string, a
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	_, err := s.pool.Exec(ctx, `UPDATE gripline_credentials SET last_seen_at=$2 WHERE credential_id=$1`, credentialID, at)
+	query := `UPDATE gripline_credentials SET last_seen_at=$2 WHERE credential_id=$1`
+	args := []any{credentialID, at}
+	if s.nodeID != "" {
+		// Last-seen is telemetry, not an authorization prerequisite, so keep this
+		// as one bounded statement instead of opening a transaction on the hot
+		// path. The ownership predicate still makes a fenced instance unable to
+		// mutate the shared credential row after a replacement acquires its node
+		// ID. A draining owner may finish recording telemetry.
+		query += ` AND EXISTS (
+			SELECT 1 FROM gripline_membership
+			WHERE node_id=$3 AND instance_id=$4 AND node_epoch=$5
+			  AND state IN ('ready','draining')
+			  AND last_seen_at > CURRENT_TIMESTAMP - ($6::double precision * interval '1 second')
+		)`
+		args = append(args, s.nodeID, s.instanceID, s.nodeEpoch, s.leaseTTL.Seconds())
+	}
+	tag, err := s.pool.Exec(ctx, query, args...)
+	if err == nil && s.nodeID != "" && tag.RowsAffected() == 0 {
+		// Zero rows can mean an unknown credential, but it can also mean this
+		// instance was fenced. Probe only the membership row so telemetry still
+		// remains best-effort while stale ownership is surfaced to callers that
+		// care (the admission path deliberately ignores this error).
+		var owned bool
+		membershipErr := s.pool.QueryRow(ctx, `SELECT EXISTS (
+			SELECT 1 FROM gripline_membership
+			WHERE node_id=$1 AND instance_id=$2 AND node_epoch=$3
+			  AND state IN ('ready','draining')
+			  AND last_seen_at > CURRENT_TIMESTAMP - ($4::double precision * interval '1 second')
+		)`, s.nodeID, s.instanceID, s.nodeEpoch, s.leaseTTL.Seconds()).Scan(&owned)
+		if membershipErr != nil {
+			return mapDBError(membershipErr)
+		}
+		if !owned {
+			s.fenced.Store(true)
+			return ErrNodeFenced
+		}
+	}
 	return mapDBError(err)
 }
 

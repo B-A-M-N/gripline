@@ -778,6 +778,8 @@ func TestPostgresFencedNodeCannotMutateAuthority(t *testing.T) {
 	assertFenced("credential verifier rotation", err)
 	_, err = old.ObserveAndCommit(ctx, credentialID, 90, credential.Hysteresis{}, now)
 	assertFenced("credential observation", err)
+	err = old.TouchLastSeenContext(ctx, credentialID, now.Add(time.Minute))
+	assertFenced("credential last-seen telemetry", err)
 	_, _, err = old.BorrowOrCreateWithPolicy(ctx, credentialID, "fencing-after-takeover-lane", lane.Features{NetworkASN: "AS-FENCE-2"}, policyContext)
 	assertFenced("lane creation", err)
 	_, err = old.ObserveRiskWithPolicy(ctx, credentialID, "fencing-lane", 90, now, policyContext, lane.TransitionMetadata{})
