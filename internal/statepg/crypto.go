@@ -428,11 +428,16 @@ func (s *Store) synchronizeCryptoOnce(ctx context.Context, local CryptoIdentity)
 		if _, err := tx.Exec(ctx, `UPDATE gripline_cluster_crypto SET signer_active_fingerprint=$1, pepper_active_fingerprint=$2, pseudonym_active_fingerprint=$3 WHERE singleton=TRUE`, shared.SignerActiveFingerprint, shared.PepperActiveFingerprint, shared.PseudonymActiveFingerprint); err != nil {
 			return CryptoIdentity{}, retryableTransactionError(err), mapDBError(err)
 		}
-	} else if local.SignerActiveKID != shared.SignerActiveKID ||
-		local.PepperActiveVersion != shared.PepperActiveVersion ||
-		local.PseudonymVersion != shared.PseudonymVersion {
-		return CryptoIdentity{}, false, fmt.Errorf("statepg: local active crypto generations differ from shared signer=%d pepper=%d pseudonym=%d",
-			shared.SignerActiveKID, shared.PepperActiveVersion, shared.PseudonymVersion)
+	} else if local.SignerActiveKID != shared.SignerActiveKID {
+		// The signer is different from the derivation rings: a node whose
+		// local signer is already active on another KID could issue assertions
+		// before the backend verifier and cluster authority have accepted that
+		// generation. Signer activation therefore remains an explicit startup
+		// agreement. Pepper and pseudonym rings, by contrast, can safely load a
+		// future generation and select the shared active one immediately after
+		// synchronization, before the node is exposed to traffic.
+		return CryptoIdentity{}, false, fmt.Errorf("statepg: local active signer generation %d differs from shared signer=%d",
+			local.SignerActiveKID, shared.SignerActiveKID)
 	} else if !matchesLoaded(local, CryptoKindSigner, shared.SignerActiveKID, shared.SignerActiveFingerprint) ||
 		!matchesLoaded(local, CryptoKindPepper, shared.PepperActiveVersion, shared.PepperActiveFingerprint) ||
 		(shared.PseudonymVersion > 0 && !matchesLoaded(local, CryptoKindPseudonym, shared.PseudonymVersion, shared.PseudonymActiveFingerprint)) {

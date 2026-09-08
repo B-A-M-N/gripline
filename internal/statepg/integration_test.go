@@ -564,7 +564,7 @@ func TestPostgresCryptoActivationRequiresLiveNodeAcknowledgements(t *testing.T) 
 	base := CryptoIdentity{
 		SignerActiveKID: 1, SignerFingerprint: "crypto-activation-signer",
 		PepperActiveVersion: 1, PepperFingerprint: "crypto-activation-pepper",
-		PseudonymVersion: 0, PseudonymFingerprint: "disabled",
+		PseudonymVersion: 1, PseudonymFingerprint: "crypto-activation-pseudonym",
 	}
 	if _, err := a.SynchronizeCrypto(ctx, base); err != nil {
 		t.Fatalf("synchronize crypto node A: %v", err)
@@ -577,15 +577,11 @@ func TestPostgresCryptoActivationRequiresLiveNodeAcknowledgements(t *testing.T) 
 		{Kind: CryptoKindSigner, Generation: 1, Fingerprint: base.SignerFingerprint},
 		{Kind: CryptoKindPepper, Generation: 1, Fingerprint: base.PepperFingerprint},
 		{Kind: CryptoKindPepper, Generation: 2, Fingerprint: "crypto-activation-pepper-2"},
+		{Kind: CryptoKindPseudonym, Generation: 1, Fingerprint: base.PseudonymFingerprint},
+		{Kind: CryptoKindPseudonym, Generation: 2, Fingerprint: "crypto-activation-pseudonym-2"},
 	}
 	if _, err := a.SynchronizeCrypto(ctx, staged); err != nil {
 		t.Fatalf("stage pepper on node A: %v", err)
-	}
-	diverged := staged
-	diverged.PepperActiveVersion = 2
-	diverged.PepperActiveFingerprint = "crypto-activation-pepper-2"
-	if _, err := b.SynchronizeCrypto(ctx, diverged); err == nil {
-		t.Fatal("a node with a locally active future pepper must not synchronize before cluster activation")
 	}
 	request := CryptoActivationRequest{
 		Kind: CryptoKindPepper, Generation: 2, Fingerprint: "crypto-activation-pepper-2",
@@ -594,8 +590,20 @@ func TestPostgresCryptoActivationRequiresLiveNodeAcknowledgements(t *testing.T) 
 	if _, err := a.ActivateCryptoGeneration(ctx, request); !errors.Is(err, ErrCryptoActivationBarrier) {
 		t.Fatalf("activation before node B acknowledgement error=%v, want barrier", err)
 	}
-	if _, err := b.SynchronizeCrypto(ctx, staged); err != nil {
-		t.Fatalf("stage pepper on node B: %v", err)
+	diverged := staged
+	diverged.PepperActiveVersion = 2
+	diverged.PepperActiveFingerprint = "crypto-activation-pepper-2"
+	diverged.PseudonymVersion = 2
+	diverged.PseudonymActiveFingerprint = "crypto-activation-pseudonym-2"
+	sharedBeforeActivation, err := b.SynchronizeCrypto(ctx, diverged)
+	if err != nil {
+		t.Fatalf("a node with a locally selected future pepper should synchronize before cluster activation: %v", err)
+	}
+	if sharedBeforeActivation.PepperActiveVersion != base.PepperActiveVersion {
+		t.Fatalf("pre-activation synchronization selected pepper %d, want shared %d", sharedBeforeActivation.PepperActiveVersion, base.PepperActiveVersion)
+	}
+	if sharedBeforeActivation.PseudonymVersion != base.PseudonymVersion {
+		t.Fatalf("pre-activation synchronization selected pseudonym %d, want shared %d", sharedBeforeActivation.PseudonymVersion, base.PseudonymVersion)
 	}
 	active, err := a.ActivateCryptoGeneration(ctx, request)
 	if err != nil {

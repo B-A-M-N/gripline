@@ -241,7 +241,7 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 			DSN: dsn, MaxConns: cfg.Authority.MaxConns, MinConns: cfg.Authority.MinConns,
 			NodeID: cfg.Authority.NodeID, LeaseTTL: cfg.Authority.LeaseTTL.D(), RenewEvery: cfg.Authority.RenewEvery.D(), MaxSourceScopes: cfg.Server.MaxSourceScopes, SourceScopeIdle: cfg.Server.SourceScopeIdle.D(),
 			ConnectTimeout: connectTimeout, OperationTimeout: operationTimeout,
-			Migrate:       false,
+			Migrate: false,
 		})
 		connectCancel()
 		if err != nil {
@@ -380,53 +380,6 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		authorities.Mutations, authorities.AuditSink, authorities.Audit, authorities.SecurityLog = postgres, postgres, postgres, postgres
 	}
 
-	pol, err := policyFor(cfg)
-	if err != nil {
-		return nil, fmt.Errorf("gripline: policy: %w", err)
-	}
-	var policyVerifier ed25519.PublicKey
-	if cfg.Policy.VerifierKeyFile != "" {
-		policyVerifier, err = policy.LoadVerifierKeyFile(cfg.Policy.VerifierKeyFile)
-		if err != nil {
-			return nil, fmt.Errorf("gripline: policy verifier: %w", err)
-		}
-	}
-	policyOptions := policy.Options{}
-	if state != nil {
-		policyOptions = policy.Options{
-			Persist:           state.PersistPolicyManifest,
-			PersistArtifact:   state.PersistPolicyArtifact,
-			PersistTransition: state.PersistPolicyTransition,
-			LoadManifest:      state.LoadPolicyManifest,
-			LoadArtifact:      state.LoadPolicyArtifact,
-		}
-	} else if postgres != nil {
-		policyOptions = policy.Options{
-			PersistContext:           postgres.PersistPolicyManifestContext,
-			InitializeContext:        postgres.InitializePolicyManifestContext,
-			PersistArtifactContext:   postgres.PersistPolicyArtifactContext,
-			PersistTransitionContext: postgres.PersistPolicyTransitionContext,
-			LoadManifestContext:      postgres.LoadPolicyManifestContext,
-			LoadArtifactContext:      postgres.LoadPolicyArtifactContext,
-			AcknowledgeContext:       postgres.AcknowledgePolicyContext,
-		}
-	}
-	policyCtx, policyCancel := context.WithTimeout(context.Background(), operationTimeout)
-	policyManager, err := policy.NewManagerContext(policyCtx, pol, policyOptions)
-	policyCancel()
-	if err != nil {
-		return nil, fmt.Errorf("gripline: policy manager: %w", err)
-	}
-	compiledPolicy := policyManager.Current()
-	if compiledPolicy == nil {
-		return nil, fmt.Errorf("gripline: policy manager published no active policy")
-	}
-	pol = &compiledPolicy.Policy
-	if postgres != nil {
-		stopPolicyWatcher := policyManager.StartWatcher(context.Background(), time.Second, operationTimeout)
-		closers = append(closers, func() error { stopPolicyWatcher(); return nil })
-	}
-
 	producerList := []producers.Producer{
 		producers.NewSourceNoveltyProducer(time.Now),
 		producers.NewResourceVelocityProducer(time.Now),
@@ -553,6 +506,57 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 				return nil, fmt.Errorf("gripline: cluster pseudonym generation: %w", err)
 			}
 		}
+	}
+
+	// Policy reconciliation acknowledges the active shared policy through the
+	// authority. Cluster crypto must be synchronized first because the same
+	// authority transaction intentionally refuses security-state mutations from
+	// an unsynchronized node.
+	pol, err := policyFor(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("gripline: policy: %w", err)
+	}
+	var policyVerifier ed25519.PublicKey
+	if cfg.Policy.VerifierKeyFile != "" {
+		policyVerifier, err = policy.LoadVerifierKeyFile(cfg.Policy.VerifierKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("gripline: policy verifier: %w", err)
+		}
+	}
+	policyOptions := policy.Options{}
+	if state != nil {
+		policyOptions = policy.Options{
+			Persist:           state.PersistPolicyManifest,
+			PersistArtifact:   state.PersistPolicyArtifact,
+			PersistTransition: state.PersistPolicyTransition,
+			LoadManifest:      state.LoadPolicyManifest,
+			LoadArtifact:      state.LoadPolicyArtifact,
+		}
+	} else if postgres != nil {
+		policyOptions = policy.Options{
+			PersistContext:           postgres.PersistPolicyManifestContext,
+			InitializeContext:        postgres.InitializePolicyManifestContext,
+			PersistArtifactContext:   postgres.PersistPolicyArtifactContext,
+			PersistTransitionContext: postgres.PersistPolicyTransitionContext,
+			LoadManifestContext:      postgres.LoadPolicyManifestContext,
+			LoadArtifactContext:      postgres.LoadPolicyArtifactContext,
+			AcknowledgeContext:       postgres.AcknowledgePolicyContext,
+		}
+	}
+	policyCtx, policyCancel := context.WithTimeout(context.Background(), operationTimeout)
+	policyManager, err := policy.NewManagerContext(policyCtx, pol, policyOptions)
+	policyCancel()
+	if err != nil {
+		return nil, fmt.Errorf("gripline: policy manager: %w", err)
+	}
+	compiledPolicy := policyManager.Current()
+	if compiledPolicy == nil {
+		return nil, fmt.Errorf("gripline: policy manager published no active policy")
+	}
+	pol = &compiledPolicy.Policy
+	if postgres != nil {
+		stopPolicyWatcher := policyManager.StartWatcher(context.Background(), time.Second, operationTimeout)
+		closers = append(closers, func() error { stopPolicyWatcher(); return nil })
 	}
 
 	term, err := terminator.New(terminator.Dependencies{
