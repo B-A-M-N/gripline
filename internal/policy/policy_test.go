@@ -183,3 +183,25 @@ func TestPolicyFailsClosedWithoutEvidenceRules(t *testing.T) {
 		t.Fatal("policy with Match <= Related classification must be invalid (P0.11)")
 	}
 }
+
+func TestPolicyRejectsInexactDistributedResourceQuantities(t *testing.T) {
+	tooLarge := int64(1<<53 + 1)
+	cases := []struct {
+		name string
+		edit func(*Policy)
+	}{
+		{"request capacity", func(p *Policy) { p.Limits.Normal.Requests.Capacity = tooLarge }},
+		{"token refill", func(p *Policy) { p.Limits.Normal.Tokens.RefillPer = tooLarge }},
+		{"cost capacity", func(p *Policy) { p.Limits.Normal.Cost.Capacity = tooLarge }},
+		{"concurrency cap", func(p *Policy) { p.Limits.Normal.ConcurrencyCap = int(tooLarge) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := Default()
+			tc.edit(p)
+			if p.IsValid() {
+				t.Fatalf("resource quantity above binary64 exactness bound must be invalid")
+			}
+		})
+	}
+}

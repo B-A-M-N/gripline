@@ -306,6 +306,12 @@ type BucketConfig struct {
 	RefillIn  time.Duration
 }
 
+// maxExactResourceInteger is the largest integer that IEEE-754 binary64 can
+// represent without rounding. Resource quantities are authored as integers but
+// the distributed authority stores bucket gauges as DOUBLE PRECISION; values
+// above this bound could otherwise silently change a hard allowance.
+const maxExactResourceInteger int64 = 1 << 53
+
 // Learning controls baseline seeding (§29, §42) and lane promotion criteria.
 type Learning struct {
 	MaximumRisk   int
@@ -642,7 +648,8 @@ func (p *Policy) IsValid() bool {
 	for _, lim := range []Limits{
 		p.Limits.Normal, p.Limits.Constrained, emergency, p.Global,
 	} {
-		if !validBucket(lim.Requests) || !validBucket(lim.Tokens) || !validBucket(lim.Cost) {
+		if lim.ConcurrencyCap < 0 || int64(lim.ConcurrencyCap) > maxExactResourceInteger ||
+			!validBucket(lim.Requests) || !validBucket(lim.Tokens) || !validBucket(lim.Cost) {
 			return false
 		}
 	}
@@ -680,7 +687,8 @@ func (p *Policy) IsValid() bool {
 
 // validBucket reports whether a BucketConfig is structurally legal (P0.19).
 func validBucket(b BucketConfig) bool {
-	if b.Capacity < 0 || b.RefillPer < 0 || b.RefillIn < 0 {
+	if b.Capacity < 0 || b.RefillPer < 0 || b.RefillIn < 0 ||
+		b.Capacity > maxExactResourceInteger || b.RefillPer > maxExactResourceInteger {
 		return false
 	}
 	// A refill rate with no positive interval is a divide-by-zero / instant
