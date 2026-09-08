@@ -1068,113 +1068,13 @@ func (t *Terminator) admitUsageWithRequestID(ctx context.Context, reqID string, 
 	allEvidence = append(allEvidence, sourceEvidence...)
 	evidenceCodes := evCodes(allEvidence)
 
-	// 8. Security observation: apply the risk observation to the AUTHORITATIVE
-	// security state atomically (P0.5/P0.6). The registry's ObserveAndCommit
-	// loads → reduces → CAS → commits, bumping revision exactly once per status
-	// mutation. The outcome is one of COMMITTED / NO_CHANGE / CONFLICT /
-	// UNAVAILABLE — never a fusion of local + stale persisted state.
-	//
-	// DEGRADED (P0.1): when authoritative history is unavailable we do NOT feed
-	// a synthetic score into the state machine. We preserve the persisted
-	// status and restrictions, evaluate only ADDITIONAL synchronous evidence
-	// for further restriction, and let the hard-limit + policy gates carry the
-	// decision. This prevents an outage from being observed as clean history
-	// that downgrades CONSTRAINED→WATCH→NORMAL.
-	var updatedCred *credential.Credential
-	after := cred.Status
-	adaptiveForObservation := adaptive
-
-	if adaptiveForObservation == AdaptiveAvailable && t.dep.Evidence != nil {
-		// Gate H / §102 phase 6: automatic quarantine is DISABLED until shadow
-		// validation. P0.14: the ceiling is expressed as MaxAutomaticStatus on
-		// the machine — the REAL score always flows into the authoritative
-		// state (a falsified low score stuck hot credentials at WATCH forever
-		// and recorded a lie in the risk history). The request-level policy
-		// denial below still uses the UNclamped risk to reject a genuinely hot
-		// credential via temporarily_restricted; we just do not commit an
-		// operator-unvalidated QUARANTINED status — the credential escalates to
-		// CONSTRAINED instead, resource-restricted immediately.
-		hy := t.credentialHysteresis()
-		if !t.pol.Risk.EnableAutomaticQuarantine {
-			hy.MaxAutomaticStatus = credential.StatusConstrained
-		}
-		// ObserveAndCommit via the registry-as-repository. Double-source the
-		// remaining risk into the machine only when we have authoritative
-		// history.
-		transitionMeta := credential.TransitionMetadata{RequestID: out.RequestID, PolicyRevision: t.pol.Revision, EvidenceCodes: evidenceCodes}
-		tr, oerr := t.dep.Registry.ObserveAndCommit(
-			ctxForRequestWithMetadata(ctx, transitionMeta), cred.CredentialID,
-			credentialRisk, hy, now,
-		)
-		if oerr != nil {
-			// Outage / not found: the observation could not be committed
-			// authoritatively. Do NOT synthesize state from the local machine.
-			// Preserve persisted status; deny if the persisted state blocks.
-			adaptiveForObservation = AdaptiveDegraded
-			if rr, lerr := t.dep.Registry.LookupAuthoritative(ctxForRequest(ctx, out.RequestID), cred.CredentialID); lerr == nil {
-				after = rr.Status
-				updatedCred = credFrom(rr)
-				markLastSeen(t.dep.Registry, cred.CredentialID, now)
-			}
-			// If even the authoritative read fails, fall through with the
-			// authenticated cred's persisted status (fail-safe, never downgrade).
-		} else {
-			switch tr.Status {
-			case credential.TransitionCommitted, credential.TransitionNoChange:
-				after = tr.Record.Status
-				updatedCred = credFrom(tr.Record)
-				if tr.Status == credential.TransitionCommitted && !adaptivePersistenceFailed {
-					adaptiveForObservation = AdaptiveAvailable
-				}
-			case credential.TransitionConflict:
-				// A concurrent writer advanced the revision. Bounded retry once:
-				// re-read authoritative and re-commit the same risk observation.
-				rec, lerr := t.dep.Registry.LookupAuthoritative(ctxForRequest(ctx, out.RequestID), cred.CredentialID)
-				if lerr != nil {
-					adaptiveForObservation = AdaptiveDegraded
-					after = cred.Status
-				} else {
-					// P0.20: Re-commit once against the authoritative record.
-					// If this also conflicts, preserve the stricter state (the
-					// concurrent writer's) rather than discarding our observation.
-					retry, rerr := t.dep.Registry.ObserveAndCommit(ctxForRequestWithMetadata(ctx, transitionMeta), cred.CredentialID, credentialRisk, hy, now)
-					switch {
-					case rerr == nil:
-						after = retry.Record.Status
-						updatedCred = credFrom(retry.Record)
-						if retry.Status == credential.TransitionCommitted && !adaptivePersistenceFailed {
-							adaptiveForObservation = AdaptiveAvailable
-						}
-					case errors.Is(rerr, credential.ErrStaleCAS):
-						// Lost the race again — preserve the concurrent writer's state.
-						after = rec.Status
-						updatedCred = credFrom(rec)
-					default:
-						adaptiveForObservation = AdaptiveDegraded
-						after = rec.Status
-						updatedCred = credFrom(rec)
-					}
-				}
-			case credential.TransitionUnavailable:
-				adaptiveForObservation = AdaptiveDegraded
-				after = cred.Status
-			}
-		}
-	} else {
-		// No adaptive state claimed (nil evidence store = explicit no-adaptive
-		// mode, P0.2) OR degraded: preserve persisted status, do not transition.
-		if t.dep.Evidence == nil {
-			// Explicit TERMINATE-no-adaptive posture: status is whatever the
-			// authenticated record carries; no hysteresis applies.
-			after = cred.Status
-			updatedCred = cred
-		} else {
-			// Degraded: preserve persisted status and restrictions.
-			after = cred.Status
-			updatedCred = cred
-			out.Degraded = true
-		}
-	}
+	// 8. Apply the credential risk observation through the authoritative
+	// load/reduce/CAS protocol. This component preserves persisted restrictions
+	// when history is unavailable and retries one concurrent-writer conflict.
+	observation := t.observeCredentialRisk(ctx, out.RequestID, cred, credentialRisk, evidenceCodes, adaptive, adaptivePersistenceFailed, out, now)
+	updatedCred := observation.credential
+	after := observation.status
+	adaptiveForObservation := observation.adaptive
 
 	// QUARANTINED at any point → deny immediately (with the actual quarantine
 	// error, not ErrRevoked — P0.30 transport-mapping cleanup).
