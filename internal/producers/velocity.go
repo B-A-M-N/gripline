@@ -140,7 +140,7 @@ func (p *ResourceVelocityProducer) checkConcurrencyVelocity(key string, value fl
 // Token velocity is LANE-scoped (TOKEN_VELOCITY_* → ScopeLane); cost velocity
 // is CREDENTIAL-scoped (COST_VELOCITY_* → ScopeCredential).
 func (p *ResourceVelocityProducer) ObserveCompletion(behavior CompletionBehavior) []Signal {
-	if behavior.Subjects.CredentialID == "" {
+	if behavior.Subjects.CredentialID == "" || !behavior.Success {
 		return nil
 	}
 	p.mu.Lock()

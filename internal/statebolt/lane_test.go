@@ -1,6 +1,7 @@
 package statebolt
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 	"time"
@@ -115,9 +116,11 @@ func TestLaneSecurityTransitionIsDurablyAudited(t *testing.T) {
 	s := openTestStore(t)
 	lim := lane.DefaultLimits()
 	lim.Security.SuspectObs = 1
-	s.SetLaneLimits(func() lane.Limits { return lim })
 	mustCreateLane(t, s, "cred_security", "lane_security", time.Now())
-	if _, err := s.ObserveRiskWithRequestID("cred_security", "lane_security", lim.Security.SuspectThresh, time.Now(), "req_lane_security"); err != nil {
+	ctx := lane.DefaultPolicyContext()
+	ctx.Limits = lim
+	ctx.Security = lim.Security
+	if _, err := s.ObserveRiskWithPolicy(context.Background(), "cred_security", "lane_security", lim.Security.SuspectThresh, time.Now(), ctx, lane.TransitionMetadata{RequestID: "req_lane_security"}); err != nil {
 		t.Fatal(err)
 	}
 	rows, err := s.ListSecurityTransitions(0, 100)
@@ -192,14 +195,16 @@ func TestLaneRetentionCommitsOnDomainError(t *testing.T) {
 	for _, backend := range []string{"memory", "bolt"} {
 		c := &clock{now: base}
 		var repo lane.Repository
+		var policyRepo lane.PolicyAwareRepository
 		var durable *Store
 		var path string
 		if backend == "memory" {
-			repo = lane.NewStore(func() lane.Limits {
+			memory := lane.NewStore(func() lane.Limits {
 				lim := lane.DefaultLimits()
 				lim.LaneIdleExpiration = time.Hour
 				return lim
 			}, func() time.Time { return c.now })
+			repo, policyRepo = memory, memory
 		} else {
 			var err error
 			path = filepath.Join(t.TempDir(), "state.db")
@@ -207,24 +212,23 @@ func TestLaneRetentionCommitsOnDomainError(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			lim := lane.DefaultLimits()
-			lim.LaneIdleExpiration = time.Hour
-			durable.SetLaneLimits(func() lane.Limits { return lim })
-			repo = durable
+			repo, policyRepo = durable, durable
 		}
 
 		featuresA := lane.Features{NetworkASN: "AS1", NetworkType: "residential", RegionClass: "US", ClientFamily: "client-a"}
 		featuresB := lane.Features{NetworkASN: "AS2", NetworkType: "hosting", RegionClass: "EU", ClientFamily: "client-b"}
-		ctx := lane.ClassificationContext{Revision: 1, Thresholds: lane.DefaultThresholds()}
-		if _, created, err := repo.BorrowOrCreate("cred", "lane-a", featuresA, ctx); err != nil || !created {
+		ctx := lane.DefaultPolicyContext()
+		ctx.Classification = lane.ClassificationContext{Revision: 1, Thresholds: lane.DefaultThresholds()}
+		ctx.Limits.LaneIdleExpiration = time.Hour
+		if _, created, err := policyRepo.BorrowOrCreateWithPolicy(context.Background(), "cred", "lane-a", featuresA, ctx); err != nil || !created {
 			t.Fatalf("%s create A: created=%v err=%v", backend, created, err)
 		}
 		c.now = base.Add(30 * time.Minute)
-		if _, created, err := repo.BorrowOrCreate("cred", "lane-b", featuresB, ctx); err != nil || !created {
+		if _, created, err := policyRepo.BorrowOrCreateWithPolicy(context.Background(), "cred", "lane-b", featuresB, ctx); err != nil || !created {
 			t.Fatalf("%s create B: created=%v err=%v", backend, created, err)
 		}
 		c.now = base.Add(80 * time.Minute)
-		_, _, err := repo.BorrowOrCreate("cred", "lane-b", lane.Features{NetworkASN: "AS2", NetworkType: "hosting", RegionClass: "EU", ClientFamily: "client-b-different"}, ctx)
+		_, _, err := policyRepo.BorrowOrCreateWithPolicy(context.Background(), "cred", "lane-b", lane.Features{NetworkASN: "AS2", NetworkType: "hosting", RegionClass: "EU", ClientFamily: "client-b-different"}, ctx)
 		if err != lane.ErrLaneConflict {
 			t.Fatalf("%s conflict err=%v, want ErrLaneConflict", backend, err)
 		}
@@ -262,14 +266,14 @@ func TestLaneRetentionCommitsOnDomainError(t *testing.T) {
 func TestLaneRepositoryExplosionLimits(t *testing.T) {
 	s := openTestStore(t)
 	lim := lane.DefaultLimits()
-	s.SetLaneLimits(func() lane.Limits { return lim })
-	ctx := lane.ClassificationContext{Revision: 1, Thresholds: lane.DefaultThresholds()}
+	ctx := lane.DefaultPolicyContext()
+	ctx.Limits = lim
 
 	var lastErr error
 	created := 0
 	for i := 0; i < lim.MaxActiveLanesPerCredential+5; i++ {
 		id := "lane_" + string(rune('a'+i))
-		_, ok, err := s.BorrowOrCreate("c", id, lane.Features{NetworkASN: "AS1", HTTPVersion: "1.1", ClientFamily: string(rune('a' + i))}, ctx)
+		_, ok, err := s.BorrowOrCreate("c", id, lane.Features{NetworkASN: "AS1", HTTPVersion: "1.1", ClientFamily: string(rune('a' + i))}, ctx.Classification)
 		_ = ok
 		if err != nil {
 			lastErr = err
@@ -318,8 +322,9 @@ func TestLaneUnblockPersistsAcrossRestart(t *testing.T) {
 	// automatic block enabled via hysteresis override.
 	hy := lane.DefaultSecurityHysteresis()
 	hy.EnableAutomaticBlock = true
-	s.SetSecurityHysteresis(hy)
-	if _, err := s.ObserveRisk("c", "l", 90, now); err != nil {
+	ctx := lane.DefaultPolicyContext()
+	ctx.Security = hy
+	if _, err := s.ObserveRiskWithPolicy(context.Background(), "c", "l", 90, now, ctx, lane.TransitionMetadata{}); err != nil {
 		t.Fatal(err)
 	}
 	rec, _ := s.Get("c", "l")

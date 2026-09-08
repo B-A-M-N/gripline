@@ -90,6 +90,7 @@ func TestResourceVelocityProducerTokenVelocity(t *testing.T) {
 		p.ObserveCompletion(CompletionBehavior{
 			Subjects: SubjectContext{CredentialID: "cred_1"},
 			Actual:   UsageEstimate{Combined: 100},
+			Success:  true,
 		})
 	}
 
@@ -97,6 +98,7 @@ func TestResourceVelocityProducerTokenVelocity(t *testing.T) {
 	sigs := p.ObserveCompletion(CompletionBehavior{
 		Subjects: SubjectContext{CredentialID: "cred_1"},
 		Actual:   UsageEstimate{Combined: 1000},
+		Success:  true,
 	})
 	if len(sigs) != 1 || sigs[0].Code != "TOKEN_VELOCITY_OVER_10X_BASELINE" {
 		t.Fatalf("expected TOKEN_VELOCITY_OVER_10X_BASELINE, got %v", sigs)
@@ -165,6 +167,7 @@ func TestResourceVelocityProducerCostAbsoluteFloor(t *testing.T) {
 		p.ObserveCompletion(CompletionBehavior{
 			Subjects: SubjectContext{CredentialID: "cred_1"},
 			Actual:   UsageEstimate{Cost: 1},
+			Success:  true,
 		})
 	}
 	// 8 micro-units is 8x the baseline but far below the absolute floor: must NOT
@@ -172,6 +175,7 @@ func TestResourceVelocityProducerCostAbsoluteFloor(t *testing.T) {
 	sigs := p.ObserveCompletion(CompletionBehavior{
 		Subjects: SubjectContext{CredentialID: "cred_1"},
 		Actual:   UsageEstimate{Cost: 8},
+		Success:  true,
 	})
 	if len(sigs) != 0 {
 		t.Fatalf("sub-floor 4x blip must NOT emit COST_VELOCITY (floor not met); got %v", sigs)

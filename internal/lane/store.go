@@ -1,6 +1,7 @@
 package lane
 
 import (
+	"context"
 	"sync"
 	"time"
 )
@@ -32,8 +33,30 @@ func DefaultLimits() Limits {
 // compared against candidates (skip for borrow, reject for same-ID reuse).
 const featSchemaVersion = 2
 
-// GetConfig is a minimal hook returning the enforced limits; nil means defaults.
+// GetConfig is a minimal hook returning static resident-store limits; nil means
+// defaults. Live policy limits are carried in PolicyContext instead.
 type GetConfig func() Limits
+
+// PolicyContext is the immutable policy snapshot used for one lane operation.
+// It deliberately travels with the request instead of being installed into a
+// shared repository, so a policy activation cannot change the semantics of an
+// admission that already captured an older snapshot.
+type PolicyContext struct {
+	Classification ClassificationContext
+	Limits         Limits
+	Security       SecurityHysteresis
+	PolicyRevision int
+}
+
+// DefaultPolicyContext returns a complete conservative context for legacy
+// callers that do not have a compiled policy snapshot.
+func DefaultPolicyContext() PolicyContext {
+	return PolicyContext{
+		Classification: ClassificationContext{Thresholds: DefaultThresholds()},
+		Limits:         DefaultLimits(),
+		Security:       DefaultSecurityHysteresis(),
+	}
+}
 
 // Repository is the lane-persistence contract the terminator depends on (P0.10:
 // the memory Store and the durable Bolt repository both satisfy it, so the
@@ -42,10 +65,6 @@ type GetConfig func() Limits
 // pure mutation reducers (reduce.go), so semantics cannot drift between the
 // resident and durable backends.
 type Repository interface {
-	// SetSecurityHysteresis overrides the risk→status hysteresis to the given
-	// compiled policy's (P0.13). A zero value falls back to defaults.
-	SetSecurityHysteresis(hy SecurityHysteresis)
-
 	// BorrowOrCreate returns an existing lane within Match similarity of a
 	// candidate feature set, else creates a new one subject to explosion
 	// limits. Returns the lane and whether it was newly created. Cross-revision
@@ -66,6 +85,23 @@ type Repository interface {
 
 	// ListLaneIDs returns the lane IDs held by a credential (a copy).
 	ListLaneIDs(credID string) []string
+}
+
+// PolicyAwareRepository applies the complete immutable policy snapshot to each
+// authoritative lane mutation. Built-in repositories implement this interface;
+// Repository methods remain compatibility wrappers using DefaultPolicyContext.
+type PolicyAwareRepository interface {
+	BorrowOrCreateWithPolicy(ctx context.Context, credID, candidateID string, features Features, policy PolicyContext) (*LaneRecord, bool, error)
+	ObserveRiskWithPolicy(ctx context.Context, credID, laneID string, riskScore int, now time.Time, policy PolicyContext, meta TransitionMetadata) (*LaneRecord, error)
+	RecordCleanAuthorizedAndPromoteWithPolicy(ctx context.Context, credID, laneID string, riskScore int, criteria PromotionCriteria, now time.Time, policy PolicyContext, meta TransitionMetadata) (*LaneRecord, bool, error)
+}
+
+// ReadRepository is the strict read contract for authoritative lane state.
+// Not-found and backend failure are distinct, and callers can cancel remote
+// reads with the request context.
+type ReadRepository interface {
+	LookupLane(ctx context.Context, credID, laneID string) (*LaneRecord, bool, error)
+	ListIDs(ctx context.Context, credID string) ([]string, error)
 }
 
 // RequestAwareRepository is an optional extension used by durable stores to
@@ -101,10 +137,6 @@ type Store struct {
 	mu  sync.Mutex
 	cfg GetConfig
 	now func() time.Time
-	// securityOverride, when non-zero, replaces the Limits.Security hysteresis
-	// (P0.13): the compiled policy's hysteresis is applied over whatever config
-	// the store was built with, so policy revision is the one authority.
-	securityOverride SecurityHysteresis
 	// auditSink, when set, durably commits every operator-transition audit
 	// entry inside the same transaction as the state change (P0.49). Nil keeps
 	// the in-memory default (entry returned to the caller, nothing persisted).
@@ -129,40 +161,27 @@ func (s *Store) limits() Limits {
 	return DefaultLimits()
 }
 
-// SetLaneLimits wires the compiled policy-owned lane capacity and retention
-// provider. It is optional on the compatibility store and safe to call during
-// construction before traffic starts.
-func (s *Store) SetLaneLimits(fn func() Limits) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.cfg = fn
-}
-
-// SetSecurityHysteresis overrides the security hysteresis used for lane
-// risk→status transitions (P0.13). The terminator calls this at construction
-// with its COMPILED policy's LaneSecurity so the policy revision — not store
-// construction defaults — is the one authority for lane security behavior.
-// A zero hy falls back to defaults (conservative: automatic block off).
-func (s *Store) SetSecurityHysteresis(hy SecurityHysteresis) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if hy.SuspectThresh > 0 && hy.BlockThresh > 0 {
-		s.securityOverride = hy
-		return
-	}
-	s.securityOverride = DefaultSecurityHysteresis()
-}
-
 // Get returns a lane record by credential + lane id (a copy).
 func (s *Store) Get(credID, laneID string) (*LaneRecord, bool) {
+	rec, ok, _ := s.LookupLane(context.Background(), credID, laneID)
+	return rec, ok
+}
+
+// Lookup returns a lane with a strict error channel for remote-compatible
+// callers. The resident store has no I/O failure mode, but still honors
+// cancellation before entering its lock.
+func (s *Store) LookupLane(ctx context.Context, credID, laneID string) (*LaneRecord, bool, error) {
+	if err := contextErr(ctx); err != nil {
+		return nil, false, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rec, ok := s.lookupLocked(credID, laneID)
 	if !ok {
-		return nil, false
+		return nil, false, nil
 	}
 	c := *rec
-	return &c, true
+	return &c, true, nil
 }
 
 func (s *Store) lookupLocked(credID, laneID string) (*LaneRecord, bool) {
@@ -183,6 +202,19 @@ func (s *Store) lookupLocked(credID, laneID string) (*LaneRecord, bool) {
 // anti-laundering floor — executed here under the store mutex so concurrent
 // admissions serialize exactly as the Bolt transaction does.
 func (s *Store) BorrowOrCreate(credID, newLaneID string, cand Features, ctx ClassificationContext) (*LaneRecord, bool, error) {
+	policy := DefaultPolicyContext()
+	policy.Classification = ctx
+	policy.Limits = s.limits()
+	policy.Security = policy.Limits.Security
+	return s.BorrowOrCreateWithPolicy(context.Background(), credID, newLaneID, cand, policy)
+}
+
+// BorrowOrCreateWithPolicy applies the request's immutable classification and
+// retention/explosion policy while holding the resident store lock.
+func (s *Store) BorrowOrCreateWithPolicy(ctx context.Context, credID, newLaneID string, cand Features, policy PolicyContext) (*LaneRecord, bool, error) {
+	if err := contextErr(ctx); err != nil {
+		return nil, false, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -197,8 +229,11 @@ func (s *Store) BorrowOrCreate(credID, newLaneID string, cand Features, ctx Clas
 		records = append(records, m[id])
 	}
 
-	lm := s.limits()
-	res, err := ApplyBorrowOrCreate(records, credID, newLaneID, cand, ctx, lm, s.now())
+	lm := policy.Limits
+	if lm.MaxActiveLanesPerCredential <= 0 {
+		lm = s.limits()
+	}
+	res, err := ApplyBorrowOrCreate(records, credID, newLaneID, cand, policy.Classification, lm, s.now())
 	if err != nil {
 		// Retention deletions are legitimate even when the mutation fails: an
 		// expired lane's capacity is freed regardless of the borrow outcome.
@@ -281,17 +316,27 @@ func (s *Store) ActiveLaneCount(credID string) int {
 
 // ListLaneIDs returns the lane IDs for a credential (a copy).
 func (s *Store) ListLaneIDs(credID string) []string {
+	ids, _ := s.ListIDs(context.Background(), credID)
+	return ids
+}
+
+// ListIDs returns all lane IDs with a strict error channel for remote-compatible
+// callers.
+func (s *Store) ListIDs(ctx context.Context, credID string) ([]string, error) {
+	if err := contextErr(ctx); err != nil {
+		return nil, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	m := s.byCred[credID]
 	if m == nil {
-		return nil
+		return nil, nil
 	}
 	ids := make([]string, 0, len(m))
 	for id := range m {
 		ids = append(ids, id)
 	}
-	return ids
+	return ids, nil
 }
 
 // ObserveRisk atomically updates a lane's risk score AND drives the lane
@@ -303,6 +348,17 @@ func (s *Store) ListLaneIDs(credID string) []string {
 // The returned LaneRecord carries the updated RiskScore, the resulting
 // SecurityStatus, and a bumped Revision (one authoritative mutation).
 func (s *Store) ObserveRisk(credID, laneID string, riskScore int, now time.Time) (*LaneRecord, error) {
+	policy := DefaultPolicyContext()
+	policy.Limits = s.limits()
+	policy.Security = policy.Limits.Security
+	return s.ObserveRiskWithPolicy(context.Background(), credID, laneID, riskScore, now, policy, TransitionMetadata{})
+}
+
+// ObserveRiskWithPolicy applies the request's immutable security hysteresis.
+func (s *Store) ObserveRiskWithPolicy(ctx context.Context, credID, laneID string, riskScore int, now time.Time, policy PolicyContext, _ TransitionMetadata) (*LaneRecord, error) {
+	if err := contextErr(ctx); err != nil {
+		return nil, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -310,15 +366,10 @@ func (s *Store) ObserveRisk(credID, laneID string, riskScore int, now time.Time)
 	if !ok {
 		return nil, ErrLaneNotFound
 	}
-	ApplyRiskObservation(rec, riskScore, s.securityHys(), now)
+	security := EffectiveSecurityHysteresis(policy.Security, policy.Limits.Security)
+	ApplyRiskObservation(rec, riskScore, security, now)
 	c := *rec
 	return &c, nil
-}
-
-// securityHys returns the configured lane security hysteresis, defaulting
-// conservatively when unset.
-func (s *Store) securityHys() SecurityHysteresis {
-	return EffectiveSecurityHysteresis(s.securityOverride, s.limits().Security)
 }
 
 // RecordCleanAuthorizedAndPromote updates clean counters and checks promotion
@@ -335,6 +386,18 @@ func (s *Store) securityHys() SecurityHysteresis {
 // Returns whether a promotion occurred. The returned LaneRecord (if any) has
 // the updated state and Revision.
 func (s *Store) RecordCleanAuthorizedAndPromote(credID, laneID string, riskScore int, crit PromotionCriteria, now time.Time) (*LaneRecord, bool, error) {
+	policy := DefaultPolicyContext()
+	policy.Limits = s.limits()
+	policy.Security = policy.Limits.Security
+	return s.RecordCleanAuthorizedAndPromoteWithPolicy(context.Background(), credID, laneID, riskScore, crit, now, policy, TransitionMetadata{})
+}
+
+// RecordCleanAuthorizedAndPromoteWithPolicy applies one request's immutable
+// policy snapshot to the promotion mutation and its causal metadata.
+func (s *Store) RecordCleanAuthorizedAndPromoteWithPolicy(ctx context.Context, credID, laneID string, riskScore int, crit PromotionCriteria, now time.Time, _ PolicyContext, _ TransitionMetadata) (*LaneRecord, bool, error) {
+	if err := contextErr(ctx); err != nil {
+		return nil, false, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -345,6 +408,13 @@ func (s *Store) RecordCleanAuthorizedAndPromote(credID, laneID string, riskScore
 	promoted := ApplyCleanAuthorizedAndPromote(rec, riskScore, crit, now)
 	c := *rec
 	return &c, promoted, nil
+}
+
+func contextErr(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	return ctx.Err()
 }
 
 // RecordCleanAuthorized increments the authorized clean request counter and

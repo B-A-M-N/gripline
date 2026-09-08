@@ -24,8 +24,6 @@ import (
 	"time"
 
 	bolt "go.etcd.io/bbolt"
-
-	"github.com/B-A-M-N/gripline/internal/lane"
 )
 
 // Bucket names (§schema). meta holds a schema marker; each logical bucket holds
@@ -96,19 +94,10 @@ type Store struct {
 	evidenceSweepMu    sync.Mutex
 	evidenceSweepAfter []byte
 	evidenceSweepStats EvidenceSweepStats
-	// mu guards the small policy-side knobs below (they are written once at
-	// terminator construction, read on every lane admission).
-	mu sync.RWMutex
-	// securityOverride carries the compiled policy's lane security hysteresis
-	// (P0.13); zero means defaults.
-	securityOverride lane.SecurityHysteresis
-	// laneLimitsFn provides the lane explosion limits (policy-compiled). Nil
-	// uses lane.DefaultLimits.
-	laneLimitsFn func() lane.Limits
-	txMu         sync.Mutex
-	txCount      uint64
-	txErrors     uint64
-	txNanos      uint64
+	txMu               sync.Mutex
+	txCount            uint64
+	txErrors           uint64
+	txNanos            uint64
 }
 
 // TransactionStats is a low-cardinality view of bbolt activity. Latency is
@@ -151,14 +140,6 @@ func (s *Store) TransactionStats() TransactionStats {
 	s.txMu.Lock()
 	defer s.txMu.Unlock()
 	return TransactionStats{Transactions: s.txCount, TransactionErrors: s.txErrors, TransactionNanos: s.txNanos}
-}
-
-// SetLaneLimits wires the lane explosion-limits provider (the runtime compiles
-// it from policy). Must be called before serving traffic.
-func (s *Store) SetLaneLimits(fn func() lane.Limits) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.laneLimitsFn = fn
 }
 
 // Open opens (creating if needed) the database at path and guarantees the

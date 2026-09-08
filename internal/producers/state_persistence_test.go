@@ -39,6 +39,7 @@ func TestPersistentProducerRestoresVelocityBaselineAcrossRestart(t *testing.T) {
 		if signals := persistedFirst.ObserveCompletion(CompletionBehavior{
 			Subjects: subjects,
 			Actual:   UsageEstimate{Combined: 100},
+			Success:  true,
 		}); len(signals) != 0 {
 			t.Fatalf("baseline observation %d emitted signals: %v", i, signals)
 		}
@@ -58,6 +59,7 @@ func TestPersistentProducerRestoresVelocityBaselineAcrossRestart(t *testing.T) {
 	signals := persistedSecond.ObserveCompletion(CompletionBehavior{
 		Subjects: subjects,
 		Actual:   UsageEstimate{Combined: 1_000},
+		Success:  true,
 	})
 	if len(signals) != 1 || signals[0].Code != "TOKEN_VELOCITY_OVER_10X_BASELINE" {
 		t.Fatalf("restarted producer did not restore baseline: %v", signals)

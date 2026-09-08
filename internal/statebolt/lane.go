@@ -2,6 +2,7 @@ package statebolt
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"strings"
 	"time"
@@ -23,18 +24,6 @@ type persistedLane struct {
 
 const laneSchemaVersion = 1
 
-// laneLimits resolves the effective limits for a lane mutation. The store is
-// constructed with a fixed limits provider (the runtime compiles it from
-// policy); tests may override.
-func (s *Store) laneLimits() lane.Limits {
-	s.mu.RLock()
-	fn := s.laneLimitsFn
-	s.mu.RUnlock()
-	if fn != nil {
-		return fn()
-	}
-	return lane.DefaultLimits()
-}
 func laneKey(credID, laneID string) ([]byte, error) {
 	if strings.ContainsRune(credID, 0) || strings.ContainsRune(laneID, 0) {
 		return nil, errNulInID
@@ -89,36 +78,23 @@ type errLaneCorrupt struct{}
 
 func (errLaneCorrupt) Error() string { return "statebolt: corrupt lane record" }
 
-// SetSecurityHysteresis implements lane.Repository (P0.13): the compiled
-// policy's hysteresis is applied to the durable store exactly as to the
-// resident one.
-func (s *Store) SetSecurityHysteresis(hy lane.SecurityHysteresis) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if hy.SuspectThresh > 0 && hy.BlockThresh > 0 {
-		s.securityOverride = hy
-		return
-	}
-	s.securityOverride = lane.DefaultSecurityHysteresis()
-}
-
-// securityHys returns the effective lane hysteresis: the override (policy)
-// wins; configured limits base next; conservative defaults last. Same
-// resolution order as the resident store, via the shared
-// lane.EffectiveSecurityHysteresis.
-func (s *Store) securityHys() lane.SecurityHysteresis {
-	s.mu.RLock()
-	override := s.securityOverride
-	s.mu.RUnlock()
-	return lane.EffectiveSecurityHysteresis(override, s.laneLimits().Security)
-}
-
 // BorrowOrCreate implements lane.Repository. The whole operation — load the
 // credential's bounded lane set, run the PURE lane reducer, apply retention
 // deletes and the upsert — is one write transaction, so concurrent admissions
 // serialize exactly as the resident store's mutex does and a crash cannot
 // leave a half-applied classification.
 func (s *Store) BorrowOrCreate(credID, newLaneID string, cand lane.Features, ctx lane.ClassificationContext) (*lane.LaneRecord, bool, error) {
+	policy := lane.DefaultPolicyContext()
+	policy.Classification = ctx
+	return s.BorrowOrCreateWithPolicy(context.Background(), credID, newLaneID, cand, policy)
+}
+
+// BorrowOrCreateWithPolicy applies the immutable request policy inside the
+// same bbolt transaction as the lane mutation.
+func (s *Store) BorrowOrCreateWithPolicy(ctx context.Context, credID, newLaneID string, cand lane.Features, policy lane.PolicyContext) (*lane.LaneRecord, bool, error) {
+	if err := contextErr(ctx); err != nil {
+		return nil, false, err
+	}
 	if err := checkLaneIDs(credID, newLaneID); err != nil {
 		return nil, false, err
 	}
@@ -130,7 +106,11 @@ func (s *Store) BorrowOrCreate(credID, newLaneID string, cand lane.Features, ctx
 		if err != nil {
 			return err
 		}
-		res, reduceErr := lane.ApplyBorrowOrCreate(records, credID, newLaneID, cand, ctx, s.laneLimits(), s.now())
+		limits := policy.Limits
+		if limits.MaxActiveLanesPerCredential <= 0 {
+			limits = lane.DefaultLimits()
+		}
+		res, reduceErr := lane.ApplyBorrowOrCreate(records, credID, newLaneID, cand, policy.Classification, limits, s.now())
 		// Retention deletions are committed even when the requested borrow is
 		// rejected. Keep the domain error outside the transaction so Bolt does
 		// not roll the cleanup back with it.
@@ -163,12 +143,22 @@ func (s *Store) BorrowOrCreate(credID, newLaneID string, cand lane.Features, ctx
 
 // Get implements lane.Repository.
 func (s *Store) Get(credID, laneID string) (*lane.LaneRecord, bool) {
+	rec, ok, _ := s.LookupLane(context.Background(), credID, laneID)
+	return rec, ok
+}
+
+// Lookup is the strict lane read path. A corrupt row or bbolt read failure is
+// returned to the caller and cannot be mistaken for an absent lane.
+func (s *Store) LookupLane(ctx context.Context, credID, laneID string) (*lane.LaneRecord, bool, error) {
+	if err := contextErr(ctx); err != nil {
+		return nil, false, err
+	}
 	key, err := laneKey(credID, laneID)
 	if err != nil {
-		return nil, false
+		return nil, false, err
 	}
 	var rec *lane.LaneRecord
-	_ = s.view(func(tx *bolt.Tx) error {
+	err = s.view(func(tx *bolt.Tx) error {
 		v := tx.Bucket(bucketLanes).Get(key)
 		if v == nil {
 			return nil
@@ -181,24 +171,33 @@ func (s *Store) Get(credID, laneID string) (*lane.LaneRecord, bool) {
 		rec = &r
 		return nil
 	})
-	return rec, rec != nil
+	return rec, rec != nil, err
 }
 
 // ObserveRisk implements lane.Repository: risk observation + security-status
 // reduction in one write transaction (P0.7).
 func (s *Store) ObserveRisk(credID, laneID string, riskScore int, now time.Time) (*lane.LaneRecord, error) {
-	return s.ObserveRiskWithMetadata(credID, laneID, riskScore, now, lane.TransitionMetadata{})
+	return s.ObserveRiskWithPolicy(context.Background(), credID, laneID, riskScore, now, lane.DefaultPolicyContext(), lane.TransitionMetadata{})
 }
 
 // ObserveRiskWithRequestID is the request-correlated durable variant used by
 // the terminator when the ingress boundary supplied an id.
 func (s *Store) ObserveRiskWithRequestID(credID, laneID string, riskScore int, now time.Time, requestID string) (*lane.LaneRecord, error) {
-	return s.ObserveRiskWithMetadata(credID, laneID, riskScore, now, lane.TransitionMetadata{RequestID: requestID})
+	return s.ObserveRiskWithPolicy(context.Background(), credID, laneID, riskScore, now, lane.DefaultPolicyContext(), lane.TransitionMetadata{RequestID: requestID})
 }
 
 // ObserveRiskWithMetadata persists request, policy, and evidence provenance
 // alongside a resulting lane security transition in the same Bolt transaction.
 func (s *Store) ObserveRiskWithMetadata(credID, laneID string, riskScore int, now time.Time, meta lane.TransitionMetadata) (*lane.LaneRecord, error) {
+	return s.ObserveRiskWithPolicy(context.Background(), credID, laneID, riskScore, now, lane.DefaultPolicyContext(), meta)
+}
+
+// ObserveRiskWithPolicy applies the request's immutable lane security policy
+// in the same bbolt transaction as the risk and transition audit mutation.
+func (s *Store) ObserveRiskWithPolicy(ctx context.Context, credID, laneID string, riskScore int, now time.Time, policy lane.PolicyContext, meta lane.TransitionMetadata) (*lane.LaneRecord, error) {
+	if err := contextErr(ctx); err != nil {
+		return nil, err
+	}
 	key, err := laneKey(credID, laneID)
 	if err != nil {
 		return nil, err
@@ -215,7 +214,8 @@ func (s *Store) ObserveRiskWithMetadata(credID, laneID string, riskScore int, no
 		}
 		rec := p.Record
 		before := rec.Security.Status
-		lane.ApplyRiskObservation(&rec, riskScore, s.securityHys(), now)
+		security := lane.EffectiveSecurityHysteresis(policy.Security, policy.Limits.Security)
+		lane.ApplyRiskObservation(&rec, riskScore, security, now)
 		if err := putLaneTx(tx, &rec); err != nil {
 			return err
 		}
@@ -241,18 +241,30 @@ func (s *Store) ObserveRiskWithMetadata(credID, laneID string, riskScore int, no
 // RecordCleanAuthorizedAndPromote implements lane.Repository (P0.25): counters
 // + promotion + revision bump in one authoritative transaction.
 func (s *Store) RecordCleanAuthorizedAndPromote(credID, laneID string, riskScore int, crit lane.PromotionCriteria, now time.Time) (*lane.LaneRecord, bool, error) {
-	return s.RecordCleanAuthorizedAndPromoteWithRequestID(credID, laneID, riskScore, crit, now, "")
+	return s.RecordCleanAuthorizedAndPromoteWithPolicy(context.Background(), credID, laneID, riskScore, crit, now, lane.DefaultPolicyContext(), lane.TransitionMetadata{})
 }
 
 // RecordCleanAuthorizedAndPromoteWithRequestID persists automatic trust
 // promotions and correlates a resulting trust transition with its request.
 func (s *Store) RecordCleanAuthorizedAndPromoteWithRequestID(credID, laneID string, riskScore int, crit lane.PromotionCriteria, now time.Time, requestID string) (*lane.LaneRecord, bool, error) {
-	return s.RecordCleanAuthorizedAndPromoteWithMetadata(credID, laneID, riskScore, crit, now, lane.TransitionMetadata{RequestID: requestID})
+	return s.RecordCleanAuthorizedAndPromoteWithPolicy(context.Background(), credID, laneID, riskScore, crit, now, lane.DefaultPolicyContext(), lane.TransitionMetadata{RequestID: requestID})
 }
 
 // RecordCleanAuthorizedAndPromoteWithMetadata persists trust-promotion
 // provenance atomically with the lane mutation.
 func (s *Store) RecordCleanAuthorizedAndPromoteWithMetadata(credID, laneID string, riskScore int, crit lane.PromotionCriteria, now time.Time, meta lane.TransitionMetadata) (*lane.LaneRecord, bool, error) {
+	return s.RecordCleanAuthorizedAndPromoteWithPolicy(context.Background(), credID, laneID, riskScore, crit, now, lane.DefaultPolicyContext(), meta)
+}
+
+// RecordCleanAuthorizedAndPromoteWithPolicy applies the request's immutable
+// policy snapshot to the promotion mutation and its causal audit metadata.
+func (s *Store) RecordCleanAuthorizedAndPromoteWithPolicy(ctx context.Context, credID, laneID string, riskScore int, crit lane.PromotionCriteria, now time.Time, policy lane.PolicyContext, meta lane.TransitionMetadata) (*lane.LaneRecord, bool, error) {
+	if err := contextErr(ctx); err != nil {
+		return nil, false, err
+	}
+	if meta.PolicyRevision == 0 {
+		meta.PolicyRevision = policy.PolicyRevision
+	}
 	var promoted bool
 	key, err := laneKey(credID, laneID)
 	if err != nil {
@@ -295,12 +307,22 @@ func (s *Store) RecordCleanAuthorizedAndPromoteWithMetadata(credID, laneID strin
 // ListLaneIDs implements lane.Repository: cursor-scan of the credential's key
 // prefix.
 func (s *Store) ListLaneIDs(credID string) []string {
+	ids, _ := s.ListIDs(context.Background(), credID)
+	return ids
+}
+
+// ListIDs is the strict lane-list read path. Cursor or database errors are
+// returned instead of being collapsed into an empty slice.
+func (s *Store) ListIDs(ctx context.Context, credID string) ([]string, error) {
+	if err := contextErr(ctx); err != nil {
+		return nil, err
+	}
 	prefix, err := lanePrefix(credID)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	var ids []string
-	_ = s.view(func(tx *bolt.Tx) error {
+	err = s.view(func(tx *bolt.Tx) error {
 		c := tx.Bucket(bucketLanes).Cursor()
 		for k, _ := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, _ = c.Next() {
 			laneID := string(k[len(prefix):])
@@ -308,7 +330,14 @@ func (s *Store) ListLaneIDs(credID string) []string {
 		}
 		return nil
 	})
-	return ids
+	return ids, err
+}
+
+func contextErr(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	return ctx.Err()
 }
 
 // ListLaneRecords returns sanitized, fully decoded lane records for
@@ -323,30 +352,6 @@ func (s *Store) ListLaneRecords(credID string) ([]*lane.LaneRecord, error) {
 		return err
 	})
 	return records, err
-}
-
-// LookupLane is the strict administrative counterpart to Repository.Get. It
-// returns the underlying read error instead of collapsing it into ok=false.
-func (s *Store) LookupLane(credID, laneID string) (*lane.LaneRecord, bool, error) {
-	key, err := laneKey(credID, laneID)
-	if err != nil {
-		return nil, false, err
-	}
-	var rec *lane.LaneRecord
-	err = s.view(func(tx *bolt.Tx) error {
-		v := tx.Bucket(bucketLanes).Get(key)
-		if v == nil {
-			return nil
-		}
-		var p persistedLane
-		if err := json.Unmarshal(v, &p); err != nil || p.SchemaVersion != laneSchemaVersion {
-			return errCorruptLane
-		}
-		r := p.Record
-		rec = &r
-		return nil
-	})
-	return rec, rec != nil, err
 }
 
 // putLaneTx writes one lane row inside an open transaction (P0.3-fix

@@ -99,6 +99,10 @@ type BaselineToken struct {
 	// term is the issuing terminator (back-pointer, set at issuance) — the
 	// completion event lands on the same authority that admitted the request.
 	term *Terminator
+	// runtimeCtx is detached from client cancellation but bounded. Completion
+	// accounting must finish even when the downstream disconnects, without
+	// allowing a remote authority call to live forever.
+	runtimeCtx context.Context
 }
 
 // Finalize records ONE clean successful observation against the lane baseline.
@@ -144,10 +148,11 @@ type CompletionResult struct {
 // fabricate completion evidence for a request it was never given the token for.
 // Complete is idempotent.
 type CompletionToken struct {
-	subjects producers.SubjectContext
-	policy   *policy.CompiledPolicy
-	done     atomic.Bool
-	term     *Terminator
+	subjects   producers.SubjectContext
+	policy     *policy.CompiledPolicy
+	done       atomic.Bool
+	term       *Terminator
+	runtimeCtx context.Context
 }
 
 // Complete records the ACTUAL resource consumption and outcome of a finished
@@ -162,7 +167,7 @@ func (c *CompletionToken) Complete(actual resource.UsageEstimate, success bool) 
 	if !c.done.CompareAndSwap(false, true) {
 		return CompletionResult{} // already observed
 	}
-	return c.term.observeCompletion(c.policy, c.subjects, actual, success)
+	return c.term.observeCompletion(c.runtimeCtx, c.policy, c.subjects, actual, success)
 }
 
 // Complete is the Outcome convenience for the proxy lifecycle (P0.4A): spend the
@@ -242,7 +247,7 @@ type Dependencies struct {
 	// capacity all-or-nothing at the hard-limit gate; a denial names the
 	// highest-priority scope that exceeded its limit. When nil, only the
 	// per-credential Concurrency seam applies (back-compat).
-	Resource *resource.Governor
+	Resource resource.Authority
 
 	// SourceID keys the SOURCE scope (network origin). Empty disables the SOURCE
 	// scope in multi-scope provisioning. Default: "" (SOURCE skipped).
@@ -321,8 +326,7 @@ type Terminator struct {
 	policies PolicyProvider
 	pol      *policy.CompiledPolicy
 	// pruneCounter triggers pruning every N admissions (optimization only).
-	pruneCounter         *atomic.Int64
-	policyWiringRevision atomic.Int64
+	pruneCounter *atomic.Int64
 }
 
 // New builds a Terminator and validates the critical seams for the requested
@@ -385,15 +389,6 @@ func New(dep Dependencies) (*Terminator, error) {
 	if err != nil {
 		return nil, fmt.Errorf("terminator: compile policy: %w", err)
 	}
-	// P0.13: the compiled policy's lane security hysteresis — including the
-	// EnableAutomaticBlock gate — overrides whatever the lane store was built
-	// with, so policy revision is the one authority for lane security behavior.
-	if dep.Lanes != nil {
-		dep.Lanes.SetSecurityHysteresis(compiled.LaneSecurity)
-		if setter, ok := dep.Lanes.(interface{ SetLaneLimits(func() lane.Limits) }); ok {
-			setter.SetLaneLimits(func() lane.Limits { return compiled.LaneLimits })
-		}
-	}
 	return &Terminator{
 		dep:          dep,
 		policies:     dep.Policies,
@@ -413,27 +408,22 @@ func (t *Terminator) currentPolicy() *policy.CompiledPolicy {
 			compiled = current
 		}
 	}
-	if compiled != nil && t.dep.Lanes != nil {
-		// Policy activation changes the live policy pointer. Update lane
-		// classification/security wiring once per revision before the next
-		// admission observes the snapshot.
-		if t.policyWiringRevision.Load() != int64(compiled.Revision) && t.policyWiringRevision.CompareAndSwap(0, int64(compiled.Revision)) {
-			t.dep.Lanes.SetSecurityHysteresis(compiled.LaneSecurity)
-			if setter, ok := t.dep.Lanes.(interface{ SetLaneLimits(func() lane.Limits) }); ok {
-				setter.SetLaneLimits(func() lane.Limits { return compiled.LaneLimits })
-			}
-		} else if t.policyWiringRevision.Load() != int64(compiled.Revision) {
-			// Another request may have won the first CAS. A revision can only
-			// advance monotonically, so retrying the wiring is harmless and
-			// keeps activation visible without a global admission lock.
-			t.dep.Lanes.SetSecurityHysteresis(compiled.LaneSecurity)
-			if setter, ok := t.dep.Lanes.(interface{ SetLaneLimits(func() lane.Limits) }); ok {
-				setter.SetLaneLimits(func() lane.Limits { return compiled.LaneLimits })
-			}
-			t.policyWiringRevision.Store(int64(compiled.Revision))
-		}
-	}
 	return compiled
+}
+
+func lanePolicyContext(compiled *policy.CompiledPolicy) lane.PolicyContext {
+	if compiled == nil {
+		return lane.DefaultPolicyContext()
+	}
+	return lane.PolicyContext{
+		Classification: lane.ClassificationContext{
+			Revision:   compiled.ClassificationRevision,
+			Thresholds: compiled.Classification,
+		},
+		Limits:         compiled.LaneLimits,
+		Security:       compiled.LaneSecurity,
+		PolicyRevision: compiled.Revision,
+	}
 }
 
 func adaptiveStatus(failed bool) AdaptiveStateStatus {
@@ -542,13 +532,23 @@ func (t *Terminator) AdmitSource(headers map[string][]string, feat lane.Features
 // the returned Outcome's reservation is SETTLED with actuals after execution
 // (proxy lifecycle). Admit/AdmitSource delegate here with {Requests: 1}.
 func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features, src TrustedSource, est resource.UsageEstimate) *Outcome {
-	return t.AdmitUsageWithRequestID(t.rand(), headers, feat, src, est)
+	return t.AdmitUsageContext(context.Background(), t.rand(), headers, feat, src, est)
 }
 
 // AdmitUsageWithRequestID is the request-boundary variant of AdmitUsage. The
 // caller supplies the ID generated before ingress authentication; an empty ID
 // is replaced with a fresh one for compatibility with internal callers.
 func (t *Terminator) AdmitUsageWithRequestID(reqID string, headers map[string][]string, feat lane.Features, src TrustedSource, est resource.UsageEstimate) *Outcome {
+	return t.AdmitUsageContext(context.Background(), reqID, headers, feat, src, est)
+}
+
+// AdmitUsageContext is the request-boundary admission entry point. Every
+// authoritative lookup and mutation performed during admission inherits ctx;
+// a remote authority therefore cannot outlive a canceled client request.
+func (t *Terminator) AdmitUsageContext(ctx context.Context, reqID string, headers map[string][]string, feat lane.Features, src TrustedSource, est resource.UsageEstimate) *Outcome {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	compiled := t.currentPolicy()
 	if compiled == nil {
 		return &Outcome{RequestID: reqID, Authorized: false, Reason: "policy_unavailable", DenialErr: errors.New("terminator: live policy unavailable")}
@@ -557,10 +557,26 @@ func (t *Terminator) AdmitUsageWithRequestID(reqID string, headers map[string][]
 	// ensuring every request uses the one snapshot selected above. The view
 	// shares mutable counters and dependencies but has no independent authority.
 	view := &Terminator{dep: t.dep, rand: t.rand, pol: compiled, pruneCounter: t.pruneCounter}
-	return view.admitUsageWithRequestID(reqID, headers, feat, src, est)
+	out := view.admitUsageWithRequestID(ctx, reqID, headers, feat, src, est)
+	if out.Baseline != nil || out.Completion != nil {
+		runtimeCtx, _ := boundedRuntimeContext(ctx)
+		if out.Baseline != nil {
+			out.Baseline.runtimeCtx = runtimeCtx
+		}
+		if out.Completion != nil {
+			out.Completion.runtimeCtx = runtimeCtx
+		}
+	}
+	return out
 }
 
-func (t *Terminator) admitUsageWithRequestID(reqID string, headers map[string][]string, feat lane.Features, src TrustedSource, est resource.UsageEstimate) *Outcome {
+// AdmitUsageWithRequestIDContext is the explicit-name compatibility variant of
+// AdmitUsageContext for callers that already use the older API naming.
+func (t *Terminator) AdmitUsageWithRequestIDContext(ctx context.Context, reqID string, headers map[string][]string, feat lane.Features, src TrustedSource, est resource.UsageEstimate) *Outcome {
+	return t.AdmitUsageContext(ctx, reqID, headers, feat, src, est)
+}
+
+func (t *Terminator) admitUsageWithRequestID(ctx context.Context, reqID string, headers map[string][]string, feat lane.Features, src TrustedSource, est resource.UsageEstimate) *Outcome {
 	if reqID == "" {
 		reqID = t.rand()
 	}
@@ -617,7 +633,7 @@ func (t *Terminator) admitUsageWithRequestID(reqID string, headers map[string][]
 	defer presented.Zero()
 
 	// 2. Authenticate.
-	cred, err := t.authenticate(presented)
+	cred, err := t.authenticate(ctx, presented)
 	if err != nil {
 		out.Authorized = false
 		out.Reason = safeReason(err)
@@ -659,7 +675,7 @@ func (t *Terminator) admitUsageWithRequestID(reqID string, headers map[string][]
 							continue
 						}
 						if ev, merr := evidence.Mint(t.pol.EvidenceRules, sig.Code, sid, now, t.pol.Revision); merr == nil && t.dep.Evidence != nil {
-							_ = t.dep.Evidence.Append(ev)
+							_ = appendEvidenceContext(ctx, t.dep.Evidence, ev)
 							tr.EvidenceIDs = append(tr.EvidenceIDs, ev.EvidenceID)
 							tr.EvidenceCodes = append(tr.EvidenceCodes, ev.Code)
 						}
@@ -707,13 +723,39 @@ func (t *Terminator) admitUsageWithRequestID(reqID string, headers map[string][]
 	// 4. Classify lane.
 	var lanesBefore, lanesAfter []string
 	if t.dep.Lanes != nil {
-		lanesBefore = t.dep.Lanes.ListLaneIDs(cred.CredentialID)
+		if reader, ok := t.dep.Lanes.(lane.ReadRepository); ok {
+			lanesBefore, err = reader.ListIDs(ctx, cred.CredentialID)
+			if err != nil {
+				out.Authorized = false
+				out.Reason = "lane_unavailable"
+				out.DenialErr = err
+				out.Degraded = true
+				out.Adaptive = AdaptiveDegraded
+				return out
+			}
+		} else {
+			lanesBefore = t.dep.Lanes.ListLaneIDs(cred.CredentialID)
+		}
 	}
-	laneID, laneRec, laneNew, lerr := t.classifyLane(cred.CredentialID, feat)
+	laneID, laneRec, laneNew, lerr := t.classifyLane(ctx, cred.CredentialID, feat)
 	if t.dep.Lanes != nil {
-		lanesAfter = t.dep.Lanes.ListLaneIDs(cred.CredentialID)
+		if reader, ok := t.dep.Lanes.(lane.ReadRepository); ok {
+			lanesAfter, err = reader.ListIDs(ctx, cred.CredentialID)
+			if err != nil {
+				out.Authorized = false
+				out.Reason = "lane_unavailable"
+				out.DenialErr = err
+				out.Degraded = true
+				out.Adaptive = AdaptiveDegraded
+				return out
+			}
+		} else {
+			lanesAfter = t.dep.Lanes.ListLaneIDs(cred.CredentialID)
+		}
 	}
-	cleanupRemovedLaneResources(t.dep.Resource, lanesBefore, lanesAfter)
+	if lerr == nil {
+		cleanupRemovedLaneResources(t.dep.Resource, lanesBefore, lanesAfter)
+	}
 	tr.LaneID = laneID
 	tr.LaneNew = laneNew
 	if laneRec != nil {
@@ -809,7 +851,7 @@ func (t *Terminator) admitUsageWithRequestID(reqID string, headers map[string][]
 		// evaluated below via the synchronous dedup path whether or not the
 		// append landed.
 		allEv := append(append([]evidence.Evidence{}, syncEv...), persistOnly...)
-		_ = t.dep.Evidence.Append(allEv...)
+		_ = appendEvidenceContext(ctx, t.dep.Evidence, allEv...)
 	}
 
 	// 6. Snapshot evidence by subject (credential + lane + source
@@ -839,14 +881,14 @@ func (t *Terminator) admitUsageWithRequestID(reqID string, headers map[string][]
 	laneSnapOK := t.dep.Evidence == nil
 	sourceSnapOK := t.dep.Evidence == nil || srcID == ""
 	if t.dep.Evidence != nil {
-		snap, snapErr := t.dep.Evidence.Snapshot(credSubjects, now)
+		snap, snapErr := snapshotEvidenceContext(ctx, t.dep.Evidence, credSubjects, now)
 		if snapErr != nil {
 			adaptive = AdaptiveDegraded
 		} else {
 			credentialEvidence = snap
 			credSnapOK = true
 		}
-		snap, snapErr = t.dep.Evidence.Snapshot(laneSubjects, now)
+		snap, snapErr = snapshotEvidenceContext(ctx, t.dep.Evidence, laneSubjects, now)
 		if snapErr != nil {
 			adaptive = AdaptiveDegraded
 		} else {
@@ -856,7 +898,7 @@ func (t *Terminator) admitUsageWithRequestID(reqID string, headers map[string][]
 		// BETA-06: source snapshot is independent — an outage degrades
 		// adaptive posture but never silently drops source evidence.
 		if len(sourceSubjects) > 0 {
-			snap, snapErr = t.dep.Evidence.Snapshot(sourceSubjects, now)
+			snap, snapErr = snapshotEvidenceContext(ctx, t.dep.Evidence, sourceSubjects, now)
 			if snapErr != nil {
 				adaptive = AdaptiveDegraded
 			} else {
@@ -965,7 +1007,7 @@ func (t *Terminator) admitUsageWithRequestID(reqID string, headers map[string][]
 		// history.
 		transitionMeta := credential.TransitionMetadata{RequestID: out.RequestID, PolicyRevision: t.pol.Revision, EvidenceCodes: evidenceCodes}
 		tr, oerr := t.dep.Registry.ObserveAndCommit(
-			ctxForRequestWithMetadata(now, transitionMeta), cred.CredentialID,
+			ctxForRequestWithMetadata(ctx, transitionMeta), cred.CredentialID,
 			credentialRisk, hy, now,
 		)
 		if oerr != nil {
@@ -973,7 +1015,7 @@ func (t *Terminator) admitUsageWithRequestID(reqID string, headers map[string][]
 			// authoritatively. Do NOT synthesize state from the local machine.
 			// Preserve persisted status; deny if the persisted state blocks.
 			adaptiveForObservation = AdaptiveDegraded
-			if rr, lerr := t.dep.Registry.LookupAuthoritative(ctxForRequest(now, out.RequestID), cred.CredentialID); lerr == nil {
+			if rr, lerr := t.dep.Registry.LookupAuthoritative(ctxForRequest(ctx, out.RequestID), cred.CredentialID); lerr == nil {
 				after = rr.Status
 				updatedCred = credFrom(rr)
 				markLastSeen(t.dep.Registry, cred.CredentialID, now)
@@ -991,7 +1033,7 @@ func (t *Terminator) admitUsageWithRequestID(reqID string, headers map[string][]
 			case credential.TransitionConflict:
 				// A concurrent writer advanced the revision. Bounded retry once:
 				// re-read authoritative and re-commit the same risk observation.
-				rec, lerr := t.dep.Registry.LookupAuthoritative(ctxForRequest(now, out.RequestID), cred.CredentialID)
+				rec, lerr := t.dep.Registry.LookupAuthoritative(ctxForRequest(ctx, out.RequestID), cred.CredentialID)
 				if lerr != nil {
 					adaptiveForObservation = AdaptiveDegraded
 					after = cred.Status
@@ -999,7 +1041,7 @@ func (t *Terminator) admitUsageWithRequestID(reqID string, headers map[string][]
 					// P0.20: Re-commit once against the authoritative record.
 					// If this also conflicts, preserve the stricter state (the
 					// concurrent writer's) rather than discarding our observation.
-					retry, rerr := t.dep.Registry.ObserveAndCommit(ctxForRequestWithMetadata(now, transitionMeta), cred.CredentialID, credentialRisk, hy, now)
+					retry, rerr := t.dep.Registry.ObserveAndCommit(ctxForRequestWithMetadata(ctx, transitionMeta), cred.CredentialID, credentialRisk, hy, now)
 					switch {
 					case rerr == nil:
 						after = retry.Record.Status
@@ -1086,7 +1128,10 @@ func (t *Terminator) admitUsageWithRequestID(reqID string, headers map[string][]
 		var rec *lane.LaneRecord
 		var rerr error
 		laneMeta := lane.TransitionMetadata{RequestID: out.RequestID, PolicyRevision: t.pol.Revision, EvidenceCodes: evidenceCodes}
-		if aware, ok := t.dep.Lanes.(lane.MetadataAwareRepository); ok {
+		lanePolicy := lanePolicyContext(t.pol)
+		if aware, ok := t.dep.Lanes.(lane.PolicyAwareRepository); ok {
+			rec, rerr = aware.ObserveRiskWithPolicy(ctx, cred.CredentialID, laneID, laneRisk, now, lanePolicy, laneMeta)
+		} else if aware, ok := t.dep.Lanes.(lane.MetadataAwareRepository); ok {
 			rec, rerr = aware.ObserveRiskWithMetadata(cred.CredentialID, laneID, laneRisk, now, laneMeta)
 		} else if aware, ok := t.dep.Lanes.(lane.RequestAwareRepository); ok {
 			rec, rerr = aware.ObserveRiskWithRequestID(cred.CredentialID, laneID, laneRisk, now, out.RequestID)
@@ -1095,11 +1140,21 @@ func (t *Terminator) admitUsageWithRequestID(reqID string, headers map[string][]
 		}
 		if rerr == nil {
 			laneSec = rec.Security.Status
+			laneRec = rec
 			tr.LaneTrustAfter = rec.State.String()
 			tr.LaneSecAfter = rec.Security.Status.String()
 			tr.LaneRevAfter = rec.Revision
-		} else if laneRec != nil {
-			laneSec = laneRec.Security.Status
+		} else {
+			out.Authorized = false
+			out.Reason = "lane_unavailable"
+			out.DenialErr = rerr
+			out.CredentialRisk = credentialRisk
+			out.LaneRisk = laneRisk
+			out.RiskAfter = effectiveRisk
+			out.Evidence = evidenceCodes
+			out.Adaptive = AdaptiveDegraded
+			out.Degraded = true
+			return out
 		}
 	}
 	// A BLOCKED lane is denied outright (lane-scoped block, P0.7). This rides
@@ -1209,16 +1264,46 @@ func (t *Terminator) admitUsageWithRequestID(reqID string, headers map[string][]
 	// Get the authoritative post-mutation lane record for AuthorizedContext.
 	var finalLaneState string
 	if t.dep.Lanes != nil {
-		if fr, ok := t.dep.Lanes.Get(cred.CredentialID, laneID); ok {
+		// classifyLane/ObserveRisk return the committed record. Reuse that
+		// snapshot instead of performing a second untyped read that could turn a
+		// backend error into a fabricated NEW state.
+		if laneRec != nil {
+			finalLaneState = laneRec.State.String()
+		} else if reader, ok := t.dep.Lanes.(lane.ReadRepository); ok {
+			fr, found, rerr := reader.LookupLane(ctx, cred.CredentialID, laneID)
+			if rerr != nil {
+				out.Authorized = false
+				out.Reason = "lane_unavailable"
+				out.DenialErr = rerr
+				out.Degraded = true
+				out.Adaptive = AdaptiveDegraded
+				return out
+			}
+			if !found || fr == nil {
+				out.Authorized = false
+				out.Reason = "lane_unavailable"
+				out.DenialErr = lane.ErrLaneNotFound
+				out.Degraded = true
+				out.Adaptive = AdaptiveDegraded
+				return out
+			}
 			finalLaneState = fr.State.String()
 		} else {
-			finalLaneState = "NEW"
+			// Legacy repositories have no strict read seam. Their successful
+			// mutation should have returned laneRec; an absent record is not a
+			// reason to manufacture authority, so deny conservatively.
+			out.Authorized = false
+			out.Reason = "lane_unavailable"
+			out.DenialErr = lane.ErrLaneNotFound
+			out.Degraded = true
+			out.Adaptive = AdaptiveDegraded
+			return out
 		}
 	} else {
 		finalLaneState = "NEW"
 	}
 
-	ctx := principal.AuthorizedContext{
+	authCtx := principal.AuthorizedContext{
 		Principal:          prin,
 		LaneID:             laneID,
 		LaneState:          finalLaneState,
@@ -1236,7 +1321,7 @@ func (t *Terminator) admitUsageWithRequestID(reqID string, headers map[string][]
 	// slot against two different reservoirs. A caller wanting BOTH must compose
 	// two governors/inspect the outcome, which is not the default posture.
 	if t.dep.Resource != nil {
-		provErr := t.provisionMultiscope(cred, laneID, laneSec, limits, ctx, reqID, out, adaptiveForObservation, laneRisk, credentialRisk, effectiveRisk, evidenceCodes, src, est, tr)
+		provErr := t.provisionMultiscope(ctx, cred, laneID, laneSec, limits, authCtx, reqID, out, adaptiveForObservation, laneRisk, credentialRisk, effectiveRisk, evidenceCodes, src, est, tr)
 		if provErr != nil {
 			return provErr
 		}
@@ -1255,7 +1340,7 @@ func (t *Terminator) admitUsageWithRequestID(reqID string, headers map[string][]
 			return out
 		}
 		// Issue assertion — if it fails, release the lease.
-		assertion, err := t.issueAssertion(ctx, reqID, cred)
+		assertion, err := t.issueAssertion(authCtx, reqID, cred)
 		if err != nil {
 			lease.Release()
 			out.Authorized = false
@@ -1270,7 +1355,7 @@ func (t *Terminator) admitUsageWithRequestID(reqID string, headers map[string][]
 		out.Lease = lease
 		out.Assertion = assertion
 	} else {
-		assertion, err := t.issueAssertion(ctx, reqID, cred)
+		assertion, err := t.issueAssertion(authCtx, reqID, cred)
 		if err != nil {
 			out.Authorized = false
 			out.Reason = "internal_identity_failure"
@@ -1334,12 +1419,12 @@ func (t *Terminator) admitUsageWithRequestID(reqID string, headers map[string][]
 	// authorizations — evidence activity (including denied requests) can
 	// contribute to pruning needs.
 	if t.pruneCounter != nil && t.pruneCounter.Add(1)%50 == 0 && t.dep.Evidence != nil {
-		t.pruneEvidence(now, credSubjects, laneSubjects, sourceSubjects...)
+		t.pruneEvidence(ctx, now, credSubjects, laneSubjects, sourceSubjects...)
 	}
 
 	// Every gate passed.
 	out.Principal = prin
-	out.Context = ctx
+	out.Context = authCtx
 	out.LaneNew = laneNew
 	out.Authorized = true
 	out.Reason = "authorized"
@@ -1367,7 +1452,7 @@ func (t *Terminator) admitUsageWithRequestID(reqID string, headers map[string][]
 // tables land in the policy, only the spec construction here changes. Today a
 // single hostile actor cannot exceed the credential cap across its lanes/sources
 // without tripping the shared budget — a conservative first posture.
-func (t *Terminator) provisionMultiscope(cred *credential.Credential, laneID string, laneSec lane.SecurityStatus, limits policy.Limits, ctx principal.AuthorizedContext, reqID string, out *Outcome, adaptiveForObservation AdaptiveStateStatus, laneRisk, credentialRisk, effectiveRisk int, evidenceCodes []string, src TrustedSource, est resource.UsageEstimate, tr *DecisionTrace) *Outcome {
+func (t *Terminator) provisionMultiscope(requestCtx context.Context, cred *credential.Credential, laneID string, laneSec lane.SecurityStatus, limits policy.Limits, authCtx principal.AuthorizedContext, reqID string, out *Outcome, adaptiveForObservation AdaptiveStateStatus, laneRisk, credentialRisk, effectiveRisk int, evidenceCodes []string, src TrustedSource, est resource.UsageEstimate, tr *DecisionTrace) *Outcome {
 	// P0.35: the selected limits' per-dimension gauges (requests/tokens/cost)
 	// ride EVERY scope's spec — requests, tokens and spend are different
 	// resources with different buckets, and each scope enforces the same
@@ -1416,7 +1501,16 @@ func (t *Terminator) provisionMultiscope(cred *credential.Credential, laneID str
 	// across every scope; the proxy settles the reservation with ACTUALS after
 	// the backend responds. Dimensions the policy doesn't gauge (zero capacity)
 	// are inert; dimensions the estimate leaves zero reserve nothing.
-	res, err := t.dep.Resource.ProvisionUsage(specs, est)
+	var res *resource.MultiReservation
+	var err error
+	if authority, ok := t.dep.Resource.(resource.ContextAuthority); ok {
+		res, err = authority.ProvisionUsageContext(requestCtx, specs, est)
+	} else {
+		if err := contextErr(requestCtx); err != nil {
+			return deny("resource_unavailable", err)
+		}
+		res, err = t.dep.Resource.ProvisionUsage(specs, est)
+	}
 	if err != nil {
 		tr.ReservationResult = "denied"
 		if errors.Is(err, resource.ErrSourceScopeSaturated) {
@@ -1435,7 +1529,7 @@ func (t *Terminator) provisionMultiscope(cred *credential.Credential, laneID str
 	tr.ReservationResult = "granted"
 	// Every scope provisioned. Issue the assertion; if it fails, release the
 	// reservation so held capacity is refunded (never a leaked hold).
-	assertion, aerr := t.issueAssertion(ctx, reqID, cred)
+	assertion, aerr := t.issueAssertion(authCtx, reqID, cred)
 	if aerr != nil {
 		res.Release()
 		return deny("internal_identity_failure", aerr)
@@ -1467,7 +1561,7 @@ func resourceSpecEnabled(spec resource.BucketSpec) bool {
 // pruneEvidence prunes expired evidence for the relevant subjects. It is a
 // no-op on failure — pruning is optimization-only.
 // P0.7 fix: accepts source subjects too.
-func (t *Terminator) pruneEvidence(now time.Time, credSubjects, laneSubjects []evidence.SubjectKey, sourceSubjects ...evidence.SubjectKey) {
+func (t *Terminator) pruneEvidence(ctx context.Context, now time.Time, credSubjects, laneSubjects []evidence.SubjectKey, sourceSubjects ...evidence.SubjectKey) {
 	if t.dep.Evidence == nil {
 		return
 	}
@@ -1479,7 +1573,7 @@ func (t *Terminator) pruneEvidence(now time.Time, credSubjects, laneSubjects []e
 			allSubjects = append(allSubjects, s)
 		}
 	}
-	t.dep.Evidence.Prune(allSubjects, now)
+	_, _ = pruneEvidenceContext(ctx, t.dep.Evidence, allSubjects, now)
 }
 
 // finalizeBaseline applies one deferred clean-activity credit (P0.27): counters
@@ -1499,10 +1593,17 @@ func (t *Terminator) finalizeBaseline(b *BaselineToken) {
 		MaxEstablishmentRisk:     pol.Learning.MaxEstablishmentRisk,
 		AllowNewLanes:            pol.Learning.AllowNewLanes,
 		AllowSuspicious:          pol.Learning.AllowSuspiciousLanes,
-		HasDisqualifyingEvidence: t.hasActiveDisqualifyingEvidence(pol, b.CredentialID, b.LaneID, now),
+		HasDisqualifyingEvidence: t.hasActiveDisqualifyingEvidence(b.runtimeCtx, pol, b.CredentialID, b.LaneID, now),
 	}
 	meta := lane.TransitionMetadata{RequestID: b.RequestID, PolicyRevision: b.PolicyRevision, EvidenceCodes: b.EvidenceCodes}
-	if aware, ok := t.dep.Lanes.(lane.MetadataAwareRepository); ok {
+	lanePolicy := lanePolicyContext(pol)
+	if aware, ok := t.dep.Lanes.(lane.PolicyAwareRepository); ok {
+		settlementCtx := b.runtimeCtx
+		if settlementCtx == nil {
+			settlementCtx = context.Background()
+		}
+		_, _, _ = aware.RecordCleanAuthorizedAndPromoteWithPolicy(settlementCtx, b.CredentialID, b.LaneID, b.LaneRisk, promCrit, now, lanePolicy, meta)
+	} else if aware, ok := t.dep.Lanes.(lane.MetadataAwareRepository); ok {
 		_, _, _ = aware.RecordCleanAuthorizedAndPromoteWithMetadata(b.CredentialID, b.LaneID, b.LaneRisk, promCrit, now, meta)
 	} else if aware, ok := t.dep.Lanes.(lane.RequestAwareRepository); ok {
 		_, _, _ = aware.RecordCleanAuthorizedAndPromoteWithRequestID(b.CredentialID, b.LaneID, b.LaneRisk, promCrit, now, b.RequestID)
@@ -1580,7 +1681,10 @@ func sprayCodes(sigs []anomaly.Signal) []string {
 // finished. Persistence is best-effort: an evidence store outage or a
 // non-compiled rule simply skips that signal; the finished request is not
 // re-evaluated (it already ran).
-func (t *Terminator) observeCompletion(pol *policy.CompiledPolicy, subjects producers.SubjectContext, actual resource.UsageEstimate, success bool) CompletionResult {
+func (t *Terminator) observeCompletion(ctx context.Context, pol *policy.CompiledPolicy, subjects producers.SubjectContext, actual resource.UsageEstimate, success bool) CompletionResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if len(t.dep.Producers) == 0 {
 		return CompletionResult{}
 	}
@@ -1625,7 +1729,7 @@ func (t *Terminator) observeCompletion(pol *policy.CompiledPolicy, subjects prod
 		}
 	}
 	if len(minted) > 0 {
-		if err := t.dep.Evidence.Append(minted...); err == nil {
+		if err := appendEvidenceContext(ctx, t.dep.Evidence, minted...); err == nil {
 			persisted = true
 		}
 	}
@@ -1650,7 +1754,7 @@ func (evidenceAppendError) Error() string { return "terminator: completion evide
 // disqualifying list (P0.26). A store outage here must NOT fail open into
 // "no disqualifying evidence" — it conservatively vetoes (fail-closed): an
 // unavailable history is unknown, and unknown blocks trust-building.
-func (t *Terminator) hasActiveDisqualifyingEvidence(pol *policy.CompiledPolicy, credID, laneID string, now time.Time) bool {
+func (t *Terminator) hasActiveDisqualifyingEvidence(ctx context.Context, pol *policy.CompiledPolicy, credID, laneID string, now time.Time) bool {
 	if pol == nil {
 		pol = t.pol
 	}
@@ -1666,7 +1770,7 @@ func (t *Terminator) hasActiveDisqualifyingEvidence(pol *policy.CompiledPolicy, 
 		{Scope: evidence.ScopeLane, ID: laneID},
 		{Scope: evidence.ScopeCredential, ID: credID},
 	}
-	snap, err := t.dep.Evidence.Snapshot(subjects, now)
+	snap, err := snapshotEvidenceContext(ctx, t.dep.Evidence, subjects, now)
 	if err != nil {
 		// History unavailable → unknown → veto. Trust-building stops during an
 		// evidence outage; it resumes when the store is readable again.
@@ -1735,13 +1839,13 @@ var (
 // fail closed as before (ErrUnknown), but the error is typed
 // LookupUnavailableError so callers/policy can distinguish spray traffic from
 // a backend outage instead of treating every miss as "no such credential".
-func (t *Terminator) authenticate(presented *secret.SealedSecret) (*credential.Credential, error) {
+func (t *Terminator) authenticate(ctx context.Context, presented *secret.SealedSecret) (*credential.Credential, error) {
 	latest := t.dep.Peppers.Latest()
 	if latest < 0 {
 		return nil, errors.New("terminator: no active pepper keys")
 	}
 	verifier := t.dep.Peppers.DeriveVerifier(presented, latest)
-	if rec, err := t.lookupVerifier(verifier, latest); err == nil {
+	if rec, err := t.lookupVerifier(ctx, verifier, latest); err == nil {
 		if aerr := rec.Authenticatable(t.dep.RiskNow()); aerr != nil {
 			// P0.50: the credential WAS identified even though its status
 			// denies authentication (revoked/quarantined/expired). Return the
@@ -1760,7 +1864,7 @@ func (t *Terminator) authenticate(presented *secret.SealedSecret) (*credential.C
 	for i := len(versions) - 2; i >= 0; i-- {
 		v := versions[i]
 		vv := t.dep.Peppers.DeriveVerifier(presented, v)
-		if rec, err := t.lookupVerifier(vv, v); err == nil {
+		if rec, err := t.lookupVerifier(ctx, vv, v); err == nil {
 			if aerr := rec.Authenticatable(t.dep.RiskNow()); aerr != nil {
 				return credFrom(rec), aerr
 			}
@@ -1794,9 +1898,9 @@ func (t *Terminator) migrateVerifier(rec *credential.CredentialRecord, verifier 
 // lookupVerifier resolves a derived verifier through the typed seam (P0.28)
 // when the registry implements it, else through the legacy bool API (all
 // misses become ErrNotFound — the legacy semantics).
-func (t *Terminator) lookupVerifier(verifier []byte, pepperVersion int) (*credential.CredentialRecord, error) {
+func (t *Terminator) lookupVerifier(ctx context.Context, verifier []byte, pepperVersion int) (*credential.CredentialRecord, error) {
 	if lu, ok := t.dep.Registry.(credential.VerifierLookup); ok {
-		return lu.FindByVerifierContext(context.Background(), verifier, pepperVersion)
+		return lu.FindByVerifierContext(ctx, verifier, pepperVersion)
 	}
 	if rec, found := t.dep.Registry.FindByVerifier(verifier, pepperVersion); found {
 		return rec, nil
@@ -1819,7 +1923,7 @@ func credFrom(rec *credential.CredentialRecord) *credential.Credential {
 // resource-table lifecycle. Lane rows may be deleted by BorrowOrCreate while
 // resolving an incoming request; their resource objects must be removed only
 // after the row disappears and only when all accounting is idle.
-func cleanupRemovedLaneResources(g *resource.Governor, before, after []string) {
+func cleanupRemovedLaneResources(g resource.Authority, before, after []string) {
 	if g == nil || len(before) == 0 {
 		return
 	}
@@ -1836,7 +1940,7 @@ func cleanupRemovedLaneResources(g *resource.Governor, before, after []string) {
 
 // classifyLane assigns/creates a lane for the request, deterministic on the
 // feature vector + policy revision (§26).
-func (t *Terminator) classifyLane(credID string, feat lane.Features) (string, *lane.LaneRecord, bool, error) {
+func (t *Terminator) classifyLane(ctx context.Context, credID string, feat lane.Features) (string, *lane.LaneRecord, bool, error) {
 	if t.dep.Lanes == nil {
 		return "lane_" + credID, nil, false, nil
 	}
@@ -1849,10 +1953,15 @@ func (t *Terminator) classifyLane(credID string, feat lane.Features) (string, *l
 	// classification universe, not the package-global
 	// lane.DefaultThresholds(), so anti-laundering sensitivity
 	// (MinComparableWeight etc.) and re-keying are policy-tunable and versioned.
-	rec, created, err := t.dep.Lanes.BorrowOrCreate(credID, laneID, feat, lane.ClassificationContext{
-		Revision:   t.pol.ClassificationRevision,
-		Thresholds: t.pol.Classification,
-	})
+	classification := lanePolicyContext(t.pol)
+	var rec *lane.LaneRecord
+	var created bool
+	var err error
+	if aware, ok := t.dep.Lanes.(lane.PolicyAwareRepository); ok {
+		rec, created, err = aware.BorrowOrCreateWithPolicy(ctx, credID, laneID, feat, classification)
+	} else {
+		rec, created, err = t.dep.Lanes.BorrowOrCreate(credID, laneID, feat, classification.Classification)
+	}
 	if err != nil {
 		return laneID, nil, false, err
 	}

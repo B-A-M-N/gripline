@@ -569,7 +569,7 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	MergeSourceIntoFeatures(&feat, src)
 	est := d.cfg.Usage.Estimate(obs)
 
-	out := d.cfg.Terminator.AdmitUsageWithRequestID(requestID, authHeaders, feat, src, est)
+	out := d.cfg.Terminator.AdmitUsageContext(r.Context(), requestID, authHeaders, feat, src, est)
 
 	if !out.Authorized {
 		observeAdmission(out)
@@ -772,7 +772,8 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// P0.4A: drive the completion producers with the ACTUAL usage. `success`
 	// is false when the upstream stream failed, so a corrupt/failed stream is
 	// not credited as clean velocity. This affects SUBSEQUENT admissions.
-	completion := out.Complete(actual, streamErr == nil)
+	success := streamErr == nil && resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices
+	completion := out.Complete(actual, success)
 	if len(completion.EvidenceCodes) > 0 {
 		d.metrics.evidenceEvents.Add(uint64(len(completion.EvidenceCodes)))
 	}

@@ -8,14 +8,31 @@ import (
 	"github.com/B-A-M-N/gripline/internal/evidence"
 )
 
-func ctxForRequest(now time.Time, requestID string) context.Context {
-	return ctxForRequestWithMetadata(now, credential.TransitionMetadata{RequestID: requestID})
+const deferredAuthorityTimeout = 5 * time.Second
+
+// boundedRuntimeContext preserves the authority work needed after a client
+// disconnects while imposing a finite completion budget. Admission itself
+// still uses the caller context; only deferred completion accounting uses this
+// detached context.
+func boundedRuntimeContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	return context.WithTimeout(context.WithoutCancel(parent), deferredAuthorityTimeout)
 }
 
-func ctxForRequestWithMetadata(now time.Time, meta credential.TransitionMetadata) context.Context {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	// Self-releasing: the cancel is invoked once the deadline passes so the
-	// goroutine/context is reclaimed even though callers never hold a ref to it.
+func ctxForRequest(parent context.Context, requestID string) context.Context {
+	return ctxForRequestWithMetadata(parent, credential.TransitionMetadata{RequestID: requestID})
+}
+
+func ctxForRequestWithMetadata(parent context.Context, meta credential.TransitionMetadata) context.Context {
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
+	// Callers intentionally receive only the context; the timer owns the
+	// cancellation so every authority operation is bounded without requiring
+	// each legacy seam to manage a second return value.
 	time.AfterFunc(5*time.Second, cancel)
 	if meta.RequestID != "" {
 		ctx = credential.WithRequestID(ctx, meta.RequestID)
@@ -33,6 +50,52 @@ func markLastSeen(reg credential.Registry, credentialID string, now time.Time) {
 		return
 	}
 	reg.TouchLastSeen(credentialID, now)
+}
+
+func appendEvidenceContext(ctx context.Context, store evidence.Store, items ...evidence.Evidence) error {
+	if store == nil {
+		return nil
+	}
+	if aware, ok := store.(evidence.ContextStore); ok {
+		return aware.AppendContext(ctx, items...)
+	}
+	if err := contextErr(ctx); err != nil {
+		return err
+	}
+	return store.Append(items...)
+}
+
+func snapshotEvidenceContext(ctx context.Context, store evidence.Store, subjects []evidence.SubjectKey, now time.Time) ([]evidence.Evidence, error) {
+	if store == nil {
+		return nil, nil
+	}
+	if aware, ok := store.(evidence.ContextStore); ok {
+		return aware.SnapshotContext(ctx, subjects, now)
+	}
+	if err := contextErr(ctx); err != nil {
+		return nil, err
+	}
+	return store.Snapshot(subjects, now)
+}
+
+func pruneEvidenceContext(ctx context.Context, store evidence.Store, subjects []evidence.SubjectKey, now time.Time) (int, error) {
+	if store == nil {
+		return 0, nil
+	}
+	if aware, ok := store.(evidence.ContextStore); ok {
+		return aware.PruneContext(ctx, subjects, now)
+	}
+	if err := contextErr(ctx); err != nil {
+		return 0, err
+	}
+	return store.Prune(subjects, now)
+}
+
+func contextErr(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	return ctx.Err()
 }
 
 // dedupAppend merges per-request synchronous evidence into the lane evidence

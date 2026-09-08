@@ -1,6 +1,7 @@
 package evidence
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -42,6 +43,15 @@ type Store interface {
 	// the count of entries removed and any error. Pruning is optimization
 	// only; Snapshot already excludes expired evidence.
 	Prune(subjects []SubjectKey, now time.Time) (int, error)
+}
+
+// ContextStore is the cancellable authority extension implemented by the
+// built-in stores. Store remains source-compatible for embedders, while the
+// data plane prefers this seam whenever available.
+type ContextStore interface {
+	AppendContext(ctx context.Context, items ...Evidence) error
+	SnapshotContext(ctx context.Context, subjects []SubjectKey, now time.Time) ([]Evidence, error)
+	PruneContext(ctx context.Context, subjects []SubjectKey, now time.Time) (int, error)
 }
 
 const (
@@ -136,6 +146,13 @@ func (s *memoryStore) Append(items ...Evidence) error {
 	return nil
 }
 
+func (s *memoryStore) AppendContext(ctx context.Context, items ...Evidence) error {
+	if err := contextErr(ctx); err != nil {
+		return err
+	}
+	return s.Append(items...)
+}
+
 func (s *memoryStore) Snapshot(subjects []SubjectKey, now time.Time) ([]Evidence, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -155,6 +172,13 @@ func (s *memoryStore) Snapshot(subjects []SubjectKey, now time.Time) ([]Evidence
 		}
 	}
 	return out, nil
+}
+
+func (s *memoryStore) SnapshotContext(ctx context.Context, subjects []SubjectKey, now time.Time) ([]Evidence, error) {
+	if err := contextErr(ctx); err != nil {
+		return nil, err
+	}
+	return s.Snapshot(subjects, now)
 }
 
 func (s *memoryStore) Prune(subjects []SubjectKey, now time.Time) (int, error) {
@@ -189,6 +213,20 @@ func (s *memoryStore) Prune(subjects []SubjectKey, now time.Time) (int, error) {
 		s.data[k] = kept
 	}
 	return pruned, nil
+}
+
+func (s *memoryStore) PruneContext(ctx context.Context, subjects []SubjectKey, now time.Time) (int, error) {
+	if err := contextErr(ctx); err != nil {
+		return 0, err
+	}
+	return s.Prune(subjects, now)
+}
+
+func contextErr(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	return ctx.Err()
 }
 
 // --- shared store semantics (P0.2-fix) ----------------------------------------

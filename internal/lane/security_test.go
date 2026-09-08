@@ -1,6 +1,7 @@
 package lane
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -118,8 +119,9 @@ func TestCleanSinceResetOnElevation(t *testing.T) {
 	// the gate here to exercise the BLOCKED transition specifically.
 	hy := DefaultSecurityHysteresis()
 	hy.EnableAutomaticBlock = true
-	store.SetSecurityHysteresis(hy)
-	if _, err := store.ObserveRisk("cred_c", laneID, 95, now.Add(time.Minute)); err != nil {
+	ctx := DefaultPolicyContext()
+	ctx.Security = hy
+	if _, err := store.ObserveRiskWithPolicy(context.Background(), "cred_c", laneID, 95, now.Add(time.Minute), ctx, TransitionMetadata{}); err != nil {
 		t.Fatal(err)
 	}
 	rec, _ = store.Get("cred_c", laneID)

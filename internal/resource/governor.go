@@ -1,6 +1,7 @@
 package resource
 
 import (
+	"context"
 	"errors"
 	"hash/fnv"
 	"strconv"
@@ -416,6 +417,19 @@ func (u UsageEstimate) amountFor(dim Dimension) int64 {
 // not reserved (nothing to refund later); the policy may still bound them at
 // settle-time through the same buckets.
 func (g *Governor) ProvisionUsage(scopes []ScopeSpec, est UsageEstimate) (*MultiReservation, error) {
+	return g.ProvisionUsageContext(context.Background(), scopes, est)
+}
+
+// ProvisionUsageContext is the cancellable resource-authority entry point.
+// The in-process governor completes quickly, while a clustered implementation
+// can use the same contract to abort a remote lease transaction at the
+// request boundary.
+func (g *Governor) ProvisionUsageContext(ctx context.Context, scopes []ScopeSpec, est UsageEstimate) (*MultiReservation, error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
 	if len(scopes) == 0 {
 		return nil, errors.New("resource: no scopes to provision")
 	}

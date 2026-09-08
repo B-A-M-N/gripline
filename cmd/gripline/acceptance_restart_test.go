@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -106,17 +107,16 @@ func TestAcceptanceRestartContainment(t *testing.T) {
 	}
 
 	// Drive a lane to BLOCKED for cred_revoked (automatic block enabled).
-	sus := rt.State
 	hy := lane.DefaultSecurityHysteresis()
 	hy.EnableAutomaticBlock = true
-	sus.SetSecurityHysteresis(hy)
 	if _, _, err := rt.Lanes.BorrowOrCreate("cred_revoked", "lane_blk", lane.Features{NetworkASN: "AS2", HTTPVersion: "1.1"}, lane.ClassificationContext{Revision: 1, Thresholds: lane.DefaultThresholds()}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := rt.Lanes.ObserveRisk("cred_revoked", "lane_blk", 90, time.Now()); err != nil {
+	policyCtx := lane.DefaultPolicyContext()
+	policyCtx.Security = hy
+	if _, err := rt.State.ObserveRiskWithPolicy(context.Background(), "cred_revoked", "lane_blk", 90, time.Now(), policyCtx, lane.TransitionMetadata{}); err != nil {
 		t.Fatal(err)
 	}
-	sus.SetSecurityHysteresis(lane.DefaultSecurityHysteresis()) // restore posture
 
 	// Persist evidence against cred_live.
 	if err := rt.Evidence.Append(evidence.Evidence{
@@ -321,14 +321,14 @@ func TestAcceptanceTransactionalOperatorMutations(t *testing.T) {
 	// Give the credential a BLOCKED lane so lane unblock has a target.
 	hy := lane.DefaultSecurityHysteresis()
 	hy.EnableAutomaticBlock = true
-	rt.State.SetSecurityHysteresis(hy)
 	if _, _, err := rt.Lanes.BorrowOrCreate("cred_op", "lane_op", lane.Features{NetworkASN: "AS9", HTTPVersion: "1.1"}, lane.ClassificationContext{Revision: 1, Thresholds: lane.DefaultThresholds()}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := rt.Lanes.ObserveRisk("cred_op", "lane_op", 95, time.Now()); err != nil {
+	policyCtx := lane.DefaultPolicyContext()
+	policyCtx.Security = hy
+	if _, err := rt.State.ObserveRiskWithPolicy(context.Background(), "cred_op", "lane_op", 95, time.Now(), policyCtx, lane.TransitionMetadata{}); err != nil {
 		t.Fatal(err)
 	}
-	rt.State.SetSecurityHysteresis(lane.DefaultSecurityHysteresis())
 	if got, _ := rt.Lanes.Get("cred_op", "lane_op"); got.Security.Status != lane.LaneBlocked {
 		t.Fatalf("setup: want BLOCKED, got %v", got.Security.Status)
 	}

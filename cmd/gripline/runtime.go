@@ -52,7 +52,7 @@ type Runtime struct {
 	AdminService *control.Service
 
 	Evidence       evidence.Store
-	Resource       *resource.Governor
+	Resource       resource.Authority
 	Control        *control.ControlPlane
 	Spray          *anomaly.Detector
 	Signer         terminator.AssertionSigner
@@ -1051,7 +1051,7 @@ func adminSecurityEvents(svc *control.Service, state *statebolt.Store) http.Hand
 	}
 }
 
-func adminMetrics(svc *control.Service, dp *proxy.DataPlane, governor *resource.Governor, state *statebolt.Store, spray *anomaly.Detector, observer *jsonlObserver, policyManager *policy.Manager, signer *terminator.Keyring, adaptiveHealth []terminator.AdaptivePersistenceHealth) http.HandlerFunc {
+func adminMetrics(svc *control.Service, dp *proxy.DataPlane, governor resource.Authority, state *statebolt.Store, spray *anomaly.Detector, observer *jsonlObserver, policyManager *policy.Manager, signer *terminator.Keyring, adaptiveHealth []terminator.AdaptivePersistenceHealth) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			adminMethodNotAllowed(w)
@@ -1091,8 +1091,8 @@ func adminMetrics(svc *control.Service, dp *proxy.DataPlane, governor *resource.
 			writeMetric("spool_max_bytes", m.Spool.MaxBytes)
 			writeMetric("spool_max_files", m.Spool.MaxFiles)
 		}
-		if governor != nil {
-			m := governor.Stats()
+		if stats, ok := governor.(interface{ Stats() resource.GovernorStats }); ok {
+			m := stats.Stats()
 			writeMetric("source_scopes", m.SourceScopes)
 			writeMetric("source_scope_saturations_total", m.SourceSaturations)
 			writeMetric("source_scope_overflows_total", m.SourceOverflows)

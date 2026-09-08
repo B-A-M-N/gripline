@@ -162,8 +162,9 @@ func LoadVerifierKeyFile(path string) (ed25519.PublicKey, error) {
 	if err != nil {
 		return nil, fmt.Errorf("policy: read verifier key: %w", err)
 	}
-	data = bytes.TrimSpace(data)
-	if block, _ := pem.Decode(data); block != nil {
+	raw := data
+	trimmed := bytes.TrimSpace(data)
+	if block, _ := pem.Decode(trimmed); block != nil {
 		pub, err := x509.ParsePKIXPublicKey(block.Bytes)
 		if err != nil {
 			return nil, fmt.Errorf("policy: parse verifier key PEM: %w", err)
@@ -174,6 +175,13 @@ func LoadVerifierKeyFile(path string) (ed25519.PublicKey, error) {
 		}
 		return append(ed25519.PublicKey(nil), key...), nil
 	}
+	// Raw Ed25519 keys are binary. Do the exact-size check before trimming so
+	// a valid key whose final byte happens to be ASCII whitespace is not
+	// truncated to 31 bytes. Text encodings are trimmed separately.
+	if len(raw) == ed25519.PublicKeySize {
+		return append(ed25519.PublicKey(nil), raw...), nil
+	}
+	data = trimmed
 	if decoded, decodeErr := base64.StdEncoding.DecodeString(string(data)); decodeErr == nil {
 		data = decoded
 	}

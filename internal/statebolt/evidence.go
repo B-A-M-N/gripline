@@ -2,6 +2,7 @@ package statebolt
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"strings"
 	"time"
@@ -107,6 +108,13 @@ func (s *Store) Append(items ...evidence.Evidence) error {
 	})
 }
 
+func (s *Store) AppendContext(ctx context.Context, items ...evidence.Evidence) error {
+	if err := contextErr(ctx); err != nil {
+		return err
+	}
+	return s.Append(items...)
+}
+
 // Snapshot implements evidence.Store: non-expired evidence for the requested
 // subjects, with the shared inclusive-expiry rule.
 func (s *Store) Snapshot(subjects []evidence.SubjectKey, now time.Time) ([]evidence.Evidence, error) {
@@ -126,6 +134,13 @@ func (s *Store) Snapshot(subjects []evidence.SubjectKey, now time.Time) ([]evide
 		return nil
 	})
 	return out, err
+}
+
+func (s *Store) SnapshotContext(ctx context.Context, subjects []evidence.SubjectKey, now time.Time) ([]evidence.Evidence, error) {
+	if err := contextErr(ctx); err != nil {
+		return nil, err
+	}
+	return s.Snapshot(subjects, now)
 }
 
 // Prune implements evidence.Store: removes expired evidence for the requested
@@ -162,6 +177,13 @@ func (s *Store) Prune(subjects []evidence.SubjectKey, now time.Time) (int, error
 		return nil
 	})
 	return pruned, err
+}
+
+func (s *Store) PruneContext(ctx context.Context, subjects []evidence.SubjectKey, now time.Time) (int, error) {
+	if err := contextErr(ctx); err != nil {
+		return 0, err
+	}
+	return s.Prune(subjects, now)
 }
 
 // loadSubjectTx loads one subject's evidence rows inside an open transaction.

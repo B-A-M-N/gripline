@@ -105,6 +105,23 @@ func TestLoadAuthenticatedFileRequiresAndVerifiesSignature(t *testing.T) {
 	}
 }
 
+func TestLoadVerifierKeyFilePreservesBinaryWhitespaceByte(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "verifier.key")
+	key := make([]byte, ed25519.PublicKeySize)
+	key[len(key)-1] = ' '
+	if err := os.WriteFile(path, key, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadVerifierKeyFile(path)
+	if err != nil {
+		t.Fatalf("binary verifier key ending in whitespace rejected: %v", err)
+	}
+	if string(got) != string(key) {
+		t.Fatalf("binary verifier key changed during load")
+	}
+}
+
 func TestFileStorePersistsCandidateAndRestoresLastKnownGood(t *testing.T) {
 	store, err := NewFileStore(filepath.Join(t.TempDir(), "lifecycle"))
 	if err != nil {

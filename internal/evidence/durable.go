@@ -11,6 +11,7 @@ package evidence
 
 import (
 	"bytes"
+	"context"
 	"encoding/gob"
 	"errors"
 	"fmt"
@@ -111,6 +112,13 @@ func (d *durableStore) Append(items ...Evidence) error {
 	return nil
 }
 
+func (d *durableStore) AppendContext(ctx context.Context, items ...Evidence) error {
+	if err := contextErr(ctx); err != nil {
+		return err
+	}
+	return d.Append(items...)
+}
+
 // Snapshot implements Store.Snapshot with the same evaluation semantics as
 // the memory and Bolt stores, including rejecting future-created evidence.
 func (d *durableStore) Snapshot(subjects []SubjectKey, now time.Time) ([]Evidence, error) {
@@ -127,6 +135,13 @@ func (d *durableStore) Snapshot(subjects []SubjectKey, now time.Time) ([]Evidenc
 		}
 	}
 	return out, nil
+}
+
+func (d *durableStore) SnapshotContext(ctx context.Context, subjects []SubjectKey, now time.Time) ([]Evidence, error) {
+	if err := contextErr(ctx); err != nil {
+		return nil, err
+	}
+	return d.Snapshot(subjects, now)
 }
 
 // Prune implements Store.Prune with the same evaluation semantics as the
@@ -164,6 +179,13 @@ func (d *durableStore) Prune(subjects []SubjectKey, now time.Time) (int, error) 
 		}
 	}
 	return pruned, nil
+}
+
+func (d *durableStore) PruneContext(ctx context.Context, subjects []SubjectKey, now time.Time) (int, error) {
+	if err := contextErr(ctx); err != nil {
+		return 0, err
+	}
+	return d.Prune(subjects, now)
 }
 
 func (d *durableStore) flushLoop() {

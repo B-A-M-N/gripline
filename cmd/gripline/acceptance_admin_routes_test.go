@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net"
 	"net/http"
@@ -39,11 +40,12 @@ func TestAcceptanceAdminLifecycleRoutes(t *testing.T) {
 	}
 	hy := lane.DefaultSecurityHysteresis()
 	hy.EnableAutomaticBlock = true
-	rt.State.SetSecurityHysteresis(hy)
-	if _, err := rt.Lanes.ObserveRisk("cred_admin_routes", "lane_admin_routes", 90, time.Now()); err != nil {
+	policyCtx := lane.DefaultPolicyContext()
+	policyCtx.Security = hy
+	if _, err := rt.State.ObserveRiskWithPolicy(context.Background(), "cred_admin_routes", "lane_admin_routes", 90, time.Now(), policyCtx, lane.TransitionMetadata{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := rt.Lanes.ObserveRisk("cred_admin_routes", "lane_admin_routes", 90, time.Now().Add(time.Second)); err != nil {
+	if _, err := rt.State.ObserveRiskWithPolicy(context.Background(), "cred_admin_routes", "lane_admin_routes", 90, time.Now().Add(time.Second), policyCtx, lane.TransitionMetadata{}); err != nil {
 		t.Fatal(err)
 	}
 

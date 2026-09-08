@@ -22,6 +22,7 @@ func TestResourceVelocityProducerLearnsSubFloorBaseline(t *testing.T) {
 		sigs := p.ObserveCompletion(CompletionBehavior{
 			Subjects: SubjectContext{CredentialID: "cred_low"},
 			Actual:   UsageEstimate{Cost: 1_000},
+			Success:  true,
 		})
 		if len(sigs) != 0 {
 			t.Fatalf("normal sub-floor cost %d must not emit: %v", i, sigs)
@@ -33,6 +34,7 @@ func TestResourceVelocityProducerLearnsSubFloorBaseline(t *testing.T) {
 	sigs := p.ObserveCompletion(CompletionBehavior{
 		Subjects: SubjectContext{CredentialID: "cred_low"},
 		Actual:   UsageEstimate{Cost: 1_000_000},
+		Success:  true,
 	})
 	if len(sigs) == 0 || sigs[0].Code != "COST_VELOCITY_OVER_4X_BASELINE_AND_ABSOLUTE_FLOOR" {
 		t.Fatalf("spike over learned low-cost norm must fire COST_VELOCITY; got %v", sigs)
@@ -71,12 +73,14 @@ func TestResourceVelocityProducerFloorStillGatesEmission(t *testing.T) {
 		p.ObserveCompletion(CompletionBehavior{
 			Subjects: SubjectContext{CredentialID: "cred_floor"},
 			Actual:   UsageEstimate{Cost: 1_000},
+			Success:  true,
 		})
 	}
 	// 8x the norm but below the floor: no emission.
 	sigs := p.ObserveCompletion(CompletionBehavior{
 		Subjects: SubjectContext{CredentialID: "cred_floor"},
 		Actual:   UsageEstimate{Cost: 8_000},
+		Success:  true,
 	})
 	if len(sigs) != 0 {
 		t.Fatalf("sub-floor 4x blip must not emit; got %v", sigs)
@@ -97,6 +101,7 @@ func TestResourceVelocityProducerSubFloorSpikesDoNotEmitCoastline(t *testing.T) 
 		p.ObserveCompletion(CompletionBehavior{
 			Subjects: SubjectContext{CredentialID: cred},
 			Actual:   UsageEstimate{Cost: 1_000},
+			Success:  true,
 		})
 	}
 	// Sub-floor 3x values: quiet, but they DO update the baseline.
@@ -104,6 +109,7 @@ func TestResourceVelocityProducerSubFloorSpikesDoNotEmitCoastline(t *testing.T) 
 		sigs := p.ObserveCompletion(CompletionBehavior{
 			Subjects: SubjectContext{CredentialID: cred},
 			Actual:   UsageEstimate{Cost: 3_000},
+			Success:  true,
 		})
 		if len(sigs) != 0 {
 			t.Fatalf("3x sub-floor values must never emit; got %v", sigs)
@@ -114,8 +120,36 @@ func TestResourceVelocityProducerSubFloorSpikesDoNotEmitCoastline(t *testing.T) 
 	sigs := p.ObserveCompletion(CompletionBehavior{
 		Subjects: SubjectContext{CredentialID: cred},
 		Actual:   UsageEstimate{Cost: 4_000},
+		Success:  true,
 	})
 	if len(sigs) != 0 {
 		t.Fatalf("within-norm value after drift must not emit; got %v", sigs)
+	}
+}
+
+func TestResourceVelocityProducerFailedCompletionsDoNotLearnCleanBaseline(t *testing.T) {
+	p := NewResourceVelocityProducer(time.Now)
+	subjects := SubjectContext{CredentialID: "cred_failed"}
+	for i := 0; i < 4; i++ {
+		p.ObserveCompletion(CompletionBehavior{
+			Subjects: subjects,
+			Actual:   UsageEstimate{Combined: 1_000_000, Cost: 1_000_000},
+			Success:  false,
+		})
+	}
+	for i := 0; i < 3; i++ {
+		p.ObserveCompletion(CompletionBehavior{
+			Subjects: subjects,
+			Actual:   UsageEstimate{Combined: 100, Cost: 100},
+			Success:  true,
+		})
+	}
+	got := p.ObserveCompletion(CompletionBehavior{
+		Subjects: subjects,
+		Actual:   UsageEstimate{Combined: 1_000, Cost: 1_000},
+		Success:  true,
+	})
+	if len(got) != 1 || got[0].Code != "TOKEN_VELOCITY_OVER_10X_BASELINE" {
+		t.Fatalf("failed completions contaminated clean baseline: %v", got)
 	}
 }

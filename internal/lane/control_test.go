@@ -1,6 +1,7 @@
 package lane
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -24,8 +25,9 @@ func TestUnblockExitsBlockedAndReseedsClean(t *testing.T) {
 	// operator-validated posture) before observing.
 	hy := DefaultSecurityHysteresis()
 	hy.EnableAutomaticBlock = true
-	store.SetSecurityHysteresis(hy)
-	if _, err := store.ObserveRisk("cred_c", laneID, 90, now); err != nil {
+	ctx := DefaultPolicyContext()
+	ctx.Security = hy
+	if _, err := store.ObserveRiskWithPolicy(context.Background(), "cred_c", laneID, 90, now, ctx, TransitionMetadata{}); err != nil {
 		t.Fatal(err)
 	}
 	rec, _ := store.Get("cred_c", laneID)
@@ -97,11 +99,12 @@ func TestOperatorTransitionAtomicWithAuditSink(t *testing.T) {
 	hy := DefaultSecurityHysteresis()
 	hy.EnableAutomaticBlock = true
 	hy.SuspectObs = 1
-	store.SetSecurityHysteresis(hy)
-	if _, err := store.ObserveRisk("cred_a", laneID, 90, now); err != nil {
+	ctx := DefaultPolicyContext()
+	ctx.Security = hy
+	if _, err := store.ObserveRiskWithPolicy(context.Background(), "cred_a", laneID, 90, now, ctx, TransitionMetadata{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.ObserveRisk("cred_a", laneID, 90, now); err != nil {
+	if _, err := store.ObserveRiskWithPolicy(context.Background(), "cred_a", laneID, 90, now, ctx, TransitionMetadata{}); err != nil {
 		t.Fatal(err)
 	}
 	rec, _ := store.Get("cred_a", laneID)
