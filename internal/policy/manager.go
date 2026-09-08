@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -13,18 +14,27 @@ import (
 // activation. The data plane receives immutable CompiledPolicy snapshots and
 // never observes a partially loaded candidate.
 type Manager struct {
-	mu                sync.Mutex
-	current           *CompiledPolicy
-	candidate         *CompiledPolicy
-	knownGood         map[int]*CompiledPolicy
-	activationEpoch   uint64
-	persist           func(Manifest) error
-	audit             func(Event) error
-	persistArtifact   func(*CompiledPolicy) error
-	persistTransition func(Manifest, Event) error
-	loadManifest      func() (Manifest, error)
-	loadArtifact      func(PolicyRef) (*CompiledPolicy, error)
-	lastRevision      int
+	mu                       sync.Mutex
+	current                  *CompiledPolicy
+	candidate                *CompiledPolicy
+	knownGood                map[int]*CompiledPolicy
+	activationEpoch          uint64
+	persist                  func(Manifest) error
+	persistContext           func(context.Context, Manifest) error
+	audit                    func(Event) error
+	auditContext             func(context.Context, Event) error
+	persistArtifact          func(*CompiledPolicy) error
+	persistArtifactContext   func(context.Context, *CompiledPolicy) error
+	persistTransition        func(Manifest, Event) error
+	persistTransitionContext func(context.Context, Manifest, Event) error
+	loadManifest             func() (Manifest, error)
+	loadManifestContext      func(context.Context) (Manifest, error)
+	loadArtifact             func(PolicyRef) (*CompiledPolicy, error)
+	loadArtifactContext      func(context.Context, PolicyRef) (*CompiledPolicy, error)
+	lastRevision             int
+	// published is the immutable data-plane view. A nil pointer means the
+	// durable authority could not be reconciled and admissions must fail closed.
+	published atomic.Pointer[Snapshot]
 }
 
 // Manifest is the durable lifecycle marker. Implementations should write it
@@ -73,44 +83,64 @@ type Snapshot struct {
 // Options supplies durable manifest and audit hooks. Both are optional for
 // tests and explicitly ephemeral deployments.
 type Options struct {
-	Persist func(Manifest) error
-	Audit   func(Event) error
+	Persist        func(Manifest) error
+	PersistContext func(context.Context, Manifest) error
+	Audit          func(Event) error
+	AuditContext   func(context.Context, Event) error
 	// PersistArtifact stores the exact compiled candidate before its manifest
 	// can reference it. This is what makes last-known-good rollback possible
 	// after a process restart rather than only while pointers remain in memory.
-	PersistArtifact func(*CompiledPolicy) error
+	PersistArtifact        func(*CompiledPolicy) error
+	PersistArtifactContext func(context.Context, *CompiledPolicy) error
 	// PersistTransition is the preferred durable hook: implementations can
 	// commit the manifest and transition journal as one crash-visible record.
 	// Persist/Audit remain supported for small integrations and tests.
-	PersistTransition func(Manifest, Event) error
+	PersistTransition        func(Manifest, Event) error
+	PersistTransitionContext func(context.Context, Manifest, Event) error
 	// Initialize is a create-only durable hook for the first clustered boot.
 	// It must never replace an existing manifest. NewManager rereads the
 	// manifest after this hook and rejects a different active policy.
-	Initialize   func(Manifest) error
-	LoadManifest func() (Manifest, error)
-	LoadArtifact func(PolicyRef) (*CompiledPolicy, error)
+	Initialize          func(Manifest) error
+	InitializeContext   func(context.Context, Manifest) error
+	LoadManifest        func() (Manifest, error)
+	LoadManifestContext func(context.Context) (Manifest, error)
+	LoadArtifact        func(PolicyRef) (*CompiledPolicy, error)
+	LoadArtifactContext func(context.Context, PolicyRef) (*CompiledPolicy, error)
 }
 
 // NewManager validates the initial policy and starts with it as known-good.
 func NewManager(initial *Policy, opts Options) (*Manager, error) {
+	return NewManagerContext(context.Background(), initial, opts)
+}
+
+// NewManagerContext is the context-aware constructor for durable policy
+// authorities. The legacy NewManager wrapper remains for in-process callers.
+func NewManagerContext(ctx context.Context, initial *Policy, opts Options) (*Manager, error) {
+	ctx = usableContext(ctx)
 	compiled, err := Compile(initial)
 	if err != nil {
 		return nil, err
 	}
 	m := &Manager{
-		current:           compiled,
-		knownGood:         map[int]*CompiledPolicy{compiled.Revision: compiled},
-		persist:           opts.Persist,
-		audit:             opts.Audit,
-		persistArtifact:   opts.PersistArtifact,
-		persistTransition: opts.PersistTransition,
-		loadManifest:      opts.LoadManifest,
-		loadArtifact:      opts.LoadArtifact,
-		lastRevision:      compiled.Revision,
-		activationEpoch:   1,
+		current:                  compiled,
+		knownGood:                map[int]*CompiledPolicy{compiled.Revision: compiled},
+		persist:                  opts.Persist,
+		persistContext:           opts.PersistContext,
+		audit:                    opts.Audit,
+		auditContext:             opts.AuditContext,
+		persistArtifact:          opts.PersistArtifact,
+		persistArtifactContext:   opts.PersistArtifactContext,
+		persistTransition:        opts.PersistTransition,
+		persistTransitionContext: opts.PersistTransitionContext,
+		loadManifest:             opts.LoadManifest,
+		loadManifestContext:      opts.LoadManifestContext,
+		loadArtifact:             opts.LoadArtifact,
+		loadArtifactContext:      opts.LoadArtifactContext,
+		lastRevision:             compiled.Revision,
+		activationEpoch:          1,
 	}
-	if opts.LoadManifest != nil {
-		manifest, loadErr := opts.LoadManifest()
+	if m.hasManifestLoader() {
+		manifest, loadErr := m.loadManifestWithContext(ctx)
 		if loadErr != nil {
 			return nil, loadErr
 		}
@@ -133,10 +163,10 @@ func NewManager(initial *Policy, opts Options) (*Manager, error) {
 				// back to its previous revision. Recover the exact artifact that
 				// the durable manifest names; its digest binds the bytes to the
 				// committed lifecycle record.
-				if opts.LoadArtifact == nil {
+				if !m.hasArtifactLoader() {
 					return nil, errors.New("policy: configured policy differs from durable active manifest and no artifact loader is configured")
 				}
-				active, activeErr := opts.LoadArtifact(manifest.Active)
+				active, activeErr := m.loadArtifactWithContext(ctx, manifest.Active)
 				if activeErr != nil {
 					return nil, fmt.Errorf("policy: load durable active artifact: %w", activeErr)
 				}
@@ -153,26 +183,26 @@ func NewManager(initial *Policy, opts Options) (*Manager, error) {
 			if manifestErr != nil {
 				return nil, manifestErr
 			}
-			if opts.PersistArtifact != nil {
-				if err := opts.PersistArtifact(compiled); err != nil {
+			if m.hasArtifactPersister() {
+				if err := m.persistArtifactWithContext(ctx, compiled); err != nil {
 					return nil, fmt.Errorf("policy: persist initial artifact: %w", err)
 				}
 			}
-			if opts.Initialize != nil {
-				if err := opts.Initialize(initialManifest); err != nil {
+			if opts.InitializeContext != nil || opts.Initialize != nil {
+				if err := m.initializeWithContext(ctx, initialManifest, opts); err != nil {
 					return nil, fmt.Errorf("policy: initialize manifest: %w", err)
 				}
-			} else if opts.Persist != nil {
-				if err := opts.Persist(initialManifest); err != nil {
+			} else if m.hasManifestPersister() {
+				if err := m.persistManifestWithContext(ctx, initialManifest); err != nil {
 					return nil, fmt.Errorf("policy: persist initial manifest: %w", err)
 				}
 			}
-			if opts.Initialize != nil || opts.Persist != nil {
+			if opts.InitializeContext != nil || opts.Initialize != nil || m.hasManifestPersister() {
 				// A create-only initializer may have lost a concurrent first
 				// boot. Re-read the winner before constructing any lifecycle
 				// state; never let startup policy input overwrite the shared
 				// authority.
-				manifest, loadErr = opts.LoadManifest()
+				manifest, loadErr = m.loadManifestWithContext(ctx)
 				if loadErr != nil {
 					return nil, loadErr
 				}
@@ -189,10 +219,10 @@ func NewManager(initial *Policy, opts Options) (*Manager, error) {
 			}
 		}
 		if manifest.Candidate != nil {
-			if opts.LoadArtifact == nil {
+			if !m.hasArtifactLoader() {
 				return nil, errors.New("policy: durable candidate exists but no artifact loader is configured")
 			}
-			candidate, candidateErr := opts.LoadArtifact(*manifest.Candidate)
+			candidate, candidateErr := m.loadArtifactWithContext(ctx, *manifest.Candidate)
 			if candidateErr != nil {
 				return nil, candidateErr
 			}
@@ -206,14 +236,15 @@ func NewManager(initial *Policy, opts Options) (*Manager, error) {
 			m.candidate = candidate
 			m.lastRevision = candidate.Revision
 		}
-		if manifest.Previous != nil && opts.LoadArtifact != nil {
-			previous, previousErr := opts.LoadArtifact(*manifest.Previous)
+		if manifest.Previous != nil && m.hasArtifactLoader() {
+			previous, previousErr := m.loadArtifactWithContext(ctx, *manifest.Previous)
 			if previousErr != nil {
 				return nil, previousErr
 			}
 			m.knownGood[previous.Revision] = previous
 		}
 	}
+	m.publishLocked()
 	return m, nil
 }
 
@@ -225,9 +256,12 @@ func samePolicyRef(a, b PolicyRef) bool {
 // durable lifecycle store is configured, that the snapshot can be reconciled
 // with the shared active manifest. It is intentionally separate from the data
 // plane Snapshot method so callers can put a timeout around readiness probes.
-func (m *Manager) Ready(_ context.Context) error {
+func (m *Manager) Ready(ctx context.Context) error {
 	if m == nil {
 		return errors.New("policy: nil manager")
+	}
+	if err := m.Reconcile(ctx); err != nil {
+		return err
 	}
 	if m.Snapshot() == nil {
 		return errors.New("policy: active snapshot unavailable")
@@ -242,27 +276,17 @@ func (m *Manager) Current() *CompiledPolicy {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.refreshDurableLocked(); err != nil {
-		return nil
-	}
 	return cloneCompiled(m.current)
 }
 
-// Snapshot returns the currently active immutable policy pointer and its
-// cluster activation epoch. This is the hot data-plane path: it performs the
-// durable refresh check but does not deep-recompile the policy on every
-// request. Manager lifecycle methods publish a newly compiled pointer before
-// changing the epoch, so one admission observes one coherent pair.
+// Snapshot returns the currently published immutable policy pointer and its
+// cluster activation epoch. It never performs I/O or compilation; a bounded
+// reconciler or an explicit control-plane/readiness call updates publication.
 func (m *Manager) Snapshot() *Snapshot {
 	if m == nil {
 		return nil
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if err := m.refreshDurableLocked(); err != nil || m.current == nil {
-		return nil
-	}
-	return &Snapshot{Policy: m.current, ActivationEpoch: m.activationEpoch}
+	return m.published.Load()
 }
 
 // PolicyEpoch returns the active policy activation epoch for downstream
@@ -283,10 +307,65 @@ func (m *Manager) Candidate() *CompiledPolicy {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.refreshDurableLocked(); err != nil {
-		return nil
-	}
 	return cloneCompiled(m.candidate)
+}
+
+// Reconcile reads the shared lifecycle manifest and atomically publishes a
+// coherent policy/epoch pair. A failed reconciliation clears publication so
+// the data plane cannot continue serving with an unverified shared policy.
+func (m *Manager) Reconcile(ctx context.Context) error {
+	if m == nil {
+		return errors.New("policy: nil manager")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.refreshDurableLocked(ctx); err != nil {
+		m.published.Store(nil)
+		return err
+	}
+	m.publishLocked()
+	return nil
+}
+
+// StartWatcher starts bounded periodic reconciliation for a durable manager.
+// The returned stop function is idempotent and should be part of runtime
+// shutdown. Notifications may be added later as an acceleration; polling is
+// the correctness mechanism.
+func (m *Manager) StartWatcher(parent context.Context, interval, operationTimeout time.Duration) func() {
+	if m == nil || m.loadManifest == nil && m.loadManifestContext == nil {
+		return func() {}
+	}
+	if interval <= 0 {
+		interval = time.Second
+	}
+	if operationTimeout <= 0 {
+		operationTimeout = 2 * time.Second
+	}
+	parent = usableContext(parent)
+	ctx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				opCtx, opCancel := context.WithTimeout(ctx, operationTimeout)
+				_ = m.Reconcile(opCtx)
+				opCancel()
+			}
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			cancel()
+			<-done
+		})
+	}
 }
 
 // refreshDurableLocked reconciles this process with the shared lifecycle
@@ -294,11 +373,11 @@ func (m *Manager) Candidate() *CompiledPolicy {
 // committed activation or rollback without a restart. A read failure returns
 // an error; Current then returns nil and the data plane fails closed instead of
 // enforcing a potentially stale policy during an authority outage.
-func (m *Manager) refreshDurableLocked() error {
-	if m.loadManifest == nil {
+func (m *Manager) refreshDurableLocked(ctx context.Context) error {
+	if !m.hasManifestLoader() {
 		return nil
 	}
-	manifest, err := m.loadManifest()
+	manifest, err := m.loadManifestWithContext(ctx)
 	if err != nil {
 		return err
 	}
@@ -317,10 +396,10 @@ func (m *Manager) refreshDurableLocked() error {
 		return err
 	}
 	if m.current.ID != manifest.Active.ID || m.current.Revision != manifest.Active.Revision || activeDigest != manifest.Active.Digest {
-		if m.loadArtifact == nil {
+		if !m.hasArtifactLoader() {
 			return errors.New("policy: shared active policy differs and no artifact loader is configured")
 		}
-		active, err := m.loadArtifact(manifest.Active)
+		active, err := m.loadArtifactWithContext(ctx, manifest.Active)
 		if err != nil {
 			return fmt.Errorf("policy: refresh active artifact: %w", err)
 		}
@@ -336,10 +415,10 @@ func (m *Manager) refreshDurableLocked() error {
 	if manifest.Candidate == nil {
 		m.candidate = nil
 	} else if m.candidate == nil || m.candidate.ID != manifest.Candidate.ID || m.candidate.Revision != manifest.Candidate.Revision {
-		if m.loadArtifact == nil {
+		if !m.hasArtifactLoader() {
 			return errors.New("policy: shared candidate exists and no artifact loader is configured")
 		}
-		candidate, err := m.loadArtifact(*manifest.Candidate)
+		candidate, err := m.loadArtifactWithContext(ctx, *manifest.Candidate)
 		if err != nil {
 			return fmt.Errorf("policy: refresh candidate artifact: %w", err)
 		}
@@ -358,10 +437,10 @@ func (m *Manager) refreshDurableLocked() error {
 		return nil
 	}
 	if _, ok := m.knownGood[manifest.Previous.Revision]; !ok {
-		if m.loadArtifact == nil {
+		if !m.hasArtifactLoader() {
 			return errors.New("policy: shared previous policy exists and no artifact loader is configured")
 		}
-		previous, err := m.loadArtifact(*manifest.Previous)
+		previous, err := m.loadArtifactWithContext(ctx, *manifest.Previous)
 		if err != nil {
 			return fmt.Errorf("policy: refresh previous artifact: %w", err)
 		}
@@ -371,6 +450,72 @@ func (m *Manager) refreshDurableLocked() error {
 		m.knownGood[previous.Revision] = previous
 	}
 	return nil
+}
+
+func usableContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
+func (m *Manager) hasManifestLoader() bool {
+	return m.loadManifestContext != nil || m.loadManifest != nil
+}
+
+func (m *Manager) hasManifestPersister() bool {
+	return m.persistContext != nil || m.persist != nil
+}
+
+func (m *Manager) hasArtifactLoader() bool {
+	return m.loadArtifactContext != nil || m.loadArtifact != nil
+}
+
+func (m *Manager) hasArtifactPersister() bool {
+	return m.persistArtifactContext != nil || m.persistArtifact != nil
+}
+
+func (m *Manager) loadManifestWithContext(ctx context.Context) (Manifest, error) {
+	if m.loadManifestContext != nil {
+		return m.loadManifestContext(usableContext(ctx))
+	}
+	return m.loadManifest()
+}
+
+func (m *Manager) loadArtifactWithContext(ctx context.Context, ref PolicyRef) (*CompiledPolicy, error) {
+	if m.loadArtifactContext != nil {
+		return m.loadArtifactContext(usableContext(ctx), ref)
+	}
+	return m.loadArtifact(ref)
+}
+
+func (m *Manager) persistManifestWithContext(ctx context.Context, manifest Manifest) error {
+	if m.persistContext != nil {
+		return m.persistContext(usableContext(ctx), manifest)
+	}
+	return m.persist(manifest)
+}
+
+func (m *Manager) persistArtifactWithContext(ctx context.Context, compiled *CompiledPolicy) error {
+	if m.persistArtifactContext != nil {
+		return m.persistArtifactContext(usableContext(ctx), compiled)
+	}
+	return m.persistArtifact(compiled)
+}
+
+func (m *Manager) initializeWithContext(ctx context.Context, manifest Manifest, opts Options) error {
+	if opts.InitializeContext != nil {
+		return opts.InitializeContext(usableContext(ctx), manifest)
+	}
+	return opts.Initialize(manifest)
+}
+
+func (m *Manager) publishLocked() {
+	if m.current == nil || m.activationEpoch == 0 {
+		m.published.Store(nil)
+		return
+	}
+	m.published.Store(&Snapshot{Policy: m.current, ActivationEpoch: m.activationEpoch})
 }
 
 func validateCompiledRef(compiled *CompiledPolicy, ref PolicyRef) error {
@@ -405,7 +550,7 @@ func cloneCompiled(compiled *CompiledPolicy) *CompiledPolicy {
 // Prepare validates and compiles a candidate. Revisions are strictly
 // monotonic; replaying an old artifact cannot replace a newer candidate.
 func (m *Manager) Prepare(p *Policy) (*CompiledPolicy, error) {
-	return m.PrepareBy(p, "", "")
+	return m.PrepareByContext(context.Background(), p, "", "")
 }
 
 // PrepareBy prepares a candidate and records the authenticated operator that
@@ -413,23 +558,34 @@ func (m *Manager) Prepare(p *Policy) (*CompiledPolicy, error) {
 // candidate manifest, so an accepted policy cannot be detached from its
 // operator identity.
 func (m *Manager) PrepareBy(p *Policy, actor, reason string) (*CompiledPolicy, error) {
+	return m.PrepareByContext(context.Background(), p, actor, reason)
+}
+
+// PrepareContext is the request-scoped policy preparation operation.
+func (m *Manager) PrepareContext(ctx context.Context, p *Policy) (*CompiledPolicy, error) {
+	return m.PrepareByContext(ctx, p, "", "")
+}
+
+// PrepareByContext is the context-aware policy preparation operation.
+func (m *Manager) PrepareByContext(ctx context.Context, p *Policy, actor, reason string) (*CompiledPolicy, error) {
 	if m == nil {
 		return nil, errors.New("policy: nil manager")
 	}
+	ctx = usableContext(ctx)
 	compiled, err := Compile(p)
 	if err != nil {
 		return nil, err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.refreshDurableLocked(); err != nil {
+	if err := m.refreshDurableLocked(ctx); err != nil {
 		return nil, err
 	}
 	if compiled.Revision <= m.lastRevision {
 		return nil, fmt.Errorf("policy: revision %d is not newer than %d", compiled.Revision, m.lastRevision)
 	}
-	if m.persistArtifact != nil {
-		if err := m.persistArtifact(compiled); err != nil {
+	if m.hasArtifactPersister() {
+		if err := m.persistArtifactWithContext(ctx, compiled); err != nil {
 			return nil, fmt.Errorf("policy: persist candidate artifact: %w", err)
 		}
 	}
@@ -438,29 +594,41 @@ func (m *Manager) PrepareBy(p *Policy, actor, reason string) (*CompiledPolicy, e
 		return nil, err
 	}
 	event := Event{Action: "prepare", Actor: actor, FromRevision: m.current.Revision, ToRevision: compiled.Revision, FromEpoch: m.activationEpoch, ToEpoch: manifest.ActivationEpoch, PolicyID: compiled.ID, Reason: reason, At: manifest.UpdatedAt}
-	if err := m.commitLocked(manifest, event); err != nil {
+	if err := m.commitLocked(ctx, manifest, event); err != nil {
 		return nil, err
 	}
 	m.candidate = compiled
 	m.lastRevision = compiled.Revision
+	m.publishLocked()
 	return compiled, nil
 }
 
 // Activate commits the currently prepared candidate. The manifest callback
 // runs while the manager lock is held and must be atomic/non-reentrant.
 func (m *Manager) Activate(reason string) error {
-	return m.ActivateBy(reason, "")
+	return m.ActivateByContext(context.Background(), reason, "")
 }
 
 // ActivateBy activates the prepared candidate and records the operator in the
 // same durable transition event.
 func (m *Manager) ActivateBy(reason, actor string) error {
+	return m.ActivateByContext(context.Background(), reason, actor)
+}
+
+// ActivateContext is the context-aware policy activation operation.
+func (m *Manager) ActivateContext(ctx context.Context, reason string) error {
+	return m.ActivateByContext(ctx, reason, "")
+}
+
+// ActivateByContext is the context-aware operator policy activation operation.
+func (m *Manager) ActivateByContext(ctx context.Context, reason, actor string) error {
 	if m == nil {
 		return errors.New("policy: nil manager")
 	}
+	ctx = usableContext(ctx)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.refreshDurableLocked(); err != nil {
+	if err := m.refreshDurableLocked(ctx); err != nil {
 		return err
 	}
 	if m.candidate == nil {
@@ -474,33 +642,45 @@ func (m *Manager) ActivateBy(reason, actor string) error {
 	if err := m.advanceManifestEpoch(&manifest); err != nil {
 		return err
 	}
-	if err := m.commitLocked(manifest, Event{Action: "activate", Actor: actor, FromRevision: from.Revision, ToRevision: to.Revision, FromEpoch: m.activationEpoch, ToEpoch: manifest.ActivationEpoch, PolicyID: to.ID, Reason: reason, At: manifest.UpdatedAt}); err != nil {
+	if err := m.commitLocked(ctx, manifest, Event{Action: "activate", Actor: actor, FromRevision: from.Revision, ToRevision: to.Revision, FromEpoch: m.activationEpoch, ToEpoch: manifest.ActivationEpoch, PolicyID: to.ID, Reason: reason, At: manifest.UpdatedAt}); err != nil {
 		return err
 	}
 	m.knownGood[to.Revision] = to
 	m.current, m.candidate = to, nil
 	m.activationEpoch = manifest.ActivationEpoch
+	m.publishLocked()
 	return nil
 }
 
 // Rollback activates an exact previously-known-good revision. It is explicit,
 // auditable, and uses the same durable manifest gate as forward activation.
 func (m *Manager) Rollback(revision int, reason string) error {
-	return m.RollbackBy(revision, reason, "")
+	return m.RollbackByContext(context.Background(), revision, reason, "")
 }
 
 // RollbackBy activates an exact known-good revision and records the operator
 // in the durable transition event.
 func (m *Manager) RollbackBy(revision int, reason, actor string) error {
+	return m.RollbackByContext(context.Background(), revision, reason, actor)
+}
+
+// RollbackContext is the context-aware policy rollback operation.
+func (m *Manager) RollbackContext(ctx context.Context, revision int, reason string) error {
+	return m.RollbackByContext(ctx, revision, reason, "")
+}
+
+// RollbackByContext is the context-aware operator policy rollback operation.
+func (m *Manager) RollbackByContext(ctx context.Context, revision int, reason, actor string) error {
 	if m == nil {
 		return errors.New("policy: nil manager")
 	}
 	if len(reason) == 0 {
 		return errors.New("policy: rollback reason required")
 	}
+	ctx = usableContext(ctx)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.refreshDurableLocked(); err != nil {
+	if err := m.refreshDurableLocked(ctx); err != nil {
 		return err
 	}
 	target := m.knownGood[revision]
@@ -518,11 +698,12 @@ func (m *Manager) RollbackBy(revision int, reason, actor string) error {
 	if err := m.advanceManifestEpoch(&manifest); err != nil {
 		return err
 	}
-	if err := m.commitLocked(manifest, Event{Action: "rollback", Actor: actor, FromRevision: from.Revision, ToRevision: target.Revision, FromEpoch: m.activationEpoch, ToEpoch: manifest.ActivationEpoch, PolicyID: target.ID, Reason: reason, At: manifest.UpdatedAt}); err != nil {
+	if err := m.commitLocked(ctx, manifest, Event{Action: "rollback", Actor: actor, FromRevision: from.Revision, ToRevision: target.Revision, FromEpoch: m.activationEpoch, ToEpoch: manifest.ActivationEpoch, PolicyID: target.ID, Reason: reason, At: manifest.UpdatedAt}); err != nil {
 		return err
 	}
 	m.current, m.candidate = target, nil
 	m.activationEpoch = manifest.ActivationEpoch
+	m.publishLocked()
 	return nil
 }
 
@@ -577,26 +758,38 @@ func (m *Manager) advanceManifestEpoch(manifest *Manifest) error {
 	return nil
 }
 
-func (m *Manager) commitLocked(manifest Manifest, event Event) error {
+func (m *Manager) commitLocked(ctx context.Context, manifest Manifest, event Event) error {
+	if m.persistTransitionContext != nil {
+		if err := m.persistTransitionContext(usableContext(ctx), manifest, event); err != nil {
+			return fmt.Errorf("policy: persist transition: %w", err)
+		}
+		return nil
+	}
 	if m.persistTransition != nil {
 		if err := m.persistTransition(manifest, event); err != nil {
 			return fmt.Errorf("policy: persist transition: %w", err)
 		}
 		return nil
 	}
-	if m.persist != nil {
-		if err := m.persist(manifest); err != nil {
+	if m.hasManifestPersister() {
+		if err := m.persistManifestWithContext(ctx, manifest); err != nil {
 			return fmt.Errorf("policy: persist transition: %w", err)
 		}
 	}
-	return m.emitLocked(event)
+	return m.emitLocked(ctx, event)
 }
 
-func (m *Manager) emitLocked(event Event) error {
-	if m.audit == nil {
+func (m *Manager) emitLocked(ctx context.Context, event Event) error {
+	if m.auditContext == nil && m.audit == nil {
 		return nil
 	}
-	if err := m.audit(event); err != nil {
+	var err error
+	if m.auditContext != nil {
+		err = m.auditContext(usableContext(ctx), event)
+	} else {
+		err = m.audit(event)
+	}
+	if err != nil {
 		return fmt.Errorf("policy: audit lifecycle event: %w", err)
 	}
 	return nil

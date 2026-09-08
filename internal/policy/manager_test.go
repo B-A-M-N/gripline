@@ -124,6 +124,9 @@ func TestManagerRefreshesCommittedSharedPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := m.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile shared active policy: %v", err)
+	}
 	if got := m.Current(); got == nil || got.Revision != 2 {
 		t.Fatalf("manager did not refresh shared active policy: %+v", got)
 	}
@@ -153,6 +156,9 @@ func TestManagerRefreshesSharedPolicyEpochWithoutArtifactChange(t *testing.T) {
 		t.Fatalf("loaded policy epoch: %d, %v", epoch, ok)
 	}
 	manifest.ActivationEpoch = 8
+	if err := m.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile shared policy epoch: %v", err)
+	}
 	if epoch, ok := m.PolicyEpoch(); !ok || epoch != 8 {
 		t.Fatalf("refreshed policy epoch: %d, %v", epoch, ok)
 	}
@@ -212,5 +218,60 @@ func TestManagerReadyFailsWhenSharedPolicyCannotRefresh(t *testing.T) {
 	}
 	if err := m.Ready(context.Background()); err == nil {
 		t.Fatal("readiness must fail when the shared policy authority cannot refresh")
+	}
+}
+
+func TestManagerSnapshotDoesNotTouchDurableAuthority(t *testing.T) {
+	compiled, err := Compile(Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := manifestFor(compiled, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loads := 0
+	m, err := NewManager(Default(), Options{
+		LoadManifest: func() (Manifest, error) {
+			loads++
+			return manifest, nil
+		},
+		LoadArtifact: func(PolicyRef) (*CompiledPolicy, error) { return compiled, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialLoads := loads
+	for i := 0; i < 100; i++ {
+		if m.Snapshot() == nil {
+			t.Fatal("published policy snapshot unexpectedly unavailable")
+		}
+	}
+	if loads != initialLoads {
+		t.Fatalf("hot Snapshot performed durable reads: before=%d after=%d", initialLoads, loads)
+	}
+}
+
+func TestManagerContextHooksReceiveCallerContext(t *testing.T) {
+	type contextKey string
+	const key contextKey = "request"
+	ctx := context.WithValue(context.Background(), key, "control-request")
+	var seen context.Context
+	m, err := NewManager(Default(), Options{
+		PersistContext: func(got context.Context, _ Manifest) error {
+			seen = got
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := Default()
+	next.Revision = 2
+	if _, err := m.PrepareByContext(ctx, next, "operator", "test"); err != nil {
+		t.Fatal(err)
+	}
+	if seen == nil || seen.Value(key) != "control-request" {
+		t.Fatal("policy persistence did not receive the caller context")
 	}
 }

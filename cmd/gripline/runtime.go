@@ -116,8 +116,8 @@ func (rt *Runtime) controlService() *control.Service { return rt.AdminService }
 func (rt *Runtime) Ready() error {
 	if rt.StateHealth != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
 		err := rt.StateHealth.Ready(ctx)
-		cancel()
 		if err != nil {
 			return fmt.Errorf("gripline: state authority not ready: %w", err)
 		}
@@ -134,7 +134,9 @@ func (rt *Runtime) Ready() error {
 			}
 		}
 		if rt.Postgres != nil {
-			if err := rt.Postgres.Ready(context.Background()); err != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if err := rt.Postgres.Ready(ctx); err != nil {
 				return fmt.Errorf("gripline: postgres authority not ready: %w", err)
 			}
 		}
@@ -220,16 +222,27 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 	var authorities authority.Bundle
 	var adminState adminStateAuthority
 	var adaptiveState adaptiveStateAuthority
+	connectTimeout := cfg.Authority.ConnectTimeout.D()
+	if connectTimeout <= 0 {
+		connectTimeout = 10 * time.Second
+	}
+	operationTimeout := cfg.Authority.OperationTimeout.D()
+	if operationTimeout <= 0 {
+		operationTimeout = 2 * time.Second
+	}
 	switch strings.ToLower(strings.TrimSpace(cfg.Authority.Backend)) {
 	case "postgres":
 		dsn := os.Getenv(cfg.Authority.DSNEnv)
 		if dsn == "" {
 			return nil, fmt.Errorf("gripline: authority DSN environment variable %q is empty", cfg.Authority.DSNEnv)
 		}
-		s, err := statepg.Open(context.Background(), statepg.Options{
+		connectCtx, connectCancel := context.WithTimeout(context.Background(), connectTimeout)
+		s, err := statepg.Open(connectCtx, statepg.Options{
 			DSN: dsn, MaxConns: cfg.Authority.MaxConns, MinConns: cfg.Authority.MinConns,
 			NodeID: cfg.Authority.NodeID, LeaseTTL: cfg.Authority.LeaseTTL.D(), RenewEvery: cfg.Authority.RenewEvery.D(), MaxSourceScopes: cfg.Server.MaxSourceScopes,
+			ConnectTimeout: connectTimeout,
 		})
+		connectCancel()
 		if err != nil {
 			return nil, fmt.Errorf("gripline: postgres authority: %w", err)
 		}
@@ -388,20 +401,29 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		}
 	} else if postgres != nil {
 		policyOptions = policy.Options{
-			Persist:           postgres.PersistPolicyManifest,
-			Initialize:        postgres.InitializePolicyManifest,
-			PersistArtifact:   postgres.PersistPolicyArtifact,
-			PersistTransition: postgres.PersistPolicyTransition,
-			LoadManifest:      postgres.LoadPolicyManifest,
-			LoadArtifact:      postgres.LoadPolicyArtifact,
+			PersistContext:           postgres.PersistPolicyManifestContext,
+			InitializeContext:        postgres.InitializePolicyManifestContext,
+			PersistArtifactContext:   postgres.PersistPolicyArtifactContext,
+			PersistTransitionContext: postgres.PersistPolicyTransitionContext,
+			LoadManifestContext:      postgres.LoadPolicyManifestContext,
+			LoadArtifactContext:      postgres.LoadPolicyArtifactContext,
 		}
 	}
-	policyManager, err := policy.NewManager(pol, policyOptions)
+	policyCtx, policyCancel := context.WithTimeout(context.Background(), operationTimeout)
+	policyManager, err := policy.NewManagerContext(policyCtx, pol, policyOptions)
+	policyCancel()
 	if err != nil {
 		return nil, fmt.Errorf("gripline: policy manager: %w", err)
 	}
 	compiledPolicy := policyManager.Current()
+	if compiledPolicy == nil {
+		return nil, fmt.Errorf("gripline: policy manager published no active policy")
+	}
 	pol = &compiledPolicy.Policy
+	if postgres != nil {
+		stopPolicyWatcher := policyManager.StartWatcher(context.Background(), time.Second, operationTimeout)
+		closers = append(closers, func() error { stopPolicyWatcher(); return nil })
+	}
 
 	producerList := []producers.Producer{
 		producers.NewSourceNoveltyProducer(time.Now),
@@ -835,6 +857,10 @@ func adminPolicyStatus(svc *control.Service, manager *policy.Manager) http.Handl
 			writeAdminError(w, err)
 			return
 		}
+		if err := manager.Reconcile(r.Context()); err != nil {
+			writePolicyAdminError(w, err)
+			return
+		}
 		active := manager.Snapshot()
 		var activeView *adminPolicySnapshot
 		if active != nil {
@@ -879,7 +905,7 @@ func adminPolicyPrepare(svc *control.Service, manager *policy.Manager, verifier 
 			writePolicyAdminError(w, err)
 			return
 		}
-		prepared, err := manager.PrepareBy(&compiled.Policy, id.Name, body.Reason)
+		prepared, err := manager.PrepareByContext(r.Context(), &compiled.Policy, id.Name, body.Reason)
 		if err != nil {
 			writePolicyAdminError(w, err)
 			return
@@ -909,7 +935,7 @@ func adminPolicyActivate(svc *control.Service, manager *policy.Manager) http.Han
 			writeAdminError(w, control.ErrReasonRequired)
 			return
 		}
-		if err := manager.ActivateBy(body.Reason, id.Name); err != nil {
+		if err := manager.ActivateByContext(r.Context(), body.Reason, id.Name); err != nil {
 			writePolicyAdminError(w, err)
 			return
 		}
@@ -944,7 +970,7 @@ func adminPolicyRollback(svc *control.Service, manager *policy.Manager) http.Han
 			writePolicyAdminError(w, errors.New("policy rollback requires a positive revision and reason"))
 			return
 		}
-		if err := manager.RollbackBy(body.Revision, body.Reason, id.Name); err != nil {
+		if err := manager.RollbackByContext(r.Context(), body.Revision, body.Reason, id.Name); err != nil {
 			writePolicyAdminError(w, err)
 			return
 		}

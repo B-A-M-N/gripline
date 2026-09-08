@@ -28,6 +28,7 @@ type Options struct {
 	LeaseTTL        time.Duration
 	RenewEvery      time.Duration
 	MaxSourceScopes int
+	ConnectTimeout  time.Duration
 }
 
 // Store is the shared transactional authority. Credential, lane, and evidence
@@ -71,6 +72,11 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if opts.ConnectTimeout <= 0 {
+		opts.ConnectTimeout = 10 * time.Second
+	}
+	connectCtx, cancel := context.WithTimeout(ctx, opts.ConnectTimeout)
+	defer cancel()
 	config, err := pgxpool.ParseConfig(opts.DSN)
 	if err != nil {
 		return nil, fmt.Errorf("statepg: parse DSN: %w", err)
@@ -81,7 +87,7 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 	if opts.MinConns > 0 {
 		config.MinConns = opts.MinConns
 	}
-	pool, err := pgxpool.NewWithConfig(ctx, config)
+	pool, err := pgxpool.NewWithConfig(connectCtx, config)
 	if err != nil {
 		return nil, fmt.Errorf("statepg: connect: %w", err)
 	}
@@ -99,16 +105,16 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 	}
 	s := &Store{pool: pool, now: opts.Now, nodeID: opts.NodeID, leaseTTL: opts.LeaseTTL, maxSourceScopes: opts.MaxSourceScopes,
 		leaseStop: make(chan struct{}), leaseDone: make(chan struct{})}
-	if err := s.Ping(ctx); err != nil {
+	if err := s.Ping(connectCtx); err != nil {
 		pool.Close()
 		return nil, err
 	}
-	if err := s.ensureSchema(ctx); err != nil {
+	if err := s.ensureSchema(connectCtx); err != nil {
 		pool.Close()
 		return nil, err
 	}
 	if s.nodeID != "" {
-		if err := s.registerNode(ctx); err != nil {
+		if err := s.registerNode(connectCtx); err != nil {
 			pool.Close()
 			return nil, err
 		}

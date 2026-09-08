@@ -44,9 +44,16 @@ func validatePolicyManifest(manifest policy.Manifest) error {
 }
 
 func (s *Store) LoadPolicyManifest() (policy.Manifest, error) {
+	return s.LoadPolicyManifestContext(context.Background())
+}
+
+func (s *Store) LoadPolicyManifestContext(ctx context.Context) (policy.Manifest, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var out policy.Manifest
 	var raw []byte
-	err := s.pool.QueryRow(context.Background(), `SELECT manifest FROM gripline_policy_manifest WHERE singleton=TRUE`).Scan(&raw)
+	err := s.pool.QueryRow(ctx, `SELECT manifest FROM gripline_policy_manifest WHERE singleton=TRUE`).Scan(&raw)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return out, nil
 	}
@@ -65,6 +72,13 @@ func (s *Store) LoadPolicyManifest() (policy.Manifest, error) {
 }
 
 func (s *Store) PersistPolicyManifest(manifest policy.Manifest) error {
+	return s.PersistPolicyManifestContext(context.Background(), manifest)
+}
+
+func (s *Store) PersistPolicyManifestContext(ctx context.Context, manifest policy.Manifest) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if manifest.ActivationEpoch == 0 {
 		manifest.ActivationEpoch = 1
 	}
@@ -75,7 +89,7 @@ func (s *Store) PersistPolicyManifest(manifest policy.Manifest) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.pool.Exec(context.Background(), `INSERT INTO gripline_policy_manifest (singleton, manifest, updated_at)
+	_, err = s.pool.Exec(ctx, `INSERT INTO gripline_policy_manifest (singleton, manifest, updated_at)
 		VALUES (TRUE,$1,$2) ON CONFLICT (singleton) DO UPDATE SET manifest=EXCLUDED.manifest, updated_at=EXCLUDED.updated_at`, raw, manifest.UpdatedAt.UTC())
 	return mapDBError(err)
 }
@@ -85,6 +99,13 @@ func (s *Store) PersistPolicyManifest(manifest policy.Manifest) error {
 // be used here: two nodes can boot concurrently with different local policy
 // files, and neither is allowed to overwrite the winner.
 func (s *Store) InitializePolicyManifest(manifest policy.Manifest) error {
+	return s.InitializePolicyManifestContext(context.Background(), manifest)
+}
+
+func (s *Store) InitializePolicyManifestContext(ctx context.Context, manifest policy.Manifest) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if manifest.ActivationEpoch == 0 {
 		manifest.ActivationEpoch = 1
 	}
@@ -95,12 +116,19 @@ func (s *Store) InitializePolicyManifest(manifest policy.Manifest) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.pool.Exec(context.Background(), `INSERT INTO gripline_policy_manifest (singleton, manifest, updated_at)
+	_, err = s.pool.Exec(ctx, `INSERT INTO gripline_policy_manifest (singleton, manifest, updated_at)
 		VALUES (TRUE,$1,$2) ON CONFLICT (singleton) DO NOTHING`, raw, manifest.UpdatedAt.UTC())
 	return mapDBError(err)
 }
 
 func (s *Store) PersistPolicyArtifact(compiled *policy.CompiledPolicy) error {
+	return s.PersistPolicyArtifactContext(context.Background(), compiled)
+}
+
+func (s *Store) PersistPolicyArtifactContext(ctx context.Context, compiled *policy.CompiledPolicy) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if compiled == nil {
 		return errors.New("statepg: policy artifact required")
 	}
@@ -115,17 +143,24 @@ func (s *Store) PersistPolicyArtifact(compiled *policy.CompiledPolicy) error {
 	if err := validatePolicyRef(policy.PolicyRef{ID: compiled.ID, Revision: compiled.Revision, Digest: digest}); err != nil {
 		return err
 	}
-	_, err = s.pool.Exec(context.Background(), `INSERT INTO gripline_policy_artifacts (policy_id, revision, digest, artifact)
+	_, err = s.pool.Exec(ctx, `INSERT INTO gripline_policy_artifacts (policy_id, revision, digest, artifact)
 		VALUES ($1,$2,$3,$4) ON CONFLICT (policy_id, revision, digest) DO NOTHING`, compiled.ID, compiled.Revision, digest, raw)
 	return mapDBError(err)
 }
 
 func (s *Store) LoadPolicyArtifact(ref policy.PolicyRef) (*policy.CompiledPolicy, error) {
+	return s.LoadPolicyArtifactContext(context.Background(), ref)
+}
+
+func (s *Store) LoadPolicyArtifactContext(ctx context.Context, ref policy.PolicyRef) (*policy.CompiledPolicy, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if err := validatePolicyRef(ref); err != nil {
 		return nil, err
 	}
 	var raw []byte
-	err := s.pool.QueryRow(context.Background(), `SELECT artifact FROM gripline_policy_artifacts WHERE policy_id=$1 AND revision=$2 AND digest=$3`, ref.ID, ref.Revision, ref.Digest).Scan(&raw)
+	err := s.pool.QueryRow(ctx, `SELECT artifact FROM gripline_policy_artifacts WHERE policy_id=$1 AND revision=$2 AND digest=$3`, ref.ID, ref.Revision, ref.Digest).Scan(&raw)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("statepg: policy artifact %s/%d not found", ref.ID, ref.Revision)
 	}
@@ -148,6 +183,13 @@ func (s *Store) LoadPolicyArtifact(ref policy.PolicyRef) (*policy.CompiledPolicy
 }
 
 func (s *Store) PersistPolicyTransition(manifest policy.Manifest, event policy.Event) error {
+	return s.PersistPolicyTransitionContext(context.Background(), manifest, event)
+}
+
+func (s *Store) PersistPolicyTransitionContext(ctx context.Context, manifest policy.Manifest, event policy.Event) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if err := validatePolicyManifest(manifest); err != nil {
 		return err
 	}
@@ -169,7 +211,6 @@ func (s *Store) PersistPolicyTransition(manifest policy.Manifest, event policy.E
 	if err != nil {
 		return err
 	}
-	ctx := context.Background()
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return mapDBError(err)
@@ -237,10 +278,17 @@ func (s *Store) PersistPolicyTransition(manifest policy.Manifest, event policy.E
 }
 
 func (s *Store) ListPolicyAudit(after uint64, limit int) ([]policy.Event, error) {
+	return s.ListPolicyAuditContext(context.Background(), after, limit)
+}
+
+func (s *Store) ListPolicyAuditContext(ctx context.Context, after uint64, limit int) ([]policy.Event, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if limit <= 0 || limit > 1000 {
 		limit = 1000
 	}
-	rows, err := s.pool.Query(context.Background(), `SELECT event FROM gripline_policy_audit WHERE sequence > $1 ORDER BY sequence LIMIT $2`, after, limit)
+	rows, err := s.pool.Query(ctx, `SELECT event FROM gripline_policy_audit WHERE sequence > $1 ORDER BY sequence LIMIT $2`, after, limit)
 	if err != nil {
 		return nil, mapDBError(err)
 	}
