@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"sort"
 	"time"
 
 	"github.com/B-A-M-N/gripline/internal/evidence"
@@ -64,17 +66,40 @@ func (s *Store) AppendContext(ctx context.Context, items ...evidence.Evidence) e
 	if len(items) == 0 {
 		return nil
 	}
+	return withTransactionRetry(ctx, "evidence append", func() error {
+		return s.appendContextOnce(ctx, items)
+	})
+}
+
+func (s *Store) appendContextOnce(ctx context.Context, items []evidence.Evidence) error {
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if err := s.requireNodeOwnership(ctx, tx, false); err != nil {
+		return err
+	}
 	bySubject := make(map[evidence.SubjectKey][]evidence.Evidence)
 	for _, item := range items {
 		key := evidence.SubjectKey{Scope: item.Scope, ID: item.SubjectID}
 		bySubject[key] = append(bySubject[key], item)
 	}
-	for subject, incoming := range bySubject {
+	subjects := make([]evidence.SubjectKey, 0, len(bySubject))
+	for subject := range bySubject {
+		subjects = append(subjects, subject)
+	}
+	sort.Slice(subjects, func(i, j int) bool {
+		if subjects[i].Scope != subjects[j].Scope {
+			return subjects[i].Scope < subjects[j].Scope
+		}
+		return subjects[i].ID < subjects[j].ID
+	})
+	for _, subject := range subjects {
+		incoming := bySubject[subject]
+		if err := s.lockEvidenceGuard(ctx, tx, subject); err != nil {
+			return err
+		}
 		existing, err := loadEvidenceSubject(ctx, tx, subject, true)
 		if err != nil {
 			return err
@@ -150,13 +175,41 @@ func (s *Store) PruneContext(ctx context.Context, subjects []evidence.SubjectKey
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
+	var pruned int
+	var lastErr error
+	for attempt := 0; attempt < maxTransactionAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		pruned, lastErr = s.pruneContextOnce(ctx, subjects, now)
+		if lastErr == nil || !retryableTransactionError(lastErr) {
+			return pruned, lastErr
+		}
+	}
+	return 0, fmt.Errorf("statepg: evidence prune remained conflicted after retries: %w", lastErr)
+}
+
+func (s *Store) pruneContextOnce(ctx context.Context, subjects []evidence.SubjectKey, now time.Time) (int, error) {
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback(ctx)
+	if err := s.requireNodeOwnership(ctx, tx, true); err != nil {
+		return 0, err
+	}
 	pruned := 0
-	for _, subject := range subjects {
+	orderedSubjects := append([]evidence.SubjectKey(nil), subjects...)
+	sort.Slice(orderedSubjects, func(i, j int) bool {
+		if orderedSubjects[i].Scope != orderedSubjects[j].Scope {
+			return orderedSubjects[i].Scope < orderedSubjects[j].Scope
+		}
+		return orderedSubjects[i].ID < orderedSubjects[j].ID
+	})
+	for _, subject := range orderedSubjects {
+		if err := s.lockEvidenceGuard(ctx, tx, subject); err != nil {
+			return 0, err
+		}
 		items, err := loadEvidenceSubject(ctx, tx, subject, true)
 		if err != nil {
 			return 0, err
@@ -178,6 +231,23 @@ func (s *Store) PruneContext(ctx context.Context, subjects []evidence.SubjectKey
 		return 0, err
 	}
 	return pruned, nil
+}
+
+// lockEvidenceGuard gives a first-write subject a durable row to lock. A
+// FOR UPDATE on gripline_evidence cannot serialize two transactions when the
+// subject has no evidence row yet.
+func (s *Store) lockEvidenceGuard(ctx context.Context, tx pgx.Tx, subject evidence.SubjectKey) error {
+	scope, id, err := evidenceSubject(subject)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO gripline_evidence_guards (scope, subject_id, created_at)
+		VALUES ($1,$2,$3) ON CONFLICT (scope, subject_id) DO NOTHING`, scope, id, s.now().UTC()); err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `SELECT scope, subject_id FROM gripline_evidence_guards
+		WHERE scope=$1 AND subject_id=$2 FOR UPDATE`, scope, id)
+	return err
 }
 
 var _ evidence.Store = (*Store)(nil)

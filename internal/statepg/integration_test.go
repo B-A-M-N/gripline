@@ -285,6 +285,181 @@ func TestPostgresAuthorityIntegration(t *testing.T) {
 	}
 }
 
+func TestPostgresFencedNodeCannotMutateAuthority(t *testing.T) {
+	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("GRIPLINE_TEST_POSTGRES_DSN is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resetIntegrationAuthority(t, ctx, dsn)
+
+	const nodeID = "pg-fencing-node"
+	old := openIntegrationStore(t, ctx, dsn, nodeID)
+	defer old.Close()
+	identity := CryptoIdentity{
+		SignerActiveKID: 1, SignerFingerprint: "fencing-signer",
+		PepperActiveVersion: 1, PepperFingerprint: "fencing-pepper",
+		PseudonymVersion: 0, PseudonymFingerprint: "disabled",
+	}
+	if _, err := old.SynchronizeCrypto(ctx, identity); err != nil {
+		t.Fatalf("synchronize old node crypto: %v", err)
+	}
+
+	now := time.Now().UTC()
+	credentialID := "fencing-credential"
+	record := &credential.CredentialRecord{
+		CredentialID: credentialID, AccountID: "fencing-account",
+		Verifier: []byte("fencing-verifier"), VerifierVersion: 1, PepperVersion: 1,
+		Status: credential.StatusNormal, PolicyID: "fencing-policy", PlanID: "fencing-plan",
+		CreatedAt: now, Revision: 1,
+	}
+	if created, err := old.InsertIfAbsent(record); err != nil || !created {
+		t.Fatalf("seed credential: created=%v err=%v", created, err)
+	}
+	policyContext := lane.DefaultPolicyContext()
+	if _, created, err := old.BorrowOrCreateWithPolicy(ctx, credentialID, "fencing-lane", lane.Features{NetworkASN: "AS-FENCE"}, policyContext); err != nil || !created {
+		t.Fatalf("seed lane: created=%v err=%v", created, err)
+	}
+	if err := old.AppendContext(ctx, evidence.Evidence{
+		EvidenceID: "fencing-evidence", Code: "FENCING_SIGNAL", Family: evidence.FamilyClientNovelty,
+		Scope: evidence.ScopeCredential, SubjectID: credentialID, Score: 1, Confidence: 50,
+		CreatedAt: now, ExpiresAt: now.Add(time.Hour), PolicyRevision: 1,
+	}); err != nil {
+		t.Fatalf("seed evidence: %v", err)
+	}
+	compiled, err := policy.Compile(policy.Default())
+	if err != nil {
+		t.Fatalf("compile fencing policy: %v", err)
+	}
+	digest, err := policy.Digest(&compiled.Policy)
+	if err != nil {
+		t.Fatalf("digest fencing policy: %v", err)
+	}
+	ref := policy.PolicyRef{ID: compiled.ID, Revision: compiled.Revision, Digest: digest}
+	if err := old.PersistPolicyArtifact(compiled); err != nil {
+		t.Fatalf("seed policy artifact: %v", err)
+	}
+	manifest := policy.Manifest{SchemaVersion: 1, ActivationEpoch: 1, Active: ref, UpdatedAt: now}
+	if err := old.InitializePolicyManifest(manifest); err != nil {
+		t.Fatalf("seed policy manifest: %v", err)
+	}
+
+	// Stop only the old membership heartbeat. Keeping its pool open lets the
+	// test issue mutations after a replacement has acquired the same node ID.
+	close(old.membershipStop)
+	<-old.membershipDone
+	if _, err := old.pool.Exec(ctx, `UPDATE gripline_membership SET last_seen_at=CURRENT_TIMESTAMP - INTERVAL '1 hour' WHERE node_id=$1`, nodeID); err != nil {
+		t.Fatalf("expire old membership lease: %v", err)
+	}
+	replacement := openIntegrationStore(t, ctx, dsn, nodeID)
+	defer replacement.Close()
+	if _, err := replacement.SynchronizeCrypto(ctx, identity); err != nil {
+		t.Fatalf("synchronize replacement crypto: %v", err)
+	}
+	if replacement.nodeEpoch <= old.nodeEpoch {
+		t.Fatalf("replacement epoch=%d did not advance old epoch=%d", replacement.nodeEpoch, old.nodeEpoch)
+	}
+
+	assertFenced := func(name string, err error) {
+		t.Helper()
+		if !errors.Is(err, ErrNodeFenced) {
+			t.Errorf("%s error=%v, want ErrNodeFenced", name, err)
+		}
+	}
+	assertFenced("credential insert", func() error {
+		candidate := *record
+		candidate.CredentialID = "fencing-after-takeover"
+		candidate.Verifier = []byte("fencing-after-takeover-verifier")
+		_, err := old.InsertIfAbsent(&candidate)
+		return err
+	}())
+	_, err = old.RotateVerifierCASContext(ctx, credentialID, 1, 1, []byte("fencing-rotated-verifier"))
+	assertFenced("credential verifier rotation", err)
+	_, err = old.ObserveAndCommit(ctx, credentialID, 90, credential.Hysteresis{}, now)
+	assertFenced("credential observation", err)
+	_, _, err = old.BorrowOrCreateWithPolicy(ctx, credentialID, "fencing-after-takeover-lane", lane.Features{NetworkASN: "AS-FENCE-2"}, policyContext)
+	assertFenced("lane creation", err)
+	_, err = old.ObserveRiskWithPolicy(ctx, credentialID, "fencing-lane", 90, now, policyContext, lane.TransitionMetadata{})
+	assertFenced("lane risk observation", err)
+	assertFenced("evidence append", old.AppendContext(ctx, evidence.Evidence{
+		EvidenceID: "fencing-after-takeover-evidence", Code: "FENCING_SIGNAL_2", Family: evidence.FamilyClientNovelty,
+		Scope: evidence.ScopeCredential, SubjectID: credentialID, Score: 1, Confidence: 50,
+		CreatedAt: now, ExpiresAt: now.Add(time.Hour), PolicyRevision: 1,
+	}))
+	assertFenced("posture mutation", old.SavePosture(control.EmergencyLockdown))
+	assertFenced("admission audit", old.AppendAdmission(ctx, control.Event{At: now, RequestID: "fencing-request", CredentialID: credentialID}))
+	assertFenced("operator audit", old.AppendOperator(ctx, control.OperatorRecord{At: now, Actor: "fencing-test", Action: "fencing.test", Target: credentialID, Reason: "test"}))
+	assertFenced("policy artifact mutation", old.PersistPolicyArtifact(compiled))
+	assertFenced("policy manifest mutation", old.PersistPolicyManifest(manifest))
+	assertFenced("policy transition mutation", old.PersistPolicyTransition(manifest, policy.Event{
+		Action: "rollback", Actor: "fencing-test", FromRevision: compiled.Revision, ToRevision: compiled.Revision,
+		PolicyID: compiled.ID, Reason: "test", At: now,
+	}))
+	assertFenced("operator credential mutation", old.RevokeCredentialWithAuditOperation(ctx, credentialID, control.OperatorRecord{
+		At: now, Actor: "fencing-test", Action: "credential.revoke", Target: credentialID, Reason: "test", Committed: true,
+	}, "fencing-operation"))
+}
+
+func TestPostgresEvidenceConcurrentFirstWrites(t *testing.T) {
+	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("GRIPLINE_TEST_POSTGRES_DSN is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resetIntegrationAuthority(t, ctx, dsn)
+	a := openIntegrationStore(t, ctx, dsn, "evidence-contention-a")
+	b := openIntegrationStore(t, ctx, dsn, "evidence-contention-b")
+	defer a.Close()
+	defer b.Close()
+	identity := CryptoIdentity{
+		SignerActiveKID: 1, SignerFingerprint: "evidence-signer",
+		PepperActiveVersion: 1, PepperFingerprint: "evidence-pepper",
+		PseudonymVersion: 0, PseudonymFingerprint: "disabled",
+	}
+	if _, err := a.SynchronizeCrypto(ctx, identity); err != nil {
+		t.Fatalf("synchronize evidence node A: %v", err)
+	}
+	if _, err := b.SynchronizeCrypto(ctx, identity); err != nil {
+		t.Fatalf("synchronize evidence node B: %v", err)
+	}
+
+	now := time.Now().UTC()
+	item := func(id, subject string) evidence.Evidence {
+		return evidence.Evidence{
+			EvidenceID: id, Code: "CONTENTION_SIGNAL", Family: evidence.FamilyClientNovelty,
+			Scope: evidence.ScopeCredential, SubjectID: subject, Score: 1, Confidence: 50,
+			CreatedAt: now, ExpiresAt: now.Add(time.Hour), PolicyRevision: 1,
+		}
+	}
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	go func() {
+		<-start
+		results <- a.AppendContext(ctx, item("a-one", "subject-a"), item("b-one", "subject-b"))
+	}()
+	go func() {
+		<-start
+		results <- b.AppendContext(ctx, item("b-two", "subject-b"), item("a-two", "subject-a"))
+	}()
+	close(start)
+	for i := 0; i < 2; i++ {
+		if err := <-results; err != nil {
+			t.Fatalf("concurrent evidence append %d: %v", i, err)
+		}
+	}
+	for _, subject := range []string{"subject-a", "subject-b"} {
+		rows, err := a.SnapshotContext(ctx, []evidence.SubjectKey{{Scope: evidence.ScopeCredential, ID: subject}}, now)
+		if err != nil {
+			t.Fatalf("snapshot %s: %v", subject, err)
+		}
+		if len(rows) != 2 {
+			t.Fatalf("subject %s lost a concurrent first-write item: rows=%+v", subject, rows)
+		}
+	}
+}
+
 func openIntegrationStore(t *testing.T, ctx context.Context, dsn, nodeID string) *Store {
 	t.Helper()
 	store, err := Open(ctx, Options{DSN: dsn, NodeID: nodeID, LeaseTTL: 10 * time.Second, RenewEvery: 2 * time.Second, MaxSourceScopes: 64})
@@ -323,6 +498,7 @@ func resetIntegrationAuthority(t *testing.T, ctx context.Context, dsn string) {
 		gripline_control_operations,
 		gripline_operator_posture,
 		gripline_evidence,
+		gripline_evidence_guards,
 		gripline_lanes,
 		gripline_lane_guards,
 		gripline_credentials,

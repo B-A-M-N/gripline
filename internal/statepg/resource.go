@@ -666,6 +666,9 @@ func (s *Store) reapExpired(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if err := s.requireNodeOwnership(ctx, tx, true); err != nil {
+		return err
+	}
 	rows, err := tx.Query(ctx, `SELECT lease_id, node_id, state FROM gripline_resource_leases WHERE state <> $1 AND expires_at <= $2 ORDER BY expires_at LIMIT 100 FOR UPDATE SKIP LOCKED`, leaseReleased, now)
 	if err != nil {
 		return mapDBError(err)
@@ -712,6 +715,9 @@ func (s *Store) RemoveScope(scope resource.Scope, id string) bool {
 		return false
 	}
 	defer tx.Rollback(ctx)
+	if err := s.requireNodeOwnership(ctx, tx, true); err != nil {
+		return false
+	}
 	var active int
 	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_resource_holds h JOIN gripline_resource_leases l ON l.lease_id=h.lease_id WHERE h.scope=$1 AND h.scope_id=$2 AND l.state <> $3`, scope, id, leaseReleased).Scan(&active); err != nil || active != 0 {
 		return false

@@ -89,9 +89,20 @@ func (s *Store) PersistPolicyManifestContext(ctx context.Context, manifest polic
 	if err != nil {
 		return err
 	}
-	_, err = s.pool.Exec(ctx, `INSERT INTO gripline_policy_manifest (singleton, manifest, updated_at)
+	tx, err := begin(ctx, s.pool)
+	if err != nil {
+		return mapDBError(err)
+	}
+	defer tx.Rollback(ctx)
+	if err := s.requireNodeMembership(ctx, tx, false, false); err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO gripline_policy_manifest (singleton, manifest, updated_at)
 		VALUES (TRUE,$1,$2) ON CONFLICT (singleton) DO UPDATE SET manifest=EXCLUDED.manifest, updated_at=EXCLUDED.updated_at`, raw, manifest.UpdatedAt.UTC())
-	return mapDBError(err)
+	if err != nil {
+		return mapDBError(err)
+	}
+	return mapDBError(tx.Commit(ctx))
 }
 
 // InitializePolicyManifest publishes the first cluster policy with
@@ -116,9 +127,20 @@ func (s *Store) InitializePolicyManifestContext(ctx context.Context, manifest po
 	if err != nil {
 		return err
 	}
-	_, err = s.pool.Exec(ctx, `INSERT INTO gripline_policy_manifest (singleton, manifest, updated_at)
+	tx, err := begin(ctx, s.pool)
+	if err != nil {
+		return mapDBError(err)
+	}
+	defer tx.Rollback(ctx)
+	if err := s.requireNodeMembership(ctx, tx, false, false); err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO gripline_policy_manifest (singleton, manifest, updated_at)
 		VALUES (TRUE,$1,$2) ON CONFLICT (singleton) DO NOTHING`, raw, manifest.UpdatedAt.UTC())
-	return mapDBError(err)
+	if err != nil {
+		return mapDBError(err)
+	}
+	return mapDBError(tx.Commit(ctx))
 }
 
 func (s *Store) PersistPolicyArtifact(compiled *policy.CompiledPolicy) error {
@@ -143,9 +165,20 @@ func (s *Store) PersistPolicyArtifactContext(ctx context.Context, compiled *poli
 	if err := validatePolicyRef(policy.PolicyRef{ID: compiled.ID, Revision: compiled.Revision, Digest: digest}); err != nil {
 		return err
 	}
-	_, err = s.pool.Exec(ctx, `INSERT INTO gripline_policy_artifacts (policy_id, revision, digest, artifact)
+	tx, err := begin(ctx, s.pool)
+	if err != nil {
+		return mapDBError(err)
+	}
+	defer tx.Rollback(ctx)
+	if err := s.requireNodeMembership(ctx, tx, false, false); err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO gripline_policy_artifacts (policy_id, revision, digest, artifact)
 		VALUES ($1,$2,$3,$4) ON CONFLICT (policy_id, revision, digest) DO NOTHING`, compiled.ID, compiled.Revision, digest, raw)
-	return mapDBError(err)
+	if err != nil {
+		return mapDBError(err)
+	}
+	return mapDBError(tx.Commit(ctx))
 }
 
 func (s *Store) LoadPolicyArtifact(ref policy.PolicyRef) (*policy.CompiledPolicy, error) {
@@ -216,6 +249,9 @@ func (s *Store) PersistPolicyTransitionContext(ctx context.Context, manifest pol
 		return mapDBError(err)
 	}
 	defer tx.Rollback(ctx)
+	if err := s.requireNodeOwnership(ctx, tx, false); err != nil {
+		return err
+	}
 	var previousRaw []byte
 	err = tx.QueryRow(ctx, `SELECT manifest FROM gripline_policy_manifest WHERE singleton=TRUE FOR UPDATE`).Scan(&previousRaw)
 	if err == nil {

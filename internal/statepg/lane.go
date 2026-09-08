@@ -93,6 +93,9 @@ func (s *Store) BorrowOrCreateWithPolicy(ctx context.Context, credID, candidateI
 		return nil, false, err
 	}
 	defer tx.Rollback(ctx)
+	if err := s.requireNodeOwnership(ctx, tx, false); err != nil {
+		return nil, false, err
+	}
 	if err := s.lockLaneGuard(ctx, tx, credID); err != nil {
 		return nil, false, err
 	}
@@ -221,6 +224,9 @@ func (s *Store) ObserveRiskWithPolicy(ctx context.Context, credID, laneID string
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
+	if err := s.requireNodeOwnership(ctx, tx, false); err != nil {
+		return nil, err
+	}
 	if err := s.lockLaneGuard(ctx, tx, credID); err != nil {
 		return nil, err
 	}
@@ -282,6 +288,9 @@ func (s *Store) RecordCleanAuthorizedAndPromoteWithPolicy(ctx context.Context, c
 		return nil, false, err
 	}
 	defer tx.Rollback(ctx)
+	if err := s.requireNodeOwnership(ctx, tx, false); err != nil {
+		return nil, false, err
+	}
 	if err := s.lockLaneGuard(ctx, tx, credID); err != nil {
 		return nil, false, err
 	}

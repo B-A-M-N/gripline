@@ -55,10 +55,13 @@ type Store struct {
 // a request id to its resource payload. Version 4 adds node-instance fencing
 // to membership and resource leases. Version 5 adds keyed adaptive windows
 // and baselines. Version 6 adds the cluster crypto identity record. Version 7
-// adds durable control-operation claims. Keep the marker versioned even though
-// the DDL below is idempotent: CREATE TABLE IF NOT EXISTS cannot add columns
-// to an already initialized database.
-const currentSchemaVersion = 7
+// adds durable control-operation claims. Version 8 adds evidence subject
+// guards for deterministic first-write locking. Keep the marker versioned
+// even though the DDL below is idempotent: CREATE TABLE IF NOT EXISTS cannot
+// add columns to an already initialized database.
+const currentSchemaVersion = 8
+
+const maxTransactionAttempts = 3
 
 var ErrMigrationRequired = errors.New("statepg: database schema requires migration")
 var ErrDSNRequired = errors.New("statepg: DSN required")
@@ -393,6 +396,12 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			PRIMARY KEY (scope, subject_id, evidence_id)
 		)`,
 		`CREATE INDEX IF NOT EXISTS gripline_evidence_subject_idx ON gripline_evidence (scope, subject_id)`,
+		`CREATE TABLE IF NOT EXISTS gripline_evidence_guards (
+			scope TEXT NOT NULL,
+			subject_id TEXT NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL,
+			PRIMARY KEY (scope, subject_id)
+		)`,
 	}
 	for _, statement := range statements {
 		if _, err := tx.Exec(ctx, statement); err != nil {
@@ -480,6 +489,11 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 		// DDL above; advancing the marker is sufficient for existing databases.
 		version = 7
 	}
+	if version == 7 {
+		// Version 8's evidence subject guard table is created by the idempotent
+		// DDL above; advancing the marker is sufficient for existing databases.
+		version = 8
+	}
 	if version != currentSchemaVersion {
 		return fmt.Errorf("%w: unsupported migration state %d", ErrMigrationRequired, version)
 	}
@@ -497,6 +511,26 @@ func begin(ctx context.Context, pool *pgxpool.Pool) (pgx.Tx, error) {
 		ctx = context.Background()
 	}
 	return pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+}
+
+// withTransactionRetry is the shared bounded retry primitive for serializable
+// authority reducers. Domain errors are returned immediately; only PostgreSQL
+// serialization failures and deadlocks are retried by the callback's error
+// classification.
+func withTransactionRetry(ctx context.Context, operation string, fn func() error) error {
+	var lastErr error
+	for attempt := 0; attempt < maxTransactionAttempts; attempt++ {
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		lastErr = fn()
+		if lastErr == nil || !retryableTransactionError(lastErr) {
+			return lastErr
+		}
+	}
+	return fmt.Errorf("statepg: %s remained conflicted after retries: %w", operation, lastErr)
 }
 
 func mapDBError(err error) error {

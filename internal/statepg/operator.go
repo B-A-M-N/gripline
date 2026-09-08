@@ -42,6 +42,9 @@ func (s *Store) AppendOperator(ctx context.Context, rec control.OperatorRecord) 
 		return mapDBError(err)
 	}
 	defer tx.Rollback(ctx)
+	if err := s.requireNodeOwnership(ctx, tx, true); err != nil {
+		return err
+	}
 	if err := appendOperator(ctx, tx, rec); err != nil {
 		return mapDBError(err)
 	}
@@ -146,6 +149,9 @@ func (s *Store) SavePosture(posture control.Posture) error {
 		return mapDBError(err)
 	}
 	defer tx.Rollback(ctx)
+	if err := s.requireNodeOwnership(ctx, tx, false); err != nil {
+		return err
+	}
 	if err := putPosture(ctx, tx, posture, s.now()); err != nil {
 		return err
 	}
@@ -164,11 +170,22 @@ func (s *Store) AppendAdmission(ctx context.Context, e control.Event) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	_, err := s.pool.Exec(ctx, `INSERT INTO gripline_admission_audit
+	tx, err := begin(ctx, s.pool)
+	if err != nil {
+		return mapDBError(err)
+	}
+	defer tx.Rollback(ctx)
+	if err := s.requireNodeOwnership(ctx, tx, true); err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO gripline_admission_audit
 		(at, request_id, credential_id, account_id, lane_id, posture, authorized, reason)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, e.At.UTC(), e.RequestID, e.CredentialID,
 		e.AccountID, e.LaneID, e.Posture, e.Authorized, e.Reason)
-	return mapDBError(err)
+	if err != nil {
+		return mapDBError(err)
+	}
+	return mapDBError(tx.Commit(ctx))
 }
 
 // ListOperatorAudit returns committed operator records in sequence order.
@@ -240,6 +257,9 @@ func (s *Store) ProvisionCredentialWithAuditOperation(ctx context.Context, rec c
 		return mapDBError(err)
 	}
 	defer tx.Rollback(ctx)
+	if err := s.requireNodeOwnership(ctx, tx, false); err != nil {
+		return err
+	}
 	replayed, err := claimControlOperation(ctx, tx, operationID, audit.Action,
 		operatorMutationPayload(audit, rec), s.now())
 	if err != nil {
@@ -274,6 +294,9 @@ func (s *Store) UnblockLaneWithAuditOperation(ctx context.Context, credID, laneI
 		return mapDBError(err)
 	}
 	defer tx.Rollback(ctx)
+	if err := s.requireNodeOwnership(ctx, tx, false); err != nil {
+		return err
+	}
 	replayed, err := claimControlOperation(ctx, tx, operationID, audit.Action,
 		operatorMutationPayload(audit, struct {
 			CredentialID string `json:"credential_id"`
@@ -336,6 +359,9 @@ func (s *Store) RevokeCredentialWithAuditOperation(ctx context.Context, credID s
 		return mapDBError(err)
 	}
 	defer tx.Rollback(ctx)
+	if err := s.requireNodeOwnership(ctx, tx, false); err != nil {
+		return err
+	}
 	replayed, err := claimControlOperation(ctx, tx, operationID, audit.Action,
 		operatorMutationPayload(audit, struct {
 			CredentialID string `json:"credential_id"`
@@ -383,6 +409,9 @@ func (s *Store) SetPostureWithAuditOperation(ctx context.Context, posture contro
 		return mapDBError(err)
 	}
 	defer tx.Rollback(ctx)
+	if err := s.requireNodeOwnership(ctx, tx, false); err != nil {
+		return err
+	}
 	replayed, err := claimControlOperation(ctx, tx, operationID, audit.Action,
 		operatorMutationPayload(audit, struct {
 			Posture control.Posture `json:"posture"`
