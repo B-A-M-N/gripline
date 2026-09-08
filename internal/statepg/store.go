@@ -28,6 +28,7 @@ type Options struct {
 	LeaseTTL        time.Duration
 	RenewEvery      time.Duration
 	MaxSourceScopes int
+	SourceScopeIdle time.Duration
 	ConnectTimeout  time.Duration
 }
 
@@ -42,6 +43,7 @@ type Store struct {
 	fenced          atomic.Bool
 	leaseTTL        time.Duration
 	maxSourceScopes int
+	sourceScopeIdle time.Duration
 	leaseStop       chan struct{}
 	leaseDone       chan struct{}
 	membershipStop  chan struct{}
@@ -106,10 +108,13 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 	if opts.MaxSourceScopes <= 0 {
 		opts.MaxSourceScopes = 4096
 	}
+	if opts.SourceScopeIdle <= 0 {
+		opts.SourceScopeIdle = 10 * time.Minute
+	}
 	if opts.RenewEvery <= 0 || opts.RenewEvery >= opts.LeaseTTL/2 {
 		opts.RenewEvery = opts.LeaseTTL / 3
 	}
-	s := &Store{pool: pool, now: opts.Now, nodeID: opts.NodeID, leaseTTL: opts.LeaseTTL, maxSourceScopes: opts.MaxSourceScopes,
+	s := &Store{pool: pool, now: opts.Now, nodeID: opts.NodeID, leaseTTL: opts.LeaseTTL, maxSourceScopes: opts.MaxSourceScopes, sourceScopeIdle: opts.SourceScopeIdle,
 		leaseStop: make(chan struct{}), leaseDone: make(chan struct{})}
 	if err := s.Ping(connectCtx); err != nil {
 		pool.Close()

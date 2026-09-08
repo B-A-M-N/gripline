@@ -232,6 +232,9 @@ func (s *Store) resolveResourceScope(ctx context.Context, tx pgx.Tx, sp resource
 		return sp, mapDBError(err)
 	}
 	if !exists {
+		if err := s.evictIdleSourceScopes(ctx, tx, now); err != nil {
+			return sp, err
+		}
 		var count int
 		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_resource_source_scopes`).Scan(&count); err != nil {
 			return sp, mapDBError(err)
@@ -247,6 +250,57 @@ func (s *Store) resolveResourceScope(ctx context.Context, tx pgx.Tx, sp resource
 		return sp, mapDBError(err)
 	}
 	return sp, nil
+}
+
+// evictIdleSourceScopes removes only source identities whose resource state
+// can be discarded without granting fresh quota or losing active accounting.
+// It runs in the caller's reservation transaction, so the source row and all
+// of its buckets disappear atomically with the decision to admit the new
+// source. SKIP LOCKED lets several nodes look for reclamation without
+// waiting on the same old candidate.
+func (s *Store) evictIdleSourceScopes(ctx context.Context, tx pgx.Tx, now time.Time) error {
+	cutoff := now.Add(-s.sourceScopeIdle)
+	for {
+		var count int
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_resource_source_scopes`).Scan(&count); err != nil {
+			return mapDBError(err)
+		}
+		if count < s.maxSourceScopes {
+			return nil
+		}
+		var scopeID string
+		err := tx.QueryRow(ctx, `SELECT ss.scope_id
+			FROM gripline_resource_source_scopes ss
+			WHERE ss.last_used_at <= $1
+			  AND ss.scope_id NOT LIKE '__source_overflow_%'
+			  AND NOT EXISTS (
+				SELECT 1 FROM gripline_resource_holds h
+				JOIN gripline_resource_leases l ON l.lease_id=h.lease_id
+				WHERE h.scope=$2 AND h.scope_id=ss.scope_id AND l.state <> $3
+			  )
+			  AND NOT EXISTS (
+				SELECT 1 FROM gripline_resource_buckets b
+				WHERE b.scope=$2 AND b.scope_id=ss.scope_id
+				  AND (b.concurrency_used <> 0 OR
+					b.available + CASE WHEN b.refill_per > 0 AND b.refill_in_ns > 0
+						THEN b.refill_per * EXTRACT(EPOCH FROM ($4 - b.updated_at)) * 1000000000.0 / b.refill_in_ns
+						ELSE 0 END < b.capacity - 1e-9)
+			  )
+			ORDER BY ss.last_used_at, ss.scope_id
+			FOR UPDATE SKIP LOCKED LIMIT 1`, cutoff, resource.ScopeSource, leaseReleased, now).Scan(&scopeID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return mapDBError(err)
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM gripline_resource_buckets WHERE scope=$1 AND scope_id=$2`, resource.ScopeSource, scopeID); err != nil {
+			return mapDBError(err)
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM gripline_resource_source_scopes WHERE scope_id=$1`, scopeID); err != nil {
+			return mapDBError(err)
+		}
+	}
 }
 
 type resourceBucketRow struct {

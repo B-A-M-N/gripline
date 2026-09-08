@@ -729,6 +729,98 @@ func TestPostgresForwardedLeaseConservativelyConsumesEstimate(t *testing.T) {
 	refunded.Release()
 }
 
+func TestPostgresSourceScopeEvictsOnlySafeIdleScopes(t *testing.T) {
+	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("GRIPLINE_TEST_POSTGRES_DSN is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resetIntegrationAuthority(t, ctx, dsn)
+	store, err := Open(ctx, Options{
+		DSN: dsn, NodeID: "source-scope-eviction", LeaseTTL: 10 * time.Second,
+		RenewEvery: 2 * time.Second, MaxSourceScopes: 1, SourceScopeIdle: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("open source-scope authority: %v", err)
+	}
+	defer store.Close()
+	identity := CryptoIdentity{
+		SignerActiveKID: 1, SignerFingerprint: "source-scope-signer",
+		PepperActiveVersion: 1, PepperFingerprint: "source-scope-pepper",
+		PseudonymVersion: 0, PseudonymFingerprint: "disabled",
+	}
+	if _, err := store.SynchronizeCrypto(ctx, identity); err != nil {
+		t.Fatalf("synchronize source-scope authority: %v", err)
+	}
+	scope := func(id string) resource.ScopeSpec {
+		return resource.ScopeSpec{Scope: resource.ScopeSource, ID: id, Buckets: resource.BucketSpec{
+			RequestsBurst: resource.BucketConfig{Capacity: 1},
+		}}
+	}
+	first, err := store.Reserve(ctx, resource.ReserveRequest{
+		RequestID: "source-scope-first", Scopes: []resource.ScopeSpec{scope("source-one")},
+		Estimate: resource.UsageEstimate{Requests: 1},
+	})
+	if err != nil {
+		t.Fatalf("reserve first source: %v", err)
+	}
+	first.Release()
+	if _, err := store.pool.Exec(ctx, `UPDATE gripline_resource_source_scopes
+		SET last_used_at=CURRENT_TIMESTAMP - INTERVAL '1 hour' WHERE scope_id='source-one'`); err != nil {
+		t.Fatalf("age first source scope: %v", err)
+	}
+	second, err := store.Reserve(ctx, resource.ReserveRequest{
+		RequestID: "source-scope-second", Scopes: []resource.ScopeSpec{scope("source-two")},
+		Estimate: resource.UsageEstimate{Requests: 1},
+	})
+	if err != nil {
+		t.Fatalf("reserve second source after safe eviction: %v", err)
+	}
+	second.Release()
+	var oldCount, newCount, bucketCount int
+	if err := store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_resource_source_scopes WHERE scope_id='source-one'`).Scan(&oldCount); err != nil {
+		t.Fatalf("count evicted source: %v", err)
+	}
+	if err := store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_resource_source_scopes WHERE scope_id='source-two'`).Scan(&newCount); err != nil {
+		t.Fatalf("count current source: %v", err)
+	}
+	if err := store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_resource_buckets WHERE scope=$1 AND scope_id='source-one'`, resource.ScopeSource).Scan(&bucketCount); err != nil {
+		t.Fatalf("count evicted source buckets: %v", err)
+	}
+	if oldCount != 0 || newCount != 1 || bucketCount != 0 {
+		t.Fatalf("source eviction old=%d new=%d old_buckets=%d, want 0/1/0", oldCount, newCount, bucketCount)
+	}
+
+	active, err := store.Reserve(ctx, resource.ReserveRequest{
+		RequestID: "source-scope-active", Scopes: []resource.ScopeSpec{scope("source-two")},
+		Estimate: resource.UsageEstimate{Requests: 1},
+	})
+	if err != nil {
+		t.Fatalf("reserve active source: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE gripline_resource_source_scopes
+		SET last_used_at=CURRENT_TIMESTAMP - INTERVAL '1 hour' WHERE scope_id='source-two'`); err != nil {
+		active.Release()
+		t.Fatalf("age active source scope: %v", err)
+	}
+	overflow, err := store.Reserve(ctx, resource.ReserveRequest{
+		RequestID: "source-scope-blocked", Scopes: []resource.ScopeSpec{scope("source-three")},
+		Estimate: resource.UsageEstimate{Requests: 1},
+	})
+	if err != nil {
+		t.Fatalf("reserve overflow source: %v", err)
+	}
+	overflow.Release()
+	active.Release()
+	if err := store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_resource_source_scopes WHERE scope_id='source-three'`).Scan(&newCount); err != nil {
+		t.Fatalf("count overflow source row: %v", err)
+	}
+	if newCount != 0 {
+		t.Fatal("overflow source must not consume a bounded source-scope row")
+	}
+}
+
 func openIntegrationStore(t *testing.T, ctx context.Context, dsn, nodeID string) *Store {
 	t.Helper()
 	store, err := Open(ctx, Options{DSN: dsn, NodeID: nodeID, LeaseTTL: 10 * time.Second, RenewEvery: 2 * time.Second, MaxSourceScopes: 64})

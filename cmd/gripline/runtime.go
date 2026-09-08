@@ -239,7 +239,7 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		connectCtx, connectCancel := context.WithTimeout(context.Background(), connectTimeout)
 		s, err := statepg.Open(connectCtx, statepg.Options{
 			DSN: dsn, MaxConns: cfg.Authority.MaxConns, MinConns: cfg.Authority.MinConns,
-			NodeID: cfg.Authority.NodeID, LeaseTTL: cfg.Authority.LeaseTTL.D(), RenewEvery: cfg.Authority.RenewEvery.D(), MaxSourceScopes: cfg.Server.MaxSourceScopes,
+			NodeID: cfg.Authority.NodeID, LeaseTTL: cfg.Authority.LeaseTTL.D(), RenewEvery: cfg.Authority.RenewEvery.D(), MaxSourceScopes: cfg.Server.MaxSourceScopes, SourceScopeIdle: cfg.Server.SourceScopeIdle.D(),
 			ConnectTimeout: connectTimeout,
 		})
 		connectCancel()
