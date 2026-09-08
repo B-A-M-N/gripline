@@ -33,7 +33,11 @@ audience="gripline-cluster-harness"
 operator_token="operator-cluster-harness-0123456789abcdef0123456789"
 secret_one="cluster-secret-one-0123456789"
 secret_two="cluster-secret-two-0123456789"
-pepper_b64="$(openssl rand -base64 32 | tr -d '\n')"
+secret_three="cluster-secret-three-0123456789"
+pepper_one_b64="$(openssl rand -base64 32 | tr -d '\n')"
+pepper_two_b64="$(openssl rand -base64 32 | tr -d '\n')"
+pseudonym_one_b64="$(openssl rand -base64 32 | tr -d '\n')"
+pseudonym_two_b64="$(openssl rand -base64 32 | tr -d '\n')"
 policy_epoch_file="$harness_dir/policy-epoch"
 printf '1\n' >"$policy_epoch_file"
 
@@ -47,7 +51,9 @@ go build -trimpath -o "$harness_dir/setup" ./cmd/gripline-test-cluster-setup
 	-keyring "$harness_dir/keyring.json" \
 	-policy "$harness_dir/policy.json" \
 	-candidate "$harness_dir/candidate.json" \
-	-verifier "$harness_dir/policy-verifier.key"
+	-verifier "$harness_dir/policy-verifier.key" \
+	-pepper-one "$pepper_one_b64" -pepper-two "$pepper_two_b64" \
+	-pseudonym-one "$pseudonym_one_b64" -pseudonym-two "$pseudonym_two_b64"
 
 export GRIPLINE_CLUSTER_DSN="$dsn"
 for node in a b c; do
@@ -67,7 +73,8 @@ for node in a b c; do
     "spool_dir": "${harness_dir}/spool-${node}", "spool_max_bytes": 1048576, "spool_max_files": 8
   },
   "identity": {"audience": "${audience}"},
-  "secrets": {"pepper_versions": {"1": "${pepper_b64}"}},
+  "secrets": {"pepper_versions": {"1": "${pepper_one_b64}", "2": "${pepper_two_b64}"}},
+  "ingress": {"pseudonym_keys": {"1": "${pseudonym_one_b64}", "2": "${pseudonym_two_b64}"}},
   "admin": {"listen": "127.0.0.1:${admin_port}", "operator_tokens": {"${operator_token}": "harness:posture.control,credential.lifecycle,lane.lifecycle,policy.install,audit.read,cluster.read,crypto.lifecycle"}},
   "paths": {"signer_keyring": "${harness_dir}/keyring.json"},
   "policy": {"file": "${harness_dir}/policy.json", "verifier_key_file": "${harness_dir}/policy-verifier.key"},
@@ -203,6 +210,73 @@ curl_data_code() {
 	curl -sS -o /dev/null -w '%{http_code}' "$url" -H "Authorization: Bearer ${secret}" 2>/dev/null || true
 }
 
+crypto_fingerprint() {
+	local status=$1 kind=$2 generation=$3
+	printf '%s' "$status" | sed -n "s/.*\"kind\":\"${kind}\",\"generation\":${generation},\"fingerprint\":\"\([^\"]*\)\".*/\1/p"
+}
+
+activate_crypto_generation() {
+	local kind=$1 generation=$2 fingerprint=$3 operation_id=$4 node_admin_port=$5
+	local body="$harness_dir/${kind}-${generation}-activation-body"
+	local code
+	code="$(curl -sS -o "$body" -w '%{http_code}' "http://127.0.0.1:${node_admin_port}/admin/crypto/activate" \
+		-H "Authorization: Bearer ${operator_token}" -H 'Content-Type: application/json' \
+		-H "Idempotency-Key: ${operation_id}" \
+		--data "{\"kind\":\"${kind}\",\"generation\":${generation},\"fingerprint\":\"${fingerprint}\",\"reason\":\"cluster ${kind} generation ${generation}\"}")"
+	if [[ "$code" != "200" ]]; then
+		cat "$body" >&2
+		exit 1
+	fi
+	for port in $((base + 20)) $((base + 21)) $((base + 22)); do
+		for _ in $(seq 1 60); do
+			status="$(curl -sS "http://127.0.0.1:${port}/admin/crypto" -H "Authorization: Bearer ${operator_token}" 2>/dev/null || true)"
+			if printf '%s' "$status" | rg -q "\"${kind}_active_(version|kid)\":${generation}"; then
+				break
+			fi
+			sleep 0.1
+		done
+		printf '%s' "$status" | rg -q "\"${kind}_active_(version|kid)\":${generation}"
+	done
+}
+
+# Pepper activation changes the generation used for newly provisioned
+# credentials. Existing v1 records remain usable while the shared authority
+# directs all new records to v2, regardless of which node handles the add.
+crypto_status_after_signer="$(curl -fsS "http://127.0.0.1:$((base + 20))/admin/crypto" -H "Authorization: Bearer ${operator_token}")"
+pepper_two_fingerprint="$(crypto_fingerprint "$crypto_status_after_signer" pepper 2)"
+pseudonym_two_fingerprint="$(crypto_fingerprint "$crypto_status_after_signer" pseudonym 2)"
+if [[ -z "$pepper_two_fingerprint" || -z "$pseudonym_two_fingerprint" ]]; then
+	echo "cluster harness: staged pepper/pseudonym fingerprints unavailable" >&2
+	exit 1
+fi
+activate_crypto_generation pepper 2 "$pepper_two_fingerprint" cluster-pepper-activate $((base + 21))
+pepper_replay_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((base + 22))/admin/crypto/activate" \
+	-H "Authorization: Bearer ${operator_token}" -H 'Content-Type: application/json' \
+	-H 'Idempotency-Key: cluster-pepper-activate' \
+	--data "{\"kind\":\"pepper\",\"generation\":2,\"fingerprint\":\"${pepper_two_fingerprint}\",\"reason\":\"cluster pepper generation 2\"}")"
+test "$pepper_replay_code" = 200
+provision cluster-credential-three "$secret_three"
+pepper_counts="$(curl -fsS "http://127.0.0.1:$((base + 22))/admin/credentials/pepper-status" -H "Authorization: Bearer ${operator_token}")"
+printf '%s' "$pepper_counts" | rg -q '"1":2'
+printf '%s' "$pepper_counts" | rg -q '"2":1'
+test "$(curl_data_code "http://127.0.0.1:$((base + 12))/v1/messages" "$secret_three")" = 200
+
+# Pseudonym activation must preserve the source scope minted under v1. The
+# shared alias lookup makes all three nodes select that existing v1 scope
+# after v2 becomes active, so rotation does not reset source quotas or
+# novelty history.
+source_scopes_before="$(curl -fsS "http://127.0.0.1:$((base + 20))/admin/metrics" -H "Authorization: Bearer ${operator_token}" | sed -n 's/^gripline_resource_source_scopes \([0-9][0-9]*\)$/\1/p')"
+if [[ -z "$source_scopes_before" || "$source_scopes_before" -lt 1 ]]; then
+	echo "cluster harness: no shared source scope was created before pseudonym rotation" >&2
+	exit 1
+fi
+activate_crypto_generation pseudonym 2 "$pseudonym_two_fingerprint" cluster-pseudonym-activate $((base + 22))
+for port in $((base + 10)) $((base + 11)) $((base + 12)); do
+	test "$(curl_data_code "http://127.0.0.1:${port}/v1/messages" "$secret_three")" = 200
+done
+source_scopes_after="$(curl -fsS "http://127.0.0.1:$((base + 21))/admin/metrics" -H "Authorization: Bearer ${operator_token}" | sed -n 's/^gripline_resource_source_scopes \([0-9][0-9]*\)$/\1/p')"
+test "$source_scopes_after" = "$source_scopes_before"
+
 # Global concurrency cap is five. Fifteen requests enter via the LB and the
 # backend's independently tracked active-work peak must never exceed five.
 mkdir -p "$harness_dir/codes"
@@ -313,6 +387,53 @@ for port in $((base + 10)) $((base + 11)) $((base + 12)); do
 	curl -fsS "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_two}" | rg -q '"policy_revision":1'
 	curl -fsS "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_two}" | rg -q '"policy_epoch":3'
 done
+
+# The shared authority is a fail-closed dependency. CI supplies the PostgreSQL
+# service container; local runs may omit it when Docker is unavailable, but the
+# CI/release jobs set REQUIRE_DB_OUTAGE so this cannot silently become optional
+# in the release gate.
+postgres_container="${GRIPLINE_TEST_POSTGRES_CONTAINER:-}"
+if [[ -z "$postgres_container" ]] && command -v docker >/dev/null 2>&1; then
+	postgres_container="$(docker ps --filter 'ancestor=postgres:16' --format '{{.ID}}' | head -n 1 || true)"
+fi
+if [[ -z "$postgres_container" ]]; then
+	if [[ "${GRIPLINE_CLUSTER_HARNESS_REQUIRE_DB_OUTAGE:-0}" == "1" ]]; then
+		echo "cluster harness: PostgreSQL container is required for outage acceptance" >&2
+		exit 1
+	fi
+	echo "cluster harness: PostgreSQL outage acceptance skipped (set GRIPLINE_TEST_POSTGRES_CONTAINER or run with a postgres:16 container)" >&2
+else
+	backend_capture_before=0
+	if [[ -f "$harness_dir/backend-capture.log" ]]; then
+		backend_capture_before="$(wc -l <"$harness_dir/backend-capture.log")"
+	fi
+	docker stop "$postgres_container" >/dev/null
+	for port in $((base + 10)) $((base + 11)) $((base + 12)); do
+		for _ in $(seq 1 60); do
+			status="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port}/readyz" 2>/dev/null || true)"
+			if [[ "$status" != "200" ]]; then
+				break
+			fi
+			sleep 0.1
+		done
+		test "$status" != "200"
+		test "$(curl_data_code "http://127.0.0.1:${port}/v1/messages" "$secret_two")" != "200"
+	done
+	backend_capture_after=0
+	if [[ -f "$harness_dir/backend-capture.log" ]]; then
+		backend_capture_after="$(wc -l <"$harness_dir/backend-capture.log")"
+	fi
+	if [[ "$backend_capture_after" != "$backend_capture_before" ]]; then
+		echo "cluster harness: protected traffic reached backend while PostgreSQL was unavailable" >&2
+		exit 1
+	fi
+	docker start "$postgres_container" >/dev/null
+	for port in $((base + 10)) $((base + 11)) $((base + 12)); do
+		wait_status "http://127.0.0.1:${port}/readyz"
+	done
+	wait_status "http://127.0.0.1:${lb_port}/readyz"
+fi
+
 # A killed replica with in-flight work must cancel the upstream request. The
 # fixture's active-work counter measures backend work, not merely proxy
 # sockets; this proves the concurrency cap is released only after cancellation

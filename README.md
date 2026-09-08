@@ -50,7 +50,7 @@ legacy clients.
 | Deterministic, policy-driven admission enforcement | An LLM classifier or heuristic black box |
 | A signed internal-identity boundary in front of a private backend | A public proxy for reaching arbitrary hosts |
 | Auditable: every operator mutation commits with its audit record | A substitute for operator judgment and incident response |
-| Single-node durable (transactional bbolt state authority) | A multi-node coordination layer (Raft/etcd is out of beta scope) |
+| Standalone/bbolt or clustered/PostgreSQL credential-containment gateway | A public arbitrary-host proxy, credential vault, or substitute for PostgreSQL HA and the backend perimeter |
 
 ## How it works
 
@@ -112,10 +112,41 @@ chmod 600 provider-key
 ./gripline credential add --config config.json --id <cred> --account <acct> --reason "provision" --secret-stdin --token-file operator-token < provider-key
 ```
 
-`deploy/config.example.json` is a complete, validated production-shaped
-configuration. Boot fails closed on missing decisions: no TLS posture, no
-fixed backend, unbounded timeouts, missing persistent state — any of these is
-a startup error, not a degraded runtime.
+`deploy/config.example.json` is the standalone/bbolt configuration. The
+clustered/PostgreSQL topology is documented in
+[`deploy/config.postgres.example.json`](deploy/config.postgres.example.json).
+Both configurations fail closed on missing decisions: no TLS posture, no fixed
+backend, unbounded timeouts, or missing durable authority is a startup error,
+not a degraded runtime.
+
+### Clustered PostgreSQL deployment
+
+Use three or more active/active gateway processes behind a load balancer, with
+one private verifier backend and a PostgreSQL service reachable by every node.
+Give each node a unique `authority.node_id`, use the same sealed signer
+keyring and staged pepper/pseudonym generations, and keep the PostgreSQL DSN in
+the environment named by `authority.dsn_env`.
+
+Apply schema changes with a migration identity before starting serving nodes:
+
+```bash
+gripline migrate plan  --config deploy/config.postgres.example.json
+gripline migrate apply --config deploy/config.postgres.example.json
+```
+
+Serving nodes only check schema compatibility and do not perform DDL. Route
+traffic only to nodes whose `/readyz` returns 200. A node that loses its
+membership epoch, shared policy/crypto state, or PostgreSQL connectivity is
+removed from service and fails protected admissions closed. PostgreSQL backup,
+PITR, replication, and failover are infrastructure responsibilities.
+
+Provider metering overlays are available as separate examples:
+[`deploy/usage.openai.example.json`](deploy/usage.openai.example.json) and
+[`deploy/usage.anthropic.example.json`](deploy/usage.anthropic.example.json).
+They show the bounded reference adapters and must be merged into the selected
+standalone or PostgreSQL configuration with deployment-specific pricing. The
+default `usage.mode=none` configuration counts requests/concurrency only and
+does not claim token or cost enforcement.
 
 Operator lifecycle:
 
@@ -135,10 +166,14 @@ gripline policy verify     --config c.json   # verify the configured signed poli
 gripline credential pepper-status --config c.json --token-file /run/secrets/gripline-operator
 gripline version
 
-# Live signer rotation remains an explicit deployment integration in public
-# beta. Coordinate the backend acceptance lifecycle, then publish the public
-# verification material:
-gripline keys export --config c.json > verification-keys.json
+# Cluster crypto lifecycle (authenticated live control plane; every mutation
+# requires a reason, fingerprint, and stable operation ID):
+gripline crypto status --config c.json --token-file /run/secrets/gripline-operator
+gripline crypto signer-prepare --config c.json --offline
+gripline crypto activate --config c.json --kind pepper --generation <n> --fingerprint <fp> --reason "..." --operation-id <id> --token-file /run/secrets/gripline-operator
+gripline crypto activate --config c.json --kind pseudonym --generation <n> --fingerprint <fp> --reason "..." --operation-id <id> --token-file /run/secrets/gripline-operator
+gripline crypto activate --config c.json --kind signer --generation <n> --fingerprint <fp> --reason "..." --operation-id <id> --token-file /run/secrets/gripline-operator
+gripline crypto retire --config c.json --kind <kind> --generation <n> --fingerprint <fp> --not-before <RFC3339> --reason "..." --operation-id <id> --token-file /run/secrets/gripline-operator
 ```
 
 Lifecycle and audit commands use the running private admin listener by default;
@@ -174,10 +209,12 @@ container, use a bounded tmpfs mount such as
 The stock executable supports versioned verifier peppers through
 `secrets.pepper_versions` (the example maps version `1` to
 `GRIPLINE_PEPPER_V1`). Keep the old version and add the new version during a
-migration; existing records continue to authenticate, while `credential add`
-derives new verifiers with the highest configured version. Re-provision records
-before retiring an old pepper. Pepper material belongs in the deployment's
-secret injector, not in the state database.
+rotation. In standalone mode the configured active ring is used; in clustered
+mode the shared PostgreSQL `PepperActiveVersion` is authoritative, so staged
+material is never used for ordinary provisioning. Re-provision records before
+retiring an old pepper. Pepper material belongs in the deployment's secret
+injector, not in the state database. Pseudonym rotations use the same staged,
+acknowledged-generation protocol and preserve existing source scope identity.
 
 ## Guarantees (and how they are proven)
 
@@ -269,9 +306,13 @@ before accepting production traffic.
 
 ## Status
 
-**Phase: public beta.** The containment story is complete and acceptance-proven
-on a single node. `AUDIT.md` is the durable verdict table for both external
-reviews; the known-gaps list below is the binding honesty surface.
+**Phase: production candidate, not yet a stable release.** Standalone/bbolt
+and clustered/PostgreSQL authority paths are implemented and covered by unit,
+integration, and executable acceptance tests. Stable-release qualification
+still requires hosted provenance, PostgreSQL HA/failover evidence, production
+network-perimeter verification, and provider SDK/usage integration evidence.
+`AUDIT.md` is the durable verdict table; the remaining qualification list
+below is the binding honesty surface.
 
 `✅` = implemented + tested · `◇` = partially / sketched
 
@@ -299,12 +340,10 @@ reviews; the known-gaps list below is the binding honesty surface.
 12. ✅ adaptive-state failure semantics — DEGRADED never fails open (P0.1)
 13. ✅ source-spray anomaly detector, bounded under one-shot-subject floods
     (`internal/anomaly`, P0.30–P0.32)
-14. ◇ acceptance-gate COMPONENT tests (`internal/gates`, spec §111) — in-process
-    component approximations of gates A–J, honestly named (`...Component`), plus
-    a compiled single-node release harness covering the public verifier hop.
-    These are NOT the full gates: multi-node resource proofs, network isolation,
-    cross-process replay, and external telemetry canaries remain deployment
-    evidence. Passing this package must never be reported as "gates A–J green".
+14. ✅ acceptance proof surface (`internal/gates`, spec §111) — component
+    invariants plus compiled single-node and three-node PostgreSQL harnesses.
+    Gate J is executable in CI; network isolation, external telemetry, and
+    provider SDK canaries remain deployment evidence.
 15. ✅ shadow-first auto-quarantine — `Risk.EnableAutomaticQuarantine=false` default;
     request-level denial still fires, persisted quarantine stays operator-set
 16. ✅ deployable executable — `cmd/gripline` + `internal/config`: boot-validated
@@ -320,9 +359,10 @@ internal/secret        SealedSecret: opaque state pointer, active redaction of e
 internal/credential    HMAC-SHA256 pepper verifier (keys copied on ingestion, empty keys refused),
                        CredentialRecord, status machine + hysteresis, registry with rotation-safe
                        verifier indexes + defensive re-check (INV-1,13)
-internal/statebolt     the single transactional bbolt authority: credentials + verifier index,
-                       lanes, evidence, policy lifecycle/artifacts, operator audit, operator posture — one write path,
-                       pure shared reducers (no semantic drift vs the memory backends)
+internal/statebolt     transactional bbolt authority for standalone mode: credentials + verifier index,
+                       lanes, evidence, policy lifecycle/artifacts, operator audit, operator posture
+internal/statepg       PostgreSQL clustered authority: shared credentials, lanes, evidence, policy,
+                       posture/audit, adaptive state, crypto generations, membership/fencing, resources
 internal/pseudonym     keyed HMAC source/fingerprint IDs (fail-closed construction, key copies,
                        negative versions refused), rotation (key distinct from verifier pepper)
 internal/principal     Principal / AuthorizedContext (no secret field)
@@ -351,54 +391,33 @@ internal/anomaly       source-spray signal detector (ASN/credential/invalid-key 
                        + emit cooldown; signals resolve through Mint at the current policy revision
 internal/observability DecisionRecord per admission (§97) projected from the internal DecisionTrace
                        (P0.50): denied decisions carry principal, lane, and policy revision (P0.51)
-internal/gates         component invariant tests for the §111 gate properties (honestly named
-                       `...Component`) — NOT the acceptance gates; compiled release/chaos harness shipped
+internal/gates         component invariant tests plus executable release, chaos, and three-node
+                       PostgreSQL cluster harnesses
 ```
 
-### Known gaps (audit honesty)
+### Remaining qualification (audit honesty)
 
-These are known-unfinished parts of the system, stated here so no invariant is
-claimed beyond what the implementation establishes:
+These boundaries remain explicit; none should be inferred away from the
+passing repository tests:
 
-- **Policy immutability:** the terminator enforces a compiled deep-copy
-  snapshot and `policy.Manager` provides monotonic prepare/activate,
-  last-known-good rollback, durable-manifest/artifact retention, and audit
-  transitions. Configured policy files use the version-1 Ed25519 envelope;
-  deployments may replace its verifier with a KMS/HSM integration.
-- **One policy per process:** the shipped runtime selects one compiled policy
-  snapshot for each process. `PlanID` is required credential metadata, but a
-  multi-plan provider policy resolver is not shipped; deployments that need
-  multiple plans must run separate policy-bound processes or add that resolver
-  at the integration seam.
-- **Single-node durable authority:** containment state is durable in one
-  transactional bbolt database and restart-proven, but this is a SINGLE-NODE
-  authority. Cross-replication (a BLOCKED lane blocked on every replica,
-  shared resource leases across nodes, leader election) is out of beta scope.
-- **Single-process resources:** the concurrency pool and token buckets prove
-  the atomic accounting invariants in-process. Resource windows are explicitly
-  process-lifetime and volatile; cross-node leases, reservation TTLs, orphan
-  recovery, and durable budget continuity need a shared backend (see
-  `07-deployment.md`).
-- **Streaming equivalence is gate-tested, not SDK-proven:** the proxy streams
-  generic HTTP + SSE pass-through with per-chunk flush and is acceptance-tested
-  for byte fidelity, incremental chunk arrival, and stalled-stream cuts. The
-  real third-party SDK matrix (OpenAI/Anthropic Python-TS, Claude Code, Codex)
-  is not run in this repo; connector-level equivalence is verified in the
-  hosting integration.
-- **Provider adapters are explicit seams:** public `adapter/ingress` and
-  `adapter/usage` contracts are shipped, with bounded OpenAI/Anthropic JSON
-  metering and static CIDR metadata as reference adapters. A hosting
-  integration must still wire authenticated edge source resolution and its
-  authoritative provider usage semantics; `NoUsage` remains request-only.
+- **One policy per process:** the runtime selects one compiled policy snapshot
+  for each process. `PlanID` is required credential metadata, but a multi-plan
+  provider policy resolver is not shipped.
+- **Backend and PostgreSQL perimeter:** the verifier backend must be private or
+  mutually authenticated, and remote PostgreSQL must use authenticated TLS.
+  PostgreSQL HA, replication, backup/PITR, failover, and operator secret
+  delivery remain infrastructure responsibilities.
+- **Provider integrations:** public ingress and usage adapter contracts are
+  shipped, with bounded OpenAI/Anthropic reference adapters and static CIDR
+  metadata. `usage.mode=none` is request/concurrency accounting only; real
+  deployments must wire authoritative provider token/cost usage and validate
+  their SDK matrix (including streaming, retries, and cancellation).
+- **Stable-release provenance:** this working tree is not itself a hosted
+  release. A stable tag must pass hosted CI/release, container smoke, checksum,
+  signature, and build-provenance verification from the exact audited commit.
 - **Legacy Gob evidence:** `internal/evidence` remains for compatibility and
-  explicitly ephemeral use. Production deployments must use `internal/statebolt`
-  as the single transactional credential/lane/evidence/audit authority.
-- **Acceptance gates are components, not gates:** `internal/gates` proves
-  in-process approximations of the §111 properties under honest names. The
-  compiled release harness proves the single-node gateway-to-public-verifier
-  path; telemetry canary sweeps, network-isolation proofs, cross-process
-  decision replay, and multi-node resource accounting remain deployment
-  evidence. Do not certify release from this repo's tests alone.
+  explicitly ephemeral use. Production standalone uses bbolt; clustered mode
+  uses PostgreSQL.
 
 ## Invariants
 

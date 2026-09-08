@@ -1,11 +1,21 @@
 # 07 — Deployment, Failure Semantics, Integration
 
-## 1. Modes → implementation phases (target architecture)
+## 1. Deployment modes and implementation phases
 
-The phases below describe the desired deployment progression, not a claim that
-every phase is delivered by this repository. The stock binary is a single-node
-`TERMINATE` + `ENFORCE` runtime with durable bbolt containment state and
-process-local resource windows.
+Gripline supports two authority topologies. Both expose the same
+`TERMINATE` + `ENFORCE` data-plane contract; the authority choice determines
+whether durable state is local to one process or shared by active/active nodes.
+
+| Topology | Durable authority | Resource behavior | Suitable deployment |
+|---|---|---|---|
+| `standalone` / bbolt | One local transactional bbolt file | Process-local buckets and leases; restart resets in-flight resource state | One gateway process or deliberately isolated development |
+| `clustered` / PostgreSQL | Shared credentials, lanes, evidence, policy, posture, audit, adaptive rows, crypto generations, membership, buckets, and leases | PostgreSQL-authoritative reservations with TTL, renewal, fencing, and conservative settlement | Multiple active/active gateways behind a load balancer |
+
+PostgreSQL HA, backups/PITR, TLS certificates, operator-token delivery, and the
+private network perimeter remain deployment responsibilities. A clustered node
+must not be advertised as ready unless it owns its membership epoch, can read
+the active policy and shared posture, has matching crypto generations, and can
+reach the resource authority.
 
 See `00-overview.md §4` for mode semantics. Deployment phases (§102):
 
@@ -20,7 +30,7 @@ Phase 6 Auto quarantine  only after validated shadow results
 Phase 7 Hardened auth  sender-constrained (DPoP / mTLS / platform keys)
 ```
 
-## 2. Consistency requirements (supported v1 versus target)
+## 2. Consistency requirements
 
 - **Strong in one authority:** credential revocation, hard concurrency
   admission, configured request/token/cost reservations, and emergency block
@@ -32,29 +42,54 @@ Phase 7 Hardened auth  sender-constrained (DPoP / mTLS / platform keys)
 - Never treat eventually-consistent state as authoritative for a hard limit
   (§77).
 
-## 3. Multi-node & hot keys (future deployment boundary)
+## 3. Cluster topology, fencing, and rollout
 
-Active/active data-plane nodes, stateless w.r.t. durable config, shared state
-for hard limits. A single hot credential must not destabilize global state — no
-one centralized mutex per request; leases/tokens are sharded/atomic per scope
-(§78–79). Load testing must cover one-credential-high-concurrency and lane
-explosion. The current Governor removes the process-wide admission lock and
-proves per-object atomicity, but it is not a cross-node lease service.
+The supported clustered shape is:
+
+```text
+                         ┌─ Gripline A ─┐
+client ─ load balancer ──┼─ Gripline B ─┼── private verifier backend
+                         └─ Gripline C ─┘
+                                  │
+                           PostgreSQL authority
+```
+
+Each process needs a unique configured `authority.node_id`. PostgreSQL assigns
+an instance identity and fencing epoch at registration. Heartbeats are scoped
+to that epoch; a replaced or paused process loses ownership and must stop
+serving. Resource leases carry the same epoch, so a stale process cannot renew,
+settle, or release capacity owned by its replacement. `/readyz` is the load
+balancer contract: route only to nodes returning 200.
+
+Before starting serving nodes on a new or upgraded database, run:
+
+```bash
+gripline migrate plan --config /etc/gripline/config.json
+gripline migrate apply --config /etc/gripline/config.json
+```
+
+Serving nodes use `Migrate=false` and only check schema compatibility. Do not
+give the Internet-facing runtime database role DDL privileges. For a v1
+rolling upgrade, keep protocol/schema compatibility within the documented
+supported range and drain old nodes before any incompatible migration.
+
+Crypto rotation is also a cluster operation: stage identical signer/pepper/
+pseudonym material, make every live node acknowledge the exact fingerprint,
+activate through the authenticated control plane, and wait for every node to
+reconcile before relying on the new generation. Signer activation requires a
+backend canary acceptance; retirement waits for the assertion TTL plus clock
+skew and verifies that old pepper credentials/source scopes are gone.
 
 ## 4. Dependency failure semantics
 
-The table below is the target multi-service contract. Entries marked **target**
-are not silently claimed by the stock single-node binary; the executable
-behavior is the final sentence in each row.
-
 | Dependency down | Behavior |
 |---|---|
-| Credential registry | **target:** short authenticated local cache (≤60s); v1 fails closed on registry errors |
+| Credential registry | Clustered and standalone admission fails closed on registry errors; no stale credential cache is used for security decisions |
 | Risk store | `DEGRADED_STATIC`; never disable hard limits |
-| Resource state | **target:** bounded distributed fallback; v1 governor is process-local and never unlimited |
-| Policy service | **target:** last validated policy; v1 uses the durable local manifest and signed artifact |
+| Resource state | Clustered PostgreSQL outage makes readiness unhealthy and new protected traffic fails closed; standalone keeps its process-local authority |
+| Policy service | Clustered nodes require the shared active manifest/artifact; policy read/reconcile failure makes the node unready |
 | Analytics | proxy continues; bounded queue drops are counted |
-| Internal signer | **target:** alternate hot signer; v1 fails closed for new upstream authorization |
+| Internal signer | New upstream authorization fails closed when signing is unavailable |
 
 Control-plane dependency degradation must not silently weaken the data plane
 (§61): data-plane admission remains fail-closed and loads only
@@ -63,22 +98,27 @@ of the process lifecycle, so listener construction or serve failure is
 reported and the supervisor drains both servers.
 
 The private admin listener exposes authenticated low-cardinality metrics at
-`GET /admin/metrics` (`audit.read`). It reports admission/denial classes,
-degraded decisions, resource/policy denials, bounded spool utilization,
-backend failures/status classes, active streams, bbolt transaction counts and
-latency, source-table saturation/overflow, detector drops, telemetry sink
-failures, global evidence-sweep counters, and active policy revision/signer
-identity. No request, credential, policy ID, signer KID, or source value is a
+`GET /admin/metrics` (`audit.read`). In clustered mode, use the PostgreSQL
+authority status and node metrics for pool waits, transaction/retry failures,
+reservation/lease state, policy lag, crypto-generation acknowledgements, and
+fencing. No request, credential, policy ID, signer KID, or source value is a
 metric label.
 
-## 5. Single-node boundary
+## 5. Resource and lease semantics
 
-This release has one authoritative bbolt file per runtime. Credential, lane,
-evidence, policy lifecycle, posture, audit, detector state, recovery manifests,
-and signer publication are restart-safe within that node. Resource buckets and in-flight
-leases are process-local and reset on restart; do not deploy multiple active
-nodes and call the resource limits globally enforced until a shared lease,
-reservation-TTL, replication, and leader/ownership protocol has been added.
+In PostgreSQL mode, reservation and release use one canonical scope/key lock
+order and database-authoritative time. A lease is:
+
+```text
+reserve → RESERVED → mark forwarded → FORWARDED → settle/release → SETTLED/RELEASED
+```
+
+An abandoned `RESERVED` lease refunds its estimate. A `FORWARDED` lease with no
+trusted settlement consumes at least its estimate and releases only
+concurrency; it never mints budget back after uncertain backend execution.
+Deadlock/serialization retries are bounded by the request context. In bbolt
+mode, the same API is backed by the local governor and in-flight leases are
+lost on process restart.
 
 ## 6. FreeInference integration
 

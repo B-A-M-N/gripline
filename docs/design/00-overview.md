@@ -98,10 +98,19 @@ where credentials can propagate
 | `QUARANTINE` | automated lane/credential quarantine after shadow validation | gated by validation |
 | `HARDENED` | optional proof-of-possession (DPoP / mTLS-bound) | opt-in for clients |
 
-The initial implementation targets `TERMINATE` + `ENFORCE` core semantics, with
-`HYGIENE` redaction and `OBSERVE` shadow evidence available. The shipped
-resource authority is single-node/process-local; distributed leases and
-durable budget continuity are target architecture, not a current guarantee.
+The implementation supports `TERMINATE` + `ENFORCE` in two authority
+topologies:
+
+| Topology | Authority and guarantees |
+|---|---|
+| `standalone` / bbolt | One durable local credential/lane/evidence/policy/posture/audit authority; resource buckets and in-flight leases are process-local and reset on restart. |
+| `clustered` / PostgreSQL | Active/active nodes share credentials, lanes, evidence, policy, posture/audit, adaptive state, resource buckets/leases, membership/fencing, and crypto-generation state. PostgreSQL outage makes nodes unready and admission fails closed. |
+
+Clustered nodes require a shared PostgreSQL authority, unique `node_id` values,
+an already-compatible schema, identical staged cryptographic generations, and
+a private verifier backend. PostgreSQL HA, backup/PITR, TLS, and the network
+perimeter remain deployment responsibilities. See `07-deployment.md` for
+migration, fencing, rotation, and failure procedures.
 
 ---
 

@@ -41,7 +41,7 @@ resale simulation, resource drain, and each dependency outage (risk store,
 credential DB, policy, gateway restart, signer failure) with **expected
 behavior specified before the test** (§109).
 
-The repository includes two executable release checks. `scripts/release-harness.sh`
+The repository includes executable release checks. `scripts/release-harness.sh`
 builds separate gateway, assertion-fixture, and public-verifier backend
 processes, then proves direct raw-key denial, malformed/forged/wrong
 audience/issuer/KID/revision assertions, query/body fidelity, chunked input,
@@ -50,7 +50,12 @@ upstream dial failure, idle-stream cutting, client cancellation, connection
 reuse, persistent restart, and exact-credential canary absence. The harness is
 not a production network-isolation or third-party SDK proof. `scripts/chaos-smoke.sh`
 adds executable state/keyring/backend/spool/telemetry failure seams and runs
-the release harness again.
+the release harness again. `scripts/cluster-harness.sh` runs three active/active
+gateways against PostgreSQL and proves shared concurrency, revocation,
+posture, policy, crypto rotation, source continuity, fencing, killed-node
+recovery, backend cancellation, and PostgreSQL outage/recovery. CI and release
+jobs require the PostgreSQL outage segment; local runs may skip it only when no
+PostgreSQL service container is available.
 
 ## 4. Acceptance gates (§111)
 
@@ -66,15 +71,17 @@ the release harness again.
 - **Gate G** — packet/request/trace/process verification: no external credential downstream.
 - **Gate H** — automatic quarantine disabled until shadow validation.
 - **Gate I** — lane-scoped compromise does not disable established legitimate lanes.
-- **Gate J** — multi-node concurrency/resource accounting is a deployment gate;
-  it is explicitly out of scope for this single-node release.
+- **Gate J** — three-node PostgreSQL concurrency/resource accounting,
+  cross-node state propagation, crypto rollout, fencing, and authority outage
+  recovery pass through `scripts/cluster-harness.sh`.
 
 ## 5. Performance & security gates (§112, §108)
 
 β pHs target: p95 added < 2ms, p99 < 5ms; 0 credential-bearing logs; 0 direct
 backend public paths; 100% deterministic authorization; 0 unsupported streaming body
 mutation. The durable benchmark reports p50/p95/p99 and throughput for the
-state-backed proxy path; it is a regression signal, not a universal SLO.
+state-backed proxy path; clustered qualification must separately measure
+PostgreSQL arbitration, pool waits, lock contention, and three-node p95/p99.
 Security tests cover log-injection, malformed/duplicate Authorization, header
 smuggling, forged forwarding headers, forged Gripline headers, direct backend
 bypass, bearer/proof replay, resource & concurrency races, baseline poisoning,

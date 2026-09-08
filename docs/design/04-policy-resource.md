@@ -2,10 +2,14 @@
 
 ## 1. Versioned policy
 
-Resource windows are process-local and volatile in single-node v1. They reset when
-the process restarts; durable credential, lane, evidence, audit, and posture
-state do not. Multi-node shared leases and window persistence are target
-architecture and are not claimed by this implementation.
+Resource behavior follows the selected authority topology. In standalone/bbolt
+mode, buckets and in-flight leases are process-local and reset on restart. In
+clustered/PostgreSQL mode, credentials, lanes, evidence, policy, posture,
+adaptive rows, and resource buckets/leases are shared and durable. PostgreSQL
+uses TTL leases, node-instance fencing, database time, canonical row-lock
+ordering, bounded transaction retries, and conservative settlement semantics.
+The stock `usage.mode=none` configuration still meters requests only; token and
+cost dimensions become active only when a provider usage adapter is configured.
 
 All policy is versioned (`id` + monotonically increasing `revision`). The
 `policy.Manager` prepare/activate lifecycle validates candidates, persists an
@@ -55,12 +59,13 @@ MUST NOT override a higher-priority denial (§58):
   expensive models, reduce concurrency, disable source classes, quarantine
   credentials, restrict admin APIs.
 
-Failure semantics (§60) for the supported single-node runtime are: credential
-or adaptive-state failure fails closed or enters `DEGRADED_STATIC` without
-disabling hard limits; analytics failure continues through a bounded queue;
-and signer failure fails closed for new upstream authorization. The
-authenticated local credential cache, distributed resource-state fallback, and
-policy-service outage behavior are target integrations, not stock v1 behavior.
+Failure semantics (§60) are fail-closed for security authority failures:
+credential/authority errors deny admission, policy or posture cannot be read as
+an implicit allow, and signer failure denies new upstream authorization.
+Analytics may continue through a bounded queue. In clustered mode a PostgreSQL
+outage makes nodes unready and prevents new protected traffic from reaching the
+backend; recovery requires a successful shared-authority and policy/crypto
+reconciliation.
 INV-9: analytics failure never disables hard quotas.
 
 ## 4. Resource dimensions & scopes
@@ -76,19 +81,22 @@ credential-cost, account-cost) carry `capacity, refill_rate, balance,
 revision`. Updates are **atomic** where concurrent authorizations could
 oversubscribe limits.
 
-## 6. Concurrency leases (single-node v1)
+## 6. Concurrency leases
 
-Concurrency is represented with atomic leases carrying TTLs:
+Concurrency is represented with atomic leases carrying TTLs. In PostgreSQL mode
+the lease row includes the owning node instance epoch and all scope rows are
+locked in canonical order:
 
 ```
 admission → lease acquired → upstream active → {completion | client-cancel |
 upstream-error | lease-timeout} → lease released
 ```
 
-The in-process lease holder owns a slot and releases at most once; a process
-crash releases all in-memory leases as the process exits. Cross-node lease TTL,
-renewal, and orphan reclamation remain target architecture. **INV-15:
-concurrency accounting never becomes negative**.
+The PostgreSQL reaper expires orphaned leases; a process crash therefore cannot
+permanently strand capacity. A forwarded-but-unsettled lease consumes its
+reserved estimate rather than refunding uncertain work. In bbolt mode the
+in-process lease holder releases at most once and process exit resets
+in-flight state. **INV-15: concurrency accounting never becomes negative**.
 
 ## 7. Reservation accounting
 
