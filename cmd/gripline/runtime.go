@@ -622,7 +622,7 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/admin/posture", adminPosture(svc))
 		mux.HandleFunc("/admin/credentials", adminCredentials(svc, adminState))
-		mux.HandleFunc("/admin/credentials/add", adminCredentialAdd(svc, adminState, peppers))
+		mux.HandleFunc("/admin/credentials/add", adminCredentialAdd(svc, adminState, peppers, policyManager, postgres))
 		mux.HandleFunc("/admin/credentials/pepper-status", adminCredentialPepperStatus(svc, adminState))
 		mux.HandleFunc("/admin/credentials/revoke", adminCredentialRevoke(svc))
 		mux.HandleFunc("/admin/lanes", adminLanes(svc, adminState))
@@ -974,7 +974,7 @@ func adminCredentialRevoke(svc *control.Service) http.HandlerFunc {
 	}
 }
 
-func adminCredentialAdd(svc *control.Service, state adminStateAuthority, peppers *credential.PepperRing) http.HandlerFunc {
+func adminCredentialAdd(svc *control.Service, state adminStateAuthority, peppers *credential.PepperRing, policyManager *policy.Manager, cryptoAuthority *statepg.Store) http.HandlerFunc {
 	type request struct {
 		CredentialID    string `json:"credential_id"`
 		AccountID       string `json:"account_id"`
@@ -998,10 +998,28 @@ func adminCredentialAdd(svc *control.Service, state adminStateAuthority, peppers
 			http.Error(w, "persistent credential authority unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		if req.CredentialID == "" || req.AccountID == "" || req.PolicyID == "" || req.PlanID == "" || req.VerifierB64 == "" || req.Reason == "" {
-			http.Error(w, "credential_id, account_id, policy_id, plan_id, verifier_b64, and reason are required", http.StatusBadRequest)
+		if req.CredentialID == "" || req.AccountID == "" || req.PlanID == "" || req.VerifierB64 == "" || req.Reason == "" {
+			http.Error(w, "credential_id, account_id, plan_id, verifier_b64, and reason are required", http.StatusBadRequest)
 			return
 		}
+		if policyManager == nil {
+			http.Error(w, "policy authority unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		// Provisioning is a control-plane mutation, but its policy binding is
+		// still security authority. Reconcile before accepting a caller-supplied
+		// id so a stale operator config cannot create a credential that
+		// immediately fails admission.
+		activePolicy, err := activeCredentialPolicy(r.Context(), policyManager, req.PolicyID)
+		if err != nil {
+			if errors.Is(err, errCredentialPolicyInactive) {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+			} else {
+				http.Error(w, "policy authority unavailable", http.StatusServiceUnavailable)
+			}
+			return
+		}
+		req.PolicyID = activePolicy
 		verifier, err := base64.StdEncoding.DecodeString(req.VerifierB64)
 		if err != nil || len(verifier) == 0 {
 			http.Error(w, "verifier_b64 must be valid base64", http.StatusBadRequest)
@@ -1015,25 +1033,16 @@ func adminCredentialAdd(svc *control.Service, state adminStateAuthority, peppers
 		if req.VerifierVersion == 0 {
 			req.VerifierVersion = 1
 		}
-		if req.PepperVersion == 0 {
-			if peppers == nil {
-				http.Error(w, "verifier pepper authority unavailable", http.StatusServiceUnavailable)
-				return
-			}
-			req.PepperVersion = peppers.Latest()
+		activePepperVersion, err := activeCredentialPepperVersion(r.Context(), peppers, cryptoAuthority)
+		if err != nil {
+			http.Error(w, "verifier pepper authority unavailable", http.StatusServiceUnavailable)
+			return
 		}
-		if peppers != nil {
-			configured := false
-			for _, version := range peppers.Versions() {
-				if version == req.PepperVersion {
-					configured = true
-					break
-				}
-			}
-			if !configured {
-				http.Error(w, "pepper_version is not configured", http.StatusBadRequest)
-				return
-			}
+		if req.PepperVersion == 0 {
+			req.PepperVersion = activePepperVersion
+		} else if req.PepperVersion != activePepperVersion {
+			http.Error(w, "pepper_version must match the active cluster generation", http.StatusBadRequest)
+			return
 		}
 		rec := credential.CredentialRecord{
 			CredentialID: req.CredentialID, AccountID: req.AccountID, Verifier: verifier,

@@ -3,9 +3,11 @@ set -euo pipefail
 
 image_name="${1:-gripline-ci}"
 container_name="gripline-smoke-$$"
+insecure_container_name="${container_name}-insecure"
 smoke_dir="$(mktemp -d)"
 cleanup() {
   docker rm -f "$container_name" >/dev/null 2>&1 || true
+  docker rm -f "$insecure_container_name" >/dev/null 2>&1 || true
   docker run --rm -v "$smoke_dir:/smoke" golang:1.25.13-alpine \
     chown -R "$(id -u):$(id -g)" /smoke >/dev/null 2>&1 || true
   rm -rf "$smoke_dir"
@@ -13,7 +15,13 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$smoke_dir/state" "$smoke_dir/tls"
-chmod 0777 "$smoke_dir/state"
+# The state directory is private to the non-root container user. Set its
+# ownership through a helper image because the host runner may not have UID
+# 65532 available. World/group-writable state is covered by the negative smoke
+# below and must never be the positive release path.
+chmod 0750 "$smoke_dir/state"
+docker run --rm -v "$smoke_dir/state:/state" golang:1.25.13-alpine \
+  chown -R 65532:65532 /state >/dev/null
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
   -subj '/CN=localhost' -keyout "$smoke_dir/tls/key.pem" \
   -out "$smoke_dir/tls/cert.pem" >/dev/null 2>&1
@@ -37,7 +45,7 @@ cat > "$smoke_dir/config.json" <<EOF
 EOF
 
 start_container() {
-  docker run -d --name "$container_name" --read-only --user 65532:65532 \
+  docker run -d --name "$1" --read-only --user 65532:65532 \
     -e "GRIPLINE_PEPPER_V1=$pepper_value" \
     -p 127.0.0.1:18443:18443 \
     --tmpfs /tmp/gripline-spool:rw,noexec,nosuid,size=64m \
@@ -45,6 +53,11 @@ start_container() {
     -v "$smoke_dir/tls:/etc/gripline/tls:ro" \
     -v "$smoke_dir/state:/var/lib/gripline" \
     "$image_name" >/dev/null
+}
+
+assert_state_files() {
+  docker run --rm -v "$smoke_dir/state:/state:ro" golang:1.25.13-alpine \
+    sh -c 'test -s /state/state.db && test -s /state/keyring.json' >/dev/null
 }
 
 wait_ready() {
@@ -56,15 +69,31 @@ wait_ready() {
   return 1
 }
 
-start_container
+start_container "$container_name"
 wait_ready
-test -s "$smoke_dir/state/state.db"
-test -s "$smoke_dir/state/keyring.json"
+assert_state_files
 docker kill --signal=TERM "$container_name" >/dev/null
 docker wait "$container_name" >/dev/null
 docker rm "$container_name" >/dev/null
-start_container
+start_container "$container_name"
 wait_ready
-test -s "$smoke_dir/state/state.db"
-test -s "$smoke_dir/state/keyring.json"
-echo "container smoke: persistent state/keyring, readiness, SIGTERM, restart passed"
+assert_state_files
+docker kill --signal=TERM "$container_name" >/dev/null
+docker wait "$container_name" >/dev/null
+docker rm "$container_name" >/dev/null
+
+# Keep an explicit regression test for the filesystem invariant that caused a
+# previous smoke failure. A deliberately insecure parent must fail closed.
+docker run --rm -v "$smoke_dir/state:/state" golang:1.25.13-alpine \
+  chmod 0777 /state >/dev/null
+start_container "$insecure_container_name"
+sleep 2
+insecure_state="$(docker inspect -f '{{.State.Status}}' "$insecure_container_name")"
+insecure_status="$(docker inspect -f '{{.State.ExitCode}}' "$insecure_container_name")"
+if [[ "$insecure_state" == "running" || "$insecure_state" == "restarting" || "$insecure_status" == "0" ]]; then
+  docker logs "$insecure_container_name" >&2 || true
+  echo "container smoke: insecure state directory unexpectedly started (state=$insecure_state exit=$insecure_status)" >&2
+  exit 1
+fi
+docker rm "$insecure_container_name" >/dev/null
+echo "container smoke: persistent state/keyring, readiness, SIGTERM, restart, insecure-state rejection passed"

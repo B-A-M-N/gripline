@@ -530,12 +530,32 @@ func runCredentialAddLiveWithOperationID(cfgPath, credID, accountID, policyID, p
 	if err != nil {
 		return err
 	}
+	client, err := newAdminClient(cfgPath)
+	if err != nil {
+		return err
+	}
+	clustered := strings.EqualFold(strings.TrimSpace(cfg.Authority.Backend), "postgres")
 	if policyID == "" {
-		pol, err := policyFor(cfg)
-		if err != nil {
-			return fmt.Errorf("credential add: active policy: %w", err)
+		if clustered {
+			var status struct {
+				Active *struct {
+					ID string `json:"id"`
+				} `json:"active"`
+			}
+			if err := client.request(http.MethodGet, "/admin/policy", token, nil, &status); err != nil {
+				return fmt.Errorf("credential add: read active policy: %w", err)
+			}
+			if status.Active == nil || status.Active.ID == "" {
+				return fmt.Errorf("credential add: live authority returned no active policy")
+			}
+			policyID = status.Active.ID
+		} else {
+			pol, err := policyFor(cfg)
+			if err != nil {
+				return fmt.Errorf("credential add: active policy: %w", err)
+			}
+			policyID = pol.ID
 		}
-		policyID = pol.ID
 	}
 	if cfg.Paths.State == "" && strings.ToLower(strings.TrimSpace(cfg.Authority.Backend)) != "postgres" {
 		return fmt.Errorf("credential add: live mode requires a configured persistent authority")
@@ -544,7 +564,25 @@ func runCredentialAddLiveWithOperationID(cfgPath, credID, accountID, policyID, p
 	if err != nil {
 		return err
 	}
-	pepperVersion := peppers.Latest()
+	pepperVersion := peppers.ActiveVersion()
+	if clustered {
+		var status struct {
+			Crypto struct {
+				Initialized         bool `json:"initialized"`
+				PepperActiveVersion int  `json:"pepper_active_version"`
+			} `json:"crypto"`
+		}
+		if err := client.request(http.MethodGet, "/admin/crypto", token, nil, &status); err != nil {
+			return fmt.Errorf("credential add: read active pepper: %w", err)
+		}
+		if !status.Crypto.Initialized || status.Crypto.PepperActiveVersion < 1 {
+			return fmt.Errorf("credential add: live authority returned no active pepper")
+		}
+		pepperVersion = status.Crypto.PepperActiveVersion
+	}
+	if _, ok := peppers.VersionFingerprint(pepperVersion); !ok {
+		return fmt.Errorf("credential add: active pepper generation %d is not loaded locally", pepperVersion)
+	}
 	raw, err := io.ReadAll(io.LimitReader(os.Stdin, terminator.MaxExternalCredentialBytes+1))
 	if err != nil {
 		return fmt.Errorf("credential add: read --secret-stdin: %w", err)
@@ -574,10 +612,6 @@ func runCredentialAddLiveWithOperationID(cfgPath, credID, accountID, policyID, p
 		}
 	}()
 	sealed.Zero()
-	client, err := newAdminClient(cfgPath)
-	if err != nil {
-		return err
-	}
 	if err := client.requestWithOperationID(http.MethodPost, "/admin/credentials/add", token, operationID, map[string]any{
 		"credential_id": credID, "account_id": accountID, "policy_id": policyID, "plan_id": planID,
 		"verifier_b64": base64.StdEncoding.EncodeToString(verifier), "verifier_version": 1,
