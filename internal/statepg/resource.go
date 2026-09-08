@@ -449,32 +449,45 @@ func (r *distributedReservation) MarkForwarded(ctx context.Context) error {
 			r.store.metrics.forwardFailures.Add(1)
 		}
 	}()
-	tx, err := begin(ctx, r.store.pool)
-	if err != nil {
-		return mapDBError(err)
-	}
-	defer tx.Rollback(ctx)
-	now, err := dbNow(ctx, tx)
-	if err != nil {
-		return err
-	}
-	if err := r.store.requireNodeOwnership(ctx, tx, false); err != nil {
-		return err
-	}
 	var expires time.Time
-	err = tx.QueryRow(ctx, `UPDATE gripline_resource_leases SET state=$1, forwarded_at=$2 WHERE lease_id=$3 AND node_id=$4 AND node_epoch=$5 AND state=$6 AND expires_at>$2 RETURNING expires_at`, leaseForwarded, now, r.leaseID, r.store.nodeID, r.store.nodeEpoch, leaseReserved).Scan(&expires)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return ErrLeaseExpired
-	}
+	err := r.store.withTransactionRetry(ctx, "resource forward", func() error {
+		var err error
+		expires, err = r.markForwardedOnce(ctx)
+		return err
+	})
 	if err != nil {
-		return mapDBError(err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return mapDBError(err)
+		return err
 	}
 	r.forwarded, r.expiresAt = true, expires
 	succeeded = true
 	return nil
+}
+
+func (r *distributedReservation) markForwardedOnce(ctx context.Context) (time.Time, error) {
+	tx, err := begin(ctx, r.store.pool)
+	if err != nil {
+		return time.Time{}, mapDBError(err)
+	}
+	defer tx.Rollback(ctx)
+	now, err := dbNow(ctx, tx)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if err := r.store.requireNodeOwnership(ctx, tx, false); err != nil {
+		return time.Time{}, err
+	}
+	var expires time.Time
+	err = tx.QueryRow(ctx, `UPDATE gripline_resource_leases SET state=$1, forwarded_at=$2 WHERE lease_id=$3 AND node_id=$4 AND node_epoch=$5 AND state=$6 AND expires_at>$2 RETURNING expires_at`, leaseForwarded, now, r.leaseID, r.store.nodeID, r.store.nodeEpoch, leaseReserved).Scan(&expires)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, ErrLeaseExpired
+	}
+	if err != nil {
+		return time.Time{}, mapDBError(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return time.Time{}, mapDBError(err)
+	}
+	return expires, nil
 }
 
 func (r *distributedReservation) Renew(ctx context.Context) error {
@@ -494,32 +507,45 @@ func (r *distributedReservation) Renew(ctx context.Context) error {
 			r.store.metrics.leaseRenewalFailures.Add(1)
 		}
 	}()
-	tx, err := begin(ctx, r.store.pool)
-	if err != nil {
-		return mapDBError(err)
-	}
-	defer tx.Rollback(ctx)
-	now, err := dbNow(ctx, tx)
-	if err != nil {
-		return err
-	}
-	if err := r.store.requireNodeOwnership(ctx, tx, true); err != nil {
-		return err
-	}
 	var expires time.Time
-	err = tx.QueryRow(ctx, `UPDATE gripline_resource_leases SET expires_at=$1 WHERE lease_id=$2 AND node_id=$3 AND node_epoch=$4 AND state IN ($5,$6) AND expires_at>$7 RETURNING expires_at`, now.Add(r.store.leaseTTL), r.leaseID, r.store.nodeID, r.store.nodeEpoch, leaseReserved, leaseForwarded, now).Scan(&expires)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return ErrLeaseExpired
-	}
+	err := r.store.withTransactionRetry(ctx, "resource lease renewal", func() error {
+		var err error
+		expires, err = r.renewOnce(ctx)
+		return err
+	})
 	if err != nil {
-		return mapDBError(err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return mapDBError(err)
+		return err
 	}
 	r.expiresAt = expires
 	succeeded = true
 	return nil
+}
+
+func (r *distributedReservation) renewOnce(ctx context.Context) (time.Time, error) {
+	tx, err := begin(ctx, r.store.pool)
+	if err != nil {
+		return time.Time{}, mapDBError(err)
+	}
+	defer tx.Rollback(ctx)
+	now, err := dbNow(ctx, tx)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if err := r.store.requireNodeOwnership(ctx, tx, true); err != nil {
+		return time.Time{}, err
+	}
+	var expires time.Time
+	err = tx.QueryRow(ctx, `UPDATE gripline_resource_leases SET expires_at=$1 WHERE lease_id=$2 AND node_id=$3 AND node_epoch=$4 AND state IN ($5,$6) AND expires_at>$7 RETURNING expires_at`, now.Add(r.store.leaseTTL), r.leaseID, r.store.nodeID, r.store.nodeEpoch, leaseReserved, leaseForwarded, now).Scan(&expires)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, ErrLeaseExpired
+	}
+	if err != nil {
+		return time.Time{}, mapDBError(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return time.Time{}, mapDBError(err)
+	}
+	return expires, nil
 }
 
 func (r *distributedReservation) SettleContext(ctx context.Context, actual resource.UsageEstimate) error {
@@ -539,6 +565,18 @@ func (r *distributedReservation) SettleContext(ctx context.Context, actual resou
 			r.store.metrics.settlementFailures.Add(1)
 		}
 	}()
+	err := r.store.withTransactionRetry(ctx, "resource lease settlement", func() error {
+		return r.settleOnce(ctx, actual)
+	})
+	if err != nil {
+		return err
+	}
+	r.settled = true
+	succeeded = true
+	return nil
+}
+
+func (r *distributedReservation) settleOnce(ctx context.Context, actual resource.UsageEstimate) error {
 	tx, err := begin(ctx, r.store.pool)
 	if err != nil {
 		return mapDBError(err)
@@ -561,7 +599,6 @@ func (r *distributedReservation) SettleContext(ctx context.Context, actual resou
 		return mapDBError(err)
 	}
 	if state == leaseReleased || state == leaseSettled {
-		succeeded = true
 		return nil
 	}
 	if !expires.After(now) {
@@ -592,8 +629,6 @@ func (r *distributedReservation) SettleContext(ctx context.Context, actual resou
 	if err := tx.Commit(ctx); err != nil {
 		return mapDBError(err)
 	}
-	r.settled = true
-	succeeded = true
 	return nil
 }
 
@@ -667,6 +702,12 @@ func (r *distributedReservation) ExpiresAt() time.Time {
 }
 
 func releaseLease(ctx context.Context, s *Store, leaseID, nodeID string, nodeEpoch int64) error {
+	return s.withTransactionRetry(ctx, "resource lease release", func() error {
+		return releaseLeaseOnce(ctx, s, leaseID, nodeID, nodeEpoch)
+	})
+}
+
+func releaseLeaseOnce(ctx context.Context, s *Store, leaseID, nodeID string, nodeEpoch int64) error {
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return mapDBError(err)
@@ -771,6 +812,14 @@ func (s *Store) leaseReaper() {
 }
 
 func (s *Store) reapExpired(ctx context.Context) error {
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
+	return s.withTransactionRetry(ctx, "resource lease expiration", func() error {
+		return s.reapExpiredOnce(ctx)
+	})
+}
+
+func (s *Store) reapExpiredOnce(ctx context.Context) error {
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return mapDBError(err)
@@ -833,6 +882,16 @@ func (s *Store) reapExpired(ctx context.Context) error {
 func (s *Store) RemoveScopeContext(ctx context.Context, scope resource.Scope, id string) (bool, error) {
 	ctx, cancel := s.operationContext(ctx)
 	defer cancel()
+	var removed bool
+	err := s.withTransactionRetry(ctx, "resource scope removal", func() error {
+		var err error
+		removed, err = s.removeScopeOnce(ctx, scope, id)
+		return err
+	})
+	return removed, err
+}
+
+func (s *Store) removeScopeOnce(ctx context.Context, scope resource.Scope, id string) (bool, error) {
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return false, mapDBError(err)

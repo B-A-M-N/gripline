@@ -366,6 +366,11 @@ type MetricsSnapshot struct {
 	Backend5xx                 uint64
 	ActiveStreams              uint64
 	EvidenceEvents             uint64
+	UsageSessions              uint64
+	UsageInputTokens           uint64
+	UsageOutputTokens          uint64
+	UsageCombinedTokens        uint64
+	UsageCostMicrounits        uint64
 	ResourceDenialsByScope     [5]uint64
 	ResourceDenialsByDimension [6]uint64
 	Spool                      SpoolStats
@@ -376,6 +381,8 @@ type proxyMetrics struct {
 	degraded, resourceDenials, policyDenials, payloadTooLarge atomic.Uint64
 	spoolRejects, completionFailures, backendFailures         atomic.Uint64
 	backend4xx, backend5xx, activeStreams, evidenceEvents     atomic.Uint64
+	usageSessions, usageInputTokens, usageOutputTokens        atomic.Uint64
+	usageCombinedTokens, usageCostMicrounits                  atomic.Uint64
 	resourceByScope                                           [5]atomic.Uint64
 	resourceByDim                                             [6]atomic.Uint64
 }
@@ -393,7 +400,10 @@ func (d *DataPlane) Metrics() MetricsSnapshot {
 		BackendFailures: d.metrics.backendFailures.Load(), Backend4xx: d.metrics.backend4xx.Load(),
 		Backend5xx: d.metrics.backend5xx.Load(), ActiveStreams: d.metrics.activeStreams.Load(),
 		EvidenceEvents: d.metrics.evidenceEvents.Load(),
-		Spool:          d.spool.Stats(),
+		UsageSessions:  d.metrics.usageSessions.Load(), UsageInputTokens: d.metrics.usageInputTokens.Load(),
+		UsageOutputTokens: d.metrics.usageOutputTokens.Load(), UsageCombinedTokens: d.metrics.usageCombinedTokens.Load(),
+		UsageCostMicrounits: d.metrics.usageCostMicrounits.Load(),
+		Spool:               d.spool.Stats(),
 	}
 	for i := range snapshot.ResourceDenialsByScope {
 		snapshot.ResourceDenialsByScope[i] = d.metrics.resourceByScope[i].Load()
@@ -402,6 +412,22 @@ func (d *DataPlane) Metrics() MetricsSnapshot {
 		snapshot.ResourceDenialsByDimension[i] = d.metrics.resourceByDim[i].Load()
 	}
 	return snapshot
+}
+
+func (d *DataPlane) recordUsage(actual resource.UsageEstimate) {
+	d.metrics.usageSessions.Add(1)
+	if actual.InputTokens > 0 {
+		d.metrics.usageInputTokens.Add(uint64(actual.InputTokens))
+	}
+	if actual.OutputTokens > 0 {
+		d.metrics.usageOutputTokens.Add(uint64(actual.OutputTokens))
+	}
+	if actual.CombinedTokens > 0 {
+		d.metrics.usageCombinedTokens.Add(uint64(actual.CombinedTokens))
+	}
+	if actual.CostMicrounits > 0 {
+		d.metrics.usageCostMicrounits.Add(uint64(actual.CostMicrounits))
+	}
 }
 
 // New validates the required seams and returns a DataPlane. Fail-closed: a
@@ -792,6 +818,7 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Finish produces the settled usage from that final surface; a header-only
 	// provider implementation still settles correctly here.
 	actual := meter.Finish(streamErr)
+	d.recordUsage(actual)
 	// P0.36: only the reserved-but-unused remainder is refunded, and only to this
 	// reservation's own buckets. Runs BEFORE the deferred Release so unsettled
 	// holds are never cancelled-and-refunded in full. Concurrency is released by

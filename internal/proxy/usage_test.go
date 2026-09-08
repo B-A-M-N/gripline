@@ -150,6 +150,10 @@ func TestDataPlaneSettlesReservationWithActualUsage(t *testing.T) {
 	if finishErrs != 1 || finishErr != nil {
 		t.Fatalf("Finish must be called exactly once with nil stream error, got n=%d err=%v", finishErrs, finishErr)
 	}
+	metrics := dp.Metrics()
+	if metrics.UsageSessions != 1 || metrics.UsageCombinedTokens != 10 {
+		t.Fatalf("usage metrics=%+v, want one session with ten combined tokens", metrics)
+	}
 
 	// Actual usage was charged: 100 - 10 = 90 available (est 50 was refunded).
 	avail, ok := gov.AvailableFor(resource.DimCombinedTokens, resource.ScopeCredential, "cred_pu")

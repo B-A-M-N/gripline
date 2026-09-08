@@ -47,6 +47,11 @@ func adminMetrics(svc *control.Service, dp *proxy.DataPlane, governor resource.A
 			writeMetric("backend_5xx_total", m.Backend5xx)
 			writeMetric("active_streams", m.ActiveStreams)
 			writeMetric("evidence_events_total", m.EvidenceEvents)
+			writeMetric("usage_sessions_total", m.UsageSessions)
+			writeMetric("usage_input_tokens_total", m.UsageInputTokens)
+			writeMetric("usage_output_tokens_total", m.UsageOutputTokens)
+			writeMetric("usage_combined_tokens_total", m.UsageCombinedTokens)
+			writeMetric("usage_cost_microunits_total", m.UsageCostMicrounits)
 			for i, count := range m.ResourceDenialsByScope {
 				writeMetric("resource_denials_scope_"+strings.ToLower(resource.Scope(i).String())+"_total", count)
 			}
