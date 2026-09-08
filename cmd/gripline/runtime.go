@@ -240,7 +240,8 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		s, err := statepg.Open(connectCtx, statepg.Options{
 			DSN: dsn, MaxConns: cfg.Authority.MaxConns, MinConns: cfg.Authority.MinConns,
 			NodeID: cfg.Authority.NodeID, LeaseTTL: cfg.Authority.LeaseTTL.D(), RenewEvery: cfg.Authority.RenewEvery.D(), MaxSourceScopes: cfg.Server.MaxSourceScopes, SourceScopeIdle: cfg.Server.SourceScopeIdle.D(),
-			ConnectTimeout: connectTimeout,
+			ConnectTimeout: connectTimeout, OperationTimeout: operationTimeout,
+			Migrate:       false,
 		})
 		connectCancel()
 		if err != nil {

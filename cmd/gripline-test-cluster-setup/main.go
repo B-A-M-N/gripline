@@ -76,7 +76,7 @@ func main() {
 func ensureAuthority(dsn string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	store, err := statepg.Open(ctx, statepg.Options{DSN: dsn, ConnectTimeout: 10 * time.Second})
+	store, err := statepg.Open(ctx, statepg.Options{DSN: dsn, ConnectTimeout: 10 * time.Second, Migrate: true})
 	if err != nil {
 		fatal("initialize authority schema: %v", err)
 	}

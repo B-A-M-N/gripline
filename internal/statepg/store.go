@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -30,6 +31,14 @@ type Options struct {
 	MaxSourceScopes int
 	SourceScopeIdle time.Duration
 	ConnectTimeout  time.Duration
+	// OperationTimeout is reserved for callers that need a store-owned
+	// default around remote operations. The request context remains the
+	// authoritative upper bound when one is supplied.
+	OperationTimeout time.Duration
+	// Migrate grants this process permission to create or alter the authority
+	// schema. Serving nodes must leave it false and only verify compatibility;
+	// the dedicated migration command sets it true.
+	Migrate bool
 }
 
 // Store is the shared transactional authority. Credential, lane, and evidence
@@ -70,9 +79,13 @@ const maxTransactionAttempts = 3
 var ErrMigrationRequired = errors.New("statepg: database schema requires migration")
 var ErrDSNRequired = errors.New("statepg: DSN required")
 
-// Open connects to PostgreSQL, verifies liveness, and creates the authority
-// schema idempotently. Schema creation is intentionally explicit at boot so a
-// partially migrated cluster cannot silently serve with missing state.
+// SupportedSchemaVersion is the schema marker expected by serving nodes.
+func SupportedSchemaVersion() int { return currentSchemaVersion }
+
+// Open connects to PostgreSQL, verifies liveness, and either applies the
+// authority schema (when Migrate is true) or verifies that an already-applied
+// schema is compatible. Serving nodes must use the latter mode so their
+// database role does not need DDL privileges.
 func Open(ctx context.Context, opts Options) (*Store, error) {
 	if opts.DSN == "" {
 		return nil, ErrDSNRequired
@@ -89,6 +102,10 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("statepg: parse DSN: %w", err)
 	}
+	// pgx uses this value for connections opened after the initial pool
+	// creation too. Bounding only NewWithConfig would still allow a later
+	// reconnect to block beyond the deployment's connection budget.
+	config.ConnConfig.ConnectTimeout = opts.ConnectTimeout
 	if opts.MaxConns > 0 {
 		config.MaxConns = opts.MaxConns
 	}
@@ -120,7 +137,12 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 		pool.Close()
 		return nil, err
 	}
-	if err := s.ensureSchema(connectCtx); err != nil {
+	if opts.Migrate {
+		if err := s.ensureSchema(connectCtx); err != nil {
+			pool.Close()
+			return nil, err
+		}
+	} else if err := CheckSchemaCompatibility(connectCtx, pool); err != nil {
 		pool.Close()
 		return nil, err
 	}
@@ -135,6 +157,95 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 	}
 	go s.leaseReaper()
 	return s, nil
+}
+
+// SchemaStatus is the read-only result used by migration planning and
+// operator status. A missing marker is represented without mutating the
+// database.
+type SchemaStatus struct {
+	Present          bool
+	Version          int
+	SupportedVersion int
+}
+
+// InspectSchema reads the schema marker without taking the migration lock or
+// executing DDL. It is safe to run with the serving runtime database role.
+func InspectSchema(ctx context.Context, opts Options) (SchemaStatus, error) {
+	status := SchemaStatus{SupportedVersion: currentSchemaVersion}
+	if opts.DSN == "" {
+		return status, ErrDSNRequired
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if opts.ConnectTimeout <= 0 {
+		opts.ConnectTimeout = 10 * time.Second
+	}
+	connectCtx, cancel := context.WithTimeout(ctx, opts.ConnectTimeout)
+	defer cancel()
+	config, err := pgxpool.ParseConfig(opts.DSN)
+	if err != nil {
+		return status, fmt.Errorf("statepg: parse DSN: %w", err)
+	}
+	config.ConnConfig.ConnectTimeout = opts.ConnectTimeout
+	if opts.MaxConns > 0 {
+		config.MaxConns = opts.MaxConns
+	}
+	if opts.MinConns > 0 {
+		config.MinConns = opts.MinConns
+	}
+	pool, err := pgxpool.NewWithConfig(connectCtx, config)
+	if err != nil {
+		return status, fmt.Errorf("statepg: connect: %w", err)
+	}
+	defer pool.Close()
+	if err := pool.Ping(connectCtx); err != nil {
+		return status, mapDBError(err)
+	}
+	var version int
+	err = pool.QueryRow(connectCtx, `SELECT version FROM gripline_schema WHERE singleton=TRUE`).Scan(&version)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return status, nil
+	}
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "42P01" {
+			return status, nil
+		}
+		return status, mapDBError(err)
+	}
+	status.Present = true
+	status.Version = version
+	return status, nil
+}
+
+// CheckSchemaCompatibility verifies that a serving node can use the
+// authority layout without changing it. It deliberately rejects both older
+// and newer markers; an explicit migration/upgrade procedure must establish
+// compatibility before the node becomes ready.
+func CheckSchemaCompatibility(ctx context.Context, pool *pgxpool.Pool) error {
+	if pool == nil {
+		return ErrMigrationRequired
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var version int
+	err := pool.QueryRow(ctx, `SELECT version FROM gripline_schema WHERE singleton=TRUE`).Scan(&version)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("%w: schema marker is missing", ErrMigrationRequired)
+	}
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "42P01" {
+			return fmt.Errorf("%w: schema is not initialized", ErrMigrationRequired)
+		}
+		return mapDBError(err)
+	}
+	if version != currentSchemaVersion {
+		return fmt.Errorf("%w: found %d, supported %d", ErrMigrationRequired, version, currentSchemaVersion)
+	}
+	return nil
 }
 
 // Close releases the shared connection pool.

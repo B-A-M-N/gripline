@@ -314,6 +314,46 @@ func TestPostgresAuthorityIntegration(t *testing.T) {
 	}
 }
 
+func TestPostgresServingOpenRequiresExplicitMigration(t *testing.T) {
+	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("GRIPLINE_TEST_POSTGRES_DSN is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resetIntegrationAuthority(t, ctx, dsn)
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect migration test authority: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `DROP TABLE gripline_schema`); err != nil {
+		pool.Close()
+		t.Fatalf("remove schema marker: %v", err)
+	}
+	pool.Close()
+
+	if status, err := InspectSchema(ctx, Options{DSN: dsn}); err != nil {
+		t.Fatalf("inspect uninitialized schema: %v", err)
+	} else if status.Present {
+		t.Fatalf("schema inspection reported marker after removal: %+v", status)
+	}
+	if _, err := Open(ctx, Options{DSN: dsn}); !errors.Is(err, ErrMigrationRequired) {
+		t.Fatalf("serving Open on uninitialized schema = %v, want ErrMigrationRequired", err)
+	}
+
+	migrated, err := Open(ctx, Options{DSN: dsn, Migrate: true})
+	if err != nil {
+		t.Fatalf("explicit migration Open: %v", err)
+	}
+	migrated.Close()
+	if status, err := InspectSchema(ctx, Options{DSN: dsn}); err != nil {
+		t.Fatalf("inspect migrated schema: %v", err)
+	} else if !status.Present || status.Version != SupportedSchemaVersion() {
+		t.Fatalf("migrated schema status=%+v, want current version", status)
+	}
+}
+
 func TestPostgresPolicyActivationRequiresLiveNodeAcknowledgements(t *testing.T) {
 	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
 	if dsn == "" {
@@ -952,7 +992,7 @@ func openIntegrationStore(t *testing.T, ctx context.Context, dsn, nodeID string)
 // PostgreSQL service.
 func resetIntegrationAuthority(t *testing.T, ctx context.Context, dsn string) {
 	t.Helper()
-	bootstrap, err := Open(ctx, Options{DSN: dsn})
+	bootstrap, err := Open(ctx, Options{DSN: dsn, Migrate: true})
 	if err != nil {
 		t.Fatalf("bootstrap integration authority schema: %v", err)
 	}
