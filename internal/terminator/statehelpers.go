@@ -29,10 +29,10 @@ func ctxForRequestWithMetadata(parent context.Context, meta credential.Transitio
 	if parent == nil {
 		parent = context.Background()
 	}
-	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
-	// Callers intentionally receive only the context; the timer owns the
-	// cancellation so every authority operation is bounded without requiring
-	// each legacy seam to manage a second return value.
+	// Use one timer for the child budget. The helper intentionally returns only
+	// the context for compatibility with legacy call sites; the timer releases
+	// its cancellation resources at the same bound.
+	ctx, cancel := context.WithCancel(parent)
 	time.AfterFunc(5*time.Second, cancel)
 	if meta.RequestID != "" {
 		ctx = credential.WithRequestID(ctx, meta.RequestID)
@@ -47,6 +47,16 @@ func ctxForRequestWithMetadata(parent context.Context, meta credential.Transitio
 // admission (P0.22): the Registry.TouchLastSeen contract is best-effort.
 func markLastSeen(reg credential.Registry, credentialID string, now time.Time) {
 	if reg == nil {
+		return
+	}
+	if aware, ok := reg.(credential.ContextLastSeenWriter); ok {
+		// Last-seen is telemetry, not authorization. Keep it out of the request
+		// critical path and bound the detached remote write independently.
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		go func() {
+			defer cancel()
+			_ = aware.TouchLastSeenContext(ctx, credentialID, now)
+		}()
 		return
 	}
 	reg.TouchLastSeen(credentialID, now)

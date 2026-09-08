@@ -420,6 +420,13 @@ func (g *Governor) ProvisionUsage(scopes []ScopeSpec, est UsageEstimate) (*Multi
 	return g.ProvisionUsageContext(context.Background(), scopes, est)
 }
 
+// Reserve implements the backend-neutral resource authority. The resident
+// governor has no durable request replay state, so it delegates to its local
+// cancellable reservation path.
+func (g *Governor) Reserve(ctx context.Context, req ReserveRequest) (UsageReservation, error) {
+	return g.ProvisionUsageContext(ctx, req.Scopes, req.Estimate)
+}
+
 // ProvisionUsageContext is the cancellable resource-authority entry point.
 // The in-process governor completes quickly, while a clustered implementation
 // can use the same contract to abort a remote lease transaction at the

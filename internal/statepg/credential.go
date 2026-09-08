@@ -227,7 +227,19 @@ func (s *Store) BumpRevision(credentialID string) error {
 }
 
 func (s *Store) TouchLastSeen(credentialID string, at time.Time) {
-	_, _ = s.pool.Exec(context.Background(), `UPDATE gripline_credentials SET last_seen_at=$2 WHERE credential_id=$1`, credentialID, at)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_ = s.TouchLastSeenContext(ctx, credentialID, at)
+}
+
+// TouchLastSeenContext is analytics-only and honors the caller's bounded
+// context. It must never be used as an authorization prerequisite.
+func (s *Store) TouchLastSeenContext(ctx context.Context, credentialID string, at time.Time) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE gripline_credentials SET last_seen_at=$2 WHERE credential_id=$1`, credentialID, at)
+	return mapDBError(err)
 }
 
 func (s *Store) UpdateStatusCAS(credentialID string, expectedRevision int, fromStatus, toStatus credential.Status) (*credential.CredentialRecord, error) {
@@ -263,10 +275,18 @@ func (s *Store) UpdateStatusCAS(credentialID string, expectedRevision int, fromS
 }
 
 func (s *Store) RotateVerifierCAS(credentialID string, expectedRevision, pepperVersion int, verifier []byte) (*credential.CredentialRecord, error) {
+	return s.RotateVerifierCASContext(context.Background(), credentialID, expectedRevision, pepperVersion, verifier)
+}
+
+// RotateVerifierCASContext performs the same row-locked atomic migration while
+// honoring the request's cancellation/deadline.
+func (s *Store) RotateVerifierCASContext(ctx context.Context, credentialID string, expectedRevision, pepperVersion int, verifier []byte) (*credential.CredentialRecord, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if pepperVersion < 1 || len(verifier) == 0 {
 		return nil, errors.New("credential: invalid rotated verifier")
 	}
-	ctx := context.Background()
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
 		return nil, mapDBError(err)

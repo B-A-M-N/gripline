@@ -149,6 +149,14 @@ func (s *Store) InsertIfAbsent(rec *credential.CredentialRecord) (bool, error) {
 // RotateVerifierCAS migrates one record to a newer pepper and updates the
 // verifier index plus credential revision in one bbolt transaction.
 func (s *Store) RotateVerifierCAS(credentialID string, expectedRevision int, pepperVersion int, verifier []byte) (*credential.CredentialRecord, error) {
+	return s.RotateVerifierCASContext(context.Background(), credentialID, expectedRevision, pepperVersion, verifier)
+}
+
+// RotateVerifierCASContext is the cancellable remote-compatible rotation seam.
+func (s *Store) RotateVerifierCASContext(ctx context.Context, credentialID string, expectedRevision int, pepperVersion int, verifier []byte) (*credential.CredentialRecord, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if pepperVersion < 1 || len(verifier) == 0 {
 		return nil, errors.New("credential: invalid rotated verifier")
 	}
@@ -198,6 +206,16 @@ func (s *Store) RotateVerifierCAS(credentialID string, expectedRevision int, pep
 		return nil
 	})
 	return out, err
+}
+
+// TouchLastSeenContext is the bounded-compatible form of the best-effort
+// analytics write. bbolt writes are local and complete synchronously.
+func (s *Store) TouchLastSeenContext(ctx context.Context, credentialID string, at time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.TouchLastSeen(credentialID, at)
+	return nil
 }
 
 // Lookup implements credential.Registry: resolve a record by id, inside a

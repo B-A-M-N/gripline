@@ -39,17 +39,18 @@ type Outcome struct {
 	Context    principal.AuthorizedContext
 	Assertion  *Assertion
 	Lease      *resource.LeaseHandle // non-nil when authorized; proxy releases on completion
-	// ResourceRes is the multi-scope resource hold (P0.23-P0.27) when a resource
-	// governor is configured. The proxy MUST release it (or the scoped leases)
-	// when the upstream request completes; until then the capacity is held for
-	// this request only.
+	// ResourceReservation is the backend-neutral resource hold (P0.23-P0.27).
+	// The proxy releases it when the upstream request completes; until then the
+	// capacity is held for this request only.
+	ResourceReservation resource.UsageReservation
+	// ResourceRes and UsageRes are deprecated compatibility views for callers
+	// that still inspect the pre-abstraction fields. New code must use
+	// ResourceReservation or Reservation().
 	ResourceRes *resource.MultiReservation
-	// UsageRes is the backend-neutral reservation returned by a distributed
-	// resource authority. ResourceRes remains for resident compatibility.
-	UsageRes  resource.UsageReservation
-	RiskAfter int      // effectiveRisk = max(credentialRisk, laneRisk)
-	Evidence  []string // evidence codes that contributed (explainability)
-	LaneNew   bool
+	UsageRes    resource.UsageReservation
+	RiskAfter   int      // effectiveRisk = max(credentialRisk, laneRisk)
+	Evidence    []string // evidence codes that contributed (explainability)
+	LaneNew     bool
 	// Degraded reports that the decision ran in AdaptiveDegraded posture: some
 	// authoritative history/state was unavailable, so the outcome preserved
 	// persisted restrictions rather than transitioning (P0.1).
@@ -192,6 +193,9 @@ func (o *Outcome) Reservation() resource.AdmissionReservation {
 	if o == nil {
 		return resource.NoopReservation{}
 	}
+	if o.ResourceReservation != nil {
+		return o.ResourceReservation
+	}
 	if o.ResourceRes != nil {
 		return o.ResourceRes
 	}
@@ -253,7 +257,7 @@ type Dependencies struct {
 	// capacity all-or-nothing at the hard-limit gate; a denial names the
 	// highest-priority scope that exceeded its limit. When nil, only the
 	// per-credential Concurrency seam applies (back-compat).
-	Resource resource.Authority
+	Resource resource.ResourceAuthority
 
 	// SourceID keys the SOURCE scope (network origin). Empty disables the SOURCE
 	// scope in multi-scope provisioning. Default: "" (SOURCE skipped).
@@ -1559,23 +1563,11 @@ func (t *Terminator) provisionMultiscope(requestCtx context.Context, cred *crede
 	// across every scope; the proxy settles the reservation with ACTUALS after
 	// the backend responds. Dimensions the policy doesn't gauge (zero capacity)
 	// are inert; dimensions the estimate leaves zero reserve nothing.
-	var res *resource.MultiReservation
-	var usageRes resource.UsageReservation
-	var err error
-	if authority, ok := t.dep.Resource.(resource.RequestDistributedAuthority); ok {
-		usageRes, err = authority.ProvisionDistributedWithRequestID(requestCtx, reqID, specs, est)
-	} else if authority, ok := t.dep.Resource.(resource.DistributedAuthority); ok {
-		usageRes, err = authority.ProvisionDistributed(requestCtx, specs, est)
-	} else if authority, ok := t.dep.Resource.(resource.ContextAuthority); ok {
-		res, err = authority.ProvisionUsageContext(requestCtx, specs, est)
-	} else if authority, ok := t.dep.Resource.(resource.UsageAuthority); ok {
-		if err := contextErr(requestCtx); err != nil {
-			return deny("resource_unavailable", err)
-		}
-		res, err = authority.ProvisionUsage(specs, est)
-	} else {
-		return deny("resource_unavailable", errors.New("terminator: resource authority has no usage provisioner"))
-	}
+	reservation, err := t.dep.Resource.Reserve(requestCtx, resource.ReserveRequest{
+		RequestID: reqID,
+		Scopes:    specs,
+		Estimate:  est,
+	})
 	if err != nil {
 		tr.ReservationResult = "denied"
 		if errors.Is(err, resource.ErrSourceScopeSaturated) {
@@ -1591,7 +1583,7 @@ func (t *Terminator) provisionMultiscope(requestCtx context.Context, cred *crede
 		}
 		return deny("resource_unavailable", err)
 	}
-	if res == nil && usageRes == nil {
+	if reservation == nil {
 		tr.ReservationResult = "unavailable"
 		return deny("resource_unavailable", errors.New("terminator: resource authority returned no reservation"))
 	}
@@ -1600,16 +1592,17 @@ func (t *Terminator) provisionMultiscope(requestCtx context.Context, cred *crede
 	// reservation so held capacity is refunded (never a leaked hold).
 	assertion, aerr := t.issueAssertion(authCtx, reqID, cred)
 	if aerr != nil {
-		if usageRes != nil {
-			usageRes.Release()
-		} else if res != nil {
-			res.Release()
-		}
+		reservation.Release()
 		return deny("internal_identity_failure", aerr)
 	}
 	out.Assertion = assertion
-	out.ResourceRes = res // proxy releases on completion (M4)
-	out.UsageRes = usageRes
+	out.ResourceReservation = reservation // proxy releases on completion (M4)
+	if local, ok := reservation.(*resource.MultiReservation); ok {
+		// Compatibility fields for legacy in-process callers. The data plane
+		// itself uses ResourceReservation and never type-switches on the holder.
+		out.ResourceRes = local
+		out.UsageRes = local
+	}
 	return nil
 }
 
@@ -1946,7 +1939,7 @@ func (t *Terminator) authenticate(ctx context.Context, presented *secret.SealedS
 			// latest pepper version. The CAS update is best-effort for the
 			// current request; authentication remains valid if a concurrent
 			// lifecycle mutation wins the race.
-			return credFrom(t.migrateVerifier(rec, verifier, latest)), nil
+			return credFrom(t.migrateVerifier(ctx, rec, verifier, latest)), nil
 		} else if !errors.Is(err, credential.ErrNotFound) {
 			return nil, err
 		}
@@ -1954,8 +1947,15 @@ func (t *Terminator) authenticate(ctx context.Context, presented *secret.SealedS
 	return nil, credential.ErrUnknown
 }
 
-func (t *Terminator) migrateVerifier(rec *credential.CredentialRecord, verifier []byte, latest int) *credential.CredentialRecord {
+func (t *Terminator) migrateVerifier(ctx context.Context, rec *credential.CredentialRecord, verifier []byte, latest int) *credential.CredentialRecord {
 	if rec == nil || rec.PepperVersion == latest {
+		return rec
+	}
+	if rotator, ok := t.dep.Registry.(credential.ContextVerifierRotator); ok {
+		updated, err := rotator.RotateVerifierCASContext(ctx, rec.CredentialID, rec.Revision, latest, verifier)
+		if err == nil {
+			return updated
+		}
 		return rec
 	}
 	rotator, ok := t.dep.Registry.(credential.VerifierRotator)

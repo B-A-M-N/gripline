@@ -39,6 +39,13 @@ func (s *Store) ProvisionDistributed(ctx context.Context, scopes []resource.Scop
 	return s.provisionDistributed(ctx, "", scopes, estimate)
 }
 
+// Reserve implements the backend-neutral resource authority. The operation id
+// is carried into the lease table when present so a retried ingress operation
+// receives the original hold rather than charging capacity twice.
+func (s *Store) Reserve(ctx context.Context, req resource.ReserveRequest) (resource.UsageReservation, error) {
+	return s.provisionDistributed(ctx, req.RequestID, req.Scopes, req.Estimate)
+}
+
 func (s *Store) ProvisionDistributedWithRequestID(ctx context.Context, requestID string, scopes []resource.ScopeSpec, estimate resource.UsageEstimate) (resource.UsageReservation, error) {
 	return s.provisionDistributed(ctx, requestID, scopes, estimate)
 }

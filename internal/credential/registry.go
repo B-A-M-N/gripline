@@ -96,6 +96,19 @@ type VerifierRotator interface {
 	RotateVerifierCAS(credentialID string, expectedRevision int, pepperVersion int, verifier []byte) (*CredentialRecord, error)
 }
 
+// ContextVerifierRotator is the cancellable form used when pepper migration is
+// performed during a live request against a remote authority.
+type ContextVerifierRotator interface {
+	RotateVerifierCASContext(context.Context, string, int, int, []byte) (*CredentialRecord, error)
+}
+
+// ContextLastSeenWriter is the bounded, best-effort form of TouchLastSeen for
+// remote registries. It is deliberately optional because last-seen data is
+// not an authorization dependency.
+type ContextLastSeenWriter interface {
+	TouchLastSeenContext(context.Context, string, time.Time) error
+}
+
 // IsUnknownCredential reports whether err is the typed "no such credential"
 // answer from a VerifierLookup (as opposed to an outage/timeouts/corruption).
 func IsUnknownCredential(err error) bool { return errors.Is(err, ErrNotFound) }
@@ -397,6 +410,21 @@ func (m *MemoryRegistry) TouchLastSeen(credentialID string, at time.Time) {
 		return
 	}
 	rec.LastSeenAt = at
+}
+
+func (m *MemoryRegistry) TouchLastSeenContext(ctx context.Context, credentialID string, at time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.TouchLastSeen(credentialID, at)
+	return nil
+}
+
+func (m *MemoryRegistry) RotateVerifierCASContext(ctx context.Context, credentialID string, expectedRevision, pepperVersion int, verifier []byte) (*CredentialRecord, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return m.RotateVerifierCAS(credentialID, expectedRevision, pepperVersion, verifier)
 }
 
 // Revoke marks a credential revoked and bumps revision.

@@ -70,7 +70,7 @@ type Runtime struct {
 	AdminService *control.Service
 
 	Evidence       evidence.Store
-	Resource       resource.Authority
+	Resource       resource.ResourceAuthority
 	Control        *control.ControlPlane
 	Spray          *anomaly.Detector
 	Signer         terminator.AssertionSigner
@@ -246,7 +246,7 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 	if cfg.Server.MaxSourceScopes != 0 || cfg.Server.SourceScopeIdle.D() > 0 {
 		localGovernor.SetSourceScopeLimits(cfg.Server.MaxSourceScopes, cfg.Server.SourceScopeIdle.D())
 	}
-	var governor resource.Authority = localGovernor
+	var governor resource.ResourceAuthority = localGovernor
 	if postgres != nil {
 		governor = postgres
 	}

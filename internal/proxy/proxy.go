@@ -645,15 +645,15 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	upstreamHeaders[assertionHeader] = []string{out.Assertion.Encode()}
 	forwardCtx, cancelForward := context.WithCancel(r.Context())
 	defer cancelForward()
-	if out.UsageRes != nil {
-		if err := out.UsageRes.MarkForwarded(r.Context()); err != nil {
+	if out.ResourceReservation != nil {
+		if err := out.ResourceReservation.MarkForwarded(r.Context()); err != nil {
 			http.Error(w, "resource_lease_error", http.StatusBadGateway)
 			return
 		}
 		if d.cfg.ReservationRenewEvery > 0 {
 			stopRenew := make(chan struct{})
 			defer close(stopRenew)
-			go renewReservation(forwardCtx, out.UsageRes, d.cfg.ReservationRenewEvery, cancelForward, stopRenew)
+			go renewReservation(forwardCtx, out.ResourceReservation, d.cfg.ReservationRenewEvery, cancelForward, stopRenew)
 		}
 	}
 
@@ -783,14 +783,12 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// reservation's own buckets. Runs BEFORE the deferred Release so unsettled
 	// holds are never cancelled-and-refunded in full. Concurrency is released by
 	// the deferred Release.
-	if out.UsageRes != nil {
+	if out.ResourceReservation != nil {
 		settleCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
-		if err := out.UsageRes.SettleContext(settleCtx, actual); err != nil {
+		if err := out.ResourceReservation.SettleContext(settleCtx, actual); err != nil {
 			d.metrics.completionFailures.Add(1)
 		}
 		cancel()
-	} else if mr, ok := reservation.(*resource.MultiReservation); ok && !mr.Settled() {
-		mr.Settle(actual)
 	}
 	// P0.4A: drive the completion producers with the ACTUAL usage. `success`
 	// is false when the upstream stream failed, so a corrupt/failed stream is

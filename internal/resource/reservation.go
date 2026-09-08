@@ -15,6 +15,33 @@ type Authority interface {
 	InUseFor(scope Scope, id string) int
 }
 
+// ReserveRequest is the backend-neutral resource admission request. RequestID
+// is the ingress operation key used by durable authorities for retry-safe
+// replay; in-process authorities may ignore it.
+type ReserveRequest struct {
+	RequestID string
+	Scopes    []ScopeSpec
+	Estimate  UsageEstimate
+}
+
+// UsageReservation is the one lifecycle contract for an admitted resource hold.
+// Release stays synchronous so callers can defer it on every exit path;
+// remote-sensitive transitions accept a context.
+type UsageReservation interface {
+	AdmissionReservation
+	MarkForwarded(context.Context) error
+	Renew(context.Context) error
+	SettleContext(context.Context, UsageEstimate) error
+	ExpiresAt() time.Time
+}
+
+// ResourceAuthority is the complete hard-resource boundary used by the
+// terminator. Local and clustered authorities share the same Reserve path.
+type ResourceAuthority interface {
+	Authority
+	Reserve(context.Context, ReserveRequest) (UsageReservation, error)
+}
+
 // UsageAuthority is the legacy in-process usage-admission extension. It is
 // separate from Authority so a remote implementation can expose an abstract
 // reservation lifecycle without returning an in-memory concrete type.
@@ -27,17 +54,6 @@ type UsageAuthority interface {
 // source-compatible legacy embedders.
 type ContextAuthority interface {
 	ProvisionUsageContext(ctx context.Context, scopes []ScopeSpec, estimate UsageEstimate) (*MultiReservation, error)
-}
-
-// UsageReservation is the backend-neutral lifecycle contract for a distributed
-// usage hold. These operations may cross a network boundary and therefore
-// accept a context; implementations must keep release/settlement idempotent.
-type UsageReservation interface {
-	AdmissionReservation
-	MarkForwarded(context.Context) error
-	Renew(context.Context) error
-	SettleContext(context.Context, UsageEstimate) error
-	ExpiresAt() time.Time
 }
 
 // DistributedAuthority is implemented by a shared lease authority. The
@@ -75,6 +91,7 @@ func (NoopReservation) Release() {}
 // an Outcome must satisfy the interface.
 var (
 	_ Authority            = (*Governor)(nil)
+	_ ResourceAuthority    = (*Governor)(nil)
 	_ UsageAuthority       = (*Governor)(nil)
 	_ ContextAuthority     = (*Governor)(nil)
 	_ AdmissionReservation = (*MultiReservation)(nil)

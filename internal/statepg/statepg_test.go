@@ -32,6 +32,7 @@ func TestSharedAuthorityInterfaceConformance(t *testing.T) {
 	var _ control.MutationStore = (*Store)(nil)
 	var _ control.SecurityTransitionReader = (*Store)(nil)
 	var _ resource.Authority = (*Store)(nil)
+	var _ resource.ResourceAuthority = (*Store)(nil)
 	var _ resource.DistributedAuthority = (*Store)(nil)
 	var _ resource.RequestDistributedAuthority = (*Store)(nil)
 }
