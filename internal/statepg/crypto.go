@@ -245,6 +245,45 @@ func (s *Store) CryptoReady(ctx context.Context) error {
 	return nil
 }
 
+// LoadCryptoIdentity returns the authority-selected active generations. It is
+// intentionally separate from ClusterStatus so the runtime reconciler gets a
+// typed authority value rather than parsing an operator diagnostic response.
+func (s *Store) LoadCryptoIdentity(ctx context.Context) (CryptoIdentity, error) {
+	if s == nil || s.pool == nil {
+		return CryptoIdentity{}, errors.New("statepg: authority is unavailable")
+	}
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
+	var shared CryptoIdentity
+	err := s.pool.QueryRow(ctx, `SELECT signer_active_kid, signer_fingerprint, signer_active_fingerprint,
+		pepper_active_version, pepper_fingerprint, pepper_active_fingerprint, pseudonym_version,
+		pseudonym_fingerprint, pseudonym_active_fingerprint, generation_epoch
+		FROM gripline_cluster_crypto WHERE singleton=TRUE`).Scan(
+		&shared.SignerActiveKID, &shared.SignerFingerprint, &shared.SignerActiveFingerprint,
+		&shared.PepperActiveVersion, &shared.PepperFingerprint, &shared.PepperActiveFingerprint,
+		&shared.PseudonymVersion, &shared.PseudonymFingerprint, &shared.PseudonymActiveFingerprint,
+		&shared.GenerationEpoch)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return CryptoIdentity{}, errors.New("statepg: cluster crypto identity is not initialized")
+	}
+	if err != nil {
+		return CryptoIdentity{}, mapDBError(err)
+	}
+	if shared.SignerActiveFingerprint == "" {
+		shared.SignerActiveFingerprint = shared.SignerFingerprint
+	}
+	if shared.PepperActiveFingerprint == "" {
+		shared.PepperActiveFingerprint = shared.PepperFingerprint
+	}
+	if shared.PseudonymActiveFingerprint == "" {
+		shared.PseudonymActiveFingerprint = shared.PseudonymFingerprint
+	}
+	if shared.GenerationEpoch == 0 {
+		return CryptoIdentity{}, errors.New("statepg: invalid cluster crypto generation epoch")
+	}
+	return shared, nil
+}
+
 // StartCryptoWatcher periodically checks the shared generation epoch so a
 // node is fenced even when no load balancer readiness probe happens to run.
 // The returned stop function is idempotent and must be joined before the
@@ -273,6 +312,57 @@ func (s *Store) StartCryptoWatcher(parent context.Context, interval, operationTi
 			case <-ticker.C:
 				checkCtx, checkCancel := context.WithTimeout(ctx, operationTimeout)
 				_ = s.CryptoReady(checkCtx)
+				checkCancel()
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			cancel()
+			<-done
+		})
+	}
+}
+
+// StartCryptoReconciler periodically detects an authority generation change
+// and gives the runtime a chance to apply the exact locally-loaded generation
+// before acknowledging it. The callback must leave the node unready on error;
+// SynchronizeCrypto is the final acknowledgement and readiness transition.
+func (s *Store) StartCryptoReconciler(parent context.Context, interval, operationTimeout time.Duration, reconcile func(context.Context, CryptoIdentity) error) func() {
+	if s == nil || s.nodeID == "" || reconcile == nil {
+		return func() {}
+	}
+	if interval <= 0 {
+		interval = time.Second
+	}
+	if operationTimeout <= 0 {
+		operationTimeout = 2 * time.Second
+	}
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				checkCtx, checkCancel := context.WithTimeout(ctx, operationTimeout)
+				stale := !s.cryptoReady.Load()
+				if !stale {
+					stale = errors.Is(s.CryptoReady(checkCtx), ErrCryptoIdentityStale)
+				}
+				if stale {
+					if shared, err := s.LoadCryptoIdentity(checkCtx); err == nil {
+						_ = reconcile(checkCtx, shared)
+					}
+				}
 				checkCancel()
 			case <-ctx.Done():
 				return

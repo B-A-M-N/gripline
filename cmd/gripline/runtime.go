@@ -330,51 +330,11 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		srcResolver = proxy.NewIngressSourceResolver(resolver)
 	}
 	if postgres != nil {
-		pseudonymVersion := 0
-		pseudonymFingerprint := "disabled"
-		pseudonymLoadedFingerprint := "disabled"
-		loaded := make([]statepg.CryptoGeneration, 0)
-		for kid, fingerprint := range signer.PublicKeyFingerprints() {
-			loaded = append(loaded, statepg.CryptoGeneration{Kind: statepg.CryptoKindSigner, Generation: kid, Fingerprint: fingerprint})
+		localCrypto, err := localCryptoIdentity(signer, peppers, pseudonyms)
+		if err != nil {
+			return nil, err
 		}
-		for version, fingerprint := range peppers.VersionFingerprints() {
-			loaded = append(loaded, statepg.CryptoGeneration{Kind: statepg.CryptoKindPepper, Generation: version, Fingerprint: fingerprint})
-		}
-		if configured, ok := pseudonyms.(*pseudonymRingAdapter); ok {
-			pseudonymVersion = configured.ActiveVersion()
-			pseudonymLoadedFingerprint = configured.Fingerprint()
-			if pseudonymVersion > 0 {
-				var found bool
-				pseudonymFingerprint, found = configured.VersionFingerprint(pseudonymVersion)
-				if !found {
-					return nil, fmt.Errorf("gripline: active pseudonym generation %d is not loaded", pseudonymVersion)
-				}
-			}
-			for version, fingerprint := range configured.VersionFingerprints() {
-				loaded = append(loaded, statepg.CryptoGeneration{Kind: statepg.CryptoKindPseudonym, Generation: version, Fingerprint: fingerprint})
-			}
-		}
-		signerFingerprint, ok := signer.PublicKeyFingerprint(signer.ActiveKid())
-		if !ok {
-			return nil, fmt.Errorf("gripline: active signer generation %d is not loaded", signer.ActiveKid())
-		}
-		pepperVersion := peppers.ActiveVersion()
-		pepperFingerprint, ok := peppers.VersionFingerprint(pepperVersion)
-		if !ok {
-			return nil, fmt.Errorf("gripline: active pepper generation %d is not loaded", pepperVersion)
-		}
-		sharedCrypto, err := postgres.SynchronizeCrypto(context.Background(), statepg.CryptoIdentity{
-			SignerActiveKID:            signer.ActiveKid(),
-			SignerFingerprint:          signer.PublicKeysetFingerprint(),
-			SignerActiveFingerprint:    signerFingerprint,
-			PepperActiveVersion:        pepperVersion,
-			PepperFingerprint:          peppers.Fingerprint(),
-			PepperActiveFingerprint:    pepperFingerprint,
-			PseudonymVersion:           pseudonymVersion,
-			PseudonymFingerprint:       pseudonymLoadedFingerprint,
-			PseudonymActiveFingerprint: pseudonymFingerprint,
-			Loaded:                     loaded,
-		})
+		sharedCrypto, err := postgres.SynchronizeCrypto(context.Background(), localCrypto)
 		if err != nil {
 			return nil, fmt.Errorf("gripline: cluster crypto identity: %w", err)
 		}
@@ -386,8 +346,10 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 				return nil, fmt.Errorf("gripline: cluster pseudonym generation: %w", err)
 			}
 		}
-		stopCryptoWatcher := postgres.StartCryptoWatcher(context.Background(), time.Second, operationTimeout)
-		closers = append(closers, func() error { stopCryptoWatcher(); return nil })
+		stopCryptoReconciler := postgres.StartCryptoReconciler(context.Background(), time.Second, operationTimeout, func(ctx context.Context, shared statepg.CryptoIdentity) error {
+			return reconcileClusterCrypto(ctx, shared, postgres, signer, peppers, pseudonyms)
+		})
+		closers = append(closers, func() error { stopCryptoReconciler(); return nil })
 	}
 
 	// Policy reconciliation acknowledges the active shared policy through the
