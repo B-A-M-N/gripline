@@ -259,10 +259,40 @@ done
 old_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${backend_port}/v1/messages" -H "X-Gripline-Assertion: ${old_assertion}")"
 test "$old_code" = 401
 
-# A killed replica is absent from readiness and cannot mint a lease. The
-# remaining two nodes continue to enforce the same five-slot authority.
+# A killed replica with in-flight work must cancel the upstream request. The
+# fixture's active-work counter measures backend work, not merely proxy
+# sockets; this proves the concurrency cap is released only after cancellation
+# reaches the actual backend operation.
+printf '0\n' >"$harness_dir/backend-active"
+curl -sS -o /dev/null "http://127.0.0.1:$((base + 12))/v1/work" \
+	-H "Authorization: Bearer ${secret_two}" >"$harness_dir/killed-request.log" 2>&1 &
+killed_request_pid=$!
+for _ in $(seq 1 50); do
+	if [[ -f "$harness_dir/backend-active" && "$(<"$harness_dir/backend-active")" -ge 1 ]]; then
+		break
+	fi
+	sleep 0.1
+done
+if [[ ! -f "$harness_dir/backend-active" || "$(<"$harness_dir/backend-active")" -lt 1 ]]; then
+	echo "cluster harness: in-flight backend work did not start before node kill" >&2
+	cat "$harness_dir/killed-request.log" >&2 || true
+	exit 1
+fi
 kill -KILL "${pids[2]}" >/dev/null 2>&1 || true
 wait "${pids[2]}" >/dev/null 2>&1 || true
+wait "$killed_request_pid" >/dev/null 2>&1 || true
+for _ in $(seq 1 50); do
+	if [[ "$(<"$harness_dir/backend-active")" -eq 0 ]]; then
+		break
+	fi
+	sleep 0.1
+done
+if [[ "$(<"$harness_dir/backend-active")" -ne 0 ]]; then
+	echo "cluster harness: backend work survived killed proxy" >&2
+	exit 1
+fi
+# A killed replica is absent from readiness and cannot mint a lease. The
+# remaining two nodes continue to enforce the same five-slot authority.
 if curl -sS "http://127.0.0.1:$((base + 12))/readyz" >/dev/null 2>&1; then
 	echo "cluster harness: killed node remained reachable" >&2
 	exit 1
