@@ -365,6 +365,40 @@ func TestPostgresServingOpenRequiresExplicitMigration(t *testing.T) {
 	}
 }
 
+func TestPostgresMigrationRefusesLiveNodes(t *testing.T) {
+	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("GRIPLINE_TEST_POSTGRES_DSN is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resetIntegrationAuthority(t, ctx, dsn)
+
+	serving, err := Open(ctx, Options{
+		DSN: dsn, NodeID: "migration-live-node", LeaseTTL: 10 * time.Second,
+		RenewEvery: 2 * time.Second, OperationTimeout: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("open serving authority: %v", err)
+	}
+	if _, err := Open(ctx, Options{
+		DSN: dsn, LeaseTTL: 10 * time.Second, OperationTimeout: 10 * time.Second,
+		Migrate: true,
+	}); !errors.Is(err, ErrMigrationRequiresQuiescence) {
+		t.Fatalf("migration beside a live node = %v, want ErrMigrationRequiresQuiescence", err)
+	}
+	serving.Close()
+
+	migrated, err := Open(ctx, Options{
+		DSN: dsn, LeaseTTL: 10 * time.Second, OperationTimeout: 10 * time.Second,
+		Migrate: true,
+	})
+	if err != nil {
+		t.Fatalf("migration after nodes stopped: %v", err)
+	}
+	migrated.Close()
+}
+
 func TestPostgresMaintenanceCleansBoundedHistoricalRows(t *testing.T) {
 	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
 	if dsn == "" {

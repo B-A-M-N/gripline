@@ -69,9 +69,12 @@ gripline migrate apply --config /etc/gripline/config.json
 ```
 
 Serving nodes use `Migrate=false` and only check schema compatibility. Do not
-give the Internet-facing runtime database role DDL privileges. For a v1
-rolling upgrade, keep protocol/schema compatibility within the documented
-supported range and drain old nodes before any incompatible migration.
+give the Internet-facing runtime database role DDL privileges. v1 uses an
+enforced stop-the-world upgrade contract: `migrate apply` refuses while a
+recently-live `ready` or `draining` membership row exists. Stop or drain every
+old node, apply the migration, then start the new binary. A future
+expand/contract release may replace this with an explicit protocol/schema
+compatibility range.
 
 Crypto rotation is also a cluster operation: stage identical signer/pepper/
 pseudonym material, make every live node acknowledge the exact fingerprint,

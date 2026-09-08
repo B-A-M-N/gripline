@@ -134,8 +134,11 @@ gripline migrate plan  --config deploy/config.postgres.example.json
 gripline migrate apply --config deploy/config.postgres.example.json
 ```
 
-Serving nodes only check schema compatibility and do not perform DDL. Route
-traffic only to nodes whose `/readyz` returns 200. A node that loses its
+Serving nodes only check schema compatibility and do not perform DDL. v1
+schema upgrades are stop-the-world: `migrate apply` refuses while any
+recently-live node is `ready` or `draining`; stop all serving nodes before
+applying a migration, then start the new binary. Route traffic only to nodes
+whose `/readyz` returns 200. A node that loses its
 membership epoch, shared policy/crypto state, or PostgreSQL connectivity is
 removed from service and fails protected admissions closed. PostgreSQL backup,
 PITR, replication, and failover are infrastructure responsibilities.

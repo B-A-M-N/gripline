@@ -89,6 +89,11 @@ const maxTransactionAttempts = 3
 const transactionRetryBaseDelay = 5 * time.Millisecond
 
 var ErrMigrationRequired = errors.New("statepg: database schema requires migration")
+
+// ErrMigrationRequiresQuiescence prevents a schema mutation from racing a
+// serving node. v1 uses a stop-the-world upgrade contract until an explicit
+// expand/contract schema range is implemented.
+var ErrMigrationRequiresQuiescence = errors.New("statepg: schema migration requires all serving nodes to be stopped")
 var ErrDSNRequired = errors.New("statepg: DSN required")
 var ErrInsecureTransport = errors.New("statepg: remote PostgreSQL requires authenticated TLS")
 
@@ -655,6 +660,19 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 		if _, err := tx.Exec(ctx, statement); err != nil {
 			return fmt.Errorf("statepg: ensure schema: %w", mapDBError(err))
 		}
+	}
+	// The current protocol advertises one exact schema version, so a migration
+	// must not run beside a live node that may still execute the old layout.
+	// Stale rows from a crashed node are ignored after its ownership lease has
+	// expired; such a process cannot pass its own epoch guard once it resumes.
+	var liveNodes int
+	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_membership
+		WHERE state IN ('ready','draining')
+		  AND last_seen_at > CURRENT_TIMESTAMP - ($1::double precision * interval '1 second')`, s.leaseTTL.Seconds()).Scan(&liveNodes); err != nil {
+		return fmt.Errorf("statepg: inspect live nodes before migration: %w", mapDBError(err))
+	}
+	if liveNodes > 0 {
+		return fmt.Errorf("%w: %d live node(s) remain", ErrMigrationRequiresQuiescence, liveNodes)
 	}
 	var version int
 	if err := tx.QueryRow(ctx, `SELECT version FROM gripline_schema WHERE singleton=TRUE`).Scan(&version); err != nil {
