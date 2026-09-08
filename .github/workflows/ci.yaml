@@ -63,7 +63,7 @@ jobs:
       - name: PostgreSQL authority integration
         env:
           GRIPLINE_TEST_POSTGRES_DSN: postgres://gripline:gripline@localhost:5432/gripline?sslmode=disable
-        run: go test -v ./internal/statepg -run '^TestPostgresAuthorityIntegration$'
+        run: go test -v ./internal/statepg -run '^TestPostgres'
 
       - name: three-node PostgreSQL cluster harness
         env:

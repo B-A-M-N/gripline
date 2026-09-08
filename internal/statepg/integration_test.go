@@ -480,6 +480,83 @@ func TestPostgresEvidenceConcurrentFirstWrites(t *testing.T) {
 	}
 }
 
+func TestPostgresForwardedLeaseConservativelyConsumesEstimate(t *testing.T) {
+	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("GRIPLINE_TEST_POSTGRES_DSN is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resetIntegrationAuthority(t, ctx, dsn)
+	a := openIntegrationStore(t, ctx, dsn, "resource-forwarded-a")
+	b := openIntegrationStore(t, ctx, dsn, "resource-forwarded-b")
+	defer a.Close()
+	defer b.Close()
+	identity := CryptoIdentity{
+		SignerActiveKID: 1, SignerFingerprint: "resource-signer",
+		PepperActiveVersion: 1, PepperFingerprint: "resource-pepper",
+		PseudonymVersion: 0, PseudonymFingerprint: "disabled",
+	}
+	if _, err := a.SynchronizeCrypto(ctx, identity); err != nil {
+		t.Fatalf("synchronize resource node A: %v", err)
+	}
+	if _, err := b.SynchronizeCrypto(ctx, identity); err != nil {
+		t.Fatalf("synchronize resource node B: %v", err)
+	}
+
+	estimate := resource.UsageEstimate{CostMicrounits: 60}
+	scope := func(id string) resource.ScopeSpec {
+		return resource.ScopeSpec{
+			Scope: resource.ScopeCredential, ID: id,
+			Buckets: resource.BucketSpec{CostBurst: resource.BucketConfig{Capacity: 100}},
+		}
+	}
+	request := func(requestID, scopeID string) resource.ReserveRequest {
+		return resource.ReserveRequest{
+			RequestID: requestID, Scopes: []resource.ScopeSpec{scope(scopeID)}, Estimate: estimate,
+		}
+	}
+	expireAndReap := func(name string, reservation resource.UsageReservation) {
+		t.Helper()
+		lease, ok := reservation.(interface{ ID() string })
+		if !ok {
+			t.Fatalf("%s reservation does not expose a durable lease id", name)
+		}
+		if _, err := a.pool.Exec(ctx, `UPDATE gripline_resource_leases
+			SET expires_at=CURRENT_TIMESTAMP - INTERVAL '1 minute' WHERE lease_id=$1`, lease.ID()); err != nil {
+			t.Fatalf("expire %s lease: %v", name, err)
+		}
+		if err := a.reapExpired(ctx); err != nil {
+			t.Fatalf("reap %s lease: %v", name, err)
+		}
+	}
+
+	forwarded, err := a.Reserve(ctx, request("forwarded-initial", "forwarded-scope"))
+	if err != nil {
+		t.Fatalf("reserve forwarded lease: %v", err)
+	}
+	if err := forwarded.MarkForwarded(ctx); err != nil {
+		t.Fatalf("mark lease forwarded: %v", err)
+	}
+	expireAndReap("forwarded", forwarded)
+	forwarded.Release()
+	if _, err := b.Reserve(ctx, request("forwarded-retry", "forwarded-scope")); err == nil {
+		t.Fatal("forwarded lease expiration must consume its reserved estimate")
+	}
+
+	reserved, err := a.Reserve(ctx, request("reserved-initial", "reserved-scope"))
+	if err != nil {
+		t.Fatalf("reserve never-forwarded lease: %v", err)
+	}
+	expireAndReap("reserved", reserved)
+	reserved.Release()
+	refunded, err := b.Reserve(ctx, request("reserved-retry", "reserved-scope"))
+	if err != nil {
+		t.Fatalf("never-forwarded lease expiration must refund its estimate: %v", err)
+	}
+	refunded.Release()
+}
+
 func openIntegrationStore(t *testing.T, ctx context.Context, dsn, nodeID string) *Store {
 	t.Helper()
 	store, err := Open(ctx, Options{DSN: dsn, NodeID: nodeID, LeaseTTL: 10 * time.Second, RenewEvery: 2 * time.Second, MaxSourceScopes: 64})
