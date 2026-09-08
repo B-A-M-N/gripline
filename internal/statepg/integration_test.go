@@ -15,6 +15,7 @@ import (
 	"github.com/B-A-M-N/gripline/internal/lane"
 	"github.com/B-A-M-N/gripline/internal/policy"
 	"github.com/B-A-M-N/gripline/internal/resource"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func TestPostgresAuthorityIntegration(t *testing.T) {
@@ -24,6 +25,7 @@ func TestPostgresAuthorityIntegration(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	resetIntegrationAuthority(t, ctx, dsn)
 	prefix := fmt.Sprintf("pg-it-%d", time.Now().UnixNano())
 	a := openIntegrationStore(t, ctx, dsn, prefix+"-a")
 	b := openIntegrationStore(t, ctx, dsn, prefix+"-b")
@@ -88,6 +90,56 @@ func TestPostgresAuthorityIntegration(t *testing.T) {
 	}
 	if got, err := c.LookupAuthoritative(ctx, credentialID); err != nil || got.Status != credential.StatusRevoked || got.Revision != 2 {
 		t.Fatalf("third-node revoke: record=%+v err=%v", got, err)
+	}
+
+	// Control mutations use a durable operation claim so a retry after an
+	// ambiguous commit does not repeat the state change or its audit row.
+	operatorCredentialID := prefix + "-operator-credential"
+	operatorRecord := *record
+	operatorRecord.CredentialID = operatorCredentialID
+	operatorRecord.Verifier = []byte("operator-verifier")
+	if created, err := a.InsertIfAbsent(&operatorRecord); err != nil || !created {
+		t.Fatalf("insert operator credential: created=%v err=%v", created, err)
+	}
+	auditBefore, err := a.CountAuditRecords()
+	if err != nil {
+		t.Fatalf("count operator audit before replay test: %v", err)
+	}
+	operatorAudit := control.OperatorRecord{
+		At: time.Now().UTC(), Actor: "integration-operator", Action: "credential.revoke",
+		Target: operatorCredentialID, Reason: "integration revoke", Posture: control.Normal.String(), Committed: true,
+	}
+	const revokeOperationID = "integration-revoke-operation"
+	if err := a.RevokeCredentialWithAuditOperation(ctx, operatorCredentialID, operatorAudit, revokeOperationID); err != nil {
+		t.Fatalf("operator revoke: %v", err)
+	}
+	if err := b.RevokeCredentialWithAuditOperation(ctx, operatorCredentialID, operatorAudit, revokeOperationID); err != nil {
+		t.Fatalf("operator revoke replay on second node: %v", err)
+	}
+	auditAfter, err := a.CountAuditRecords()
+	if err != nil {
+		t.Fatalf("count operator audit after replay test: %v", err)
+	}
+	if auditAfter != auditBefore+1 {
+		t.Fatalf("operation replay must append one audit row, before=%d after=%d", auditBefore, auditAfter)
+	}
+	operatorGot, err := c.LookupAuthoritative(ctx, operatorCredentialID)
+	if err != nil || operatorGot.Status != credential.StatusRevoked || operatorGot.Revision != 2 {
+		t.Fatalf("operator revoke replay state: record=%+v err=%v", operatorGot, err)
+	}
+	conflictingAudit := operatorAudit
+	conflictingAudit.Reason = "different payload"
+	if err := c.RevokeCredentialWithAuditOperation(ctx, operatorCredentialID, conflictingAudit, revokeOperationID); !errors.Is(err, control.ErrOperationConflict) {
+		t.Fatalf("reused operation id with changed payload error=%v, want conflict", err)
+	}
+	repeatAudit := operatorAudit
+	repeatAudit.Reason = "independent repeat"
+	if err := c.RevokeCredentialWithAuditOperation(ctx, operatorCredentialID, repeatAudit, "integration-revoke-repeat"); err != nil {
+		t.Fatalf("independent repeat revoke: %v", err)
+	}
+	operatorGot, err = a.LookupAuthoritative(ctx, operatorCredentialID)
+	if err != nil || operatorGot.Revision != 2 {
+		t.Fatalf("independent repeat revoke must not bump revision: record=%+v err=%v", operatorGot, err)
 	}
 
 	policyContext := lane.DefaultPolicyContext()
@@ -240,4 +292,50 @@ func openIntegrationStore(t *testing.T, ctx context.Context, dsn, nodeID string)
 		t.Fatalf("open PostgreSQL node %s: %v", nodeID, err)
 	}
 	return store
+}
+
+// resetIntegrationAuthority is intentionally an exact Gripline table list.
+// This test is opt-in and mutates its supplied database, but it must never
+// truncate unrelated application data when a developer points it at a shared
+// PostgreSQL service.
+func resetIntegrationAuthority(t *testing.T, ctx context.Context, dsn string) {
+	t.Helper()
+	bootstrap, err := Open(ctx, Options{DSN: dsn})
+	if err != nil {
+		t.Fatalf("bootstrap integration authority schema: %v", err)
+	}
+	bootstrap.Close()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect integration reset authority: %v", err)
+	}
+	defer pool.Close()
+	const tables = `
+		gripline_resource_leases,
+		gripline_resource_holds,
+		gripline_resource_buckets,
+		gripline_resource_source_scopes,
+		gripline_credential_receipts,
+		gripline_security_transitions,
+		gripline_admission_audit,
+		gripline_lane_operator_audit,
+		gripline_operator_audit,
+		gripline_control_operations,
+		gripline_operator_posture,
+		gripline_evidence,
+		gripline_lanes,
+		gripline_lane_guards,
+		gripline_credentials,
+		gripline_policy_audit,
+		gripline_policy_artifacts,
+		gripline_policy_manifest,
+		gripline_adaptive_window_keys,
+		gripline_adaptive_window_subjects,
+		gripline_adaptive_baselines,
+		gripline_adaptive_state,
+		gripline_cluster_crypto,
+		gripline_membership`
+	if _, err := pool.Exec(ctx, "TRUNCATE TABLE "+tables+" RESTART IDENTITY CASCADE"); err != nil {
+		t.Fatalf("reset integration authority: %v", err)
+	}
 }

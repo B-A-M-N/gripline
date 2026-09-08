@@ -122,6 +122,7 @@ func resetAuthority(dsn string) {
 		gripline_admission_audit,
 		gripline_lane_operator_audit,
 		gripline_operator_audit,
+		gripline_control_operations,
 		gripline_operator_posture,
 		gripline_evidence,
 		gripline_lanes,

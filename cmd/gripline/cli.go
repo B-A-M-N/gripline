@@ -145,6 +145,7 @@ func runCredentialCLI(args []string) error {
 	cfgPath := fs.String("config", "/etc/gripline/config.json", "path to the deployment configuration")
 	credID := fs.String("id", "", "credential id (revoke)")
 	reason := fs.String("reason", "", "audit reason (revoke, required)")
+	operationID := fs.String("operation-id", "", "stable Idempotency-Key for retrying a mutation")
 	account := fs.String("account", "", "account id (add, required)")
 	policyID := fs.String("policy", "", "policy id (add; defaults to the active policy)")
 	planID := fs.String("plan", "plan-default", "plan id (add)")
@@ -188,7 +189,7 @@ func runCredentialCLI(args []string) error {
 		if *offline {
 			return runCredentialRevoke(*cfgPath, *credID, *reason, tok)
 		}
-		return runCredentialRevokeLive(*cfgPath, *credID, *reason, tok)
+		return runCredentialRevokeLiveWithOperationID(*cfgPath, *credID, *reason, tok, *operationID)
 	case "add":
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
@@ -200,7 +201,7 @@ func runCredentialCLI(args []string) error {
 		if err != nil {
 			return err
 		}
-		return runCredentialAddLive(*cfgPath, *credID, *account, *policyID, *planID, *reason, tok)
+		return runCredentialAddLiveWithOperationID(*cfgPath, *credID, *account, *policyID, *planID, *reason, tok, *operationID)
 	default:
 		return fmt.Errorf("credential: unknown action %q (expected list|pepper-status|add|revoke)", args[0])
 	}
@@ -216,6 +217,7 @@ func runLaneCLI(args []string) error {
 	credID := fs.String("credential", "", "credential id (required)")
 	laneID := fs.String("id", "", "lane id (unblock)")
 	reason := fs.String("reason", "", "audit reason (unblock, required)")
+	operationID := fs.String("operation-id", "", "stable Idempotency-Key for retrying a mutation")
 	token := fs.String("token", "", "operator token (env GRIPLINE_OPERATOR_TOKEN)")
 	tokenFile := fs.String("token-file", "", "read the operator token from this file")
 	offline := fs.Bool("offline", false, "operate directly on a stopped state database")
@@ -243,7 +245,7 @@ func runLaneCLI(args []string) error {
 		if *offline {
 			return runLaneUnblock(*cfgPath, *credID, *laneID, *reason, tok)
 		}
-		return runLaneUnblockLive(*cfgPath, *credID, *laneID, *reason, tok)
+		return runLaneUnblockLiveWithOperationID(*cfgPath, *credID, *laneID, *reason, tok, *operationID)
 	default:
 		return fmt.Errorf("lane: unknown action %q (expected list|unblock)", args[0])
 	}
@@ -283,6 +285,10 @@ func newAdminClient(cfgPath string) (*adminClient, error) {
 }
 
 func (c *adminClient) request(method, path, token string, body any, out any) error {
+	return c.requestWithOperationID(method, path, token, "", body, out)
+}
+
+func (c *adminClient) requestWithOperationID(method, path, token, operationID string, body any, out any) error {
 	var reader io.Reader
 	if body != nil {
 		data, err := json.Marshal(body)
@@ -300,6 +306,9 @@ func (c *adminClient) request(method, path, token string, body any, out any) err
 	}
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	if operationID != "" {
+		req.Header.Set("Idempotency-Key", operationID)
 	}
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -370,7 +379,7 @@ func runCredentialPepperStatusLive(cfgPath, token string) error {
 	return w.Flush()
 }
 
-func runCredentialRevokeLive(cfgPath, credID, reason, token string) error {
+func runCredentialRevokeLiveWithOperationID(cfgPath, credID, reason, token, operationID string) error {
 	if credID == "" || reason == "" || token == "" {
 		return fmt.Errorf("credential revoke: --id, --reason, and --token (or GRIPLINE_OPERATOR_TOKEN) are required")
 	}
@@ -378,7 +387,7 @@ func runCredentialRevokeLive(cfgPath, credID, reason, token string) error {
 	if err != nil {
 		return err
 	}
-	if err := c.request(http.MethodPost, "/admin/credentials/revoke", token, map[string]string{
+	if err := c.requestWithOperationID(http.MethodPost, "/admin/credentials/revoke", token, operationID, map[string]string{
 		"credential_id": credID, "reason": reason,
 	}, nil); err != nil {
 		return fmt.Errorf("credential revoke: %w", err)
@@ -388,6 +397,10 @@ func runCredentialRevokeLive(cfgPath, credID, reason, token string) error {
 }
 
 func runCredentialAddLive(cfgPath, credID, accountID, policyID, planID, reason, token string) error {
+	return runCredentialAddLiveWithOperationID(cfgPath, credID, accountID, policyID, planID, reason, token, "")
+}
+
+func runCredentialAddLiveWithOperationID(cfgPath, credID, accountID, policyID, planID, reason, token, operationID string) error {
 	if credID == "" || accountID == "" || planID == "" || reason == "" || token == "" {
 		return fmt.Errorf("credential add: --id, --account, --reason, and --token (or --token-file/GRIPLINE_OPERATOR_TOKEN) are required")
 	}
@@ -443,7 +456,7 @@ func runCredentialAddLive(cfgPath, credID, accountID, policyID, planID, reason, 
 	if err != nil {
 		return err
 	}
-	if err := client.request(http.MethodPost, "/admin/credentials/add", token, map[string]any{
+	if err := client.requestWithOperationID(http.MethodPost, "/admin/credentials/add", token, operationID, map[string]any{
 		"credential_id": credID, "account_id": accountID, "policy_id": policyID, "plan_id": planID,
 		"verifier_b64": base64.StdEncoding.EncodeToString(verifier), "verifier_version": 1,
 		"pepper_version": pepperVersion, "reason": reason,
@@ -489,7 +502,7 @@ func runLaneListLive(cfgPath, credID, token string) error {
 	return w.Flush()
 }
 
-func runLaneUnblockLive(cfgPath, credID, laneID, reason, token string) error {
+func runLaneUnblockLiveWithOperationID(cfgPath, credID, laneID, reason, token, operationID string) error {
 	if credID == "" || laneID == "" || reason == "" || token == "" {
 		return fmt.Errorf("lane unblock: --credential, --id, --reason, and --token (or GRIPLINE_OPERATOR_TOKEN) are required")
 	}
@@ -497,7 +510,7 @@ func runLaneUnblockLive(cfgPath, credID, laneID, reason, token string) error {
 	if err != nil {
 		return err
 	}
-	if err := c.request(http.MethodPost, "/admin/lanes/unblock", token, map[string]string{
+	if err := c.requestWithOperationID(http.MethodPost, "/admin/lanes/unblock", token, operationID, map[string]string{
 		"credential_id": credID, "lane_id": laneID, "reason": reason,
 	}, nil); err != nil {
 		return fmt.Errorf("lane unblock: %w", err)

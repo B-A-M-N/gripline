@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -154,6 +155,22 @@ var ErrUnauthorized = errors.New("control: operator lacks required capability")
 // justification. An unauditable why is an unauditable action.
 var ErrReasonRequired = errors.New("control: operator action requires a reason")
 
+// ErrOperationIDRequired is returned by clustered control planes when a
+// mutating request omits the client-owned idempotency key. Without that key an
+// ambiguous commit cannot be retried safely after a database failover.
+var ErrOperationIDRequired = errors.New("control: idempotency key required")
+
+// ErrOperationIDUnsupported indicates that a caller supplied an idempotency
+// key to a mutation store that cannot durably claim it.
+var ErrOperationIDUnsupported = errors.New("control: idempotency keys unsupported by mutation store")
+
+// ErrOperationIDInvalid indicates a malformed client-owned idempotency key.
+var ErrOperationIDInvalid = errors.New("control: invalid idempotency key")
+
+// ErrOperationConflict indicates that an idempotency key was reused for a
+// different operation or payload.
+var ErrOperationConflict = errors.New("control: idempotency key payload conflict")
+
 // TokenAuthenticator authenticates operators via bearer tokens. Tokens are
 // stored and compared as domain-separated SHA-256 digests — the raw token is never
 // retained, so a read of the authenticator's table does not yield usable
@@ -270,6 +287,10 @@ type Service struct {
 	// audit-append + in-memory plane flip. A restart then restores the same
 	// posture — locking down does not silently vanish on reboot.
 	posturePersist func(ctx context.Context, target Posture, actor, reason string) error
+	// requireOperationIDs is enabled for the PostgreSQL cluster authority. It
+	// is deliberately opt-in so standalone/legacy test seams remain source
+	// compatible while clustered mutations fail closed without replay keys.
+	requireOperationIDs bool
 }
 
 // Authenticator is the operator authentication seam.
@@ -309,6 +330,13 @@ func WithPosturePersister(fn func(ctx context.Context, target Posture, actor, re
 	return func(s *Service) { s.posturePersist = fn }
 }
 
+// WithRequiredOperationIDs makes transactional cluster mutations require a
+// client-supplied Idempotency-Key. The key is validated and claimed by the
+// operation-aware mutation store.
+func WithRequiredOperationIDs() ServiceOption {
+	return func(s *Service) { s.requireOperationIDs = true }
+}
+
 // MutationStore is the narrow, transactional operator-mutation seam (P0.18,
 // defined in the CONSUMER package so the state store never imports control
 // semantics it does not need): each action mutates state AND appends its
@@ -335,22 +363,45 @@ type MutationStore interface {
 	SetPostureWithAudit(ctx context.Context, posture Posture, audit OperatorRecord) error
 }
 
+// OperationMutationStore extends MutationStore with durable operation claims.
+// The operation ID is stored in the same transaction as the state mutation and
+// its audit row. Implementations must return nil for an exact replay and
+// ErrOperationConflict for a reused ID with a different action or payload.
+type OperationMutationStore interface {
+	ProvisionCredentialWithAuditOperation(ctx context.Context, rec credential.CredentialRecord, audit OperatorRecord, operationID string) error
+	RevokeCredentialWithAuditOperation(ctx context.Context, credID string, audit OperatorRecord, operationID string) error
+	UnblockLaneWithAuditOperation(ctx context.Context, credID, laneID string, audit OperatorRecord, now time.Time, operationID string) error
+	SetPostureWithAuditOperation(ctx context.Context, posture Posture, audit OperatorRecord, operationID string) error
+}
+
 // ProvisionCredential adds a verifier-only credential through the authenticated
 // lifecycle surface. Raw secrets are intentionally absent from this API.
 func (s *Service) ProvisionCredential(ctx context.Context, token string, rec credential.CredentialRecord, reason string) error {
+	return s.ProvisionCredentialWithOperationID(ctx, token, rec, reason, "")
+}
+
+// ProvisionCredentialWithOperationID is the replay-safe clustered variant of
+// ProvisionCredential. operationID is normally the HTTP Idempotency-Key.
+func (s *Service) ProvisionCredentialWithOperationID(ctx context.Context, token string, rec credential.CredentialRecord, reason, operationID string) error {
 	id, err := s.authorize(ctx, token, CapCredentialLifecycle, reason)
 	if err != nil {
 		s.record(ctx, "", "credential.add", rec.CredentialID, reason, false, err.Error())
+		return err
+	}
+	ops, err := s.operationMutations(operationID)
+	if err != nil {
+		s.record(ctx, id.Name, "credential.add", rec.CredentialID, reason, false, err.Error())
 		return err
 	}
 	if s.mutations == nil {
 		s.record(ctx, id.Name, "credential.add", rec.CredentialID, reason, false, "no transactional credential provisioner wired")
 		return errors.New("control: credential provisioning requires a transactional state store")
 	}
-	if err := s.mutations.ProvisionCredentialWithAudit(ctx, rec, OperatorRecord{
+	audit := OperatorRecord{
 		At: s.now().UTC(), Actor: id.Name, Action: "credential.add", Target: rec.CredentialID,
 		Reason: reason, Posture: s.postureString(ctx), Committed: true,
-	}); err != nil {
+	}
+	if err := provisionCredentialMutation(s.mutations, ops, ctx, rec, audit, operationID); err != nil {
 		s.record(ctx, id.Name, "credential.add", rec.CredentialID, reason, false, err.Error())
 		return err
 	}
@@ -461,6 +512,13 @@ func (s *Service) commitAudit(ctx context.Context, actor, action, target, reason
 // switch. On success it also feeds the in-memory plane (which the data plane
 // consults) and its bounded audit buffer.
 func (s *Service) SetEmergency(ctx context.Context, token string, on bool, reason string) (Posture, error) {
+	return s.SetEmergencyWithOperationID(ctx, token, on, reason, "")
+}
+
+// SetEmergencyWithOperationID is the replay-safe clustered variant of
+// SetEmergency. Replaying an exact committed operation returns the same
+// target posture without appending a second mutation audit row.
+func (s *Service) SetEmergencyWithOperationID(ctx context.Context, token string, on bool, reason, operationID string) (Posture, error) {
 	id, err := s.authorize(ctx, token, CapPosture, reason)
 	if err != nil {
 		s.record(ctx, "", "posture.set_emergency", "global", reason, false, err.Error())
@@ -470,16 +528,21 @@ func (s *Service) SetEmergency(ctx context.Context, token string, on bool, reaso
 	if on {
 		target = EmergencyLockdown
 	}
+	ops, err := s.operationMutations(operationID)
+	if err != nil {
+		s.record(ctx, id.Name, "posture.set_emergency", "global", reason, false, err.Error())
+		return s.plane.Posture(), err
+	}
 	// P0.10/P0.18: when the transactional mutation store is wired, the posture
 	// AND its audit row commit atomically — a failed persist aborts the
 	// transition. The legacy posturePersist seam behaves identically for
 	// deployments that wired only posture; the plain path remains for
 	// non-durable test/dev wiring.
 	if s.mutations != nil {
-		if err := s.mutations.SetPostureWithAudit(ctx, target, OperatorRecord{
+		if err := setPostureMutation(s.mutations, ops, ctx, target, OperatorRecord{
 			At: s.now().UTC(), Actor: id.Name, Action: "posture.set_emergency",
 			Target: "global", Reason: reason, Posture: target.String(), Committed: true,
-		}); err != nil {
+		}, operationID); err != nil {
 			s.record(ctx, id.Name, "posture.set_emergency", "global", reason, false, err.Error())
 			return s.plane.Posture(), fmt.Errorf("control: posture persist + audit failed, action aborted: %w", err)
 		}
@@ -514,16 +577,27 @@ func (s *Service) SetEmergency(ctx context.Context, token string, on bool, reaso
 // audit after a successful mutation returns an error but the credential IS
 // revoked (the operator sees the failure and can re-audit).
 func (s *Service) RevokeCredential(ctx context.Context, token, credID, reason string) error {
+	return s.RevokeCredentialWithOperationID(ctx, token, credID, reason, "")
+}
+
+// RevokeCredentialWithOperationID is the replay-safe clustered variant of
+// RevokeCredential. The operation ID is durable across node/failover retries.
+func (s *Service) RevokeCredentialWithOperationID(ctx context.Context, token, credID, reason, operationID string) error {
 	id, err := s.authorize(ctx, token, CapCredentialLifecycle, reason)
 	if err != nil {
 		s.record(ctx, "", "credential.revoke", credID, reason, false, err.Error())
 		return err
 	}
+	ops, err := s.operationMutations(operationID)
+	if err != nil {
+		s.record(ctx, id.Name, "credential.revoke", credID, reason, false, err.Error())
+		return err
+	}
 	if s.mutations != nil {
-		if err := s.mutations.RevokeCredentialWithAudit(ctx, credID, OperatorRecord{
+		if err := revokeCredentialMutation(s.mutations, ops, ctx, credID, OperatorRecord{
 			At: s.now().UTC(), Actor: id.Name, Action: "credential.revoke",
 			Target: credID, Reason: reason, Posture: s.postureString(ctx), Committed: true,
-		}); err != nil {
+		}, operationID); err != nil {
 			s.record(ctx, id.Name, "credential.revoke", credID, reason, false, err.Error())
 			return err
 		}
@@ -553,16 +627,27 @@ func (s *Service) RevokeCredential(ctx context.Context, token, credID, reason st
 // mutation FIRST, then audit, same transactional truthfulness as
 // RevokeCredential.
 func (s *Service) UnblockLane(ctx context.Context, token, credID, laneID, reason string) error {
+	return s.UnblockLaneWithOperationID(ctx, token, credID, laneID, reason, "")
+}
+
+// UnblockLaneWithOperationID is the replay-safe clustered variant of
+// UnblockLane.
+func (s *Service) UnblockLaneWithOperationID(ctx context.Context, token, credID, laneID, reason, operationID string) error {
 	id, err := s.authorize(ctx, token, CapLaneLifecycle, reason)
 	if err != nil {
 		s.record(ctx, "", "lane.unblock", laneID, reason, false, err.Error())
 		return err
 	}
+	ops, err := s.operationMutations(operationID)
+	if err != nil {
+		s.record(ctx, id.Name, "lane.unblock", laneID, reason, false, err.Error())
+		return err
+	}
 	if s.mutations != nil {
-		if err := s.mutations.UnblockLaneWithAudit(ctx, credID, laneID, OperatorRecord{
+		if err := unblockLaneMutation(s.mutations, ops, ctx, credID, laneID, OperatorRecord{
 			At: s.now().UTC(), Actor: id.Name, Action: "lane.unblock",
 			Target: credID + "/" + laneID, Reason: reason, Posture: s.postureString(ctx), Committed: true,
-		}, s.now()); err != nil {
+		}, s.now(), operationID); err != nil {
 			s.record(ctx, id.Name, "lane.unblock", laneID, reason, false, err.Error())
 			return err
 		}
@@ -581,6 +666,52 @@ func (s *Service) UnblockLane(ctx context.Context, token, credID, laneID, reason
 		return fmt.Errorf("control: audit commit failed after unblock: %w", err)
 	}
 	return nil
+}
+
+func (s *Service) operationMutations(operationID string) (OperationMutationStore, error) {
+	operationID = strings.TrimSpace(operationID)
+	if operationID == "" {
+		if s.requireOperationIDs && s.mutations != nil {
+			return nil, ErrOperationIDRequired
+		}
+		return nil, nil
+	}
+	if s.mutations == nil {
+		return nil, ErrOperationIDUnsupported
+	}
+	ops, ok := s.mutations.(OperationMutationStore)
+	if !ok {
+		return nil, ErrOperationIDUnsupported
+	}
+	return ops, nil
+}
+
+func provisionCredentialMutation(ms MutationStore, ops OperationMutationStore, ctx context.Context, rec credential.CredentialRecord, audit OperatorRecord, operationID string) error {
+	if ops != nil {
+		return ops.ProvisionCredentialWithAuditOperation(ctx, rec, audit, operationID)
+	}
+	return ms.ProvisionCredentialWithAudit(ctx, rec, audit)
+}
+
+func revokeCredentialMutation(ms MutationStore, ops OperationMutationStore, ctx context.Context, credID string, audit OperatorRecord, operationID string) error {
+	if ops != nil {
+		return ops.RevokeCredentialWithAuditOperation(ctx, credID, audit, operationID)
+	}
+	return ms.RevokeCredentialWithAudit(ctx, credID, audit)
+}
+
+func unblockLaneMutation(ms MutationStore, ops OperationMutationStore, ctx context.Context, credID, laneID string, audit OperatorRecord, now time.Time, operationID string) error {
+	if ops != nil {
+		return ops.UnblockLaneWithAuditOperation(ctx, credID, laneID, audit, now, operationID)
+	}
+	return ms.UnblockLaneWithAudit(ctx, credID, laneID, audit, now)
+}
+
+func setPostureMutation(ms MutationStore, ops OperationMutationStore, ctx context.Context, posture Posture, audit OperatorRecord, operationID string) error {
+	if ops != nil {
+		return ops.SetPostureWithAuditOperation(ctx, posture, audit, operationID)
+	}
+	return ms.SetPostureWithAudit(ctx, posture, audit)
 }
 
 // LaneUnblockAdapter adapts a *lane.Store to the LaneOperator seam. The store

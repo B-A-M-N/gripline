@@ -1,6 +1,7 @@
 package terminator
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -91,6 +92,13 @@ func TestControlPlaneEmergencyLockdownDeniesNewLanes(t *testing.T) {
 
 	// Flip to emergency lockdown as the operator.
 	cp.SetEmergency(true, "ops-oncall", "active credential exfiltration")
+	// Supply the activation epoch as a clustered authority would. This lets the
+	// test distinguish the pre-lockdown lane above from a lane materialized by a
+	// request after the switch.
+	term.dep.Posture = timestampedPostureAuthority{
+		posture:   control.EmergencyLockdown,
+		updatedAt: time.Now(),
+	}
 
 	// A NEW lane request (different features, would create a new lane) is denied.
 	newLane := laneFeatures("AS-NEW")
@@ -101,6 +109,13 @@ func TestControlPlaneEmergencyLockdownDeniesNewLanes(t *testing.T) {
 	if out.Reason != "emergency_lockdown" {
 		t.Fatalf("P0.40: denial reason = %q, want emergency_lockdown", out.Reason)
 	}
+	// The first denied request may have created a durable NEW row before the
+	// posture gate. A retry must remain denied; otherwise another node could
+	// observe that row as "existing" and bypass the lockdown gate.
+	retry := term.Admit(bearerHeaders(raw), newLane)
+	if retry.Authorized || retry.Reason != "emergency_lockdown" {
+		t.Fatalf("P0.40: materialized non-established lane retry must remain denied: authorized=%v reason=%q", retry.Authorized, retry.Reason)
+	}
 
 	// The established lane still authorizes during lockdown — but under the
 	// EMERGENCY limit set (P0.48): one in-flight request, not the normal cap.
@@ -109,6 +124,19 @@ func TestControlPlaneEmergencyLockdownDeniesNewLanes(t *testing.T) {
 	} else {
 		o.Reservation().Release()
 	}
+}
+
+type timestampedPostureAuthority struct {
+	posture   control.Posture
+	updatedAt time.Time
+}
+
+func (a timestampedPostureAuthority) PostureContext(_ context.Context) (control.Posture, error) {
+	return a.posture, nil
+}
+
+func (a timestampedPostureAuthority) PostureSnapshotContext(_ context.Context) (control.Posture, time.Time, error) {
+	return a.posture, a.updatedAt, nil
 }
 
 // TestControlPlaneAuditTrailRecordsDecisions proves P0.35: the control plane's

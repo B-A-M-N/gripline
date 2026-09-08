@@ -748,6 +748,7 @@ func (t *Terminator) admitUsageWithRequestID(ctx context.Context, reqID string, 
 	tr.CredentialRevBefore = cred.Revision
 	tr.CredentialRevAfter = cred.Revision
 	controlEmergency := false
+	postureAt := time.Time{}
 	postureAuthority := t.dep.Posture
 	if postureAuthority == nil && t.dep.Control != nil {
 		postureAuthority = t.dep.Control
@@ -755,7 +756,11 @@ func (t *Terminator) admitUsageWithRequestID(ctx context.Context, reqID string, 
 	if postureAuthority != nil {
 		var controlErr error
 		var posture control.Posture
-		posture, controlErr = postureAuthority.PostureContext(ctx)
+		if snapshotAuthority, ok := postureAuthority.(control.PostureSnapshotAuthority); ok {
+			posture, postureAt, controlErr = snapshotAuthority.PostureSnapshotContext(ctx)
+		} else {
+			posture, controlErr = postureAuthority.PostureContext(ctx)
+		}
 		if controlErr != nil {
 			out.Authorized = false
 			out.Reason = "control_unavailable"
@@ -1176,11 +1181,16 @@ func (t *Terminator) admitUsageWithRequestID(ctx context.Context, reqID string, 
 	}
 
 	// Emergency-lockdown gate (P0.40/P0.41): in EMERGENCY_LOCKDOWN the operator
-	// switch denies NEW lane creation outright (reduce attack surface immediately)
-	// while ESTABLISHED lanes and persisted restrictions remain in force. The
-	// authoritative risk observation above still ran (so elevation is durable even
-	// during the firefight); only NEW lanes are refused.
-	if laneNew && controlEmergency {
+	// switch denies NEW lanes outright (reduce attack surface immediately) while
+	// pre-existing lanes and persisted restrictions remain in force. A denied
+	// NEW-lane request may already have materialized a row in the shared
+	// authority; comparing its first-seen time with the shared posture epoch
+	// prevents another node from laundering that row into an admitted request.
+	createdDuringLockdown := false
+	if controlEmergency && laneRec != nil && !postureAt.IsZero() {
+		createdDuringLockdown = !laneRec.FirstSeenAt.Before(postureAt)
+	}
+	if controlEmergency && (laneNew || createdDuringLockdown) {
 		out.Authorized = false
 		out.Reason = "emergency_lockdown"
 		out.DenialErr = ErrorEmergencyLockdown

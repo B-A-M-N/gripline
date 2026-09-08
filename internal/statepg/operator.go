@@ -69,41 +69,68 @@ func (s *Store) LoadPostureContext(ctx context.Context) (control.Posture, error)
 
 // PostureContext implements control.PostureAuthority.
 func (s *Store) PostureContext(ctx context.Context) (control.Posture, error) {
-	if s.nodeID == "" {
-		return s.LoadPostureContext(ctx)
+	posture, _, err := s.PostureSnapshotContext(ctx)
+	return posture, err
+}
+
+// PostureSnapshotContext reads the shared posture and its activation time.
+// The timestamp is used only to classify whether a lane was materialized
+// during the current lockdown; the posture value remains the authorization
+// authority.
+func (s *Store) PostureSnapshotContext(ctx context.Context) (control.Posture, time.Time, error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
-		return control.Normal, err
+		return control.Normal, time.Time{}, err
+	}
+	if s.nodeID == "" {
+		var raw int
+		var updatedAt time.Time
+		err := s.pool.QueryRow(ctx, `SELECT posture, updated_at FROM gripline_operator_posture WHERE singleton=TRUE`).Scan(&raw, &updatedAt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return control.Normal, time.Time{}, nil
+		}
+		if err != nil {
+			return control.Normal, time.Time{}, mapDBError(err)
+		}
+		if raw < int(control.Normal) || raw > int(control.EmergencyLockdown) {
+			return control.Normal, time.Time{}, fmt.Errorf("statepg: unknown persisted posture %d", raw)
+		}
+		return control.Posture(raw), updatedAt, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return control.Normal, time.Time{}, err
 	}
 	var raw int
 	var state string
-	var lastSeen, now time.Time
+	var lastSeen, now, updatedAt time.Time
 	err := s.pool.QueryRow(ctx, `SELECT COALESCE(p.posture,0), m.state, m.last_seen_at,
-		CURRENT_TIMESTAMP FROM gripline_membership m LEFT JOIN gripline_operator_posture p
+		CURRENT_TIMESTAMP, COALESCE(p.updated_at, TIMESTAMPTZ 'epoch') FROM gripline_membership m LEFT JOIN gripline_operator_posture p
 		ON p.singleton=TRUE WHERE m.node_id=$1 AND m.instance_id=$2 AND m.node_epoch=$3`,
-		s.nodeID, s.instanceID, s.nodeEpoch).Scan(&raw, &state, &lastSeen, &now)
+		s.nodeID, s.instanceID, s.nodeEpoch).Scan(&raw, &state, &lastSeen, &now, &updatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		s.fenced.Store(true)
-		return control.Normal, ErrNodeFenced
+		return control.Normal, time.Time{}, ErrNodeFenced
 	}
 	if err != nil {
-		return control.Normal, mapDBError(err)
+		return control.Normal, time.Time{}, mapDBError(err)
 	}
 	if now.Sub(lastSeen) >= s.leaseTTL {
 		s.fenced.Store(true)
-		return control.Normal, ErrNodeFenced
+		return control.Normal, time.Time{}, ErrNodeFenced
 	}
 	if state == "draining" {
-		return control.Normal, ErrNodeDraining
+		return control.Normal, time.Time{}, ErrNodeDraining
 	}
 	if state != "ready" {
 		s.fenced.Store(true)
-		return control.Normal, ErrNodeFenced
+		return control.Normal, time.Time{}, ErrNodeFenced
 	}
 	if raw < int(control.Normal) || raw > int(control.EmergencyLockdown) {
-		return control.Normal, fmt.Errorf("statepg: unknown persisted posture %d", raw)
+		return control.Normal, time.Time{}, fmt.Errorf("statepg: unknown persisted posture %d", raw)
 	}
-	return control.Posture(raw), nil
+	return control.Posture(raw), updatedAt, nil
 }
 
 func (s *Store) LoadPosture() (control.Posture, error) {
@@ -191,6 +218,13 @@ func mapCredentialMutationError(err error) error {
 }
 
 func (s *Store) ProvisionCredentialWithAudit(ctx context.Context, rec credential.CredentialRecord, audit control.OperatorRecord) error {
+	return s.ProvisionCredentialWithAuditOperation(ctx, rec, audit, "")
+}
+
+// ProvisionCredentialWithAuditOperation atomically claims operationID, inserts
+// the credential, and appends its operator audit row. An exact retry returns
+// nil without replaying either mutation or audit.
+func (s *Store) ProvisionCredentialWithAuditOperation(ctx context.Context, rec credential.CredentialRecord, audit control.OperatorRecord, operationID string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -206,6 +240,14 @@ func (s *Store) ProvisionCredentialWithAudit(ctx context.Context, rec credential
 		return mapDBError(err)
 	}
 	defer tx.Rollback(ctx)
+	replayed, err := claimControlOperation(ctx, tx, operationID, audit.Action,
+		operatorMutationPayload(audit, rec), s.now())
+	if err != nil {
+		return err
+	}
+	if replayed {
+		return nil
+	}
 	_, err = tx.Exec(ctx, `INSERT INTO gripline_credentials (`+credentialColumns+`)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`, insertArgs(&rec, security)...)
 	if err != nil {
@@ -218,6 +260,12 @@ func (s *Store) ProvisionCredentialWithAudit(ctx context.Context, rec credential
 }
 
 func (s *Store) UnblockLaneWithAudit(ctx context.Context, credID, laneID string, audit control.OperatorRecord, now time.Time) error {
+	return s.UnblockLaneWithAuditOperation(ctx, credID, laneID, audit, now, "")
+}
+
+// UnblockLaneWithAuditOperation atomically claims operationID and applies the
+// lane mutation plus both audit records. Exact retries are no-ops.
+func (s *Store) UnblockLaneWithAuditOperation(ctx context.Context, credID, laneID string, audit control.OperatorRecord, now time.Time, operationID string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -226,6 +274,17 @@ func (s *Store) UnblockLaneWithAudit(ctx context.Context, credID, laneID string,
 		return mapDBError(err)
 	}
 	defer tx.Rollback(ctx)
+	replayed, err := claimControlOperation(ctx, tx, operationID, audit.Action,
+		operatorMutationPayload(audit, struct {
+			CredentialID string `json:"credential_id"`
+			LaneID       string `json:"lane_id"`
+		}{CredentialID: credID, LaneID: laneID}), s.now())
+	if err != nil {
+		return err
+	}
+	if replayed {
+		return nil
+	}
 	if err := s.lockLaneGuard(ctx, tx, credID); err != nil {
 		return mapDBError(err)
 	}
@@ -261,6 +320,14 @@ func (s *Store) UnblockLaneWithAudit(ctx context.Context, credID, laneID string,
 }
 
 func (s *Store) RevokeCredentialWithAudit(ctx context.Context, credID string, audit control.OperatorRecord) error {
+	return s.RevokeCredentialWithAuditOperation(ctx, credID, audit, "")
+}
+
+// RevokeCredentialWithAuditOperation atomically claims operationID and
+// revokes the credential. Re-revoking an already revoked credential is
+// intentionally a state no-op: operator retries must not keep increasing its
+// revision. Exact operation retries do not append a duplicate audit row.
+func (s *Store) RevokeCredentialWithAuditOperation(ctx context.Context, credID string, audit control.OperatorRecord, operationID string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -269,6 +336,16 @@ func (s *Store) RevokeCredentialWithAudit(ctx context.Context, credID string, au
 		return mapDBError(err)
 	}
 	defer tx.Rollback(ctx)
+	replayed, err := claimControlOperation(ctx, tx, operationID, audit.Action,
+		operatorMutationPayload(audit, struct {
+			CredentialID string `json:"credential_id"`
+		}{CredentialID: credID}), s.now())
+	if err != nil {
+		return err
+	}
+	if replayed {
+		return nil
+	}
 	var rec *credential.CredentialRecord
 	rec, err = scanCredential(tx.QueryRow(ctx, `SELECT `+credentialColumns+` FROM gripline_credentials WHERE credential_id=$1 FOR UPDATE`, credID))
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -277,11 +354,13 @@ func (s *Store) RevokeCredentialWithAudit(ctx context.Context, credID string, au
 	if err != nil {
 		return mapCredentialReadError(err)
 	}
-	rec.Status = credential.StatusRevoked
-	rec.Revision++
-	rec.RotatedAt = s.now()
-	if err := updateCredentialRow(ctx, tx, rec); err != nil {
-		return err
+	if rec.Status != credential.StatusRevoked {
+		rec.Status = credential.StatusRevoked
+		rec.Revision++
+		rec.RotatedAt = s.now()
+		if err := updateCredentialRow(ctx, tx, rec); err != nil {
+			return err
+		}
 	}
 	if err := appendOperator(ctx, tx, audit); err != nil {
 		return mapDBError(err)
@@ -290,6 +369,12 @@ func (s *Store) RevokeCredentialWithAudit(ctx context.Context, credID string, au
 }
 
 func (s *Store) SetPostureWithAudit(ctx context.Context, posture control.Posture, audit control.OperatorRecord) error {
+	return s.SetPostureWithAuditOperation(ctx, posture, audit, "")
+}
+
+// SetPostureWithAuditOperation atomically claims operationID and persists the
+// cluster posture with its operator audit row. Exact retries are no-ops.
+func (s *Store) SetPostureWithAuditOperation(ctx context.Context, posture control.Posture, audit control.OperatorRecord, operationID string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -298,6 +383,16 @@ func (s *Store) SetPostureWithAudit(ctx context.Context, posture control.Posture
 		return mapDBError(err)
 	}
 	defer tx.Rollback(ctx)
+	replayed, err := claimControlOperation(ctx, tx, operationID, audit.Action,
+		operatorMutationPayload(audit, struct {
+			Posture control.Posture `json:"posture"`
+		}{Posture: posture}), s.now())
+	if err != nil {
+		return err
+	}
+	if replayed {
+		return nil
+	}
 	if err := putPosture(ctx, tx, posture, s.now()); err != nil {
 		return err
 	}
@@ -308,6 +403,7 @@ func (s *Store) SetPostureWithAudit(ctx context.Context, posture control.Posture
 }
 
 var (
-	_ control.AuditRepository = (*Store)(nil)
-	_ control.MutationStore   = (*Store)(nil)
+	_ control.AuditRepository        = (*Store)(nil)
+	_ control.MutationStore          = (*Store)(nil)
+	_ control.OperationMutationStore = (*Store)(nil)
 )

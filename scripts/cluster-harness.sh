@@ -16,7 +16,11 @@ cleanup() {
 	for pid in "${pids[@]}"; do
 		wait "$pid" >/dev/null 2>&1 || true
 	done
-	rm -rf "$harness_dir"
+	if [[ "${GRIPLINE_CLUSTER_HARNESS_KEEP:-0}" == "1" ]]; then
+		echo "cluster harness artifacts: $harness_dir" >&2
+	else
+		rm -rf "$harness_dir"
+	fi
 }
 trap cleanup EXIT
 
@@ -123,9 +127,9 @@ wait_status "http://127.0.0.1:${backend_port}/healthz" 401
 provision() {
 	local id=$1 secret=$2
 	printf '%s\n' "$secret" | GRIPLINE_OPERATOR_TOKEN="$operator_token" \
-		"$harness_dir/gripline" credential add --config "$harness_dir/config-a.json" \
+	"$harness_dir/gripline" credential add --config "$harness_dir/config-a.json" \
 		--id "$id" --account "${id}-account" --policy gripline-default-v1 \
-		--plan cluster-plan --reason "cluster harness seed" --secret-stdin \
+		--plan cluster-plan --reason "cluster harness seed" --operation-id "cluster-add-${id}" --secret-stdin \
 		>"$harness_dir/provision-${id}.log" 2>&1
 }
 provision cluster-credential-one "$secret_one"
@@ -159,16 +163,32 @@ if [[ "$(awk '$1 == 200 {n++} END {print n+0}' "$harness_dir/codes"/*)" -lt 1 ]]
 fi
 
 # A revoke committed through A must deny on the other two authorities.
+missing_operation_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((base + 20))/admin/credentials/revoke" \
+	-H "Authorization: Bearer ${operator_token}" -H 'Content-Type: application/json' \
+	--data '{"credential_id":"cluster-credential-one","reason":"missing operation id"}')"
+test "$missing_operation_code" = 400
 revoke_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((base + 20))/admin/credentials/revoke" \
 	-H "Authorization: Bearer ${operator_token}" -H 'Content-Type: application/json' \
+	-H 'Idempotency-Key: cluster-revoke-one' \
 	--data '{"credential_id":"cluster-credential-one","reason":"cluster revoke"}')"
 test "$revoke_code" = 200
+replay_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((base + 21))/admin/credentials/revoke" \
+	-H "Authorization: Bearer ${operator_token}" -H 'Content-Type: application/json' \
+	-H 'Idempotency-Key: cluster-revoke-one' \
+	--data '{"credential_id":"cluster-credential-one","reason":"cluster revoke"}')"
+test "$replay_code" = 200
+conflict_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((base + 22))/admin/credentials/revoke" \
+	-H "Authorization: Bearer ${operator_token}" -H 'Content-Type: application/json' \
+	-H 'Idempotency-Key: cluster-revoke-one' \
+	--data '{"credential_id":"cluster-credential-one","reason":"different operation payload"}')"
+test "$conflict_code" = 409
 test "$(curl_data_code "http://127.0.0.1:$((base + 11))/v1/messages" "$secret_one")" != 200
 test "$(curl_data_code "http://127.0.0.1:$((base + 12))/v1/messages" "$secret_one")" != 200
 
 # Lockdown committed through B must be observed by A, B, and C.
 lockdown_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((base + 21))/admin/posture" \
 	-H "Authorization: Bearer ${operator_token}" -H 'Content-Type: application/json' \
+	-H 'Idempotency-Key: cluster-lockdown' \
 	--data '{"on":true,"reason":"cluster lockdown"}')"
 test "$lockdown_code" = 200
 for port in $((base + 10)) $((base + 11)) $((base + 12)); do
@@ -176,6 +196,7 @@ for port in $((base + 10)) $((base + 11)) $((base + 12)); do
 done
 unlock_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((base + 20))/admin/posture" \
 	-H "Authorization: Bearer ${operator_token}" -H 'Content-Type: application/json' \
+	-H 'Idempotency-Key: cluster-unlock' \
 	--data '{"on":false,"reason":"cluster harness continues"}')"
 test "$unlock_code" = 200
 

@@ -679,6 +679,11 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		// (P0.49).
 		if authorities.Mutations != nil {
 			opts = append(opts, control.WithMutationStore(authorities.Mutations))
+			if postgres != nil {
+				// Every clustered control mutation must carry a durable replay key;
+				// otherwise an ambiguous PostgreSQL commit cannot be retried safely.
+				opts = append(opts, control.WithRequiredOperationIDs())
+			}
 		} else {
 			opts = append(opts, control.WithLaneOperator(control.LaneUnblockAdapter{Unblock: func(credID, laneID, actor, reason string, now time.Time) error {
 				mem, ok := lanes.(*lane.Store)
@@ -1006,7 +1011,7 @@ func adminPosture(svc *control.Service) http.HandlerFunc {
 			return
 		}
 		token := bearer(r.Header.Get("Authorization"))
-		posture, err := svc.SetEmergency(r.Context(), token, b.On, b.Reason)
+		posture, err := svc.SetEmergencyWithOperationID(r.Context(), token, b.On, b.Reason, adminOperationID(r))
 		if err != nil {
 			writeAdminError(w, err)
 			return
@@ -1057,7 +1062,7 @@ func adminCredentialRevoke(svc *control.Service) http.HandlerFunc {
 			http.Error(w, "credential_id and reason are required", http.StatusBadRequest)
 			return
 		}
-		if err := svc.RevokeCredential(r.Context(), bearer(r.Header.Get("Authorization")), req.CredentialID, req.Reason); err != nil {
+		if err := svc.RevokeCredentialWithOperationID(r.Context(), bearer(r.Header.Get("Authorization")), req.CredentialID, req.Reason, adminOperationID(r)); err != nil {
 			writeAdminError(w, err)
 			return
 		}
@@ -1132,7 +1137,7 @@ func adminCredentialAdd(svc *control.Service, state adminStateAuthority, peppers
 			Status: credential.StatusNormal, PolicyID: req.PolicyID, PlanID: req.PlanID,
 			CreatedAt: time.Now().UTC(), Revision: 1,
 		}
-		if err := svc.ProvisionCredential(r.Context(), bearer(r.Header.Get("Authorization")), rec, req.Reason); err != nil {
+		if err := svc.ProvisionCredentialWithOperationID(r.Context(), bearer(r.Header.Get("Authorization")), rec, req.Reason, adminOperationID(r)); err != nil {
 			writeAdminError(w, err)
 			return
 		}
@@ -1228,7 +1233,7 @@ func adminLaneUnblock(svc *control.Service) http.HandlerFunc {
 			http.Error(w, "credential_id, lane_id, and reason are required", http.StatusBadRequest)
 			return
 		}
-		if err := svc.UnblockLane(r.Context(), bearer(r.Header.Get("Authorization")), req.CredentialID, req.LaneID, req.Reason); err != nil {
+		if err := svc.UnblockLaneWithOperationID(r.Context(), bearer(r.Header.Get("Authorization")), req.CredentialID, req.LaneID, req.Reason, adminOperationID(r)); err != nil {
 			writeAdminError(w, err)
 			return
 		}
@@ -1466,6 +1471,12 @@ func writeAdminError(w http.ResponseWriter, err error) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 	case errors.Is(err, control.ErrReasonRequired):
 		http.Error(w, "reason required", http.StatusBadRequest)
+	case errors.Is(err, control.ErrOperationIDRequired), errors.Is(err, control.ErrOperationIDInvalid):
+		http.Error(w, "valid Idempotency-Key required", http.StatusBadRequest)
+	case errors.Is(err, control.ErrOperationConflict):
+		http.Error(w, "Idempotency-Key was already used for another operation", http.StatusConflict)
+	case errors.Is(err, control.ErrOperationIDUnsupported):
+		http.Error(w, "idempotency authority unavailable", http.StatusServiceUnavailable)
 	case errors.Is(err, credential.ErrNotFound), errors.Is(err, lane.ErrLaneNotFound):
 		http.Error(w, "not found", http.StatusNotFound)
 	default:
@@ -1479,6 +1490,16 @@ func bearer(h string) string {
 		return ""
 	}
 	return strings.TrimSpace(rest)
+}
+
+// adminOperationID returns the client-owned replay key for a mutating admin
+// request. PostgreSQL-backed services require this header before making a
+// state change; standalone services keep legacy behavior when it is absent.
+func adminOperationID(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	return strings.TrimSpace(r.Header.Get("Idempotency-Key"))
 }
 
 func parseSpec(spec string) (string, []string, error) {

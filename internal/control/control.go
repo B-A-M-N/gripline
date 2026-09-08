@@ -51,6 +51,14 @@ type PostureAuthority interface {
 	PostureContext(context.Context) (Posture, error)
 }
 
+// PostureSnapshotAuthority optionally exposes the authoritative activation
+// time alongside the posture. Cluster admission uses it to distinguish a
+// pre-lockdown non-established lane from a NEW lane materialized by a request
+// that lockdown already denied.
+type PostureSnapshotAuthority interface {
+	PostureSnapshotContext(context.Context) (Posture, time.Time, error)
+}
+
 // EventKind distinguishes audit records.
 type EventKind int
 

@@ -54,10 +54,11 @@ type Store struct {
 // and the shared audit/state tables now used by the runtime. Version 3 binds
 // a request id to its resource payload. Version 4 adds node-instance fencing
 // to membership and resource leases. Version 5 adds keyed adaptive windows
-// and baselines. Version 6 adds the cluster crypto identity record. Keep the marker versioned even though
+// and baselines. Version 6 adds the cluster crypto identity record. Version 7
+// adds durable control-operation claims. Keep the marker versioned even though
 // the DDL below is idempotent: CREATE TABLE IF NOT EXISTS cannot add columns
 // to an already initialized database.
-const currentSchemaVersion = 6
+const currentSchemaVersion = 7
 
 var ErrMigrationRequired = errors.New("statepg: database schema requires migration")
 var ErrDSNRequired = errors.New("statepg: DSN required")
@@ -250,6 +251,12 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			posture TEXT NOT NULL,
 			committed BOOLEAN NOT NULL,
 			detail TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS gripline_control_operations (
+			operation_id TEXT PRIMARY KEY,
+			action TEXT NOT NULL,
+			payload_fingerprint TEXT NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS gripline_admission_audit (
 			sequence BIGSERIAL PRIMARY KEY,
@@ -467,6 +474,11 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 		// Version 6's cluster crypto identity table is created by the idempotent
 		// DDL above; advancing the marker is sufficient for existing databases.
 		version = 6
+	}
+	if version == 6 {
+		// Version 7's control-operation claim table is created by the idempotent
+		// DDL above; advancing the marker is sufficient for existing databases.
+		version = 7
 	}
 	if version != currentSchemaVersion {
 		return fmt.Errorf("%w: unsupported migration state %d", ErrMigrationRequired, version)
