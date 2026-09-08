@@ -65,6 +65,11 @@ jobs:
           GRIPLINE_TEST_POSTGRES_DSN: postgres://gripline:gripline@localhost:5432/gripline?sslmode=disable
         run: go test -v ./internal/statepg -run '^TestPostgresAuthorityIntegration$'
 
+      - name: three-node PostgreSQL cluster harness
+        env:
+          GRIPLINE_TEST_POSTGRES_DSN: postgres://gripline:gripline@localhost:5432/gripline?sslmode=disable
+        run: bash scripts/cluster-harness.sh
+
       - name: definitive causal demo
         run: go run ./cmd/gripline-demo --headless
 

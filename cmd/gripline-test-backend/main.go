@@ -15,7 +15,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -28,6 +30,9 @@ func main() {
 	audience := flag.String("audience", "", "expected assertion audience")
 	minPolicyRev := flag.Int("min-policy-rev", 0, "minimum accepted policy revision for test freshness checks")
 	capturePath := flag.String("capture", "", "optional accepted-request header capture path")
+	workDelay := flag.Duration("work-delay", 0, "duration for /v1/work before completing")
+	activePath := flag.String("active", "", "optional file containing current accepted backend work")
+	peakPath := flag.String("peak", "", "optional file containing peak accepted backend work")
 	flag.Parse()
 	if *keysPath == "" || *audience == "" {
 		log.Fatal("-keys and -audience are required")
@@ -47,6 +52,33 @@ func main() {
 	}
 
 	var captureMu sync.Mutex
+	var statsMu sync.Mutex
+	var active atomic.Int64
+	var peak atomic.Int64
+	writeStat := func(path string, value int64) {
+		if path == "" {
+			return
+		}
+		statsMu.Lock()
+		defer statsMu.Unlock()
+		if err := os.WriteFile(path, []byte(strconv.FormatInt(value, 10)), 0o600); err != nil {
+			log.Printf("stats %s: %v", path, err)
+		}
+	}
+	beginWork := func() func() {
+		current := active.Add(1)
+		for {
+			previous := peak.Load()
+			if current <= previous || peak.CompareAndSwap(previous, current) {
+				break
+			}
+		}
+		writeStat(*activePath, current)
+		writeStat(*peakPath, peak.Load())
+		return func() {
+			writeStat(*activePath, active.Add(-1))
+		}
+	}
 	capture := func(r *http.Request) {
 		if *capturePath == "" {
 			return
@@ -77,6 +109,21 @@ func main() {
 		if *minPolicyRev > 0 && claims.PolicyRev < *minPolicyRev {
 			http.Error(w, "stale policy revision", http.StatusUnauthorized)
 			return
+		}
+		if r.URL.Path == "/v1/work" {
+			releaseWork := beginWork()
+			defer releaseWork()
+			delay := *workDelay
+			if delay <= 0 {
+				delay = 2 * time.Second
+			}
+			timer := time.NewTimer(delay)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+			case <-r.Context().Done():
+				return
+			}
 		}
 		if r.URL.Path == "/v1/status/429" {
 			w.Header().Set("Retry-After", "3")

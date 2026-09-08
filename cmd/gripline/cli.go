@@ -402,8 +402,8 @@ func runCredentialAddLive(cfgPath, credID, accountID, policyID, planID, reason, 
 		}
 		policyID = pol.ID
 	}
-	if cfg.Paths.State == "" {
-		return fmt.Errorf("credential add: live mode requires a configured persistent paths.state")
+	if cfg.Paths.State == "" && strings.ToLower(strings.TrimSpace(cfg.Authority.Backend)) != "postgres" {
+		return fmt.Errorf("credential add: live mode requires a configured persistent authority")
 	}
 	peppers, err := loadPepperRing(cfg)
 	if err != nil {
