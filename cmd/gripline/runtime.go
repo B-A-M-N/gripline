@@ -1269,6 +1269,21 @@ func adminMetrics(svc *control.Service, dp *proxy.DataPlane, governor resource.A
 			writeMetric("source_scope_overflows_total", m.SourceOverflows)
 			writeMetric("source_scope_evictions_total", m.SourceEvictions)
 		}
+		if statsAuthority, ok := governor.(resource.ContextStatsAuthority); ok {
+			if m, err := statsAuthority.StatsContext(r.Context()); err == nil {
+				writeMetric("resource_stats_available", 1)
+				writeMetric("resource_active_concurrency", m.ActiveConcurrency)
+				writeMetric("resource_active_leases", m.ActiveLeases)
+				writeMetric("resource_forwarded_leases", m.ForwardedLeases)
+				writeMetric("resource_settled_leases", m.SettledLeases)
+				writeMetric("resource_released_leases", m.ReleasedLeases)
+				writeMetric("resource_active_holds", m.ActiveHolds)
+				writeMetric("resource_source_scopes", m.SourceScopes)
+				writeMetric("resource_source_overflows", m.SourceOverflows)
+			} else {
+				writeMetric("resource_stats_available", 0)
+			}
+		}
 		if policyManager != nil {
 			if current := policyManager.Current(); current != nil {
 				writeMetric("active_policy_revision", current.Revision)
