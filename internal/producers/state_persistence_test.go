@@ -44,11 +44,17 @@ func TestPersistentProducerRestoresVelocityBaselineAcrossRestart(t *testing.T) {
 		}
 	}
 
+	if err := persistedFirst.Flush(); err != nil {
+		t.Fatalf("flush baseline checkpoint: %v", err)
+	}
+	defer persistedFirst.Close()
+
 	second := NewResourceVelocityProducer(func() time.Time { return base })
 	persistedSecond, err := NewPersistentProducer(second, second, store, "resource_velocity")
 	if err != nil {
 		t.Fatalf("create restarted persistent producer: %v", err)
 	}
+	defer persistedSecond.Close()
 	signals := persistedSecond.ObserveCompletion(CompletionBehavior{
 		Subjects: subjects,
 		Actual:   UsageEstimate{Combined: 1_000},

@@ -92,7 +92,9 @@ concurrency accounting never becomes negative**.
 
 ## 7. Reservation accounting
 
-Where exact usage is unknown at admission:
+Where exact usage is unknown at admission, the stock provider adapter reserves
+the configured maximum body and output allowance before execution; adapters
+with a stronger bounded request parser may provide a tighter estimate:
 
 ```
 estimate → reserve → execute → observe actual → reconcile

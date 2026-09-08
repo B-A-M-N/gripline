@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -387,6 +388,64 @@ func TestDataPlaneReservationReleasedOnSuccessAndTransportError(t *testing.T) {
 	}
 	if inUse := gov.InUseAll(); inUse != 0 {
 		t.Fatalf("P0.8: reservation leaked on transport error: %d slots in use", inUse)
+	}
+}
+
+func TestBackendErrorStatusesNeverBuildBaselineTrust(t *testing.T) {
+	signer, _ := terminator.GenerateSigner()
+	pep := &credential.PepperKey{Version: 1, Key: []byte("backend-status-pepper")}
+	store := lane.NewStore(nil, time.Now)
+	reg := credential.NewMemoryRegistry()
+	if err := reg.Insert(&credential.CredentialRecord{
+		CredentialID: "cred_backend_status", AccountID: "acct_backend_status",
+		Verifier:        credential.Verifier(secret.NewFromBytes([]byte("sk-backend-status")), pep),
+		VerifierVersion: 1, PepperVersion: 1, Status: credential.StatusNormal,
+		PolicyID: "fi-default-v1", PlanID: "plan-a", CreatedAt: time.Now(), Revision: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	term, err := terminator.New(terminator.Dependencies{
+		Registry: reg, Peppers: credential.MustPepperRing(pep), Lanes: store,
+		Policy: policy.Default(), Signer: signer, Audience: testAudience,
+		Evidence: evidence.NewMemoryStore(), Resource: resource.NewGovernor(nil),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var status atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(int(status.Load()))
+		_, _ = w.Write([]byte("provider error"))
+	}))
+	defer backend.Close()
+	backendURL, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dp, err := New(Config{Terminator: term, BackendURL: backendURL, Audience: testAudience})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, code := range []int{400, 401, 403, 404, 429, 500, 503} {
+		status.Store(int32(code))
+		req := httptest.NewRequest(http.MethodPost, "http://gripline.local/v1/messages", strings.NewReader(`{}`))
+		req.Header.Set("Authorization", "Bearer sk-backend-status")
+		rec := httptest.NewRecorder()
+		dp.ServeHTTP(rec, req)
+		if rec.Code != code {
+			t.Fatalf("backend status %d changed at proxy: got %d", code, rec.Code)
+		}
+	}
+	ids := store.ListLaneIDs("cred_backend_status")
+	if len(ids) != 1 {
+		t.Fatalf("expected one classified lane, got %v", ids)
+	}
+	row, ok := store.Get("cred_backend_status", ids[0])
+	if !ok {
+		t.Fatal("classified lane disappeared")
+	}
+	if row.AuthorizedCleanRequests != 0 {
+		t.Fatalf("provider error responses built clean baseline trust: %+v", row)
 	}
 }
 

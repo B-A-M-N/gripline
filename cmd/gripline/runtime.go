@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -50,20 +51,21 @@ type Runtime struct {
 	// mux is the operator surface for it.
 	AdminService *control.Service
 
-	Evidence      evidence.Store
-	Resource      *resource.Governor
-	Control       *control.ControlPlane
-	Spray         *anomaly.Detector
-	Signer        terminator.AssertionSigner
-	Policy        *policy.Policy
-	PolicyManager *policy.Manager
-	State         *statebolt.Store // non-nil when backed by the transactional store
-	Audience      string
-	DataPlane     http.Handler
-	Admin         *http.Server
-	closers       []func() error
-	closeOnce     sync.Once
-	closeErr      error
+	Evidence       evidence.Store
+	Resource       *resource.Governor
+	Control        *control.ControlPlane
+	Spray          *anomaly.Detector
+	Signer         terminator.AssertionSigner
+	Policy         *policy.Policy
+	PolicyManager  *policy.Manager
+	State          *statebolt.Store // non-nil when backed by the transactional store
+	Audience       string
+	DataPlane      http.Handler
+	Admin          *http.Server
+	adaptiveHealth []terminator.AdaptivePersistenceHealth
+	closers        []func() error
+	closeOnce      sync.Once
+	closeErr       error
 }
 
 // controlService returns the admin control-plane service (test/CLI seam).
@@ -79,6 +81,11 @@ func (rt *Runtime) Ready() error {
 			return fmt.Errorf("gripline: state store not ready: %w", err)
 		}
 	}
+	for _, health := range rt.adaptiveHealth {
+		if health != nil && health.PersistenceError() != nil {
+			return fmt.Errorf("gripline: adaptive state checkpoint unavailable")
+		}
+	}
 	return nil
 }
 
@@ -86,6 +93,7 @@ func (rt *Runtime) Ready() error {
 // P0.1 fix: Every authority is instantiated exactly once and shared.
 func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 	var closers []func() error
+	var adaptiveHealth []terminator.AdaptivePersistenceHealth
 	defer func() {
 		if retErr == nil {
 			return
@@ -181,6 +189,8 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		if err != nil {
 			return nil, fmt.Errorf("gripline: spray state: %w", err)
 		}
+		adaptiveHealth = append(adaptiveHealth, spray)
+		closers = append(closers, spray.Close)
 	} else {
 		spray = anomaly.NewDetector(time.Now, anomaly.DefaultThresholds())
 	}
@@ -199,18 +209,21 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 	if err != nil {
 		return nil, fmt.Errorf("gripline: policy: %w", err)
 	}
+	var policyVerifier ed25519.PublicKey
+	if cfg.Policy.VerifierKeyFile != "" {
+		policyVerifier, err = policy.LoadVerifierKeyFile(cfg.Policy.VerifierKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("gripline: policy verifier: %w", err)
+		}
+	}
 	policyOptions := policy.Options{}
 	if state != nil {
-		policyStore, storeErr := policy.NewFileStore(cfg.Paths.State + ".policy")
-		if storeErr != nil {
-			return nil, fmt.Errorf("gripline: policy lifecycle store: %w", storeErr)
-		}
 		policyOptions = policy.Options{
-			Persist:           policyStore.Persist,
-			PersistArtifact:   policyStore.PersistArtifact,
-			PersistTransition: policyStore.PersistTransition,
-			LoadManifest:      policyStore.LoadManifest,
-			LoadArtifact:      policyStore.LoadArtifact,
+			Persist:           state.PersistPolicyManifest,
+			PersistArtifact:   state.PersistPolicyArtifact,
+			PersistTransition: state.PersistPolicyTransition,
+			LoadManifest:      state.LoadPolicyManifest,
+			LoadArtifact:      state.LoadPolicyArtifact,
 		}
 	}
 	policyManager, err := policy.NewManager(pol, policyOptions)
@@ -237,22 +250,26 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 				return nil, fmt.Errorf("gripline: producer state %s: %w", name, perr)
 			}
 			producerList[i] = persistent
+			adaptiveHealth = append(adaptiveHealth, persistent)
+			closers = append(closers, persistent.Close)
 		}
 	}
 
 	term, err := terminator.New(terminator.Dependencies{
-		Registry:  reg,
-		Peppers:   peppers,
-		Lanes:     lanes, // Shared lane authority
-		Policy:    pol,
-		Signer:    signer,
-		Audience:  cfg.Identity.Audience,
-		Evidence:  evStore,
-		Mode:      terminator.ModeEnforce,
-		Resource:  governor, // Shared resource governor
-		Control:   ctrl,     // Shared control plane
-		Spray:     spray,    // Shared spray detector
-		Producers: producerList,
+		Registry:       reg,
+		Peppers:        peppers,
+		Lanes:          lanes, // Shared lane authority
+		Policy:         pol,
+		Signer:         signer,
+		Audience:       cfg.Identity.Audience,
+		Evidence:       evStore,
+		Mode:           terminator.ModeEnforce,
+		Resource:       governor, // Shared resource governor
+		Control:        ctrl,     // Shared control plane
+		Spray:          spray,    // Shared spray detector
+		Producers:      producerList,
+		AdaptiveHealth: adaptiveHealth,
+		Policies:       policyManager,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("gripline: terminator: %w", err)
@@ -358,6 +375,7 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		if err != nil {
 			return nil, fmt.Errorf("gripline: usage adapter: %w", err)
 		}
+		provider.MaxOutputTokens = cfg.Usage.MaxOutputTokens
 		proxyCfg.Usage = proxy.AdaptUsageProvider(provider)
 	}
 	// Admission and completion decisions are shipped as bounded JSONL events
@@ -447,13 +465,18 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/admin/posture", adminPosture(svc))
 		mux.HandleFunc("/admin/credentials", adminCredentials(svc, state))
-		mux.HandleFunc("/admin/credentials/add", adminCredentialAdd(svc, state))
+		mux.HandleFunc("/admin/credentials/add", adminCredentialAdd(svc, state, peppers))
+		mux.HandleFunc("/admin/credentials/pepper-status", adminCredentialPepperStatus(svc, state))
 		mux.HandleFunc("/admin/credentials/revoke", adminCredentialRevoke(svc))
 		mux.HandleFunc("/admin/lanes", adminLanes(svc, state))
 		mux.HandleFunc("/admin/lanes/unblock", adminLaneUnblock(svc))
 		mux.HandleFunc("/admin/audit", adminAudit(svc, state))
 		mux.HandleFunc("/admin/security-events", adminSecurityEvents(svc, state))
-		mux.HandleFunc("/admin/metrics", adminMetrics(svc, dp, governor, state, spray, decisionObserver, policyManager, signer))
+		mux.HandleFunc("/admin/policy", adminPolicyStatus(svc, policyManager))
+		mux.HandleFunc("/admin/policy/prepare", adminPolicyPrepare(svc, policyManager, policyVerifier))
+		mux.HandleFunc("/admin/policy/activate", adminPolicyActivate(svc, policyManager))
+		mux.HandleFunc("/admin/policy/rollback", adminPolicyRollback(svc, policyManager))
+		mux.HandleFunc("/admin/metrics", adminMetrics(svc, dp, governor, state, spray, decisionObserver, policyManager, signer, adaptiveHealth))
 		adminSrv = &http.Server{
 			Addr:              cfg.Admin.Listen,
 			Handler:           mux,
@@ -465,21 +488,22 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 	}
 
 	return &Runtime{
-		Registry:      reg,
-		Lanes:         lanes, // Shared lane authority
-		AdminService:  adminSvc,
-		Evidence:      evStore,
-		Resource:      governor, // Shared resource governor
-		Control:       ctrl,     // Shared control plane
-		Spray:         spray,    // Shared spray detector
-		Signer:        signer,
-		Policy:        pol,
-		PolicyManager: policyManager,
-		State:         state,
-		Audience:      cfg.Identity.Audience,
-		DataPlane:     dp,
-		Admin:         adminSrv,
-		closers:       closers,
+		Registry:       reg,
+		Lanes:          lanes, // Shared lane authority
+		AdminService:   adminSvc,
+		Evidence:       evStore,
+		Resource:       governor, // Shared resource governor
+		Control:        ctrl,     // Shared control plane
+		Spray:          spray,    // Shared spray detector
+		Signer:         signer,
+		Policy:         pol,
+		PolicyManager:  policyManager,
+		State:          state,
+		Audience:       cfg.Identity.Audience,
+		DataPlane:      dp,
+		Admin:          adminSrv,
+		adaptiveHealth: adaptiveHealth,
+		closers:        closers,
 	}, nil
 }
 
@@ -561,6 +585,150 @@ func (rt *Runtime) Close() error {
 	return rt.closeErr
 }
 
+type adminPolicySnapshot struct {
+	ID       string `json:"id"`
+	Revision int    `json:"revision"`
+	Digest   string `json:"digest"`
+}
+
+func adminPolicySnapshotOf(compiled *policy.CompiledPolicy) *adminPolicySnapshot {
+	if compiled == nil {
+		return nil
+	}
+	digest, err := policy.Digest(&compiled.Policy)
+	if err != nil {
+		return nil
+	}
+	return &adminPolicySnapshot{ID: compiled.ID, Revision: compiled.Revision, Digest: digest}
+}
+
+// adminPolicyStatus exposes only immutable policy identity metadata. The
+// artifact itself is not echoed back through the control plane.
+func adminPolicyStatus(svc *control.Service, manager *policy.Manager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			adminMethodNotAllowed(w)
+			return
+		}
+		if _, err := svc.AuthorizeCapability(r.Context(), bearer(r.Header.Get("Authorization")), control.CapPolicyInstall); err != nil {
+			writeAdminError(w, err)
+			return
+		}
+		writeAdminJSON(w, map[string]any{
+			"active":    adminPolicySnapshotOf(manager.Current()),
+			"candidate": adminPolicySnapshotOf(manager.Candidate()),
+		})
+	}
+}
+
+func adminPolicyPrepare(svc *control.Service, manager *policy.Manager, verifier ed25519.PublicKey) http.HandlerFunc {
+	type request struct {
+		Artifact json.RawMessage `json:"artifact"`
+		Reason   string          `json:"reason"`
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			adminMethodNotAllowed(w)
+			return
+		}
+		id, err := svc.AuthorizeCapability(r.Context(), bearer(r.Header.Get("Authorization")), control.CapPolicyInstall)
+		if err != nil {
+			writeAdminError(w, err)
+			return
+		}
+		var body request
+		if err := decodeAdminJSONLimit(w, r, &body, 4<<20); err != nil {
+			return
+		}
+		if strings.TrimSpace(body.Reason) == "" {
+			writeAdminError(w, control.ErrReasonRequired)
+			return
+		}
+		if len(verifier) != ed25519.PublicKeySize {
+			http.Error(w, "policy verifier unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		compiled, err := policy.LoadAuthenticated(body.Artifact, verifier)
+		if err != nil {
+			writePolicyAdminError(w, err)
+			return
+		}
+		prepared, err := manager.PrepareBy(&compiled.Policy, id.Name, body.Reason)
+		if err != nil {
+			writePolicyAdminError(w, err)
+			return
+		}
+		writeAdminJSON(w, map[string]any{"prepared": adminPolicySnapshotOf(prepared)})
+	}
+}
+
+func adminPolicyActivate(svc *control.Service, manager *policy.Manager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			adminMethodNotAllowed(w)
+			return
+		}
+		id, err := svc.AuthorizeCapability(r.Context(), bearer(r.Header.Get("Authorization")), control.CapPolicyInstall)
+		if err != nil {
+			writeAdminError(w, err)
+			return
+		}
+		var body struct {
+			Reason string `json:"reason"`
+		}
+		if err := decodeAdminJSON(w, r, &body); err != nil {
+			return
+		}
+		if strings.TrimSpace(body.Reason) == "" {
+			writeAdminError(w, control.ErrReasonRequired)
+			return
+		}
+		if err := manager.ActivateBy(body.Reason, id.Name); err != nil {
+			writePolicyAdminError(w, err)
+			return
+		}
+		writeAdminJSON(w, map[string]any{"active": adminPolicySnapshotOf(manager.Current())})
+	}
+}
+
+func adminPolicyRollback(svc *control.Service, manager *policy.Manager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			adminMethodNotAllowed(w)
+			return
+		}
+		id, err := svc.AuthorizeCapability(r.Context(), bearer(r.Header.Get("Authorization")), control.CapPolicyInstall)
+		if err != nil {
+			writeAdminError(w, err)
+			return
+		}
+		var body struct {
+			Revision int    `json:"revision"`
+			Reason   string `json:"reason"`
+		}
+		if err := decodeAdminJSON(w, r, &body); err != nil {
+			return
+		}
+		if body.Revision < 1 || strings.TrimSpace(body.Reason) == "" {
+			writePolicyAdminError(w, errors.New("policy rollback requires a positive revision and reason"))
+			return
+		}
+		if err := manager.RollbackBy(body.Revision, body.Reason, id.Name); err != nil {
+			writePolicyAdminError(w, err)
+			return
+		}
+		writeAdminJSON(w, map[string]any{"active": adminPolicySnapshotOf(manager.Current())})
+	}
+}
+
+func writePolicyAdminError(w http.ResponseWriter, err error) {
+	if errors.Is(err, control.ErrUnauthenticated) || errors.Is(err, control.ErrUnauthorized) || errors.Is(err, control.ErrReasonRequired) {
+		writeAdminError(w, err)
+		return
+	}
+	http.Error(w, "policy action rejected", http.StatusBadRequest)
+}
+
 func adminPosture(svc *control.Service) http.HandlerFunc {
 	type body struct {
 		On     bool   `json:"on"`
@@ -635,7 +803,7 @@ func adminCredentialRevoke(svc *control.Service) http.HandlerFunc {
 	}
 }
 
-func adminCredentialAdd(svc *control.Service, state *statebolt.Store) http.HandlerFunc {
+func adminCredentialAdd(svc *control.Service, state *statebolt.Store, peppers *credential.PepperRing) http.HandlerFunc {
 	type request struct {
 		CredentialID    string `json:"credential_id"`
 		AccountID       string `json:"account_id"`
@@ -677,7 +845,24 @@ func adminCredentialAdd(svc *control.Service, state *statebolt.Store) http.Handl
 			req.VerifierVersion = 1
 		}
 		if req.PepperVersion == 0 {
-			req.PepperVersion = 1
+			if peppers == nil {
+				http.Error(w, "verifier pepper authority unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			req.PepperVersion = peppers.Latest()
+		}
+		if peppers != nil {
+			configured := false
+			for _, version := range peppers.Versions() {
+				if version == req.PepperVersion {
+					configured = true
+					break
+				}
+			}
+			if !configured {
+				http.Error(w, "pepper_version is not configured", http.StatusBadRequest)
+				return
+			}
 		}
 		rec := credential.CredentialRecord{
 			CredentialID: req.CredentialID, AccountID: req.AccountID, Verifier: verifier,
@@ -690,6 +875,29 @@ func adminCredentialAdd(svc *control.Service, state *statebolt.Store) http.Handl
 			return
 		}
 		writeAdminJSON(w, map[string]string{"credential_id": req.CredentialID, "status": "ACTIVE"})
+	}
+}
+
+func adminCredentialPepperStatus(svc *control.Service, state *statebolt.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			adminMethodNotAllowed(w)
+			return
+		}
+		if _, err := svc.AuthorizeCapability(r.Context(), bearer(r.Header.Get("Authorization")), control.CapCredentialLifecycle); err != nil {
+			writeAdminError(w, err)
+			return
+		}
+		if state == nil {
+			http.Error(w, "persistent credential authority unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		counts, err := state.CountCredentialsByPepperVersion()
+		if err != nil {
+			http.Error(w, "credential authority unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		writeAdminJSON(w, counts)
 	}
 }
 
@@ -843,7 +1051,7 @@ func adminSecurityEvents(svc *control.Service, state *statebolt.Store) http.Hand
 	}
 }
 
-func adminMetrics(svc *control.Service, dp *proxy.DataPlane, governor *resource.Governor, state *statebolt.Store, spray *anomaly.Detector, observer *jsonlObserver, policyManager *policy.Manager, signer *terminator.Keyring) http.HandlerFunc {
+func adminMetrics(svc *control.Service, dp *proxy.DataPlane, governor *resource.Governor, state *statebolt.Store, spray *anomaly.Detector, observer *jsonlObserver, policyManager *policy.Manager, signer *terminator.Keyring, adaptiveHealth []terminator.AdaptivePersistenceHealth) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			adminMethodNotAllowed(w)
@@ -910,6 +1118,14 @@ func adminMetrics(svc *control.Service, dp *proxy.DataPlane, governor *resource.
 		if spray != nil {
 			writeMetric("detector_drops_total", spray.Stats().Dropped)
 		}
+		adaptiveHealthy := 1
+		for _, health := range adaptiveHealth {
+			if health != nil && health.PersistenceError() != nil {
+				adaptiveHealthy = 0
+				break
+			}
+		}
+		writeMetric("adaptive_persistence_healthy", adaptiveHealthy)
 		if observer != nil {
 			m := observer.Stats()
 			writeMetric("telemetry_drops_total", m.Dropped)
@@ -941,7 +1157,11 @@ func auditCursor(r *http.Request) (uint64, int, error) {
 }
 
 func decodeAdminJSON(w http.ResponseWriter, r *http.Request, dst any) error {
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
+	return decodeAdminJSONLimit(w, r, dst, 4096)
+}
+
+func decodeAdminJSONLimit(w http.ResponseWriter, r *http.Request, dst any, maxBytes int64) error {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBytes))
 	var raw json.RawMessage
 	if err := dec.Decode(&raw); err != nil || len(bytes.TrimSpace(raw)) == 0 || bytes.TrimSpace(raw)[0] != '{' {
 		http.Error(w, "bad request", http.StatusBadRequest)

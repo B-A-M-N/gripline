@@ -133,6 +133,8 @@ func (s *Store) limits() Limits {
 // provider. It is optional on the compatibility store and safe to call during
 // construction before traffic starts.
 func (s *Store) SetLaneLimits(fn func() Limits) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.cfg = fn
 }
 

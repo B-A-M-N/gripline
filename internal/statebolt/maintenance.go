@@ -26,6 +26,8 @@ type RecoveryManifest struct {
 	PolicyRevision            int       `json:"policy_revision,omitempty"`
 	PolicyDigest              string    `json:"policy_digest,omitempty"`
 	SignerPublicFingerprints  []string  `json:"signer_public_fingerprints,omitempty"`
+	SignerKeyringSHA256       string    `json:"signer_keyring_sha256,omitempty"`
+	SignerKeyringBytes        int64     `json:"signer_keyring_bytes,omitempty"`
 	RequiredPepperVersions    []int     `json:"required_pepper_versions,omitempty"`
 	RequiredPseudonymVersions []int     `json:"required_pseudonym_versions,omitempty"`
 	CreatedAt                 time.Time `json:"created_at"`
@@ -39,6 +41,8 @@ type RecoveryMetadata struct {
 	PolicyRevision            int
 	PolicyDigest              string
 	SignerPublicFingerprints  []string
+	SignerKeyringSHA256       string
+	SignerKeyringBytes        int64
 	RequiredPepperVersions    []int
 	RequiredPseudonymVersions []int
 }
@@ -61,7 +65,7 @@ func CheckFile(path string) error {
 		if meta == nil || btoi(meta.Get(keySchemaVersion)) != currentSchemaVersion {
 			return fmt.Errorf("statebolt: invalid schema: %w", ErrMigrationRequired)
 		}
-		for _, bucket := range [][]byte{bucketCredentials, bucketLanes, bucketEvidence, bucketOperatorAudit, bucketSecurityAudit, bucketOperatorState, bucketDetectorState} {
+		for _, bucket := range [][]byte{bucketCredentials, bucketLanes, bucketEvidence, bucketOperatorAudit, bucketSecurityAudit, bucketOperatorState, bucketDetectorState, bucketPolicyManifest, bucketPolicyArtifacts, bucketPolicyAudit} {
 			if tx.Bucket(bucket) == nil {
 				return fmt.Errorf("statebolt: missing bucket %q", bucket)
 			}
@@ -121,6 +125,8 @@ func (s *Store) BackupWithRecoveryManifest(path, manifestPath string, metadata R
 		PolicyID: metadata.PolicyID, PolicyRevision: metadata.PolicyRevision,
 		PolicyDigest:              metadata.PolicyDigest,
 		SignerPublicFingerprints:  append([]string(nil), metadata.SignerPublicFingerprints...),
+		SignerKeyringSHA256:       metadata.SignerKeyringSHA256,
+		SignerKeyringBytes:        metadata.SignerKeyringBytes,
 		RequiredPepperVersions:    append([]int(nil), metadata.RequiredPepperVersions...),
 		RequiredPseudonymVersions: append([]int(nil), metadata.RequiredPseudonymVersions...),
 		CreatedAt:                 time.Now().UTC(),
@@ -145,9 +151,9 @@ func ValidateRecoveryManifest(backup, manifestPath string) error {
 	if err != nil {
 		return err
 	}
-	var manifest RecoveryManifest
-	if err := json.Unmarshal(manifestData, &manifest); err != nil {
-		return fmt.Errorf("statebolt: parse recovery manifest: %w", err)
+	manifest, err := ParseRecoveryManifest(manifestData)
+	if err != nil {
+		return err
 	}
 	if manifest.FormatVersion != 1 || manifest.SchemaVersion != currentSchemaVersion || manifest.PolicyID == "" || manifest.PolicyRevision < 1 || manifest.PolicyDigest == "" || len(manifest.SignerPublicFingerprints) == 0 || len(manifest.RequiredPepperVersions) == 0 {
 		return fmt.Errorf("statebolt: unsupported recovery manifest format/schema: %w", ErrMigrationRequired)
@@ -157,6 +163,72 @@ func ValidateRecoveryManifest(backup, manifestPath string) error {
 		return errors.New("statebolt: recovery manifest does not match backup")
 	}
 	return nil
+}
+
+// ParseRecoveryManifest decodes and validates the structural fields of a
+// recovery sidecar. It is also used by restore tooling to validate the actual
+// external authority bundle before installing the database.
+func ParseRecoveryManifest(data []byte) (RecoveryManifest, error) {
+	var manifest RecoveryManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return RecoveryManifest{}, fmt.Errorf("statebolt: parse recovery manifest: %w", err)
+	}
+	if manifest.FormatVersion != 1 || manifest.SchemaVersion != currentSchemaVersion || manifest.PolicyID == "" || manifest.PolicyRevision < 1 || manifest.PolicyDigest == "" || len(manifest.SignerPublicFingerprints) == 0 || len(manifest.RequiredPepperVersions) == 0 {
+		return RecoveryManifest{}, fmt.Errorf("statebolt: unsupported recovery manifest format/schema: %w", ErrMigrationRequired)
+	}
+	return manifest, nil
+}
+
+// ValidateRecoveryEnvironment verifies that the signer and secret-generation
+// inputs available to the restoring process match the sidecar. Secret values
+// remain in the external secret manager; only their required generations are
+// compared here.
+func ValidateRecoveryEnvironment(manifest RecoveryManifest, metadata RecoveryMetadata) error {
+	if manifest.PolicyID != metadata.PolicyID || manifest.PolicyRevision != metadata.PolicyRevision || manifest.PolicyDigest != metadata.PolicyDigest {
+		return errors.New("statebolt: supplied policy environment does not match recovery manifest")
+	}
+	if manifest.SignerKeyringSHA256 != "" && manifest.SignerKeyringSHA256 != metadata.SignerKeyringSHA256 {
+		return errors.New("statebolt: supplied signer keyring does not match recovery manifest")
+	}
+	if manifest.SignerKeyringBytes != 0 && manifest.SignerKeyringBytes != metadata.SignerKeyringBytes {
+		return errors.New("statebolt: supplied signer keyring size does not match recovery manifest")
+	}
+	if !containsAll(metadata.SignerPublicFingerprints, manifest.SignerPublicFingerprints) {
+		return errors.New("statebolt: supplied signer verifier generations are incomplete")
+	}
+	if !containsAllInts(metadata.RequiredPepperVersions, manifest.RequiredPepperVersions) {
+		return errors.New("statebolt: supplied verifier pepper generations are incomplete")
+	}
+	if !containsAllInts(metadata.RequiredPseudonymVersions, manifest.RequiredPseudonymVersions) {
+		return errors.New("statebolt: supplied pseudonym generations are incomplete")
+	}
+	return nil
+}
+
+func containsAll(have, required []string) bool {
+	set := make(map[string]struct{}, len(have))
+	for _, value := range have {
+		set[value] = struct{}{}
+	}
+	for _, value := range required {
+		if _, ok := set[value]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func containsAllInts(have, required []int) bool {
+	set := make(map[int]struct{}, len(have))
+	for _, value := range have {
+		set[value] = struct{}{}
+	}
+	for _, value := range required {
+		if _, ok := set[value]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func validateRecoveryMetadata(metadata RecoveryMetadata) error {

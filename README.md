@@ -132,10 +132,12 @@ gripline audit security list   --config c.json --token-file /run/secrets/griplin
 gripline audit security export --config c.json --token-file /run/secrets/gripline-operator > security.jsonl
 gripline keys export       --config c.json   # public backend verification material only
 gripline policy verify     --config c.json   # verify the configured signed policy artifact
+gripline credential pepper-status --config c.json --token-file /run/secrets/gripline-operator
 gripline version
 
-# Live signer rotation is intentionally not exposed in public beta. Coordinate
-# key lifecycle externally, then publish the public verification material:
+# Live signer rotation remains an explicit deployment integration in public
+# beta. Coordinate the backend acceptance lifecycle, then publish the public
+# verification material:
 gripline keys export --config c.json > verification-keys.json
 ```
 
@@ -179,11 +181,11 @@ secret injector, not in the state database.
 
 ## Guarantees (and how they are proven)
 
-- **The raw external secret is not forwarded past the boundary** — stripped
-  immediately from the inbound header map before source/usage adapters run;
-  only a signed assertion is re-injected on the trusted hop (INV-1/10/11/12).
-  As with any Go process, caller-owned immutable input bytes may still exist in
-  runtime memory; Gripline zeroes every mutable copy it owns.
+- **Supported external credential carriers are terminated at the boundary** —
+  Gripline strips the extracted credential before source/usage adapters run
+  and never intentionally re-emits it; only a signed assertion is re-injected
+  on the trusted hop (INV-1/10/11/12). It does not scan arbitrary application
+  payloads for duplicate copies of the same byte sequence.
 - **Containment survives restart** — credential CONSTRAINED/REVOKED, lane
   SUSPICIOUS/BLOCKED, evidence, emergency posture, and signer identity restore
   from the transactional bbolt state plus the restricted signer keyring
@@ -319,7 +321,7 @@ internal/credential    HMAC-SHA256 pepper verifier (keys copied on ingestion, em
                        CredentialRecord, status machine + hysteresis, registry with rotation-safe
                        verifier indexes + defensive re-check (INV-1,13)
 internal/statebolt     the single transactional bbolt authority: credentials + verifier index,
-                       lanes, evidence, operator audit, operator posture — one write path,
+                       lanes, evidence, policy lifecycle/artifacts, operator audit, operator posture — one write path,
                        pure shared reducers (no semantic drift vs the memory backends)
 internal/pseudonym     keyed HMAC source/fingerprint IDs (fail-closed construction, key copies,
                        negative versions refused), rotation (key distinct from verifier pepper)
@@ -336,8 +338,8 @@ internal/policy        versioned + validated policy (threshold ladder checked), 
 internal/resource      atomic token buckets with all-or-nothing Reservations, concurrency leases
                        with shared release state (copy-safe, INV-15; race-tested)
 internal/terminator    admission flow (§53): extract → strip secret+internal headers → authenticate →
-                       policy binding → lane → evidence → risk → policy resolver → hard limit →
-                       internal identity; policy snapshot at New; explicit TERMINATE/ENFORCE modes;
+                       policy binding → lane → evidence → risk → live policy snapshot → hard limit →
+                       internal identity; live manager policy snapshots per request; explicit TERMINATE/ENFORCE modes;
                        128-bit random request ids; Ed25519 keyring with
                        prepare/publish/accept/activate/retire rotation lifecycle
 internal/proxy         terminate-and-forward data plane: strip reserved headers (INV-12), re-inject

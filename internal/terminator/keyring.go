@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -353,7 +354,7 @@ func LoadOrCreateKeyring(path string) (*Keyring, error) {
 		return NewKeyring()
 	}
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o750); err != nil {
+		if err := prepareKeyringDir(dir); err != nil {
 			return nil, err
 		}
 	}
@@ -498,6 +499,11 @@ func loadKeyringFile(path string) (*Keyring, error) {
 // a missing file; callers then generate it through the exclusive temp-file
 // commit in Save.
 func validateKeyringFile(path string, allowMissing bool) error {
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err := validateKeyringDir(dir); err != nil {
+			return err
+		}
+	}
 	info, err := os.Lstat(path)
 	if err != nil {
 		if allowMissing && errors.Is(err, os.ErrNotExist) {
@@ -515,6 +521,35 @@ func validateKeyringFile(path string, allowMissing bool) error {
 		return fmt.Errorf("terminator: keyring %s permissions %04o are too broad; require 0600", path, info.Mode().Perm())
 	}
 	return nil
+}
+
+func prepareKeyringDir(path string) error {
+	if err := os.MkdirAll(path, 0o750); err != nil {
+		return err
+	}
+	return validateKeyringDir(path)
+}
+
+func validateKeyringDir(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("terminator: keyring parent %s must be a real directory", path)
+	}
+	if info.Mode().Perm()&0o022 != 0 && !keyringDirOwnedByProcess(info) {
+		return fmt.Errorf("terminator: keyring parent %s permissions %04o are writable by group/other", path, info.Mode().Perm())
+	}
+	return nil
+}
+
+func keyringDirOwnedByProcess(info os.FileInfo) bool {
+	if info.Mode().Perm()&0o002 != 0 {
+		return false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return ok && int(stat.Uid) == os.Getuid() && int(stat.Gid) == os.Getgid()
 }
 
 // Keyring is a rotating set of assertion signers (generations), mirroring the

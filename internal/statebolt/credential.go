@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 	"time"
 
@@ -14,6 +15,24 @@ import (
 	"github.com/B-A-M-N/gripline/internal/control"
 	"github.com/B-A-M-N/gripline/internal/credential"
 )
+
+// CountCredentialsByPepperVersion reports how many durable credentials still
+// depend on each verifier-pepper generation. It is an operator safety check
+// before retiring an old pepper; it never exposes verifier material.
+func (s *Store) CountCredentialsByPepperVersion() (map[int]int, error) {
+	counts := make(map[int]int)
+	err := s.view(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketCredentials).ForEach(func(_, value []byte) error {
+			var record persistedCredential
+			if err := json.Unmarshal(value, &record); err != nil || record.SchemaVersion != credentialSchemaVersion || record.Record.PepperVersion < 1 {
+				return fmt.Errorf("statebolt: corrupt credential while counting pepper versions")
+			}
+			counts[record.Record.PepperVersion]++
+			return nil
+		})
+	})
+	return counts, err
+}
 
 // persistedCredential is the versioned on-disk envelope for a credential row.
 // The record carries the verifier (a one-way digest, INV-1) — never a raw key.

@@ -61,6 +61,10 @@ type Observation struct {
 	// provider adapter make a bounded pre-execution estimate without receiving
 	// the body itself.
 	BodySize int64
+	// MaxBodyBytes is the configured hard request ceiling. It lets a usage
+	// adapter reserve conservatively for chunked requests whose ContentLength is
+	// unknown.
+	MaxBodyBytes int64
 }
 
 // FeatureResolver derives the normalized lane feature vector from a sanitized
@@ -539,11 +543,12 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	terminator.StripSecretHeaders(obsHeaders)
 
 	obs := Observation{
-		Header:     obsHeaders,
-		RemoteAddr: remoteIP(r),
-		ProtoMajor: r.ProtoMajor,
-		URLPath:    r.URL.Path,
-		BodySize:   r.ContentLength,
+		Header:       obsHeaders,
+		RemoteAddr:   remoteIP(r),
+		ProtoMajor:   r.ProtoMajor,
+		URLPath:      r.URL.Path,
+		BodySize:     r.ContentLength,
+		MaxBodyBytes: d.cfg.MaxBodyBytes,
 	}
 	// P0.11-fix: a configured source resolver that FAILS must fail the request
 	// closed, not silently degrade to "no source" (which would disable the
@@ -792,10 +797,10 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		d.cfg.Observer.ObserveCompletion(event)
 	}
-	// P0.27/P0.17: Finalize baseline trust ONLY after successful stream
-	// completion. A request whose backend stream corrupts/fails earns no clean
-	// trust.
-	if streamErr == nil {
+	// P0.27/P0.17: Finalize baseline trust ONLY after a clean, successful
+	// backend response. A fully delivered 4xx/5xx is transport-clean but is not
+	// trust-building provider activity; resource accounting still settled above.
+	if streamErr == nil && resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
 		out.FinalizeBaseline()
 	}
 }

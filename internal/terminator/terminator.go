@@ -89,6 +89,7 @@ type BaselineToken struct {
 	// Eligible reports whether the admission ran in AdaptiveAvailable posture
 	// — a degraded admission never builds baseline trust (P0.1).
 	Eligible bool
+	policy   *policy.CompiledPolicy
 
 	// done guards idempotent finalization: a request completed and then
 	// double-released (error path + defer) must count once.
@@ -144,6 +145,7 @@ type CompletionResult struct {
 // Complete is idempotent.
 type CompletionToken struct {
 	subjects producers.SubjectContext
+	policy   *policy.CompiledPolicy
 	done     atomic.Bool
 	term     *Terminator
 }
@@ -160,7 +162,7 @@ func (c *CompletionToken) Complete(actual resource.UsageEstimate, success bool) 
 	if !c.done.CompareAndSwap(false, true) {
 		return CompletionResult{} // already observed
 	}
-	return c.term.observeCompletion(c.subjects, actual, success)
+	return c.term.observeCompletion(c.policy, c.subjects, actual, success)
 }
 
 // Complete is the Outcome convenience for the proxy lifecycle (P0.4A): spend the
@@ -269,6 +271,19 @@ type Dependencies struct {
 	// engine from REAL request behavior rather than manually seeded evidence.
 	// Nil/empty disables live evidence production.
 	Producers []producers.Producer
+
+	// AdaptiveHealth reports durable checkpoint failures for adaptive state.
+	// A failed checkpoint does not rewrite an already-authorized response, but
+	// it prevents trust promotion and marks subsequent decisions degraded until
+	// persistence recovers.
+	AdaptiveHealth []AdaptivePersistenceHealth
+
+	// Policies is the live policy authority. When set, each admission takes one
+	// immutable snapshot from Current at its start; the snapshot is retained by
+	// baseline/completion tokens so an activation cannot create a mixed-revision
+	// decision for an in-flight request. Policy is still required as the initial
+	// validated snapshot for construction and compatibility.
+	Policies PolicyProvider
 }
 
 // resourceController abstracts concurrency admission per scope.
@@ -277,6 +292,19 @@ type Dependencies struct {
 // still active (new admissions respect the lower cap).
 type resourceController interface {
 	Acquire(scope string, maxConcurrency int) *resource.LeaseHandle
+}
+
+// AdaptivePersistenceHealth is implemented by durable detector wrappers.
+// Readiness and admission use it to distinguish a live database from a
+// database whose adaptive checkpoints are failing.
+type AdaptivePersistenceHealth interface {
+	PersistenceError() error
+}
+
+// PolicyProvider is the live policy authority consumed by the data plane.
+// Implementations must return immutable compiled snapshots.
+type PolicyProvider interface {
+	Current() *policy.CompiledPolicy
 }
 
 // Terminator is the credential-termination admission engine.
@@ -290,9 +318,11 @@ type Terminator struct {
 	// re-configuration (New). The old shallow struct copy shared the evidence
 	// map: a caller writing dep.Policy.EvidenceRules["NEW_LANE"] after
 	// construction rewrote live enforcement.
-	pol *policy.CompiledPolicy
+	policies PolicyProvider
+	pol      *policy.CompiledPolicy
 	// pruneCounter triggers pruning every N admissions (optimization only).
-	pruneCounter atomic.Int64
+	pruneCounter         *atomic.Int64
+	policyWiringRevision atomic.Int64
 }
 
 // New builds a Terminator and validates the critical seams for the requested
@@ -306,7 +336,14 @@ func New(dep Dependencies) (*Terminator, error) {
 		return nil, errors.New("terminator: pepper ring required")
 	}
 	if dep.Policy == nil {
-		return nil, errors.New("terminator: policy required")
+		if dep.Policies == nil {
+			return nil, errors.New("terminator: policy required")
+		}
+		current := dep.Policies.Current()
+		if current == nil {
+			return nil, errors.New("terminator: policy required")
+		}
+		dep.Policy = &current.Policy
 	}
 	if dep.Signer == nil {
 		return nil, errors.New("terminator: signer required")
@@ -358,10 +395,64 @@ func New(dep Dependencies) (*Terminator, error) {
 		}
 	}
 	return &Terminator{
-		dep:  dep,
-		rand: newRequestID,
-		pol:  compiled,
+		dep:          dep,
+		policies:     dep.Policies,
+		rand:         newRequestID,
+		pol:          compiled,
+		pruneCounter: &atomic.Int64{},
 	}, nil
+}
+
+func (t *Terminator) currentPolicy() *policy.CompiledPolicy {
+	if t == nil {
+		return nil
+	}
+	compiled := t.pol
+	if t.policies != nil {
+		if current := t.policies.Current(); current != nil {
+			compiled = current
+		}
+	}
+	if compiled != nil && t.dep.Lanes != nil {
+		// Policy activation changes the live policy pointer. Update lane
+		// classification/security wiring once per revision before the next
+		// admission observes the snapshot.
+		if t.policyWiringRevision.Load() != int64(compiled.Revision) && t.policyWiringRevision.CompareAndSwap(0, int64(compiled.Revision)) {
+			t.dep.Lanes.SetSecurityHysteresis(compiled.LaneSecurity)
+			if setter, ok := t.dep.Lanes.(interface{ SetLaneLimits(func() lane.Limits) }); ok {
+				setter.SetLaneLimits(func() lane.Limits { return compiled.LaneLimits })
+			}
+		} else if t.policyWiringRevision.Load() != int64(compiled.Revision) {
+			// Another request may have won the first CAS. A revision can only
+			// advance monotonically, so retrying the wiring is harmless and
+			// keeps activation visible without a global admission lock.
+			t.dep.Lanes.SetSecurityHysteresis(compiled.LaneSecurity)
+			if setter, ok := t.dep.Lanes.(interface{ SetLaneLimits(func() lane.Limits) }); ok {
+				setter.SetLaneLimits(func() lane.Limits { return compiled.LaneLimits })
+			}
+			t.policyWiringRevision.Store(int64(compiled.Revision))
+		}
+	}
+	return compiled
+}
+
+func adaptiveStatus(failed bool) AdaptiveStateStatus {
+	if failed {
+		return AdaptiveDegraded
+	}
+	return AdaptiveAvailable
+}
+
+func (t *Terminator) adaptivePersistenceFailed() bool {
+	if t == nil {
+		return false
+	}
+	for _, health := range t.dep.AdaptiveHealth {
+		if health != nil && health.PersistenceError() != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // newRequestID returns a unique, non-secret request id (§71): 128 bits of
@@ -458,11 +549,24 @@ func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features,
 // caller supplies the ID generated before ingress authentication; an empty ID
 // is replaced with a fresh one for compatibility with internal callers.
 func (t *Terminator) AdmitUsageWithRequestID(reqID string, headers map[string][]string, feat lane.Features, src TrustedSource, est resource.UsageEstimate) *Outcome {
+	compiled := t.currentPolicy()
+	if compiled == nil {
+		return &Outcome{RequestID: reqID, Authorized: false, Reason: "policy_unavailable", DenialErr: errors.New("terminator: live policy unavailable")}
+	}
+	// Keep the existing implementation's receiver-local policy references while
+	// ensuring every request uses the one snapshot selected above. The view
+	// shares mutable counters and dependencies but has no independent authority.
+	view := &Terminator{dep: t.dep, rand: t.rand, pol: compiled, pruneCounter: t.pruneCounter}
+	return view.admitUsageWithRequestID(reqID, headers, feat, src, est)
+}
+
+func (t *Terminator) admitUsageWithRequestID(reqID string, headers map[string][]string, feat lane.Features, src TrustedSource, est resource.UsageEstimate) *Outcome {
 	if reqID == "" {
 		reqID = t.rand()
 	}
 	now := t.dep.RiskNow()
 	out := &Outcome{RequestID: reqID}
+	adaptivePersistenceFailed := t.adaptivePersistenceFailed()
 	// P0.50: the internal decision trace lives for the whole pipeline and is
 	// populated at every gate, so DENIED decisions are as explainable as
 	// authorized ones. P0.51: policy identity is stamped from the COMPILED
@@ -478,7 +582,7 @@ func (t *Terminator) AdmitUsageWithRequestID(reqID string, headers map[string][]
 		SourceObserved:         src.sourceID() != "",
 		Estimate:               est,
 		ReservationResult:      "none",
-		Adaptive:               AdaptiveAvailable,
+		Adaptive:               adaptiveStatus(adaptivePersistenceFailed),
 		CredentialStatusBefore: "unknown",
 		CredentialStatusAfter:  "unknown",
 	}
@@ -729,7 +833,7 @@ func (t *Terminator) AdmitUsageWithRequestID(reqID string, headers map[string][]
 	// adaptive tracks whether authoritative history was available (P0.1). An
 	// unavailable history is UNKNOWN, not empty: it must never become risk=0 in
 	// the state machine.
-	adaptive := AdaptiveAvailable
+	adaptive := adaptiveStatus(adaptivePersistenceFailed)
 	var credentialEvidence, laneEvidence, sourceEvidence []evidence.Evidence
 	credSnapOK := t.dep.Evidence == nil
 	laneSnapOK := t.dep.Evidence == nil
@@ -881,7 +985,7 @@ func (t *Terminator) AdmitUsageWithRequestID(reqID string, headers map[string][]
 			case credential.TransitionCommitted, credential.TransitionNoChange:
 				after = tr.Record.Status
 				updatedCred = credFrom(tr.Record)
-				if tr.Status == credential.TransitionCommitted {
+				if tr.Status == credential.TransitionCommitted && !adaptivePersistenceFailed {
 					adaptiveForObservation = AdaptiveAvailable
 				}
 			case credential.TransitionConflict:
@@ -900,7 +1004,7 @@ func (t *Terminator) AdmitUsageWithRequestID(reqID string, headers map[string][]
 					case rerr == nil:
 						after = retry.Record.Status
 						updatedCred = credFrom(retry.Record)
-						if retry.Status == credential.TransitionCommitted {
+						if retry.Status == credential.TransitionCommitted && !adaptivePersistenceFailed {
 							adaptiveForObservation = AdaptiveAvailable
 						}
 					case errors.Is(rerr, credential.ErrStaleCAS):
@@ -1202,6 +1306,7 @@ func (t *Terminator) AdmitUsageWithRequestID(reqID string, headers map[string][]
 			// admission's token is issued but the proxy-side finalize is a
 			// no-op for it (flagged in the token).
 			Eligible: adaptiveForObservation == AdaptiveAvailable,
+			policy:   t.pol,
 			term:     t,
 		}
 	}
@@ -1219,7 +1324,8 @@ func (t *Terminator) AdmitUsageWithRequestID(reqID string, headers map[string][]
 				CredentialID: cred.CredentialID,
 				AccountID:    cred.AccountID,
 			},
-			term: t,
+			policy: t.pol,
+			term:   t,
 		}
 	}
 
@@ -1227,7 +1333,7 @@ func (t *Terminator) AdmitUsageWithRequestID(reqID string, headers map[string][]
 	// Pruning runs every admission to bound memory, not just successful
 	// authorizations — evidence activity (including denied requests) can
 	// contribute to pruning needs.
-	if t.pruneCounter.Add(1)%50 == 0 && t.dep.Evidence != nil {
+	if t.pruneCounter != nil && t.pruneCounter.Add(1)%50 == 0 && t.dep.Evidence != nil {
 		t.pruneEvidence(now, credSubjects, laneSubjects, sourceSubjects...)
 	}
 
@@ -1382,14 +1488,18 @@ func (t *Terminator) pruneEvidence(now time.Time, credSubjects, laneSubjects []e
 // admission. Called only from BaselineToken.Finalize, which owns idempotency.
 func (t *Terminator) finalizeBaseline(b *BaselineToken) {
 	now := t.dep.RiskNow()
+	pol := b.policy
+	if pol == nil {
+		pol = t.pol
+	}
 	promCrit := lane.PromotionCriteria{
-		MinCleanAge:              t.pol.Learning.MinCleanAge,
-		MinCleanRequests:         t.pol.Learning.MinCleanRequests,
-		MinCleanActiveDays:       t.pol.Learning.MinCleanActiveDays,
-		MaxEstablishmentRisk:     t.pol.Learning.MaxEstablishmentRisk,
-		AllowNewLanes:            t.pol.Learning.AllowNewLanes,
-		AllowSuspicious:          t.pol.Learning.AllowSuspiciousLanes,
-		HasDisqualifyingEvidence: t.hasActiveDisqualifyingEvidence(b.CredentialID, b.LaneID, now),
+		MinCleanAge:              pol.Learning.MinCleanAge,
+		MinCleanRequests:         pol.Learning.MinCleanRequests,
+		MinCleanActiveDays:       pol.Learning.MinCleanActiveDays,
+		MaxEstablishmentRisk:     pol.Learning.MaxEstablishmentRisk,
+		AllowNewLanes:            pol.Learning.AllowNewLanes,
+		AllowSuspicious:          pol.Learning.AllowSuspiciousLanes,
+		HasDisqualifyingEvidence: t.hasActiveDisqualifyingEvidence(pol, b.CredentialID, b.LaneID, now),
 	}
 	meta := lane.TransitionMetadata{RequestID: b.RequestID, PolicyRevision: b.PolicyRevision, EvidenceCodes: b.EvidenceCodes}
 	if aware, ok := t.dep.Lanes.(lane.MetadataAwareRepository); ok {
@@ -1470,9 +1580,12 @@ func sprayCodes(sigs []anomaly.Signal) []string {
 // finished. Persistence is best-effort: an evidence store outage or a
 // non-compiled rule simply skips that signal; the finished request is not
 // re-evaluated (it already ran).
-func (t *Terminator) observeCompletion(subjects producers.SubjectContext, actual resource.UsageEstimate, success bool) CompletionResult {
+func (t *Terminator) observeCompletion(pol *policy.CompiledPolicy, subjects producers.SubjectContext, actual resource.UsageEstimate, success bool) CompletionResult {
 	if len(t.dep.Producers) == 0 {
 		return CompletionResult{}
+	}
+	if pol == nil {
+		pol = t.pol
 	}
 	behavior := producers.CompletionBehavior{
 		Subjects: subjects,
@@ -1493,7 +1606,7 @@ func (t *Terminator) observeCompletion(subjects producers.SubjectContext, actual
 	for _, prod := range t.dep.Producers {
 		sigs := prod.ObserveCompletion(behavior)
 		for _, sig := range sigs {
-			rule, ok := t.pol.EvidenceRules[sig.Code]
+			rule, ok := pol.EvidenceRules[sig.Code]
 			if !ok {
 				continue // not compiled into the active policy — ignore
 			}
@@ -1501,7 +1614,7 @@ func (t *Terminator) observeCompletion(subjects producers.SubjectContext, actual
 			if !ok {
 				continue // scope's subject unavailable (e.g. no source) — skip
 			}
-			ev, err := evidence.Mint(t.pol.EvidenceRules, sig.Code, subjectID, t.dep.RiskNow(), t.pol.Revision)
+			ev, err := evidence.Mint(pol.EvidenceRules, sig.Code, subjectID, t.dep.RiskNow(), pol.Revision)
 			if err != nil {
 				continue
 			}
@@ -1537,8 +1650,11 @@ func (evidenceAppendError) Error() string { return "terminator: completion evide
 // disqualifying list (P0.26). A store outage here must NOT fail open into
 // "no disqualifying evidence" — it conservatively vetoes (fail-closed): an
 // unavailable history is unknown, and unknown blocks trust-building.
-func (t *Terminator) hasActiveDisqualifyingEvidence(credID, laneID string, now time.Time) bool {
-	if len(t.pol.Learning.DisqualifyingEvidenceCodes) == 0 {
+func (t *Terminator) hasActiveDisqualifyingEvidence(pol *policy.CompiledPolicy, credID, laneID string, now time.Time) bool {
+	if pol == nil {
+		pol = t.pol
+	}
+	if len(pol.Learning.DisqualifyingEvidenceCodes) == 0 {
 		return false
 	}
 	if t.dep.Evidence == nil {
@@ -1556,8 +1672,8 @@ func (t *Terminator) hasActiveDisqualifyingEvidence(credID, laneID string, now t
 		// evidence outage; it resumes when the store is readable again.
 		return true
 	}
-	dq := make(map[string]struct{}, len(t.pol.Learning.DisqualifyingEvidenceCodes))
-	for _, c := range t.pol.Learning.DisqualifyingEvidenceCodes {
+	dq := make(map[string]struct{}, len(pol.Learning.DisqualifyingEvidenceCodes))
+	for _, c := range pol.Learning.DisqualifyingEvidenceCodes {
 		dq[c] = struct{}{}
 	}
 	for _, ev := range snap {

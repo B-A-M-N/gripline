@@ -168,6 +168,10 @@ type UsageSection struct {
 	InputMicrounitsPerToken  int64  `json:"input_microunits_per_token,omitempty"`
 	OutputMicrounitsPerToken int64  `json:"output_microunits_per_token,omitempty"`
 	DefaultOutputTokens      int64  `json:"default_output_tokens,omitempty"`
+	// MaxOutputTokens is the conservative pre-execution output reservation.
+	// It must be explicit when token/cost enforcement is enabled; request
+	// headers cannot lower this hard ceiling safely.
+	MaxOutputTokens int64 `json:"max_output_tokens,omitempty"`
 }
 
 // TLSSection configures the public listener's TLS.
@@ -468,8 +472,11 @@ func (c *Config) Validate() error {
 	if c.Usage.Mode != "" && c.Usage.Mode != "none" && c.Usage.Mode != "openai" && c.Usage.Mode != "anthropic" {
 		return fmt.Errorf("usage.mode must be none, openai, or anthropic, got %q", c.Usage.Mode)
 	}
-	if c.Usage.InputMicrounitsPerToken < 0 || c.Usage.OutputMicrounitsPerToken < 0 || c.Usage.DefaultOutputTokens < 0 {
-		return fmt.Errorf("usage pricing and default_output_tokens must be non-negative")
+	if c.Usage.InputMicrounitsPerToken < 0 || c.Usage.OutputMicrounitsPerToken < 0 || c.Usage.DefaultOutputTokens < 0 || c.Usage.MaxOutputTokens < 0 {
+		return fmt.Errorf("usage pricing and output-token bounds must be non-negative")
+	}
+	if (c.Usage.Mode == "openai" || c.Usage.Mode == "anthropic") && c.Usage.MaxOutputTokens == 0 {
+		return fmt.Errorf("usage.max_output_tokens is required when usage.mode enables token metering")
 	}
 	if c.Ingress != nil {
 		for version, value := range c.Ingress.PseudonymKeys {
@@ -507,9 +514,9 @@ func (c *Config) Validate() error {
 	if c.Policy.File != "" && c.Policy.VerifierKeyFile == "" {
 		return fmt.Errorf("policy.verifier_key_file is required when policy.file is configured: unsigned policy artifacts are not accepted")
 	}
-	if c.Policy.File == "" && c.Policy.VerifierKeyFile != "" {
-		return fmt.Errorf("policy.verifier_key_file requires policy.file")
-	}
+	// A verifier key may be configured without a startup artifact so operators
+	// can prepare signed candidates against the built-in default policy. The
+	// key is still required whenever a file artifact is selected.
 
 	// Admin: if exposed, it must be fully configured (P0.47).
 	if c.Admin != nil {

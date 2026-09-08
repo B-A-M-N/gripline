@@ -24,7 +24,7 @@ type publicUsageProvider struct{ provider publicusage.Provider }
 func (p publicUsageProvider) Estimate(obs Observation) resource.UsageEstimate {
 	e := p.provider.Estimate(publicusage.Observation{
 		Header: obs.Header, RemoteAddr: obs.RemoteAddr, ProtoMajor: obs.ProtoMajor,
-		URLPath: obs.URLPath, BodySize: obs.BodySize,
+		URLPath: obs.URLPath, BodySize: obs.BodySize, MaxBodyBytes: obs.MaxBodyBytes,
 	})
 	return resource.UsageEstimate{
 		Requests: e.Requests, InputTokens: e.InputTokens, OutputTokens: e.OutputTokens,
@@ -35,7 +35,7 @@ func (p publicUsageProvider) Estimate(obs Observation) resource.UsageEstimate {
 func (p publicUsageProvider) Begin(obs Observation, resp *http.Response) UsageSession {
 	return publicUsageSession{session: p.provider.Begin(publicusage.Observation{
 		Header: obs.Header, RemoteAddr: obs.RemoteAddr, ProtoMajor: obs.ProtoMajor,
-		URLPath: obs.URLPath, BodySize: obs.BodySize,
+		URLPath: obs.URLPath, BodySize: obs.BodySize, MaxBodyBytes: obs.MaxBodyBytes,
 	}, resp)}
 }
 

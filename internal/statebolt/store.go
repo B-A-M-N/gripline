@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -30,22 +31,27 @@ import (
 // Bucket names (§schema). meta holds a schema marker; each logical bucket holds
 // one record type. All values are versioned JSON envelopes.
 var (
-	bucketMeta          = []byte("meta")
-	bucketCredentials   = []byte("credentials")
-	bucketCredVerifier  = []byte("credential_verifiers") // "pepVer/verifierB64" -> credentialID
-	bucketLanes         = []byte("lanes")                // "credID/laneID" -> lane record
-	bucketEvidence      = []byte("evidence")             // subjectKey/id -> evidence
-	bucketOperatorAudit = []byte("operator_audit")       // seq -> OperatorRecord
-	bucketSecurityAudit = []byte("security_audit")       // seq -> SecurityTransitionRecord
-	bucketOperatorState = []byte("operator_state")       // "posture" -> Posture
-	bucketDetectorState = []byte("detector_state")       // bounded detector snapshots
-	keySchemaVersion    = []byte("schema_version")
-	keyPosture          = []byte("posture")
-	keyAuditSequence    = []byte("audit_sequence")
-	keySecuritySequence = []byte("security_sequence")
+	bucketMeta            = []byte("meta")
+	bucketCredentials     = []byte("credentials")
+	bucketCredVerifier    = []byte("credential_verifiers") // "pepVer/verifierB64" -> credentialID
+	bucketLanes           = []byte("lanes")                // "credID/laneID" -> lane record
+	bucketEvidence        = []byte("evidence")             // subjectKey/id -> evidence
+	bucketOperatorAudit   = []byte("operator_audit")       // seq -> OperatorRecord
+	bucketSecurityAudit   = []byte("security_audit")       // seq -> SecurityTransitionRecord
+	bucketOperatorState   = []byte("operator_state")       // "posture" -> Posture
+	bucketDetectorState   = []byte("detector_state")       // bounded detector snapshots
+	bucketPolicyManifest  = []byte("policy_manifest")      // "active" -> lifecycle manifest
+	bucketPolicyArtifacts = []byte("policy_artifacts")     // revision/digest -> policy bytes
+	bucketPolicyAudit     = []byte("policy_audit")         // seq -> lifecycle event
+	keySchemaVersion      = []byte("schema_version")
+	keyPosture            = []byte("posture")
+	keyAuditSequence      = []byte("audit_sequence")
+	keySecuritySequence   = []byte("security_sequence")
+	keyPolicyManifest     = []byte("active")
+	keyPolicySequence     = []byte("audit_sequence")
 )
 
-const currentSchemaVersion = 2
+const currentSchemaVersion = 3
 
 // ErrMigrationRequired is returned when a database carries a schema version
 // newer than this build or cannot be migrated safely.
@@ -61,6 +67,14 @@ var schemaMigrations = []schemaMigration{
 	{From: 1, To: 2, Apply: func(tx *bolt.Tx) error {
 		_, err := tx.CreateBucketIfNotExists(bucketDetectorState)
 		return err
+	}},
+	{From: 2, To: 3, Apply: func(tx *bolt.Tx) error {
+		for _, b := range [][]byte{bucketPolicyManifest, bucketPolicyArtifacts, bucketPolicyAudit} {
+			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
+				return err
+			}
+		}
+		return nil
 	}},
 }
 
@@ -157,8 +171,8 @@ func Open(path string, opts Options) (*Store, error) {
 		return nil, errors.New("statebolt: empty database path")
 	}
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o750); err != nil {
-			return nil, fmt.Errorf("statebolt: create dir: %w", err)
+		if err := prepareAuthorityDir(dir); err != nil {
+			return nil, fmt.Errorf("statebolt: authority directory: %w", err)
 		}
 	}
 	if err := validateStateFile(path, true); err != nil {
@@ -176,6 +190,65 @@ func Open(path string, opts Options) (*Store, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+// OpenReadOnly opens an existing authority for inspection without running
+// schema creation or migration. Offline status and recovery verification use
+// this path so a read-only command cannot create a new security database.
+func OpenReadOnly(path string, opts Options) (*Store, error) {
+	if opts.Now == nil {
+		opts.Now = time.Now
+	}
+	if path == "" {
+		return nil, errors.New("statebolt: empty database path")
+	}
+	if err := validateStateFile(path, false); err != nil {
+		return nil, err
+	}
+	db, err := bolt.Open(path, 0o600, &bolt.Options{ReadOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("statebolt: open read-only %s: %w", path, err)
+	}
+	s := &Store{db: db, now: opts.Now, lastSeen: make(map[string]time.Time), lastSeenInterval: time.Minute}
+	if err := s.view(func(tx *bolt.Tx) error {
+		meta := tx.Bucket(bucketMeta)
+		if meta == nil || btoi(meta.Get(keySchemaVersion)) != currentSchemaVersion {
+			return fmt.Errorf("statebolt: unsupported read-only schema: %w", ErrMigrationRequired)
+		}
+		return nil
+	}); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+func prepareAuthorityDir(path string) error {
+	if err := os.MkdirAll(path, 0o750); err != nil {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return errors.New("authority parent must be a real directory")
+	}
+	if info.Mode().Perm()&0o022 != 0 && !directoryOwnedByProcess(info) {
+		return fmt.Errorf("authority parent permissions %04o are writable by group/other", info.Mode().Perm())
+	}
+	return nil
+}
+
+// directoryOwnedByProcess permits the common service-account layout where a
+// directory is group-writable only by the same account's primary group. A
+// directory writable by an unrelated group or by everyone remains rejected.
+func directoryOwnedByProcess(info os.FileInfo) bool {
+	if info.Mode().Perm()&0o002 != 0 {
+		return false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return ok && int(stat.Uid) == os.Getuid() && int(stat.Gid) == os.Getgid()
 }
 
 func validateStateFile(path string, allowMissing bool) error {
@@ -219,6 +292,7 @@ func (s *Store) init() error {
 		for _, b := range [][]byte{
 			bucketMeta, bucketCredentials, bucketCredVerifier, bucketLanes,
 			bucketEvidence, bucketOperatorAudit, bucketSecurityAudit, bucketOperatorState, bucketDetectorState,
+			bucketPolicyManifest, bucketPolicyArtifacts, bucketPolicyAudit,
 		} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return fmt.Errorf("statebolt: create bucket %s: %w", b, err)

@@ -24,9 +24,9 @@ Phase 7 Hardened auth  sender-constrained (DPoP / mTLS / platform keys)
 
 - **Strong in one authority:** credential revocation, hard concurrency
   admission, configured request/token/cost reservations, and emergency block
-  state. Token/cost budgets require a configured usage adapter and are settled
-  after execution unless the provider supplies a conservative pre-execution
-  maximum.
+  state. Token/cost budgets require a configured usage adapter; the stock
+  adapter reserves the configured maximum request body and output allowance
+  before execution, then settles against structured response usage.
 - **Eventual OK:** analytics, baseline updates, historical investigation,
   low-severity evidence propagation.
 - Never treat eventually-consistent state as authoritative for a hard limit
@@ -74,8 +74,8 @@ metric label.
 ## 5. Single-node boundary
 
 This release has one authoritative bbolt file per runtime. Credential, lane,
-evidence, posture, audit, detector state, recovery manifests, and signer
-publication are restart-safe within that node. Resource buckets and in-flight
+evidence, policy lifecycle, posture, audit, detector state, recovery manifests,
+and signer publication are restart-safe within that node. Resource buckets and in-flight
 leases are process-local and reset on restart; do not deploy multiple active
 nodes and call the resource limits globally enforced until a shared lease,
 reservation-TTL, replication, and leader/ownership protocol has been added.

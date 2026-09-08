@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"syscall"
 )
 
 type fileStoreRecord struct {
@@ -37,6 +38,9 @@ func NewFileStore(dir string) (*FileStore, error) {
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return nil, fmt.Errorf("policy: create lifecycle directory: %w", err)
 	}
+	if err := validatePolicyDir(dir); err != nil {
+		return nil, fmt.Errorf("policy: lifecycle directory: %w", err)
+	}
 	return &FileStore{dir: dir, manifestPath: filepath.Join(dir, "manifest.json"), auditPath: filepath.Join(dir, "audit.jsonl")}, nil
 }
 
@@ -54,7 +58,32 @@ func OpenFileStore(dir string) (*FileStore, error) {
 	if !info.IsDir() {
 		return nil, errors.New("policy: lifecycle path is not a directory")
 	}
+	if err := validatePolicyDir(dir); err != nil {
+		return nil, fmt.Errorf("policy: lifecycle directory: %w", err)
+	}
 	return &FileStore{dir: dir, manifestPath: filepath.Join(dir, "manifest.json"), auditPath: filepath.Join(dir, "audit.jsonl")}, nil
+}
+
+func validatePolicyDir(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return errors.New("lifecycle directory must be a real directory")
+	}
+	if info.Mode().Perm()&0o022 != 0 && !policyDirOwnedByProcess(info) {
+		return fmt.Errorf("lifecycle directory permissions %04o are writable by group/other", info.Mode().Perm())
+	}
+	return nil
+}
+
+func policyDirOwnedByProcess(info os.FileInfo) bool {
+	if info.Mode().Perm()&0o002 != 0 {
+		return false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return ok && int(stat.Uid) == os.Getuid() && int(stat.Gid) == os.Getgid()
 }
 
 func (s *FileStore) LoadManifest() (Manifest, error) {

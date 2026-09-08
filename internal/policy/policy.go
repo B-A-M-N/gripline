@@ -96,6 +96,18 @@ func LoadAuthenticatedFile(path string, verifier ed25519.PublicKey) (*CompiledPo
 	if err != nil {
 		return nil, err
 	}
+	return LoadAuthenticated(data, verifier)
+}
+
+// LoadAuthenticated verifies and compiles a bounded signed policy envelope
+// supplied by an operator API. The byte-oriented entry point keeps the HTTP
+// control plane on the same authenticated artifact path as startup, without
+// making the server trust a filesystem path supplied by a caller.
+func LoadAuthenticated(data []byte, verifier ed25519.PublicKey) (*CompiledPolicy, error) {
+	const maxPolicyBytes = 4 << 20
+	if len(data) == 0 || len(data) > maxPolicyBytes {
+		return nil, fmt.Errorf("policy: signed artifact size must be between 1 and %d bytes", maxPolicyBytes)
+	}
 	if len(verifier) != ed25519.PublicKeySize {
 		return nil, errors.New("policy: Ed25519 verifier key required")
 	}

@@ -15,6 +15,8 @@ type StateStore interface {
 
 const detectorStateVersion = 1
 
+const detectorCheckpointInterval = 500 * time.Millisecond
+
 type winState struct {
 	Keys     map[string]time.Time `json:"keys"`
 	LastSeen time.Time            `json:"last_seen"`
@@ -118,20 +120,69 @@ func NewPersistentDetector(now func() time.Time, th Thresholds, store StateStore
 		}
 	}
 	d.store, d.stateName = store, name
+	d.checkpointStop = make(chan struct{})
+	d.checkpointDone = make(chan struct{})
+	go d.checkpointLoop()
 	return d, nil
 }
 
 func (d *Detector) persistLocked() {
-	if d.store == nil {
-		return
+	if d.store != nil {
+		d.dirty.Store(true)
 	}
-	data, err := d.snapshotLocked()
+}
+
+// checkpointLoop coalesces detector observations into bounded periodic
+// checkpoints. The detector's mutex protects in-memory windows; the separate
+// flush mutex prevents two durable snapshots from racing.
+func (d *Detector) checkpointLoop() {
+	ticker := time.NewTicker(detectorCheckpointInterval)
+	defer ticker.Stop()
+	defer close(d.checkpointDone)
+	for {
+		select {
+		case <-ticker.C:
+			_ = d.Flush()
+		case <-d.checkpointStop:
+			return
+		}
+	}
+}
+
+// Flush checkpoints dirty state synchronously. It is used for threshold
+// crossings, controlled shutdown, and restart-boundary tests.
+func (d *Detector) Flush() error {
+	if d == nil {
+		return errors.New("anomaly: nil detector")
+	}
+	d.flushMu.Lock()
+	defer d.flushMu.Unlock()
+	if d.store == nil || !d.dirty.Swap(false) {
+		return d.PersistenceError()
+	}
+	data, err := d.SnapshotState()
 	if err == nil {
 		err = d.store.SaveDetectorState(d.stateName, data)
 	}
+	d.mu.Lock()
+	d.stateErr = err
+	d.mu.Unlock()
 	if err != nil {
-		d.stateErr = err
+		d.dirty.Store(true)
 	}
+	return err
+}
+
+// Close stops the checkpoint worker and performs one final synchronous flush.
+func (d *Detector) Close() error {
+	if d == nil || d.store == nil {
+		return nil
+	}
+	d.closeOnce.Do(func() {
+		close(d.checkpointStop)
+		<-d.checkpointDone
+	})
+	return d.Flush()
 }
 
 // PersistenceError reports the latest checkpoint failure, if any.

@@ -72,3 +72,19 @@ func TestManagerRejectsReplayAndUnreasonedRollback(t *testing.T) {
 		t.Fatal("rollback must require an operator reason")
 	}
 }
+
+func TestManagerSnapshotsAreDefensiveCopies(t *testing.T) {
+	m, err := NewManager(Default(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := m.Current()
+	rule := first.EvidenceRules["NEW_LANE"]
+	rule.Score = 0
+	first.EvidenceRules["NEW_LANE"] = rule
+	first.Risk.Watch = 99
+	second := m.Current()
+	if second.EvidenceRules["NEW_LANE"].Score == 0 || second.Risk.Watch == 99 {
+		t.Fatal("mutating Current result changed manager-owned policy")
+	}
+}

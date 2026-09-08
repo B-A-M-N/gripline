@@ -45,6 +45,7 @@ type PolicyRef struct {
 // explanation rather than an unexplained pointer swap.
 type Event struct {
 	Action       string    `json:"action"`
+	Actor        string    `json:"actor,omitempty"`
 	FromRevision int       `json:"from_revision"`
 	ToRevision   int       `json:"to_revision"`
 	PolicyID     string    `json:"policy_id"`
@@ -168,7 +169,7 @@ func (m *Manager) Current() *CompiledPolicy {
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.current
+	return cloneCompiled(m.current)
 }
 
 // Candidate returns the prepared but not yet active snapshot, if any.
@@ -178,12 +179,38 @@ func (m *Manager) Candidate() *CompiledPolicy {
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.candidate
+	return cloneCompiled(m.candidate)
+}
+
+// cloneCompiled returns a newly compiled copy of a manager-owned snapshot.
+// CompiledPolicy contains maps and slices, so returning the internal pointer
+// would let callers mutate future enforcement through a supposedly immutable
+// lifecycle API.
+func cloneCompiled(compiled *CompiledPolicy) *CompiledPolicy {
+	if compiled == nil {
+		return nil
+	}
+	copy, err := Compile(&compiled.Policy)
+	if err != nil {
+		// Manager-owned policies were validated before insertion. Returning nil
+		// here is safer than exposing a mutable or partially copied policy if a
+		// future change violates that invariant.
+		return nil
+	}
+	return copy
 }
 
 // Prepare validates and compiles a candidate. Revisions are strictly
 // monotonic; replaying an old artifact cannot replace a newer candidate.
 func (m *Manager) Prepare(p *Policy) (*CompiledPolicy, error) {
+	return m.PrepareBy(p, "", "")
+}
+
+// PrepareBy prepares a candidate and records the authenticated operator that
+// requested it. The actor is part of the same durable transition event as the
+// candidate manifest, so an accepted policy cannot be detached from its
+// operator identity.
+func (m *Manager) PrepareBy(p *Policy, actor, reason string) (*CompiledPolicy, error) {
 	if m == nil {
 		return nil, errors.New("policy: nil manager")
 	}
@@ -205,7 +232,7 @@ func (m *Manager) Prepare(p *Policy) (*CompiledPolicy, error) {
 	if err != nil {
 		return nil, err
 	}
-	event := Event{Action: "prepare", FromRevision: m.current.Revision, ToRevision: compiled.Revision, PolicyID: compiled.ID, At: manifest.UpdatedAt}
+	event := Event{Action: "prepare", Actor: actor, FromRevision: m.current.Revision, ToRevision: compiled.Revision, PolicyID: compiled.ID, Reason: reason, At: manifest.UpdatedAt}
 	if err := m.commitLocked(manifest, event); err != nil {
 		return nil, err
 	}
@@ -217,6 +244,12 @@ func (m *Manager) Prepare(p *Policy) (*CompiledPolicy, error) {
 // Activate commits the currently prepared candidate. The manifest callback
 // runs while the manager lock is held and must be atomic/non-reentrant.
 func (m *Manager) Activate(reason string) error {
+	return m.ActivateBy(reason, "")
+}
+
+// ActivateBy activates the prepared candidate and records the operator in the
+// same durable transition event.
+func (m *Manager) ActivateBy(reason, actor string) error {
 	if m == nil {
 		return errors.New("policy: nil manager")
 	}
@@ -230,7 +263,7 @@ func (m *Manager) Activate(reason string) error {
 	if err != nil {
 		return err
 	}
-	if err := m.commitLocked(manifest, Event{Action: "activate", FromRevision: from.Revision, ToRevision: to.Revision, PolicyID: to.ID, Reason: reason, At: manifest.UpdatedAt}); err != nil {
+	if err := m.commitLocked(manifest, Event{Action: "activate", Actor: actor, FromRevision: from.Revision, ToRevision: to.Revision, PolicyID: to.ID, Reason: reason, At: manifest.UpdatedAt}); err != nil {
 		return err
 	}
 	m.knownGood[to.Revision] = to
@@ -241,6 +274,12 @@ func (m *Manager) Activate(reason string) error {
 // Rollback activates an exact previously-known-good revision. It is explicit,
 // auditable, and uses the same durable manifest gate as forward activation.
 func (m *Manager) Rollback(revision int, reason string) error {
+	return m.RollbackBy(revision, reason, "")
+}
+
+// RollbackBy activates an exact known-good revision and records the operator
+// in the durable transition event.
+func (m *Manager) RollbackBy(revision int, reason, actor string) error {
 	if m == nil {
 		return errors.New("policy: nil manager")
 	}
@@ -261,7 +300,7 @@ func (m *Manager) Rollback(revision int, reason string) error {
 	if err != nil {
 		return err
 	}
-	if err := m.commitLocked(manifest, Event{Action: "rollback", FromRevision: from.Revision, ToRevision: target.Revision, PolicyID: target.ID, Reason: reason, At: manifest.UpdatedAt}); err != nil {
+	if err := m.commitLocked(manifest, Event{Action: "rollback", Actor: actor, FromRevision: from.Revision, ToRevision: target.Revision, PolicyID: target.ID, Reason: reason, At: manifest.UpdatedAt}); err != nil {
 		return err
 	}
 	m.current, m.candidate = target, nil

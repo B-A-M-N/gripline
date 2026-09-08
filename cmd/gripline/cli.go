@@ -37,31 +37,102 @@ import (
 	"github.com/B-A-M-N/gripline/internal/terminator"
 )
 
-// runPolicyCLI dispatches policy artifact inspection commands. Verification
-// deliberately shares policyFor with the server composition root, so an
-// operator can prove the exact authenticated artifact that startup will use.
+// runPolicyCLI dispatches policy verification and the authenticated lifecycle
+// commands used by the running control plane.
 func runPolicyCLI(args []string) error {
-	if len(args) == 0 || args[0] != "verify" {
-		return fmt.Errorf("policy: expected 'verify --config path.json'")
+	if len(args) == 0 {
+		return fmt.Errorf("policy: expected verify, status, prepare, activate, or rollback")
 	}
-	fs := flag.NewFlagSet("policy verify", flag.ExitOnError)
+	if args[0] == "verify" {
+		fs := flag.NewFlagSet("policy verify", flag.ContinueOnError)
+		cfgPath := fs.String("config", "/etc/gripline/config.json", "path to the deployment configuration")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		cfg, err := config.Load(*cfgPath)
+		if err != nil {
+			return fmt.Errorf("policy verify: %w", err)
+		}
+		pol, err := policyFor(cfg)
+		if err != nil {
+			return fmt.Errorf("policy verify: %w", err)
+		}
+		digest, err := policy.Digest(pol)
+		if err != nil {
+			return fmt.Errorf("policy verify: %w", err)
+		}
+		fmt.Printf("policy verified: %s revision=%d digest=%s\n", pol.ID, pol.Revision, digest)
+		return errSubcommand
+	}
+	fs := flag.NewFlagSet("policy", flag.ContinueOnError)
 	cfgPath := fs.String("config", "/etc/gripline/config.json", "path to the deployment configuration")
+	filePath := fs.String("file", "", "signed policy envelope (prepare)")
+	reason := fs.String("reason", "", "operator reason")
+	revision := fs.Int("revision", 0, "known-good revision (rollback)")
+	token := fs.String("token", "", "operator token (env GRIPLINE_OPERATOR_TOKEN)")
+	tokenFile := fs.String("token-file", "", "read the operator token from this file")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
-	cfg, err := config.Load(*cfgPath)
+	tok, err := operatorTokenFromFile(*token, *tokenFile)
 	if err != nil {
-		return fmt.Errorf("policy verify: %w", err)
+		return err
 	}
-	pol, err := policyFor(cfg)
+	if tok == "" {
+		return fmt.Errorf("policy %s: --token (or GRIPLINE_OPERATOR_TOKEN) is required", args[0])
+	}
+	client, err := newAdminClient(*cfgPath)
 	if err != nil {
-		return fmt.Errorf("policy verify: %w", err)
+		return err
 	}
-	digest, err := policy.Digest(pol)
-	if err != nil {
-		return fmt.Errorf("policy verify: %w", err)
+	switch args[0] {
+	case "status":
+		var status map[string]any
+		if err := client.request(http.MethodGet, "/admin/policy", tok, nil, &status); err != nil {
+			return fmt.Errorf("policy status: %w", err)
+		}
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(status); err != nil {
+			return err
+		}
+	case "prepare":
+		if *filePath == "" || strings.TrimSpace(*reason) == "" {
+			return fmt.Errorf("policy prepare: --file and --reason are required")
+		}
+		artifact, err := os.ReadFile(*filePath)
+		if err != nil {
+			return fmt.Errorf("policy prepare: read artifact: %w", err)
+		}
+		if len(artifact) > 4<<20 {
+			return fmt.Errorf("policy prepare: artifact exceeds 4194304 bytes")
+		}
+		var result map[string]any
+		if err := client.request(http.MethodPost, "/admin/policy/prepare", tok, map[string]any{
+			"artifact": json.RawMessage(artifact), "reason": *reason,
+		}, &result); err != nil {
+			return fmt.Errorf("policy prepare: %w", err)
+		}
+		fmt.Printf("policy candidate prepared\n")
+	case "activate":
+		if strings.TrimSpace(*reason) == "" {
+			return fmt.Errorf("policy activate: --reason is required")
+		}
+		if err := client.request(http.MethodPost, "/admin/policy/activate", tok, map[string]string{"reason": *reason}, nil); err != nil {
+			return fmt.Errorf("policy activate: %w", err)
+		}
+		fmt.Println("policy candidate activated")
+	case "rollback":
+		if *revision < 1 || strings.TrimSpace(*reason) == "" {
+			return fmt.Errorf("policy rollback: --revision and --reason are required")
+		}
+		if err := client.request(http.MethodPost, "/admin/policy/rollback", tok, map[string]any{"revision": *revision, "reason": *reason}, nil); err != nil {
+			return fmt.Errorf("policy rollback: %w", err)
+		}
+		fmt.Printf("policy rolled back to revision %d\n", *revision)
+	default:
+		return fmt.Errorf("policy: unknown action %q", args[0])
 	}
-	fmt.Printf("policy verified: %s revision=%d digest=%s\n", pol.ID, pol.Revision, digest)
 	return errSubcommand
 }
 
@@ -94,6 +165,18 @@ func runCredentialCLI(args []string) error {
 			return runCredentialList(*cfgPath)
 		}
 		return runCredentialListLive(*cfgPath, tok)
+	case "pepper-status":
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		tok, err := operatorTokenFromFile(*token, *tokenFile)
+		if err != nil {
+			return err
+		}
+		if *offline {
+			return fmt.Errorf("credential pepper-status: offline mode is not supported; use the authenticated live authority")
+		}
+		return runCredentialPepperStatusLive(*cfgPath, tok)
 	case "revoke":
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
@@ -119,7 +202,7 @@ func runCredentialCLI(args []string) error {
 		}
 		return runCredentialAddLive(*cfgPath, *credID, *account, *policyID, *planID, *reason, tok)
 	default:
-		return fmt.Errorf("credential: unknown action %q (expected list|add|revoke)", args[0])
+		return fmt.Errorf("credential: unknown action %q (expected list|pepper-status|add|revoke)", args[0])
 	}
 }
 
@@ -254,6 +337,35 @@ func runCredentialListLive(cfgPath, token string) error {
 	fmt.Fprintln(w, "CREDENTIAL\tACCOUNT\tSTATUS\tPOLICY\tCREATED\tREV")
 	for _, s := range rows {
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\n", s.CredentialID, s.AccountID, s.Status, s.PolicyID, s.CreatedAt.UTC().Format(time.RFC3339), s.Revision)
+	}
+	return w.Flush()
+}
+
+func runCredentialPepperStatusLive(cfgPath, token string) error {
+	if token == "" {
+		return fmt.Errorf("credential pepper-status: --token (or GRIPLINE_OPERATOR_TOKEN) is required")
+	}
+	c, err := newAdminClient(cfgPath)
+	if err != nil {
+		return err
+	}
+	var counts map[string]int
+	if err := c.request(http.MethodGet, "/admin/credentials/pepper-status", token, nil, &counts); err != nil {
+		return fmt.Errorf("credential pepper-status: %w", err)
+	}
+	versions := make([]int, 0, len(counts))
+	for raw := range counts {
+		version, err := strconv.Atoi(raw)
+		if err != nil {
+			return fmt.Errorf("credential pepper-status: invalid server version %q", raw)
+		}
+		versions = append(versions, version)
+	}
+	sort.Ints(versions)
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "VERSION\tCREDENTIALS")
+	for _, version := range versions {
+		fmt.Fprintf(w, "%d\t%d\n", version, counts[strconv.Itoa(version)])
 	}
 	return w.Flush()
 }
@@ -523,7 +635,7 @@ func runStateCLI(args []string) error {
 			return err
 		}
 		defer state.Close()
-		metadata, err := recoveryMetadata(cfg)
+		metadata, err := recoveryMetadata(cfg, state)
 		if err != nil {
 			return err
 		}
@@ -544,7 +656,33 @@ func runStateCLI(args []string) error {
 		if manifest == "" {
 			manifest = *fromPath + ".manifest.json"
 		}
-		err := statebolt.RestoreBackupWithManifest(*fromPath, manifest, cfg.Paths.State)
+		if err := statebolt.ValidateRecoveryManifest(*fromPath, manifest); err != nil {
+			return err
+		}
+		sourceState, err := statebolt.OpenReadOnly(*fromPath, statebolt.Options{})
+		if err != nil {
+			return fmt.Errorf("state restore: inspect source authority: %w", err)
+		}
+		metadata, metadataErr := recoveryMetadata(cfg, sourceState)
+		closeErr := sourceState.Close()
+		if metadataErr != nil {
+			return metadataErr
+		}
+		if closeErr != nil {
+			return fmt.Errorf("state restore: close source authority: %w", closeErr)
+		}
+		manifestData, err := os.ReadFile(manifest)
+		if err != nil {
+			return err
+		}
+		recoveryManifest, err := statebolt.ParseRecoveryManifest(manifestData)
+		if err != nil {
+			return err
+		}
+		if err := statebolt.ValidateRecoveryEnvironment(recoveryManifest, metadata); err != nil {
+			return fmt.Errorf("state restore: external authority validation: %w", err)
+		}
+		err = statebolt.RestoreBackupWithManifest(*fromPath, manifest, cfg.Paths.State)
 		if err != nil {
 			return err
 		}
@@ -564,13 +702,30 @@ func runStateCLI(args []string) error {
 // must restore with the state database. Secret values are read only to detect
 // the legacy version-1 environment fallback and are never placed in the
 // manifest.
-func recoveryMetadata(cfg *config.Config) (statebolt.RecoveryMetadata, error) {
+func recoveryMetadata(cfg *config.Config, durableState *statebolt.Store) (statebolt.RecoveryMetadata, error) {
 	if cfg == nil {
 		return statebolt.RecoveryMetadata{}, fmt.Errorf("recovery metadata: config required")
 	}
-	pol, err := policyFor(cfg)
-	if err != nil {
-		return statebolt.RecoveryMetadata{}, err
+	var pol *policy.Policy
+	if durableState != nil {
+		manifest, err := durableState.LoadPolicyManifest()
+		if err != nil {
+			return statebolt.RecoveryMetadata{}, fmt.Errorf("recovery metadata: durable policy manifest: %w", err)
+		}
+		if manifest.Active.Revision > 0 {
+			active, err := durableState.LoadPolicyArtifact(manifest.Active)
+			if err != nil {
+				return statebolt.RecoveryMetadata{}, fmt.Errorf("recovery metadata: durable policy artifact: %w", err)
+			}
+			pol = &active.Policy
+		}
+	}
+	if pol == nil {
+		var err error
+		pol, err = policyFor(cfg)
+		if err != nil {
+			return statebolt.RecoveryMetadata{}, err
+		}
 	}
 	policyDigest, err := policy.Digest(pol)
 	if err != nil {
@@ -582,6 +737,13 @@ func recoveryMetadata(cfg *config.Config) (statebolt.RecoveryMetadata, error) {
 		if err != nil {
 			return statebolt.RecoveryMetadata{}, fmt.Errorf("recovery metadata: signer keyring: %w", err)
 		}
+		keyringData, err := os.ReadFile(cfg.Paths.SignerKeyring)
+		if err != nil {
+			return statebolt.RecoveryMetadata{}, fmt.Errorf("recovery metadata: read signer keyring: %w", err)
+		}
+		sum := sha256.Sum256(keyringData)
+		metadata.SignerKeyringSHA256 = hex.EncodeToString(sum[:])
+		metadata.SignerKeyringBytes = int64(len(keyringData))
 		for kid, pub := range keyring.PublicKeys() {
 			sum := sha256.Sum256(pub)
 			metadata.SignerPublicFingerprints = append(metadata.SignerPublicFingerprints, fmt.Sprintf("%d:%s", kid, hex.EncodeToString(sum[:8])))
@@ -836,10 +998,11 @@ func runStatusCLI(cfgPath string) error {
 	policyDigest, _ := policy.Digest(pol)
 	policyState := "configured"
 	if cfg.Paths.State != "" {
-		if lifecycle, lifecycleErr := policy.OpenFileStore(cfg.Paths.State + ".policy"); lifecycleErr == nil {
-			if manifest, manifestErr := lifecycle.LoadManifest(); manifestErr == nil && manifest.Active.Revision > 0 {
+		if lifecycle, lifecycleErr := statebolt.OpenReadOnly(cfg.Paths.State, statebolt.Options{}); lifecycleErr == nil {
+			if manifest, manifestErr := lifecycle.LoadPolicyManifest(); manifestErr == nil && manifest.Active.Revision > 0 {
 				policyState = "durable"
 			}
+			_ = lifecycle.Close()
 		}
 	}
 	usageConfigured := cfg.Usage.Mode == "openai" || cfg.Usage.Mode == "anthropic"
@@ -946,21 +1109,22 @@ func statusPolicyFor(cfg *config.Config) (*policy.Policy, error) {
 	if cfg.Paths.State == "" {
 		return pol, nil
 	}
-	store, err := policy.OpenFileStore(cfg.Paths.State + ".policy")
+	store, err := statebolt.OpenReadOnly(cfg.Paths.State, statebolt.Options{})
 	if errors.Is(err, os.ErrNotExist) {
 		return pol, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("policy lifecycle status: %w", err)
 	}
-	manifest, err := store.LoadManifest()
+	defer store.Close()
+	manifest, err := store.LoadPolicyManifest()
 	if err != nil {
 		return nil, fmt.Errorf("policy lifecycle status: %w", err)
 	}
 	if manifest.Active.Revision == 0 {
 		return pol, nil
 	}
-	active, err := store.LoadArtifact(manifest.Active)
+	active, err := store.LoadPolicyArtifact(manifest.Active)
 	if err != nil {
 		return nil, fmt.Errorf("policy lifecycle status artifact: %w", err)
 	}

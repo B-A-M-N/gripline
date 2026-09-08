@@ -26,6 +26,7 @@ package anomaly
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -94,11 +95,16 @@ type Detector struct {
 	// srcCred: source -> (credential -> lastSeen); distinct credentials per source.
 	srcCred map[string]*winSet
 	// srcInvalid: source -> (invalid-key pseudonym -> lastSeen) (P0.30).
-	srcInvalid map[string]*winSet
-	store      StateStore
-	stateName  string
-	stateErr   error
-	dropped    uint64
+	srcInvalid     map[string]*winSet
+	store          StateStore
+	stateName      string
+	stateErr       error
+	dropped        uint64
+	dirty          atomic.Bool
+	flushMu        sync.Mutex
+	checkpointStop chan struct{}
+	checkpointDone chan struct{}
+	closeOnce      sync.Once
 }
 
 // Stats reports bounded-state pressure without exposing detector subjects.
@@ -214,8 +220,6 @@ func (d *Detector) Observe(source, credentialID, asn string, now time.Time) []Si
 		return nil
 	}
 	d.mu.Lock()
-	defer d.mu.Unlock()
-
 	var out []Signal
 	if asn != "" && d.observe(d.credAsn, credentialID, asn, "MORE_THAN_3_UNRELATED_ASNS_IN_10_MIN", d.th.MaxASNsPerCredentialInWindow, now) {
 		out = append(out, Signal{Code: "MORE_THAN_3_UNRELATED_ASNS_IN_10_MIN"})
@@ -224,6 +228,10 @@ func (d *Detector) Observe(source, credentialID, asn string, now time.Time) []Si
 		out = append(out, Signal{Code: "SOURCE_ATTEMPTING_MANY_UNRELATED_CREDENTIALS"})
 	}
 	d.persistLocked()
+	d.mu.Unlock()
+	if len(out) > 0 {
+		_ = d.Flush()
+	}
 	return out
 }
 
@@ -241,11 +249,13 @@ func (d *Detector) ObserveInvalidCredential(source, candidate string, now time.T
 		return nil
 	}
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	if d.observe(d.srcInvalid, source, candidate, "SOURCE_ATTEMPTING_MANY_INVALID_CREDENTIALS", d.th.MaxInvalidPerSourceWindow, now) {
 		d.persistLocked()
+		d.mu.Unlock()
+		_ = d.Flush()
 		return []Signal{{Code: "SOURCE_ATTEMPTING_MANY_INVALID_CREDENTIALS"}}
 	}
 	d.persistLocked()
+	d.mu.Unlock()
 	return nil
 }

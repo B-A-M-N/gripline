@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -23,6 +24,8 @@ type StateSnapshotter interface {
 }
 
 const producerStateVersion = 1
+
+const detectorCheckpointInterval = 500 * time.Millisecond
 
 type windowState struct {
 	Keys     map[string]time.Time `json:"keys"`
@@ -167,16 +170,24 @@ func (p *ResourceVelocityProducer) RestoreState(data []byte) error {
 }
 
 // PersistentProducer restores a producer at startup and checkpoints its
-// bounded state after each observation. Checkpoint failure is retained for
-// operational reporting but never turns an already-authorized request into a
-// different authorization result.
+// bounded state asynchronously. Observations only mutate the in-memory bounded
+// detector and mark it dirty; the periodic worker coalesces many observations
+// into one serialized state snapshot and one durable transaction. A threshold
+// crossing forces an immediate checkpoint so newly detected abuse is not left
+// solely in memory. Checkpoint failure is retained for operational reporting
+// and retried by later flushes.
 type PersistentProducer struct {
-	producer Producer
-	snapshot StateSnapshotter
-	store    StateStore
-	name     string
-	mu       sync.Mutex
-	err      error
+	producer  Producer
+	snapshot  StateSnapshotter
+	store     StateStore
+	name      string
+	mu        sync.Mutex // protects err
+	err       error
+	dirty     atomic.Bool
+	flushMu   sync.Mutex
+	stop      chan struct{}
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 func NewPersistentProducer(producer Producer, snapshot StateSnapshotter, store StateStore, name string) (*PersistentProducer, error) {
@@ -192,31 +203,90 @@ func NewPersistentProducer(producer Producer, snapshot StateSnapshotter, store S
 			return nil, fmt.Errorf("producers: restore %s: %w", name, err)
 		}
 	}
-	return &PersistentProducer{producer: producer, snapshot: snapshot, store: store, name: name}, nil
+	p := &PersistentProducer{
+		producer: producer,
+		snapshot: snapshot,
+		store:    store,
+		name:     name,
+		stop:     make(chan struct{}),
+		done:     make(chan struct{}),
+	}
+	go p.checkpointLoop()
+	return p, nil
 }
 
 func (p *PersistentProducer) ObserveAdmission(b AdmissionBehavior) []Signal {
 	out := p.producer.ObserveAdmission(b)
-	p.persist()
+	p.markDirty()
+	if len(out) > 0 {
+		_ = p.Flush()
+	}
 	return out
 }
 
 func (p *PersistentProducer) ObserveCompletion(b CompletionBehavior) []Signal {
 	out := p.producer.ObserveCompletion(b)
-	p.persist()
+	p.markDirty()
+	if len(out) > 0 {
+		_ = p.Flush()
+	}
 	return out
 }
 
-func (p *PersistentProducer) persist() {
+func (p *PersistentProducer) markDirty() {
+	p.dirty.Store(true)
+}
+
+func (p *PersistentProducer) checkpointLoop() {
+	ticker := time.NewTicker(detectorCheckpointInterval)
+	defer ticker.Stop()
+	defer close(p.done)
+	for {
+		select {
+		case <-ticker.C:
+			_ = p.Flush()
+		case <-p.stop:
+			return
+		}
+	}
+}
+
+// Flush checkpoints dirty state synchronously. It is intended for threshold
+// crossings, graceful shutdown, and tests that need a restart boundary.
+func (p *PersistentProducer) Flush() error {
+	if p == nil {
+		return errors.New("producers: nil persistent producer")
+	}
+	p.flushMu.Lock()
+	defer p.flushMu.Unlock()
+	if !p.dirty.Swap(false) {
+		return p.PersistenceError()
+	}
 	data, err := p.snapshot.SnapshotState()
 	if err == nil {
 		err = p.store.SaveDetectorState(p.name, data)
 	}
+	p.mu.Lock()
+	p.err = err
+	p.mu.Unlock()
 	if err != nil {
-		p.mu.Lock()
-		p.err = err
-		p.mu.Unlock()
+		p.dirty.Store(true)
 	}
+	return err
+}
+
+// Close stops the checkpoint worker and performs one final synchronous flush.
+func (p *PersistentProducer) Close() error {
+	if p == nil {
+		return nil
+	}
+	var err error
+	p.closeOnce.Do(func() {
+		close(p.stop)
+		<-p.done
+		err = p.Flush()
+	})
+	return err
 }
 
 // PersistenceError returns the latest checkpoint error, if any.

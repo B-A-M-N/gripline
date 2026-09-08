@@ -131,16 +131,19 @@ func TestDurableProxyPathPercentiles(t *testing.T) {
 	p := newDurablePath(t)
 	const samples = 200
 	durations := make([]time.Duration, 0, samples)
+	var total time.Duration
 	for i := 0; i < samples; i++ {
 		start := time.Now()
 		p.request(t)
-		durations = append(durations, time.Since(start))
+		d := time.Since(start)
+		durations = append(durations, d)
+		total += d
 	}
 	sort.Slice(durations, func(i, j int) bool { return durations[i] < durations[j] })
 	p50 := durations[samples/2]
 	p95 := durations[samples*95/100]
 	p99 := durations[samples*99/100]
-	t.Logf("durable proxy path p50=%s p95=%s p99=%s throughput=%0.1f req/s", p50, p95, p99, float64(samples)/durations[samples-1].Seconds())
+	t.Logf("durable proxy path p50=%s p95=%s p99=%s throughput=%0.1f req/s", p50, p95, p99, float64(samples)/total.Seconds())
 	if p99 > 2*time.Second {
 		t.Fatalf("durable proxy p99=%s exceeds regression bound", p99)
 	}
