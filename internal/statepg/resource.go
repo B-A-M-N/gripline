@@ -829,8 +829,43 @@ func (s *Store) InUseFor(scope resource.Scope, id string) int {
 	return used
 }
 
+// StatsContext returns bounded, low-cardinality resource health from the
+// shared authority. The query is intentionally error-preserving: an authority
+// outage must not be reported as an empty resource system.
+func (s *Store) StatsContext(ctx context.Context) (resource.ResourceStats, error) {
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
+	var stats resource.ResourceStats
+	var activeConcurrency, activeLeases, forwardedLeases, settledLeases, releasedLeases, activeHolds, sourceScopes, sourceOverflows int64
+	err := s.pool.QueryRow(ctx, `SELECT
+		COALESCE((SELECT SUM(concurrency_used) FROM gripline_resource_buckets WHERE dimension=$1),0),
+		(SELECT COUNT(*) FROM gripline_resource_leases WHERE state <> $2),
+		(SELECT COUNT(*) FROM gripline_resource_leases WHERE state = $3),
+		(SELECT COUNT(*) FROM gripline_resource_leases WHERE state = $4),
+		(SELECT COUNT(*) FROM gripline_resource_leases WHERE state = $5),
+		(SELECT COUNT(*) FROM gripline_resource_holds h JOIN gripline_resource_leases l ON l.lease_id=h.lease_id WHERE l.state <> $5),
+		(SELECT COUNT(*) FROM gripline_resource_source_scopes),
+		(SELECT COUNT(*) FROM gripline_resource_source_scopes WHERE scope_id LIKE '__source_overflow_%')`,
+		resource.DimConcurrency, leaseReleased, leaseForwarded, leaseSettled, leaseReleased).Scan(
+		&activeConcurrency, &activeLeases, &forwardedLeases, &settledLeases,
+		&releasedLeases, &activeHolds, &sourceScopes, &sourceOverflows)
+	if err != nil {
+		return resource.ResourceStats{}, mapDBError(err)
+	}
+	stats.ActiveConcurrency = int(activeConcurrency)
+	stats.ActiveLeases = int(activeLeases)
+	stats.ForwardedLeases = int(forwardedLeases)
+	stats.SettledLeases = int(settledLeases)
+	stats.ReleasedLeases = int(releasedLeases)
+	stats.ActiveHolds = int(activeHolds)
+	stats.SourceScopes = int(sourceScopes)
+	stats.SourceOverflows = int(sourceOverflows)
+	return stats, nil
+}
+
 var (
 	_ resource.Authority                   = (*Store)(nil)
 	_ resource.DistributedAuthority        = (*Store)(nil)
 	_ resource.ContextDiagnosticsAuthority = (*Store)(nil)
+	_ resource.ContextStatsAuthority       = (*Store)(nil)
 )

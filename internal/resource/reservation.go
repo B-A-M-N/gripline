@@ -65,6 +65,27 @@ type ContextDiagnosticsAuthority interface {
 	RemoveScopeContext(context.Context, Scope, string) (bool, error)
 }
 
+// ResourceStats is a low-cardinality authority health snapshot. It deliberately
+// contains totals only; scope and credential identifiers must never become
+// observability labels.
+type ResourceStats struct {
+	ActiveConcurrency int
+	ActiveLeases      int
+	ForwardedLeases   int
+	SettledLeases     int
+	ReleasedLeases    int
+	ActiveHolds       int
+	SourceScopes      int
+	SourceOverflows   int
+}
+
+// ContextStatsAuthority is the cancellable, error-aware resource diagnostics
+// extension. A remote authority must return an error when its statistics are
+// unavailable instead of fabricating an empty snapshot.
+type ContextStatsAuthority interface {
+	StatsContext(context.Context) (ResourceStats, error)
+}
+
 // DistributedAuthority is implemented by a shared lease authority. The
 // returned reservation owns every scope hold and may be renewed for a stream.
 type DistributedAuthority interface {
@@ -99,12 +120,13 @@ func (NoopReservation) Release() {}
 // Compile-time conformance: every reservation shape callers may receive from
 // an Outcome must satisfy the interface.
 var (
-	_ Authority            = (*Governor)(nil)
-	_ ResourceAuthority    = (*Governor)(nil)
-	_ UsageAuthority       = (*Governor)(nil)
-	_ ContextAuthority     = (*Governor)(nil)
-	_ AdmissionReservation = (*MultiReservation)(nil)
-	_ UsageReservation     = (*MultiReservation)(nil)
-	_ AdmissionReservation = (*LeaseHandle)(nil)
-	_ AdmissionReservation = NoopReservation{}
+	_ Authority             = (*Governor)(nil)
+	_ ResourceAuthority     = (*Governor)(nil)
+	_ UsageAuthority        = (*Governor)(nil)
+	_ ContextAuthority      = (*Governor)(nil)
+	_ ContextStatsAuthority = (*Governor)(nil)
+	_ AdmissionReservation  = (*MultiReservation)(nil)
+	_ UsageReservation      = (*MultiReservation)(nil)
+	_ AdmissionReservation  = (*LeaseHandle)(nil)
+	_ AdmissionReservation  = NoopReservation{}
 )

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"hash/fnv"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -258,6 +259,31 @@ func (g *Governor) Stats() GovernorStats {
 	return GovernorStats{SourceScopes: len(g.sourceScopes), MaxSourceScopes: g.maxSourceScopes,
 		SourceEvictions: g.sourceEvictions, SourceSaturations: g.sourceSaturations,
 		SourceOverflows: g.sourceOverflows}
+}
+
+// StatsContext is the cancellable diagnostics form used by clustered
+// observability. The local governor cannot fail remotely, but it still honors
+// cancellation so callers can use one bounded contract for every authority.
+func (g *Governor) StatsContext(ctx context.Context) (ResourceStats, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return ResourceStats{}, err
+	}
+	g.metaMu.Lock()
+	defer g.metaMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return ResourceStats{}, err
+	}
+	stats := ResourceStats{SourceScopes: len(g.sourceScopes)}
+	for key, pool := range g.pools {
+		stats.ActiveConcurrency += pool.InUse()
+		if strings.HasPrefix(key, "SOURCE:") && strings.HasPrefix(strings.TrimPrefix(key, "SOURCE:"), "__source_overflow_") {
+			stats.SourceOverflows++
+		}
+	}
+	return stats, nil
 }
 
 func (g *Governor) ensureSourceScopeLocked(sp ScopeSpec) (ScopeSpec, error) {
