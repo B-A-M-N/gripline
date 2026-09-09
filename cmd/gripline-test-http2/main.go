@@ -88,7 +88,7 @@ func main() {
 		}(i)
 	}
 	wg.Wait()
-	if unexpected.Load() != 0 || canceled.Load() == 0 {
+	if unexpected.Load() != 0 || canceled.Load() != int64(*count) {
 		fatal("canceled streams=%d unexpected=%d", canceled.Load(), unexpected.Load())
 	}
 

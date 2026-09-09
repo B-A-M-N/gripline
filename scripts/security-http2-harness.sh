@@ -45,6 +45,10 @@ run_h2() {
 	shift
 	local output="$scratch_dir/${name}.log"
 	local -a nghttp_args=(-n -v -t 5)
+	local expected_successes=1
+	if [[ "$name" == stream-churn ]]; then
+		expected_successes=16
+	fi
 	if [[ "${GRIPLINE_H2_INSECURE:-0}" == "1" ]]; then
 		nghttp_args+=(-y)
 	fi
@@ -68,8 +72,9 @@ run_h2() {
 		cat "$output" >&2
 		exit 1
 	fi
-	if ! rg -q ':status: 2[0-9][0-9]' "$output"; then
-		echo "security HTTP/2 harness: ${name} did not receive a successful response" >&2
+	status_successes="$(rg -o ':status: 2[0-9][0-9]' "$output" | wc -l | tr -d ' ' || true)"
+	if [[ ! "$status_successes" =~ ^[0-9]+$ || "$status_successes" -lt "$expected_successes" ]]; then
+		echo "security HTTP/2 harness: ${name} successful responses=${status_successes:-0}, want at least ${expected_successes}" >&2
 		cat "$output" >&2
 		exit 1
 	fi
@@ -149,12 +154,13 @@ if command -v h2load >/dev/null; then
 		-H "authorization: Bearer ${secret}" \
 		-H 'content-type: application/json' \
 		-d "$payload" "$h2load_url" >"$load_output" 2>&1
-	done_count="$(rg -o '[0-9]+ done' "$load_output" | awk '{print $1}' | tail -1)"
-	succeeded_count="$(rg -o '[0-9]+ succeeded' "$load_output" | awk '{print $1}' | tail -1)"
-	two_xx_count="$(rg -o '[0-9]+ 2xx' "$load_output" | awk '{print $1}' | tail -1)"
-	error_count="$(rg -o '[0-9]+ errored' "$load_output" | awk '{print $1}' | tail -1)"
-	timeout_count="$(rg -o '[0-9]+ timeout' "$load_output" | awk '{print $1}' | tail -1)"
-	if [[ ! "$done_count" =~ ^[0-9]+$ || ! "$succeeded_count" =~ ^[0-9]+$ || ! "$two_xx_count" =~ ^[0-9]+$ || "$done_count" == 0 || "$succeeded_count" != "$done_count" || "$two_xx_count" != "$done_count" || "${error_count:-0}" != 0 || "${timeout_count:-0}" != 0 ]]; then
+	done_count="$(rg -o '[0-9]+ done' "$load_output" | awk '{print $1}' | tail -1 || true)"
+	succeeded_count="$(rg -o '[0-9]+ succeeded' "$load_output" | awk '{print $1}' | tail -1 || true)"
+	two_xx_count="$(rg -o '[0-9]+ 2xx' "$load_output" | awk '{print $1}' | tail -1 || true)"
+	failed_count="$(rg -o '[0-9]+ failed' "$load_output" | awk '{print $1}' | tail -1 || true)"
+	error_count="$(rg -o '[0-9]+ errored' "$load_output" | awk '{print $1}' | tail -1 || true)"
+	timeout_count="$(rg -o '[0-9]+ timeout' "$load_output" | awk '{print $1}' | tail -1 || true)"
+	if [[ ! "$done_count" =~ ^[0-9]+$ || ! "$succeeded_count" =~ ^[0-9]+$ || ! "$two_xx_count" =~ ^[0-9]+$ || "$done_count" == 0 || "$succeeded_count" != "$done_count" || "$two_xx_count" != "$done_count" || "${failed_count:-0}" != 0 || "${error_count:-0}" != 0 || "${timeout_count:-0}" != 0 ]]; then
 		echo "security HTTP/2 harness: h2load did not report successful responses" >&2
 		cat "$load_output" >&2
 		exit 1

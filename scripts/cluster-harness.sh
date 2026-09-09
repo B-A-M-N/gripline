@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+diagnose_failure() {
+	local rc=$?
+	echo "cluster harness failed: line=${BASH_LINENO[0]:-0} command=${BASH_COMMAND@Q} rc=${rc}" >&2
+}
+trap diagnose_failure ERR
+
 # Multi-process PostgreSQL acceptance gate. The database is supplied by CI (or
 # GRIPLINE_TEST_POSTGRES_DSN); three separately running gateways receive only
 # shared authority state, and every client request enters through the compiled
@@ -37,6 +43,7 @@ operator_token="operator-cluster-harness-0123456789abcdef0123456789"
 secret_one="cluster-secret-one-0123456789"
 secret_two="cluster-secret-two-0123456789"
 secret_three="cluster-secret-three-0123456789"
+secret_four="cluster-secret-four-0123456789"
 pepper_one_b64="$(openssl rand -base64 32 | tr -d '\n')"
 pepper_two_b64="$(openssl rand -base64 32 | tr -d '\n')"
 pseudonym_one_b64="$(openssl rand -base64 32 | tr -d '\n')"
@@ -59,7 +66,7 @@ node_a_pid=${pids[0]:-}
 node_b_pid=${pids[1]:-}
 node_c_pid=${pids[2]:-}
 operator_token=${operator_token}
-request_secret=${secret_two}
+request_secret=${secret_four}
 EOF
 	fi
 }
@@ -132,7 +139,7 @@ for node in a b c; do
 	    "verifier_control": {"url": "https://127.0.0.1:${control_backend_port}/v1/verifier/rotate", "ca_file": "${ca_cert}", "client_cert_file": "${control_client_cert}", "client_key_file": "${control_client_key}", "server_name": "control.internal", "min_version": "1.2"},
     "timeout": "5s",
     "allowed_endpoints": [
-      {"method": "GET", "path": "/v1/messages"},
+      {"method": "POST", "path": "/v1/messages"},
       {"method": "GET", "path": "/v1/work"}
     ]
   },
@@ -210,8 +217,8 @@ pids+=("$!")
 
 wait_status() {
 	local url=$1 expected=${2:-200}
-	for _ in $(seq 1 120); do
-		if [[ "$(curl -sS -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)" == "$expected" ]]; then
+	for _ in $(seq 1 "${GRIPLINE_CLUSTER_HARNESS_READY_ATTEMPTS:-600}"); do
+		if [[ "$(curl -sS --max-time 2 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)" == "$expected" ]]; then
 			return 0
 		fi
 		sleep 0.1
@@ -289,7 +296,11 @@ provision() {
 	"$harness_dir/gripline" credential add --config "$harness_dir/config-a.json" \
 		--id "$id" --account "${id}-account" --policy gripline-default-v1 \
 		--plan cluster-plan --reason "cluster harness seed" --operation-id "cluster-add-${id}" --secret-stdin \
-		>"$harness_dir/provision-${id}.log" 2>&1
+		>"$harness_dir/provision-${id}.log" 2>&1 || {
+			echo "cluster harness: provisioning ${id} failed" >&2
+			cat "$harness_dir/provision-${id}.log" >&2
+			return 1
+		}
 }
 provision cluster-credential-one "$secret_one"
 provision cluster-credential-two "$secret_two"
@@ -305,15 +316,15 @@ no_cert_control_code="$(curl --cacert "$ca_cert" --resolve "control.internal:${c
 test "$no_cert_control_code" = 000
 direct_control_code="$(inference_control_curl -sS -o /dev/null -w '%{http_code}' -X POST "https://control.internal:${control_backend_port}/v1/verifier/rotate" -d '{}' 2>/dev/null || true)"
 test "$direct_control_code" = 403
-control_data_code="$(control_curl -sS -o /dev/null -w '%{http_code}' "https://control.internal:${control_backend_port}/v1/messages")"
+control_data_code="$(control_curl -sS -o /dev/null -w '%{http_code}' -X POST "https://control.internal:${control_backend_port}/v1/messages" -d '{}')"
 test "$control_data_code" = 404
-control_to_data_code="$(control_data_curl -sS -o /dev/null -w '%{http_code}' "https://backend.internal:${backend_port}/v1/messages" 2>/dev/null || true)"
+control_to_data_code="$(control_data_curl -sS -o /dev/null -w '%{http_code}' -X POST "https://backend.internal:${backend_port}/v1/messages" -d '{}' 2>/dev/null || true)"
 test "$control_to_data_code" = 403
 
 # Capture an assertion signed by the original key before rotation. Retirement
 # below must make this assertion unverifiable at the backend after its TTL
 # overlap has explicitly elapsed.
-pre_rotation_assertion="$(curl -fsS "http://127.0.0.1:${lb_port}/v1/messages" -H "Authorization: Bearer ${secret_two}")"
+pre_rotation_assertion="$(curl -fsS -X POST "http://127.0.0.1:${lb_port}/v1/messages" -H "Authorization: Bearer ${secret_two}" -d '{}')"
 printf '%s\n' "$pre_rotation_assertion" | rg -q '"policy_revision":1'
 old_assertion="$(<"$harness_dir/latest-assertion")"
 test -n "$old_assertion"
@@ -357,7 +368,7 @@ test "$old_code" = 401
 
 curl_data_code() {
 	local url=$1 secret=$2
-	curl -sS -o /dev/null -w '%{http_code}' "$url" -H "Authorization: Bearer ${secret}" 2>/dev/null || true
+	curl -sS -o /dev/null -w '%{http_code}' -X POST "$url" -H "Authorization: Bearer ${secret}" -d '{}' 2>/dev/null || true
 }
 
 wait_data_denied() {
@@ -486,8 +497,8 @@ if [[ "$load_seconds" -gt 0 ]]; then
 		: >"$result_file"
 		while [[ "$(date +%s)" -lt "$load_end_epoch" ]]; do
 			started="$(date +%s%N)"
-			code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${lb_port}/v1/messages" \
-				-H "Authorization: Bearer ${load_secret}" 2>/dev/null || true)"
+			code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${lb_port}/v1/messages" \
+				-H "Authorization: Bearer ${load_secret}" -d '{}' 2>/dev/null || true)"
 			ended="$(date +%s%N)"
 			printf '%s\t%s\n' "${code:-000}" "$((ended - started))" >>"$result_file"
 		done
@@ -525,6 +536,7 @@ if [[ "$load_seconds" -gt 0 ]]; then
 fi
 
 # A revoke committed through A must deny on the other two authorities.
+provision cluster-credential-four "$secret_four"
 missing_operation_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((base + 20))/admin/credentials/revoke" \
 	-H "Authorization: Bearer ${operator_token}" -H 'Content-Type: application/json' \
 	--data '{"credential_id":"cluster-credential-one","reason":"missing operation id"}')"
@@ -565,7 +577,19 @@ test "$unlock_code" = 200
 # Policy activation and rollback through A must propagate to B and C via the
 # watcher; each node's backend-visible assertion revision is checked directly.
 candidate="$(<"$harness_dir/candidate.json")"
-old_response="$(curl -fsS "http://127.0.0.1:${lb_port}/v1/messages" -H "Authorization: Bearer ${secret_two}")"
+old_response_file="$harness_dir/old-response.json"
+old_response_code=000
+for _ in $(seq 1 240); do
+old_response_code="$(curl -sS -o "$old_response_file" -w '%{http_code}' -X POST "http://127.0.0.1:${lb_port}/v1/messages" -H "Authorization: Bearer ${secret_four}" -d '{}' 2>/dev/null || true)"
+	if [[ "$old_response_code" == 200 ]]; then break; fi
+	sleep 0.5
+done
+if [[ "$old_response_code" != 200 ]]; then
+	echo "cluster harness: fresh lifecycle credential never received a successful response (last status ${old_response_code})" >&2
+	cat "$old_response_file" >&2 || true
+	exit 1
+fi
+old_response="$(<"$old_response_file")"
 printf '%s\n' "$old_response" | rg -q '"policy_revision":1'
 printf '%s\n' "$old_response" | rg -q '"policy_epoch":1'
 prepare_payload="$(printf '{"artifact":%s,"reason":"cluster policy canary"}' "$candidate")"
@@ -593,14 +617,14 @@ test "$activate_code" = 200
 printf '2\n' >"$policy_epoch_file"
 for port in $((base + 10)) $((base + 11)) $((base + 12)); do
 	for _ in $(seq 1 50); do
-		if curl -fsS "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_two}" 2>/dev/null | rg -q '"policy_revision":2' && \
-			curl -fsS "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_two}" 2>/dev/null | rg -q '"policy_epoch":2'; then
+		if curl -fsS -X POST "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_four}" -d '{}' 2>/dev/null | rg -q '"policy_revision":2' && \
+			curl -fsS -X POST "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_four}" -d '{}' 2>/dev/null | rg -q '"policy_epoch":2'; then
 			break
 		fi
 		sleep 0.1
 	done
-	curl -fsS "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_two}" | rg -q '"policy_revision":2'
-	curl -fsS "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_two}" | rg -q '"policy_epoch":2'
+	curl -fsS -X POST "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_four}" -d '{}' | rg -q '"policy_revision":2'
+	curl -fsS -X POST "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_four}" -d '{}' | rg -q '"policy_epoch":2'
 done
 rollback_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((base + 20))/admin/policy/rollback" \
 	-H "Authorization: Bearer ${operator_token}" -H 'Content-Type: application/json' \
@@ -610,14 +634,14 @@ test "$rollback_code" = 200
 printf '3\n' >"$policy_epoch_file"
 for port in $((base + 10)) $((base + 11)) $((base + 12)); do
 	for _ in $(seq 1 50); do
-		if curl -fsS "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_two}" 2>/dev/null | rg -q '"policy_revision":1' && \
-			curl -fsS "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_two}" 2>/dev/null | rg -q '"policy_epoch":3'; then
+		if curl -fsS -X POST "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_four}" -d '{}' 2>/dev/null | rg -q '"policy_revision":1' && \
+			curl -fsS -X POST "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_four}" -d '{}' 2>/dev/null | rg -q '"policy_epoch":3'; then
 			break
 		fi
 		sleep 0.1
 	done
-	curl -fsS "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_two}" | rg -q '"policy_revision":1'
-	curl -fsS "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_two}" | rg -q '"policy_epoch":3'
+	curl -fsS -X POST "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_four}" -d '{}' | rg -q '"policy_revision":1'
+	curl -fsS -X POST "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_four}" -d '{}' | rg -q '"policy_epoch":3'
 done
 
 # The shared authority is a fail-closed dependency. CI supplies the PostgreSQL
@@ -661,7 +685,12 @@ else
 	fi
 	docker start "$postgres_container" >/dev/null
 	for port in $((base + 10)) $((base + 11)) $((base + 12)); do
-		wait_status "http://127.0.0.1:${port}/readyz"
+		if ! wait_status "http://127.0.0.1:${port}/readyz"; then
+			echo "cluster harness: node on port ${port} did not recover after PostgreSQL restart" >&2
+			for node in a b c; do cat "$harness_dir/gripline-${node}.log" >&2 2>/dev/null || true; done
+			cat "${GRIPLINE_CLUSTER_WRITER_LOG:-/dev/null}" >&2 2>/dev/null || true
+			exit 1
+		fi
 	done
 	wait_status "http://127.0.0.1:${lb_port}/readyz"
 fi

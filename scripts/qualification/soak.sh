@@ -10,6 +10,7 @@ project="gripline-soak-${$}"
 work_dir="$(mktemp -d)"
 monitor_pid=""
 harness_pid=""
+writer_pid=""
 harness_artifact="$work_dir/harness.env"
 snapshot_file="$work_dir/soak.tsv"
 relation_file="$work_dir/relations.tsv"
@@ -18,6 +19,7 @@ row_file="$work_dir/rows.tsv"
 maintenance_bin="$work_dir/maintenance"
 duration_text="5m"
 workers="${GRIPLINE_CLUSTER_SOAK_WORKERS:-24}"
+handoff_timeout="${GRIPLINE_SOAK_HANDOFF_TIMEOUT:-600}"
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 		--duration) duration_text=${2:?--duration requires a value}; shift 2 ;;
@@ -33,9 +35,11 @@ esac
 [[ "$amount" =~ ^[1-9][0-9]*$ ]] || { echo "soak qualification: duration must be positive" >&2; exit 2; }
 case "$unit" in s) duration=$amount ;; m) duration=$((amount * 60)) ;; h) duration=$((amount * 3600)) ;; esac
 [[ "$workers" =~ ^[1-9][0-9]*$ ]] || { echo "soak qualification: workers must be positive" >&2; exit 2; }
+[[ "$handoff_timeout" =~ ^[1-9][0-9]*$ ]] || { echo "soak qualification: handoff timeout must be positive" >&2; exit 2; }
 cleanup() {
 	if [[ -n "$harness_pid" ]]; then kill -TERM "$harness_pid" >/dev/null 2>&1 || true; wait "$harness_pid" >/dev/null 2>&1 || true; fi
 	if [[ -n "$monitor_pid" ]]; then kill "$monitor_pid" >/dev/null 2>&1 || true; wait "$monitor_pid" >/dev/null 2>&1 || true; fi
+	if [[ -n "$writer_pid" ]]; then kill "$writer_pid" >/dev/null 2>&1 || true; wait "$writer_pid" >/dev/null 2>&1 || true; fi
 	docker compose -p "$project" -f "$fixture_dir/compose.yaml" down -v --remove-orphans >/dev/null 2>&1 || true
 	rm -rf "$work_dir"
 }
@@ -45,6 +49,8 @@ docker compose version >/dev/null || { echo "soak qualification: docker compose 
 command -v go >/dev/null || { echo "soak qualification: go is required" >&2; exit 2; }
 command -v curl >/dev/null || { echo "soak qualification: curl is required" >&2; exit 2; }
 GOCACHE="${GOCACHE:-/tmp/gripline-go-cache}" go build -trimpath -o "$maintenance_bin" ./cmd/gripline-test-pg-maintenance
+writer_bin="$work_dir/pg-writer"
+GOCACHE="${GOCACHE:-/tmp/gripline-go-cache}" go build -trimpath -o "$writer_bin" ./cmd/gripline-test-pg-writer
 compose=(docker compose -p "$project" -f "$fixture_dir/compose.yaml")
 "${compose[@]}" up -d >/dev/null
 for _ in $(seq 1 90); do
@@ -55,7 +61,13 @@ monitor_failure="$work_dir/monitor.failure"
 promotion_file="$work_dir/promotion.expected"
 pause_file="$work_dir/harness.pause"
 release_file="$work_dir/harness.release"
-dsn="postgres://gripline:gripline@127.0.0.1:${GRIPLINE_HA_PRIMARY_PORT:-25432}/gripline?sslmode=disable"
+writer_port=$((25434 + ($$ % 100)))
+dsn="postgres://gripline:gripline@127.0.0.1:${writer_port}/gripline?sslmode=disable"
+"$writer_bin" -listen "127.0.0.1:${writer_port}" \
+	-backend-dsn "postgres://gripline:gripline@127.0.0.1:${GRIPLINE_HA_PRIMARY_PORT:-25432}/gripline?sslmode=disable" \
+	-backend-dsn "postgres://gripline:gripline@127.0.0.1:${GRIPLINE_HA_REPLICA_PORT:-25433}/gripline?sslmode=disable" \
+	>"$work_dir/pg-writer.log" 2>&1 &
+writer_pid=$!
 table_counts() {
 	"${compose[@]}" exec -T primary psql -U gripline -d gripline -X -Atqc "
 		SELECT 'gripline_credentials=' || count(*) FROM gripline_credentials
@@ -139,9 +151,22 @@ monitor() {
 		sleep 5
 	done
 }
+wait_replica_caught_up() {
+	local primary_lsn=""
+	for _ in $(seq 1 "${GRIPLINE_SOAK_REPLICATION_WAIT_ATTEMPTS:-120}"); do
+		primary_lsn="$("${compose[@]}" exec -T primary psql -U gripline -d gripline -X -Atqc 'SELECT pg_current_wal_flush_lsn()' 2>/dev/null || true)"
+		if [[ "$primary_lsn" =~ ^[0-9A-Fa-f]+/[0-9A-Fa-f]+$ ]] &&
+			"${compose[@]}" exec -T replica psql -U gripline -d gripline -X -Atqc "SELECT pg_last_wal_replay_lsn() >= '${primary_lsn}'::pg_lsn" 2>/dev/null | rg -qx t; then
+			return 0
+		fi
+		sleep 0.5
+	done
+	echo "soak qualification: replica did not catch up to primary WAL position ${primary_lsn}" >&2
+	return 1
+}
 monitor &
 monitor_pid=$!
-GRIPLINE_CLUSTER_HARNESS_ARTIFACT_FILE="$harness_artifact" GRIPLINE_CLUSTER_HARNESS_PAUSE_FILE="$pause_file" GRIPLINE_CLUSTER_HARNESS_RELEASE_FILE="$release_file" GRIPLINE_TEST_POSTGRES_DSN="$dsn" GRIPLINE_TEST_POSTGRES_CONTAINER="${project}-primary-1" GRIPLINE_CLUSTER_HARNESS_REQUIRE_DB_OUTAGE=1 GRIPLINE_CLUSTER_HARNESS_LOAD_SECONDS="$duration" GRIPLINE_CLUSTER_HARNESS_LOAD_WORKERS="$workers" bash "$repo_dir/scripts/cluster-harness.sh" >"$work_dir/harness.log" 2>&1 &
+GRIPLINE_LOG_READINESS_FAILURES=1 GRIPLINE_CLUSTER_HARNESS_ARTIFACT_FILE="$harness_artifact" GRIPLINE_CLUSTER_HARNESS_PAUSE_FILE="$pause_file" GRIPLINE_CLUSTER_HARNESS_RELEASE_FILE="$release_file" GRIPLINE_CLUSTER_WRITER_LOG="$work_dir/pg-writer.log" GRIPLINE_CLUSTER_HARNESS_KEEP="${GRIPLINE_QUALIFICATION_KEEP:-0}" GRIPLINE_TEST_POSTGRES_DSN="$dsn" GRIPLINE_TEST_POSTGRES_CONTAINER="${project}-primary-1" GRIPLINE_CLUSTER_HARNESS_REQUIRE_DB_OUTAGE=1 GRIPLINE_CLUSTER_HARNESS_LOAD_SECONDS="$duration" GRIPLINE_CLUSTER_HARNESS_LOAD_WORKERS="$workers" bash "$repo_dir/scripts/cluster-harness.sh" >"$work_dir/harness.log" 2>&1 &
 harness_pid=$!
 for _ in $(seq 1 120); do
 	if [[ -s "$harness_artifact" ]]; then break; fi
@@ -150,7 +175,7 @@ for _ in $(seq 1 120); do
 done
 [[ -s "$harness_artifact" ]] || { echo "soak qualification: cluster harness did not publish its runtime fixture" >&2; cat "$work_dir/harness.log" >&2; exit 1; }
 
-for _ in $(seq 1 120); do
+for _ in $(seq 1 $((handoff_timeout * 4))); do
 	[[ -f "$pause_file" ]] && break
 	if ! kill -0 "$harness_pid" >/dev/null 2>&1; then cat "$work_dir/harness.log" >&2; exit 1; fi
 	sleep 0.25
@@ -178,6 +203,7 @@ for node in a b c; do
 done
 base="$(awk -F= '$1 == "base" {print $2}' "$harness_artifact")"
 request_secret="$(awk -F= '$1 == "request_secret" {print $2}' "$harness_artifact")"
+wait_replica_caught_up
 touch "$promotion_file"
 "${compose[@]}" stop primary >/dev/null
 "${compose[@]}" exec -T replica gosu postgres pg_ctl promote -D /var/lib/postgresql/data >/dev/null
@@ -188,12 +214,32 @@ done
 "${compose[@]}" exec -T replica psql -U gripline -d gripline -X -Atqc 'SELECT pg_is_in_recovery()' | rg -qx f
 "${compose[@]}" exec -T replica psql -U gripline -d gripline -X -Atqc 'SELECT singleton FROM gripline_policy_manifest WHERE singleton=TRUE' | rg -qx t
 for port in $((base + 10)) $((base + 11)); do
+	ready_response="$work_dir/post-promotion-ready-${port}.json"
+	ready_status=000
 	for _ in $(seq 1 90); do
-		if curl -fsS "http://127.0.0.1:${port}/readyz" >/dev/null 2>&1; then break; fi
+		ready_status="$(curl -sS -o "$ready_response" -w '%{http_code}' "http://127.0.0.1:${port}/readyz" 2>/dev/null || true)"
+		if [[ "$ready_status" == 200 ]]; then break; fi
 		sleep 1
 	done
-	curl -fsS "http://127.0.0.1:${port}/readyz" >/dev/null
-	curl -fsS "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${request_secret}" >/dev/null
+	if [[ "$ready_status" != 200 ]]; then
+		echo "soak qualification: post-promotion readiness failed on port ${port} (status ${ready_status})" >&2
+		cat "$ready_response" >&2 || true
+		cat "$work_dir/pg-writer.log" >&2 || true
+		exit 1
+	fi
+	data_response="$work_dir/post-promotion-${port}.json"
+	data_status=000
+	for _ in $(seq 1 90); do
+		data_status="$(curl -sS -o "$data_response" -w '%{http_code}' -X POST "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${request_secret}" -d '{}' 2>/dev/null || true)"
+		if [[ "$data_status" == 200 ]]; then break; fi
+		sleep 1
+	done
+	if [[ "$data_status" != 200 ]]; then
+		echo "soak qualification: post-promotion data request failed on port ${port} (status ${data_status})" >&2
+		cat "$data_response" >&2 || true
+		cat "$work_dir/pg-writer.log" >&2 || true
+		exit 1
+	fi
 done
 touch "$release_file"
 if ! wait "$harness_pid"; then cat "$work_dir/harness.log" >&2; exit 1; fi

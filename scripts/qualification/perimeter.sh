@@ -8,24 +8,50 @@ set -euo pipefail
 
 lab="gripline-perimeter-${$}"
 work_dir="$(mktemp -d)"
+keep="${GRIPLINE_QUALIFICATION_KEEP:-0}"
+network_octet=$((16 + ($$ % 200)))
+public_subnet="10.240.${network_octet}.0/24"
+private_subnet="10.241.${network_octet}.0/24"
+control_subnet="10.242.${network_octet}.0/24"
+db_subnet="10.243.${network_octet}.0/24"
+public_ip="10.240.${network_octet}.10"
+private_ip="10.241.${network_octet}.10"
 networks=("${lab}-public" "${lab}-private" "${lab}-control" "${lab}-db")
 containers=("${lab}-backend" "${lab}-admin" "${lab}-gateway" "${lab}-control" "${lab}-attacker" "${lab}-postgres" "${lab}-inference-client" "${lab}-control-client")
+diagnose_failure() {
+	local rc=$?
+	if (( rc != 0 )); then
+		echo "perimeter qualification failed: rc=${rc}" >&2
+		for container in "${containers[@]}"; do
+			echo "--- ${container} ---" >&2
+			docker logs --tail 80 "$container" >&2 2>/dev/null || true
+		docker inspect "$container" --format '{{.State.Status}} exit={{.State.ExitCode}} error={{.State.Error}}' >&2 2>/dev/null || true
+		docker exec "$container" sh -c 'ip addr; ip route' >&2 2>/dev/null || true
+		done
+		if [[ "$keep" == 1 ]]; then echo "perimeter qualification diagnostics retained: $work_dir" >&2; fi
+	fi
+}
 cleanup() {
+	if [[ "$keep" == 1 ]]; then
+		echo "perimeter qualification retained: $lab" >&2
+		echo "perimeter qualification diagnostics retained: $work_dir" >&2
+		return
+	fi
 	for container in "${containers[@]}"; do docker rm -f "$container" >/dev/null 2>&1 || true; done
 	for network in "${networks[@]}"; do docker network rm "$network" >/dev/null 2>&1 || true; done
 	rm -rf "$work_dir"
 }
+trap diagnose_failure ERR
 trap cleanup EXIT
 
 command -v docker >/dev/null || { echo "perimeter qualification: docker is required" >&2; exit 2; }
 command -v openssl >/dev/null || { echo "perimeter qualification: openssl is required" >&2; exit 2; }
 command -v go >/dev/null || { echo "perimeter qualification: go is required" >&2; exit 2; }
 
-for network in "${networks[@]}"; do
-	docker network create --internal "$network" >/dev/null
-done
-docker network rm "${lab}-public" >/dev/null
-docker network create "${lab}-public" >/dev/null
+docker network create --subnet "$public_subnet" "${lab}-public" >/dev/null
+docker network create --internal --subnet "$private_subnet" "${lab}-private" >/dev/null
+docker network create --internal --subnet "$control_subnet" "${lab}-control" >/dev/null
+docker network create --internal --subnet "$db_subnet" "${lab}-db" >/dev/null
 
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=Gripline qualification CA" \
 	-keyout "$work_dir/ca.key" -out "$work_dir/ca.pem" >/dev/null 2>&1
@@ -80,22 +106,22 @@ GOCACHE="${GOCACHE:-/tmp/gripline-go-cache}" go build -trimpath -o "$work_dir/ba
 pepper="$(openssl rand -base64 32 | tr -d '\n')"
 cat >"$work_dir/gateway.json" <<EOF
 {
-  "listen": "0.0.0.0:8080",
+  "listen": "${public_ip}:8080",
   "tls": {"terminate_tls_upstream": true},
   "backend": {"url": "https://backend.internal:8443", "timeout": "5s", "tls": {"ca_file":"/fixture/ca.pem","client_cert_file":"/fixture/gateway.pem","client_key_file":"/fixture/gateway.key","server_name":"backend.internal","min_version":"1.2"}, "allowed_endpoints": [{"method":"POST","path":"/v1/messages"}]},
   "server": {"read_timeout":"10s","write_timeout":"10s","idle_timeout":"10s","read_header_timeout":"5s"},
   "identity": {"audience":"perimeter-qualification"},
   "secrets": {"pepper_versions":{"1":"${pepper}"}},
-  "admin": {"listen":"0.0.0.0:8081","operator_tokens":{"perimeter-qualification-operator-0123456789abcdef":"harness:credential.lifecycle,audit.read"}},
+  "admin": {"listen":"127.0.0.1:8081","operator_tokens":{"perimeter-qualification-operator-0123456789abcdef":"harness:credential.lifecycle,audit.read"}},
   "paths": {"state":"/fixture/state.db","signer_keyring":"/fixture/keyring.json"},
   "deployment": {"allow_ephemeral_state":false}
 }
 EOF
 docker run -d --name "${lab}-admin" --network "${lab}-control" --network-alias admin.internal nginx:alpine@sha256:72ba65eb42c10344912a84ff42408db7d34f2feb642204570ab8fc5ffd29f1d3 >/dev/null
-docker run -d --name "${lab}-gateway" --network "${lab}-public" --network-alias gateway.internal \
+docker run -d --name "${lab}-gateway" --network "${lab}-public" --ip "$public_ip" --network-alias gateway.internal \
 	-v "$work_dir:/fixture" debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 \
 	/fixture/gripline -config /fixture/gateway.json >/dev/null
-docker network connect "${lab}-private" "${lab}-gateway"
+docker network connect --ip "$private_ip" "${lab}-private" "${lab}-gateway"
 docker run -d --name "${lab}-control" --network "${lab}-control" --network-alias control.internal \
 	-v "$work_dir/control.conf:/etc/nginx/nginx.conf:ro" -v "$work_dir:/tls:ro" nginx:alpine@sha256:72ba65eb42c10344912a84ff42408db7d34f2feb642204570ab8fc5ffd29f1d3 >/dev/null
 docker run -d --name "${lab}-attacker" --network "${lab}-public" \
@@ -104,6 +130,7 @@ docker run -d --name "${lab}-postgres" --network "${lab}-db" --network-alias pos
 	-e POSTGRES_PASSWORD=qualification postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94 >/dev/null
 docker run -d --name "${lab}-inference-client" --network "${lab}-private" \
 	-v "$work_dir:/tls:ro" curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b sleep 600 >/dev/null
+docker network connect "${lab}-public" "${lab}-inference-client"
 docker network connect "${lab}-control" "${lab}-inference-client"
 docker run -d --name "${lab}-control-client" --network "${lab}-control" \
 	-v "$work_dir:/tls:ro" curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b sleep 600 >/dev/null

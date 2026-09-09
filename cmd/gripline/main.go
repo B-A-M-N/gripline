@@ -213,6 +213,9 @@ func run(cfgPath string) (retErr error) {
 			return
 		}
 		if err := rt.Ready(); err != nil {
+			if os.Getenv("GRIPLINE_LOG_READINESS_FAILURES") == "1" {
+				log.Printf("gripline: readyz not ready: %v", err)
+			}
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_, _ = w.Write([]byte("not_ready"))
 			return

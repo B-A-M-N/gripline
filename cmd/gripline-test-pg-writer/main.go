@@ -80,6 +80,10 @@ func main() {
 					}
 					probeCancel()
 				}
+				previous, _ := active.Load().(string)
+				if selected != previous {
+					log.Printf("active backend=%q", selected)
+				}
 				active.Store(selected)
 			}
 		}

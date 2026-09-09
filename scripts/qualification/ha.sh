@@ -12,16 +12,35 @@ project="gripline-ha-${$}"
 work_dir="$(mktemp -d)"
 live_pids=()
 keep="${GRIPLINE_QUALIFICATION_KEEP:-0}"
+phase="fixture-start"
+compose=()
+diagnose_failure() {
+	local rc=$?
+	if (( rc != 0 )); then
+		echo "HA lab failure: phase=${phase} rc=${rc}" >&2
+		"${compose[@]}" ps >&2 2>/dev/null || true
+		"${compose[@]}" logs --no-color --tail=120 >&2 2>/dev/null || true
+		if [[ -f "$work_dir/live-gripline.log" ]]; then
+			echo "HA lab live Gripline log:" >&2
+			tail -120 "$work_dir/live-gripline.log" >&2 || true
+		fi
+		if [[ "$keep" == 1 ]]; then
+			echo "HA lab diagnostics retained: $work_dir" >&2
+		fi
+	fi
+}
 cleanup() {
 	for pid in "${live_pids[@]}"; do kill -TERM "$pid" >/dev/null 2>&1 || true; done
 	for pid in "${live_pids[@]}"; do wait "$pid" >/dev/null 2>&1 || true; done
-	rm -rf "$work_dir"
 	if [[ "$keep" == 1 ]]; then
 		echo "HA lab retained: docker compose -p $project -f $fixture_dir/compose.yaml" >&2
+		echo "HA lab diagnostics retained: $work_dir" >&2
 	else
 		docker compose -p "$project" -f "$fixture_dir/compose.yaml" down -v --remove-orphans >/dev/null 2>&1 || true
+		rm -rf "$work_dir"
 	fi
 }
+trap diagnose_failure ERR
 trap cleanup EXIT
 
 command -v docker >/dev/null || { echo "ha qualification: docker is required" >&2; exit 2; }
@@ -32,6 +51,7 @@ command -v openssl >/dev/null || { echo "ha qualification: openssl is required" 
 compose=(docker compose -p "$project" -f "$fixture_dir/compose.yaml")
 
 "${compose[@]}" up -d
+phase="replica-catchup"
 for _ in $(seq 1 90); do
 	if "${compose[@]}" exec -T primary pg_isready -U gripline -d gripline >/dev/null 2>&1 && \
 		"${compose[@]}" exec -T replica pg_isready -U gripline -d gripline >/dev/null 2>&1; then
@@ -90,7 +110,6 @@ state_fingerprint() {
 		(SELECT count(*) FROM gripline_credentials WHERE status=4),
 		(SELECT count(*) FROM gripline_lanes WHERE credential_id='qualification-active'),
 		(SELECT count(*) FROM gripline_evidence WHERE subject_id='qualification-active'),
-		(SELECT posture FROM gripline_operator_posture WHERE singleton=TRUE),
 		(SELECT count(*) FROM gripline_control_operations WHERE operation_id='qualification-seed-operation'),
 		(SELECT count(*) FROM gripline_credential_receipts WHERE request_id='qualification-seed-request'),
 		(SELECT count(*) FROM gripline_resource_leases WHERE lease_id='qualification-seed-lease' AND state='reserved'),
@@ -103,8 +122,12 @@ state_fingerprint() {
 }
 
 expected_state="$(state_fingerprint primary)"
-[[ "$expected_state" == *"|1|1|1|1|0|1|1|1|1|1|1|5|1|1"* ]] || {
+[[ "$expected_state" == *"|1|1|1|1|1|1|1|1|1|1|5|1|1"* ]] || {
 	echo "ha qualification: reference state seed is incomplete: $expected_state" >&2
+	exit 1
+}
+[[ "$(sql primary 'SELECT posture FROM gripline_operator_posture WHERE singleton=TRUE')" == 0 ]] || {
+	echo "ha qualification: reference state seed has non-clear operator posture" >&2
 	exit 1
 }
 for _ in $(seq 1 60); do
@@ -118,6 +141,7 @@ done
 	exit 1
 }
 
+phase="live-build"
 # Start a real Gripline node against a repository-owned writer endpoint. The
 # writer endpoint probes both PostgreSQL instances and only routes to the
 # non-recovery authority, so the server process survives a primary kill while
@@ -125,6 +149,7 @@ done
 GOCACHE="${GOCACHE:-/tmp/gripline-go-cache}" go build -trimpath -o "$work_dir/gripline" ./cmd/gripline
 GOCACHE="${GOCACHE:-/tmp/gripline-go-cache}" go build -trimpath -o "$work_dir/pg-writer" ./cmd/gripline-test-pg-writer
 GOCACHE="${GOCACHE:-/tmp/gripline-go-cache}" go build -trimpath -o "$work_dir/backend" ./cmd/gripline-test-backend
+phase="live-start"
 writer_port=$((25434 + ($$ % 100)))
 live_port=$((25600 + ($$ % 100)))
 live_backend_port=$((live_port + 1))
@@ -141,7 +166,8 @@ cat >"$live_config" <<EOF
   "server": {"read_timeout":"10s","write_timeout":"10s","idle_timeout":"10s","read_header_timeout":"5s"},
   "identity": {"audience":"ha-live-qualification"},
   "secrets": {"pepper_versions":{"1":"${pepper_one}","2":"${pepper_two}"}},
-  "admin": {"listen":"127.0.0.1:${live_admin_port}","operator_tokens":{"${live_operator}":"harness:credential.lifecycle,posture.control,audit.read"}},
+  "ingress": {"pseudonym_keys":{"1":"${pseudonym_one}","2":"${pseudonym_two}"}},
+  "admin": {"listen":"127.0.0.1:${live_admin_port}","operator_tokens":{"${live_operator}":"harness:credential.lifecycle,posture.control,crypto.lifecycle,cluster.read,audit.read"}},
   "paths": {"signer_keyring":"${work_dir}/keyring.json"},
   "policy": {"file":"${work_dir}/policy.json","verifier_key_file":"${work_dir}/verifier.key"},
   "authority": {"backend":"postgres","dsn_env":"GRIPLINE_HA_WRITER_DSN","node_id":"ha-live-node","lease_ttl":"5s","renew_every":"1s","connect_timeout":"3s","operation_timeout":"1s","max_conns":4,"min_conns":1},
@@ -160,8 +186,8 @@ for _ in $(seq 1 60); do
 	sleep 0.25
 done
 curl -fsS "http://127.0.0.1:${live_port}/readyz" >/dev/null
-printf '%s\n' "$live_secret" | GRIPLINE_OPERATOR_TOKEN="$live_operator" "$work_dir/gripline" credential add --config "$live_config" --id ha-live-credential --account ha-live --policy gripline-default-v1 --plan ha-live --reason "HA reference qualification" --secret-stdin >/dev/null
-curl -fsS "http://127.0.0.1:${live_port}/v1/messages" -H "Authorization: Bearer ${live_secret}" >/dev/null
+printf '%s\n' "$live_secret" | GRIPLINE_OPERATOR_TOKEN="$live_operator" "$work_dir/gripline" credential add --config "$live_config" --id ha-live-credential --account ha-live --policy gripline-default-v1 --plan ha-live --reason "HA reference qualification" --operation-id "ha-live-credential-add-${$}" --secret-stdin >/dev/null
+curl -fsS -X POST "http://127.0.0.1:${live_port}/v1/messages" -H "Authorization: Bearer ${live_secret}" -H 'Content-Type: application/json' --data '{}' >/dev/null
 live_expected_state="$(state_fingerprint primary)"
 for _ in $(seq 1 60); do
 	if [[ "$(state_fingerprint replica 2>/dev/null || true)" == "$live_expected_state" ]]; then break; fi
@@ -173,6 +199,7 @@ done
 }
 
 echo "ha qualification: stopping primary and promoting replica"
+	phase="failover"
 ambiguous_operation="ha-unknown-commit-${$}"
 ambiguous_reason="HA unknown-commit posture mutation"
 ambiguous_url="http://127.0.0.1:${live_admin_port}/admin/posture"
@@ -223,12 +250,13 @@ for _ in $(seq 1 90); do
 done
 kill -0 "${live_pids[2]}"
 curl -fsS "http://127.0.0.1:${live_port}/readyz" >/dev/null
-curl -fsS "http://127.0.0.1:${live_port}/v1/messages" -H "Authorization: Bearer ${live_secret}" >/dev/null
+curl -fsS -X POST "http://127.0.0.1:${live_port}/v1/messages" -H "Authorization: Bearer ${live_secret}" -H 'Content-Type: application/json' --data '{}' >/dev/null
 echo "ha qualification: live Gripline node recovered through stable writer endpoint"
 
 # Rejoin the failed node from the promoted authority. pg_basebackup -R writes
 # standby.signal and primary_conninfo, proving the node came back as a
 # follower instead of silently forking a second authority.
+phase="rejoin"
 "${compose[@]}" run --rm --no-deps --entrypoint bash primary -ceu \
 	'rm -rf -- /var/lib/postgresql/data/*; PGPASSWORD=gripline pg_basebackup -h replica -U replicator -D /var/lib/postgresql/data -Fp -Xs -P -R; chown -R postgres:postgres /var/lib/postgresql/data; chmod 0700 /var/lib/postgresql/data' \
 	>/dev/null
