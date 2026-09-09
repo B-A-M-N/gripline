@@ -34,7 +34,32 @@ trap cleanup EXIT
 
 cd "$repo_dir"
 dsn="${GRIPLINE_TEST_POSTGRES_DSN:-postgres://gripline:gripline@127.0.0.1:5432/gripline?sslmode=disable}"
-base=$((19000 + ($$ % 800) * 10))
+pick_cluster_base() {
+	python3 - <<'PY'
+import socket
+
+offsets = (0, 1, 2, 10, 11, 12, 20, 21, 22)
+for base in range(19000, 27000, 10):
+    sockets = []
+    try:
+        for offset in offsets:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("127.0.0.1", base + offset))
+            sockets.append(sock)
+    except OSError:
+        for sock in sockets:
+            sock.close()
+        continue
+    for sock in sockets:
+        sock.close()
+    print(base)
+    raise SystemExit(0)
+raise SystemExit("no free cluster harness listener range")
+PY
+}
+
+base="$(pick_cluster_base)"
 lb_port=$base
 backend_port=$((base + 1))
 control_backend_port=$((base + 2))
