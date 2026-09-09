@@ -14,7 +14,7 @@ restore_port="${GRIPLINE_PITR_RESTORE_PORT:-$(pick_free_port "$((pitr_port + 1))
 export GRIPLINE_PITR_PORT="$pitr_port" GRIPLINE_PITR_RESTORE_PORT="$restore_port"
 cleanup() {
 	rm -rf "${work_dir:-}"
-	docker compose -p "$project" -f "$fixture_dir/compose.yaml" down -v --remove-orphans >/dev/null 2>&1 || true
+	docker compose --profile restore -p "$project" -f "$fixture_dir/compose.yaml" down -v --remove-orphans >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
