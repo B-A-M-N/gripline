@@ -164,7 +164,7 @@ write_readiness_config() {
 {
   "listen": "127.0.0.1:$((25500 + ${#name}))",
   "tls": {"terminate_tls_upstream": true},
-  "backend": {"url": "http://127.0.0.1:1", "timeout": "2s", "allowed_endpoints": [{"method": "POST", "path": "/v1/messages"}]},
+  "backend": {"url": "http://127.0.0.1:1", "trust_mode": "private_network", "timeout": "2s", "allowed_endpoints": [{"method": "POST", "path": "/v1/messages"}]},
   "server": {"read_timeout": "5s", "write_timeout": "5s", "idle_timeout": "5s", "read_header_timeout": "2s"},
   "identity": {"audience": "pitr-readiness"},
   "secrets": {"pepper_versions": ${configured_peppers}},

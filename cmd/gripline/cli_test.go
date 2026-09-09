@@ -22,7 +22,7 @@ import (
 func cliStatefulConfig(t *testing.T, dir, backendURL string) string {
 	t.Helper()
 	t.Setenv("GRIPLINE_PEPPER_V1", testPepperEnv)
-	cfgJSON := `{"listen":"127.0.0.1:0","backend":{"url":"` + backendURL + `","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"test-audience"},"admin":{"listen":"127.0.0.1:0","operator_tokens":{"op-tok-cli-0123456789abcdef0123456789abcdef":"cli:credential.lifecycle,lane.lifecycle"}},"tls":{"terminate_tls_upstream":true},"paths":{"state":"` + filepath.Join(dir, "state.db") + `","signer_keyring":"` + filepath.Join(dir, "keyring.json") + `"}}`
+	cfgJSON := `{"listen":"127.0.0.1:0","backend":{"url":"` + backendURL + `","trust_mode":"private_network","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"test-audience"},"admin":{"listen":"127.0.0.1:0","operator_tokens":{"op-tok-cli-0123456789abcdef0123456789abcdef":"cli:credential.lifecycle,lane.lifecycle"}},"tls":{"terminate_tls_upstream":true},"paths":{"state":"` + filepath.Join(dir, "state.db") + `","signer_keyring":"` + filepath.Join(dir, "keyring.json") + `"}}`
 	p := filepath.Join(dir, "config.json")
 	if err := os.WriteFile(p, []byte(cfgJSON), 0o640); err != nil {
 		t.Fatal(err)
@@ -64,7 +64,7 @@ func TestCLIStatusCommandRecognizesPostgresAuthority(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }))
 	defer backend.Close()
 	cfgPath := filepath.Join(dir, "config.json")
-	cfgJSON := `{"listen":"127.0.0.1:8080","backend":{"url":"` + backend.URL + `","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"test-audience"},"tls":{"terminate_tls_upstream":true},"authority":{"backend":"postgres","dsn_env":"GRIPLINE_STATUS_DSN","node_id":"status-node","lease_ttl":"10s","renew_every":"2s"}}`
+	cfgJSON := `{"listen":"127.0.0.1:8080","backend":{"url":"` + backend.URL + `","trust_mode":"private_network","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"test-audience"},"tls":{"terminate_tls_upstream":true},"authority":{"backend":"postgres","dsn_env":"GRIPLINE_STATUS_DSN","node_id":"status-node","lease_ttl":"10s","renew_every":"2s"}}`
 	if err := os.WriteFile(cfgPath, []byte(cfgJSON), 0o640); err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +129,7 @@ func TestCLILifecycleUsesLiveAdmin(t *testing.T) {
 
 	dir := t.TempDir()
 	adminAddr := strings.TrimPrefix(admin.URL, "http://")
-	cfgJSON := `{"listen":"127.0.0.1:8080","backend":{"url":"http://backend.invalid:80","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"test-audience"},"admin":{"listen":"` + adminAddr + `","operator_tokens":{"` + token + `":"ops:credential.lifecycle,lane.lifecycle,cluster.read"}},"tls":{"terminate_tls_upstream":true},"paths":{"audit_log":"` + filepath.Join(dir, "audit.jsonl") + `"}}`
+	cfgJSON := `{"listen":"127.0.0.1:8080","backend":{"url":"http://backend.invalid:80","trust_mode":"private_network","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"test-audience"},"admin":{"listen":"` + adminAddr + `","operator_tokens":{"` + token + `":"ops:credential.lifecycle,lane.lifecycle,cluster.read"}},"tls":{"terminate_tls_upstream":true},"paths":{"audit_log":"` + filepath.Join(dir, "audit.jsonl") + `"}}`
 	cfgPath := filepath.Join(dir, "config.json")
 	if err := os.WriteFile(cfgPath, []byte(cfgJSON), 0o640); err != nil {
 		t.Fatal(err)
@@ -205,7 +205,7 @@ func TestCLICredentialAddUsesSharedExternalContract(t *testing.T) {
 	dir := t.TempDir()
 	adminAddr := strings.TrimPrefix(admin.URL, "http://")
 	cfgPath := filepath.Join(dir, "config.json")
-	cfgJSON := `{"listen":"127.0.0.1:8080","backend":{"url":"http://backend.invalid:80","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"test-audience"},"tls":{"terminate_tls_upstream":true},"admin":{"listen":"` + adminAddr + `","operator_tokens":{"` + token + `":"ops:credential.lifecycle"}},"paths":{"state":"/server-only/state.db"}}`
+	cfgJSON := `{"listen":"127.0.0.1:8080","backend":{"url":"http://backend.invalid:80","trust_mode":"private_network","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"test-audience"},"tls":{"terminate_tls_upstream":true},"admin":{"listen":"` + adminAddr + `","operator_tokens":{"` + token + `":"ops:credential.lifecycle"}},"paths":{"state":"/server-only/state.db"}}`
 	if err := os.WriteFile(cfgPath, []byte(cfgJSON), 0o600); err != nil {
 		t.Fatal(err)
 	}

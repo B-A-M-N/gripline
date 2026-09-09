@@ -44,7 +44,7 @@ cat >"$work_dir/config.json" <<EOF
 {
   "listen": "127.0.0.1:${gateway_port}",
   "tls": {"cert_file": "${work_dir}/server.pem", "key_file": "${work_dir}/server.key", "min_version": "1.2"},
-  "backend": {"url": "http://127.0.0.1:${backend_port}", "timeout": "10s", "allowed_endpoints": [{"method": "POST", "path": "/v1/messages"}]},
+  "backend": {"url": "http://127.0.0.1:${backend_port}", "trust_mode": "private_network", "timeout": "10s", "allowed_endpoints": [{"method": "POST", "path": "/v1/messages"}]},
   "server": {"read_timeout": "10s", "write_timeout": "10s", "idle_timeout": "10s", "read_header_timeout": "5s", "stream_write_idle_timeout": "2s", "max_header_bytes": 65536, "max_body_bytes": 1048576, "http2_max_concurrent_streams": 64, "http2_header_table_bytes": 65536, "http2_max_read_frame_bytes": 1048576, "http2_max_upload_buffer_per_connection": 1048576, "http2_max_upload_buffer_per_stream": 65536, "spool_dir": "${work_dir}/spool", "spool_max_bytes": 1048576, "spool_max_files": 8},
   "identity": {"audience": "http2-qualification"},
   "secrets": {"pepper_versions": {"1": "${pepper}"}},

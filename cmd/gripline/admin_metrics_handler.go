@@ -67,6 +67,9 @@ func adminMetrics(svc *control.Service, dp *proxy.DataPlane, governor resource.A
 			writeMetric("usage_cost_microunits_total", m.UsageCostMicrounits)
 			writeMetric("usage_conservative_settlements_total", m.UsageConservativeSettlements)
 			writeMetric("http2_errors_total", m.HTTP2Errors)
+			writeMetric("preauth_source_table_saturated_total", m.PreAuthSourceTableSaturated)
+			writeMetric("preauth_overflow_assignments_total", m.PreAuthOverflowAssignments)
+			writeMetric("preauth_overflow_denials_total", m.PreAuthOverflowDenials)
 			for i, count := range m.ResourceDenialsByScope {
 				writeMetric("resource_denials_scope_"+strings.ToLower(resource.Scope(i).String())+"_total", count)
 			}

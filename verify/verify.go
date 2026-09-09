@@ -354,6 +354,26 @@ type Verifier struct {
 	replay              ReplayGuard
 }
 
+// ProductionOptions is the fail-closed constructor contract for a backend
+// that is claiming production readiness. New remains available for narrowly
+// scoped compatibility fixtures; production code should use this constructor
+// so transport trust, distributed replay, and authority freshness cannot be
+// accidentally left opt-in.
+type ProductionOptions struct {
+	KeySet   *KeySet
+	Audience string
+
+	Transport TransportTrust
+	Replay    ReplayGuard
+
+	CredentialRevisions        RevisionSource
+	ContextCredentialRevisions ContextRevisionSource
+	MinPolicyRevision          int
+	PolicyEpochs               PolicyEpochSource
+	ContextPolicyEpochs        ContextPolicyEpochSource
+	MinPolicyEpoch             uint64
+}
+
 // PublishKey installs one public signer generation for the verifier overlap
 // window. A backend control plane may call this only after authenticating its
 // operator/runtime transport; the caller can then verify a candidate canary
@@ -413,6 +433,48 @@ func New(set *KeySet, audience string) (*Verifier, error) {
 	for _, key := range set.Keys {
 		pub, _ := base64.StdEncoding.DecodeString(key.PublicKey)
 		v.keys[key.KID] = append(ed25519.PublicKey(nil), pub...)
+	}
+	return v, nil
+}
+
+// NewProduction constructs a verifier with the minimum non-optional
+// production controls enabled: an exact audience, transport trust, an atomic
+// replay authority, credential revision freshness, and policy activation
+// epoch freshness. This prevents a backend from silently shipping the
+// signature-only verifier posture.
+func NewProduction(opts ProductionOptions) (*Verifier, error) {
+	if opts.KeySet == nil {
+		return nil, errors.New("gripline verify: production key set required")
+	}
+	if strings.TrimSpace(opts.Audience) == "" {
+		return nil, errors.New("gripline verify: production audience required")
+	}
+	if opts.Transport == nil {
+		return nil, errors.New("gripline verify: production transport trust required")
+	}
+	if opts.Replay == nil {
+		return nil, errors.New("gripline verify: production replay guard required")
+	}
+	if opts.CredentialRevisions == nil && opts.ContextCredentialRevisions == nil {
+		return nil, errors.New("gripline verify: production credential revision source required")
+	}
+	if opts.PolicyEpochs == nil && opts.ContextPolicyEpochs == nil {
+		return nil, errors.New("gripline verify: production policy epoch source required")
+	}
+	v, err := New(opts.KeySet, opts.Audience)
+	if err != nil {
+		return nil, err
+	}
+	v.RequireTransportTrust(opts.Transport).WithReplayGuard(opts.Replay)
+	if opts.ContextCredentialRevisions != nil {
+		v.WithContextRevisionChecks(opts.ContextCredentialRevisions, opts.MinPolicyRevision)
+	} else {
+		v.WithRevisionChecks(opts.CredentialRevisions, opts.MinPolicyRevision)
+	}
+	if opts.ContextPolicyEpochs != nil {
+		v.WithContextPolicyEpochChecks(opts.ContextPolicyEpochs, opts.MinPolicyEpoch)
+	} else {
+		v.WithPolicyEpochChecks(opts.PolicyEpochs, opts.MinPolicyEpoch)
 	}
 	return v, nil
 }

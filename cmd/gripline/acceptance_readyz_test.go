@@ -24,7 +24,7 @@ func TestAcceptanceReadyzIsReal(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	cfgJSON := `{"listen":"127.0.0.1:0","backend":{"url":"` + backend.URL + `","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"test-audience"},"tls":{"terminate_tls_upstream":true},"paths":{"state":"` + filepath.Join(dir, "state.db") + `","signer_keyring":"` + filepath.Join(dir, "keyring.json") + `"}}`
+	cfgJSON := `{"listen":"127.0.0.1:0","backend":{"url":"` + backend.URL + `","trust_mode":"private_network","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"test-audience"},"tls":{"terminate_tls_upstream":true},"paths":{"state":"` + filepath.Join(dir, "state.db") + `","signer_keyring":"` + filepath.Join(dir, "keyring.json") + `"}}`
 	cfgPath := filepath.Join(dir, "config.json")
 	if err := os.WriteFile(cfgPath, []byte(cfgJSON), 0o640); err != nil {
 		t.Fatal(err)

@@ -19,7 +19,7 @@ func TestAcceptanceKeysExportIsReadOnly(t *testing.T) {
 	dir := t.TempDir()
 	keyringPath := filepath.Join(dir, "keyring.json")
 	configPath := filepath.Join(dir, "config.json")
-	configBody := `{"listen":"127.0.0.1:8080","backend":{"url":"http://backend.invalid:80","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"test-audience"},"tls":{"terminate_tls_upstream":true},"paths":{"signer_keyring":"` + keyringPath + `"}}`
+	configBody := `{"listen":"127.0.0.1:8080","backend":{"url":"http://backend.invalid:80","trust_mode":"private_network","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"test-audience"},"tls":{"terminate_tls_upstream":true},"paths":{"signer_keyring":"` + keyringPath + `"}}`
 	if err := os.WriteFile(configPath, []byte(configBody), 0o640); err != nil {
 		t.Fatal(err)
 	}

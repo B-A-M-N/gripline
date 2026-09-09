@@ -37,7 +37,7 @@ cat > "$smoke_dir/config.json" <<EOF
 {
   "listen": "0.0.0.0:18443",
   "tls": {"cert_file": "/etc/gripline/tls/cert.pem", "key_file": "/etc/gripline/tls/key.pem", "min_version": "1.2"},
-  "backend": {"url": "http://127.0.0.1:1", "timeout": "5s"},
+  "backend": {"url": "http://127.0.0.1:1", "trust_mode": "private_network", "timeout": "5s"},
   "server": {"read_timeout": "5s", "write_timeout": "5s", "idle_timeout": "5s", "read_header_timeout": "5s", "spool_dir": "/tmp/gripline-spool"},
   "identity": {"audience": "smoke"},
   "paths": {"state": "/var/lib/gripline/state.db", "signer_keyring": "/var/lib/gripline/keyring.json"}

@@ -1,11 +1,16 @@
 package proxy
 
 import (
+	"hash/maphash"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+const preAuthOverflowShards = 64
 
 // preAuthGuard bounds work that happens before a credential is known to be
 // valid. It is intentionally separate from authorization policy: an invalid
@@ -21,6 +26,10 @@ type preAuthGuard struct {
 	windowStart       time.Time
 	windowCount       int
 	sources           map[string]*preAuthSource
+	overflowSeed      maphash.Seed
+	sourceTableFull   atomic.Uint64
+	overflowAssigned  atomic.Uint64
+	overflowDenied    atomic.Uint64
 }
 
 type preAuthSource struct {
@@ -48,7 +57,7 @@ func newPreAuthGuard(maxConcurrent, requestsPerSecond, sourceRequestsPerSecond, 
 	return &preAuthGuard{
 		maxConcurrent: maxConcurrent, requestsPerSecond: requestsPerSecond,
 		sourceRequestsPS: sourceRequestsPerSecond, maxSources: maxSources,
-		sourceIdle: sourceIdle, windowStart: time.Now(), sources: make(map[string]*preAuthSource),
+		sourceIdle: sourceIdle, windowStart: time.Now(), sources: make(map[string]*preAuthSource), overflowSeed: maphash.MakeSeed(),
 	}
 }
 
@@ -81,9 +90,12 @@ func (g *preAuthGuard) acquireKey(key string, now time.Time) (func(), bool) {
 		}
 	}
 	state, ok := g.sources[key]
+	overflow := false
 	if !ok {
 		if len(g.sources) >= g.maxSources {
-			key = "__overflow__"
+			g.sourceTableFull.Add(1)
+			key = g.overflowKey(key)
+			overflow = true
 			state = g.sources[key]
 		}
 		if state == nil {
@@ -95,7 +107,13 @@ func (g *preAuthGuard) acquireKey(key string, now time.Time) (func(), bool) {
 		state.windowStart, state.count = now, 0
 	}
 	if state.count >= g.sourceRequestsPS {
+		if overflow || strings.HasPrefix(key, "__overflow_") {
+			g.overflowDenied.Add(1)
+		}
 		return nil, false
+	}
+	if overflow {
+		g.overflowAssigned.Add(1)
 	}
 	state.count++
 	state.lastSeen = now
@@ -111,6 +129,30 @@ func (g *preAuthGuard) acquireKey(key string, now time.Time) (func(), bool) {
 			g.mu.Unlock()
 		})
 	}, true
+}
+
+func (g *preAuthGuard) overflowKey(source string) string {
+	var hash maphash.Hash
+	hash.SetSeed(g.overflowSeed)
+	_, _ = hash.WriteString(source)
+	return "__overflow_" + strconv.FormatUint(hash.Sum64()%preAuthOverflowShards, 10)
+}
+
+type preAuthMetricsSnapshot struct {
+	SourceTableSaturated uint64
+	OverflowAssignments  uint64
+	OverflowDenials      uint64
+}
+
+func (g *preAuthGuard) metricsSnapshot() preAuthMetricsSnapshot {
+	if g == nil {
+		return preAuthMetricsSnapshot{}
+	}
+	return preAuthMetricsSnapshot{
+		SourceTableSaturated: g.sourceTableFull.Load(),
+		OverflowAssignments:  g.overflowAssigned.Load(),
+		OverflowDenials:      g.overflowDenied.Load(),
+	}
 }
 
 func canonicalPeer(remote string) string {

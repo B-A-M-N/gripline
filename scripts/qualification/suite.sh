@@ -2,9 +2,9 @@
 set -uo pipefail
 
 # Run the repository-owned reference qualification gates and emit sanitized,
-# immutable-source evidence. Gate logs stay in a temporary directory unless
-# GRIPLINE_QUALIFICATION_KEEP=1; result JSON never contains credentials,
-# assertions, private keys, or DSNs.
+# immutable-source evidence. Gate logs are retained as bounded, sanitized
+# artifacts and hashed into the manifest; result JSON never contains
+# credentials, assertions, private keys, or DSNs.
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 requested_result_dir="${GRIPLINE_QUALIFICATION_RESULT_DIR:-}"
 keep="${GRIPLINE_QUALIFICATION_KEEP:-0}"
@@ -65,7 +65,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-declare -A status exit_code duration_seconds evidence_sha256 telemetry_sha256
+declare -A status exit_code duration_seconds evidence_sha256 telemetry_sha256 log_sha256
 overall=0
 
 safe_version() {
@@ -76,6 +76,16 @@ safe_version() {
 
 json_escape() {
 	printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+sanitize_log() {
+	# Qualification fixtures use synthetic secrets, but retaining only a
+	# bounded redacted transcript keeps evidence useful without making secret
+	# hygiene depend on every fixture's logging style.
+	head -c 1048576 "$1" | sed -E \
+		-e 's#(Authorization: Bearer[[:space:]]+|([Pp]assword|[Ss]ecret|[Tt]oken|[Dd][Ss][Nn])[=:][[:space:]]*)[^[:space:]]+#\1<redacted>#g' \
+		-e 's#(GRIPLINE_[A-Z0-9_]+=)[^[:space:]]+#\1<redacted>#g' \
+		-e 's#(/tmp/)[^[:space:]]+#\1<redacted>#g'
 }
 
 run_gate() {
@@ -98,9 +108,12 @@ run_gate() {
 	status[$name]=$([[ "$rc" == 0 ]] && echo pass || echo fail)
 	exit_code[$name]=$rc
 	duration_seconds[$name]=$((ended_epoch - started_epoch))
-	local summary summary_json telemetry_file telemetry_hash
+	local summary summary_json telemetry_file telemetry_hash sanitized_log_file
 	summary="$( (rg -i 'qualification.*(passed|metrics|samples=)|cluster harness: capacity load metrics=' "$log" || true) | tail -5 | tr '\n' ' ' | tr -cd '[:print:]' | cut -c1-1200)"
 	summary_json="$(json_escape "$summary")"
+	sanitized_log_file="${name}-log.txt"
+	sanitize_log "$log" >"$result_dir/$sanitized_log_file"
+	log_sha256[$name]="$(sha256sum "$result_dir/$sanitized_log_file" | awk '{print $1}')"
 	telemetry_file=""
 	if [[ -f "$result_dir/${name}-telemetry.json" ]]; then telemetry_file="${name}-telemetry.json"; fi
 	cat >"$result_dir/${name}.json" <<EOF
@@ -120,7 +133,8 @@ run_gate() {
   },
   "measurements": {
     "sanitized_summary": "${summary_json}"
-	}$(if [[ -n "$telemetry_file" ]]; then printf ',\n  "telemetry": {"path": "%s", "sha256": "%s"}' "$telemetry_file" "$(sha256sum "$result_dir/$telemetry_file" | awk '{print $1}')"; fi)
+	},
+  "log": {"path": "${sanitized_log_file}", "sha256": "${log_sha256[$name]}"}$(if [[ -n "$telemetry_file" ]]; then printf ',\n  "telemetry": {"path": "%s", "sha256": "%s"}' "$telemetry_file" "$(sha256sum "$result_dir/$telemetry_file" | awk '{print $1}')"; fi)
 }
 EOF
 	evidence_sha256[$name]="$(sha256sum "$result_dir/${name}.json" | awk '{print $1}')"
@@ -157,7 +171,8 @@ manifest_evidence_entry() {
 	local key=$1
 	local record_hash=${evidence_sha256[$key]:-}
 	local telemetry_hash=${telemetry_sha256[$key]:-}
-	printf '    "%s": {"record": {"path": "%s.json", "sha256": "%s"}' "$key" "$key" "$record_hash"
+	local log_hash=${log_sha256[$key]:-}
+	printf '    "%s": {"record": {"path": "%s.json", "sha256": "%s"}, "log": {"path": "%s-log.txt", "sha256": "%s"}' "$key" "$key" "$record_hash" "$key" "$log_hash"
 	if [[ -n "$telemetry_hash" ]]; then
 		printf ', "telemetry": {"path": "%s-telemetry.json", "sha256": "%s"}' "$key" "$key" "$telemetry_hash"
 	fi
@@ -180,10 +195,10 @@ required_gates='["postgres-ha", "postgres-pitr", "perimeter", "clustered-perimet
 if [[ "$only_soak" == 1 ]]; then
 	required_gates='["soak"]'
 fi
-h2load_provenance="$(safe_version h2load --version)"
-if [[ -z "$h2load_provenance" ]]; then
-	h2load_provenance="pinned Docker fixture: scripts/qualification/fixtures/http2/Dockerfile"
-fi
+# http2.sh always wraps h2load in the pinned repository-owned container. The
+# host package, when present, is only used for nghttp and is never the load
+# generator whose result is certified.
+h2load_provenance="pinned Docker fixture: scripts/qualification/fixtures/http2/Dockerfile (runtime version is in http2-log.txt)"
 
 cat >"$result_dir/manifest.json" <<EOF
 {

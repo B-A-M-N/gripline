@@ -9,6 +9,7 @@
 
   "backend": {
     "url": "https://provider.internal:443",
+    "trust_mode": "private_network",
     "timeout": "30s",
     "dial_timeout": "5s",
     "tls_handshake_timeout": "5s",

@@ -434,6 +434,9 @@ type MetricsSnapshot struct {
 	UsageCostMicrounits          uint64
 	UsageConservativeSettlements uint64
 	HTTP2Errors                  uint64
+	PreAuthSourceTableSaturated  uint64
+	PreAuthOverflowAssignments   uint64
+	PreAuthOverflowDenials       uint64
 	ResourceDenialsByScope       [5]uint64
 	ResourceDenialsByDimension   [6]uint64
 	Spool                        SpoolStats
@@ -472,6 +475,10 @@ func (d *DataPlane) Metrics() MetricsSnapshot {
 		HTTP2Errors:                  d.metrics.http2Errors.Load(),
 		Spool:                        d.spool.Stats(),
 	}
+	preAuth := d.preAuth.metricsSnapshot()
+	snapshot.PreAuthSourceTableSaturated = preAuth.SourceTableSaturated
+	snapshot.PreAuthOverflowAssignments = preAuth.OverflowAssignments
+	snapshot.PreAuthOverflowDenials = preAuth.OverflowDenials
 	for i := range snapshot.ResourceDenialsByScope {
 		snapshot.ResourceDenialsByScope[i] = d.metrics.resourceByScope[i].Load()
 	}

@@ -14,21 +14,28 @@ import (
 // the selected authority answers a bounded probe. A /readyz handler that only
 // echoes a static flag is a lie — this is the check behind the endpoint.
 func (rt *Runtime) Ready() error {
-	if rt.StateHealth != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	readinessCtx, readinessCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer readinessCancel()
+	check := func(reason string, fn func(context.Context) error) error {
+		ctx, cancel := context.WithTimeout(readinessCtx, 500*time.Millisecond)
 		defer cancel()
-		err := rt.StateHealth.Ready(ctx)
-		if err != nil {
-			return fmt.Errorf("gripline: state authority not ready: %w", err)
+		if err := fn(ctx); err != nil {
+			return fmt.Errorf("gripline: readiness.%s: %w", reason, err)
+		}
+		return nil
+	}
+	if rt.StateHealth != nil {
+		if err := check("state_authority", rt.StateHealth.Ready); err != nil {
+			return err
 		}
 		if rt.Postgres != nil {
-			if err := rt.Postgres.CryptoReady(ctx); err != nil {
-				return fmt.Errorf("gripline: cluster crypto not ready: %w", err)
+			if err := check("cluster_crypto", rt.Postgres.CryptoReady); err != nil {
+				return err
 			}
 		}
 		if rt.PolicyHealth != nil {
-			if err := rt.PolicyHealth.Ready(ctx); err != nil {
-				return fmt.Errorf("gripline: policy authority not ready: %w", err)
+			if err := check("policy_authority", rt.PolicyHealth.Ready); err != nil {
+				return err
 			}
 		}
 	} else {
@@ -39,21 +46,16 @@ func (rt *Runtime) Ready() error {
 			}
 		}
 		if rt.Postgres != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancel()
-			if err := rt.Postgres.Ready(ctx); err != nil {
-				return fmt.Errorf("gripline: postgres authority not ready: %w", err)
+			if err := check("postgres_authority", rt.Postgres.Ready); err != nil {
+				return err
 			}
-			if err := rt.Postgres.CryptoReady(ctx); err != nil {
-				return fmt.Errorf("gripline: cluster crypto not ready: %w", err)
+			if err := check("cluster_crypto", rt.Postgres.CryptoReady); err != nil {
+				return err
 			}
 		}
 		if rt.PolicyHealth != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			err := rt.PolicyHealth.Ready(ctx)
-			cancel()
-			if err != nil {
-				return fmt.Errorf("gripline: policy authority not ready: %w", err)
+			if err := check("policy_authority", rt.PolicyHealth.Ready); err != nil {
+				return err
 			}
 		}
 	}
@@ -62,11 +64,8 @@ func (rt *Runtime) Ready() error {
 			if recovery, ok := health.(interface {
 				RecoverPersistence(context.Context) error
 			}); ok {
-				recoveryCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-				err := recovery.RecoverPersistence(recoveryCtx)
-				cancel()
-				if err != nil {
-					return fmt.Errorf("gripline: adaptive state checkpoint unavailable: %w", err)
+				if err := check("adaptive_recovery", recovery.RecoverPersistence); err != nil {
+					return err
 				}
 			}
 			if health.PersistenceError() != nil {
@@ -76,11 +75,11 @@ func (rt *Runtime) Ready() error {
 	}
 	if rt.Resource != nil {
 		if statsAuthority, ok := rt.Resource.(resource.ContextStatsAuthority); ok {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			_, err := statsAuthority.StatsContext(ctx)
-			cancel()
-			if err != nil {
-				return fmt.Errorf("gripline: resource authority not ready: %w", err)
+			if err := check("resource_authority", func(ctx context.Context) error {
+				_, err := statsAuthority.StatsContext(ctx)
+				return err
+			}); err != nil {
+				return err
 			}
 		}
 	}

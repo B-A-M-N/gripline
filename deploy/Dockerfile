@@ -9,7 +9,7 @@
 # refuses to boot without them (deployment.allow_ephemeral_state defaults to
 # false).
 
-FROM golang:1.25.13-alpine AS build
+FROM golang:1.25.13-alpine@sha256:1e0126852075c9c60731c8ba49088448b91f63e2aed97ca9d1a9791622a05946 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -20,7 +20,7 @@ ARG BUILD_DATE=unknown
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION} -X main.buildCommit=${COMMIT} -X main.buildDate=${BUILD_DATE}" -o /out/gripline ./cmd/gripline
 RUN mkdir -p /out/state
 
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
 ARG VERSION=dev
 ARG COMMIT=unknown
 ARG BUILD_DATE=unknown

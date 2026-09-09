@@ -79,3 +79,22 @@ func TestPreAuthSourceUsesTrustedForwardingIdentity(t *testing.T) {
 		t.Fatalf("untrusted peer accepted spoofed XFF: %q", got)
 	}
 }
+
+func TestPreAuthOverflowUsesBoundedShards(t *testing.T) {
+	guard := newPreAuthGuard(256, 1000, 1, 1, time.Minute)
+	accepted := 0
+	for i := 0; i < 128; i++ {
+		release, ok := guard.acquireKey("source-"+string(rune('a'+i)), time.Unix(100, 0))
+		if ok {
+			accepted++
+			release()
+		}
+	}
+	if accepted < 2 {
+		t.Fatalf("bounded overflow shards admitted %d sources, want at least 2", accepted)
+	}
+	metrics := guard.metricsSnapshot()
+	if metrics.SourceTableSaturated == 0 || metrics.OverflowAssignments == 0 {
+		t.Fatalf("overflow metrics = %+v, want saturation and assignments", metrics)
+	}
+}

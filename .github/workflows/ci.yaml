@@ -54,6 +54,10 @@ jobs:
       - name: diff check
         run: git diff --check
 
+      - name: Assert immutable container bases
+        run: |
+          awk '/^[[:space:]]*FROM[[:space:]]+/ { split($2, image, "@sha256:"); if (length(image) != 2 || length(image[2]) != 64 || image[2] !~ /^[0-9a-f]+$/) { print "unpinned base: " $0; bad=1 } } END { exit bad }' deploy/Dockerfile scripts/qualification/fixtures/http2/Dockerfile
+
       - name: staticcheck
         run: staticcheck ./...
 

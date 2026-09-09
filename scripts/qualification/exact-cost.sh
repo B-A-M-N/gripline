@@ -42,7 +42,7 @@ start_gateway() {
 {
   "listen": "127.0.0.1:${gateway_port}",
   "tls": {"terminate_tls_upstream": true},
-  "backend": {"url": "http://127.0.0.1:${backend_port}", "timeout": "10s", "allowed_endpoints": ${allowed_json}},
+  "backend": {"url": "http://127.0.0.1:${backend_port}", "trust_mode": "private_network", "timeout": "10s", "allowed_endpoints": ${allowed_json}},
   "server": {"read_timeout":"10s","write_timeout":"10s","idle_timeout":"10s","read_header_timeout":"5s"},
   "identity": {"audience":"exact-cost-qualification"},
   "secrets": {"pepper_versions":{"1":"${pepper}"}},

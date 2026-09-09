@@ -62,7 +62,7 @@ for index in "${!providers[@]}"; do
 {
   "listen": "127.0.0.1:${gateway_port}",
   "tls": {"terminate_tls_upstream": true},
-  "backend": {"url": "http://127.0.0.1:${backend_port}", "timeout": "10s", "allowed_endpoints": [${allowed}]},
+  "backend": {"url": "http://127.0.0.1:${backend_port}", "trust_mode": "private_network", "timeout": "10s", "allowed_endpoints": [${allowed}]},
   "server": {"read_timeout": "10s", "write_timeout": "10s", "idle_timeout": "10s", "read_header_timeout": "5s", "stream_write_idle_timeout": "2s", "max_body_bytes": 1048576, "spool_dir": "${work_dir}/spool-${provider}", "spool_max_bytes": 1048576, "spool_max_files": 8},
   "identity": {"audience": "sdk-qualification-${provider}"},
   "secrets": {"pepper_versions": {"1": "${pepper}"}},

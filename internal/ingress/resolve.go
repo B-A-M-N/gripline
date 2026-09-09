@@ -114,11 +114,25 @@ func (r *Resolver) ResolveContext(ctx context.Context, remoteAddr string, header
 	return src, nil
 }
 
-// CanonicalClientIP derives the cheap, raw source key used before credential
-// authentication. It deliberately performs no pseudonym, database, or ASN
-// work. Forwarding headers are considered only when the direct TCP peer is in
-// trusted; malformed trusted-proxy chains fall back to that direct peer.
+// CanonicalClientIP derives the authoritative raw source key. It deliberately
+// performs no pseudonym, database, or ASN work. Forwarding headers are
+// considered only when the direct TCP peer is trusted; malformed trusted-proxy
+// chains are errors because the strict post-auth path must never silently
+// reinterpret an ambiguous source.
 func CanonicalClientIP(remoteAddr string, headers http.Header, trusted []netip.Prefix) (netip.Addr, error) {
+	return canonicalClientIP(remoteAddr, headers, trusted, true)
+}
+
+// CanonicalPreAuthClientIP is the conservative pre-auth variant. A malformed
+// forwarding chain falls back to the direct proxy peer, preserving a bounded
+// abuse-control key without allowing malformed metadata to select an attacker
+// chosen identity. The authenticated/authoritative resolver must use
+// CanonicalClientIP instead.
+func CanonicalPreAuthClientIP(remoteAddr string, headers http.Header, trusted []netip.Prefix) (netip.Addr, error) {
+	return canonicalClientIP(remoteAddr, headers, trusted, false)
+}
+
+func canonicalClientIP(remoteAddr string, headers http.Header, trusted []netip.Prefix, strict bool) (netip.Addr, error) {
 	peer, err := ExtractPeer(remoteAddr)
 	if err != nil {
 		return netip.Addr{}, fmt.Errorf("extract peer: %w", err)
@@ -133,6 +147,9 @@ func CanonicalClientIP(remoteAddr string, headers http.Header, trusted []netip.P
 	}
 	for _, hop := range hops {
 		if hop == "" {
+			if strict {
+				return netip.Addr{}, fmt.Errorf("trusted forwarding chain contains an empty hop")
+			}
 			return canonical.WithZone(""), nil
 		}
 	}
@@ -140,6 +157,9 @@ func CanonicalClientIP(remoteAddr string, headers http.Header, trusted []netip.P
 	for _, raw := range hops {
 		ip, err := netip.ParseAddr(raw)
 		if err != nil || ip.IsUnspecified() {
+			if strict {
+				return netip.Addr{}, fmt.Errorf("trusted forwarding chain contains invalid hop %q", raw)
+			}
 			return canonical.WithZone(""), nil
 		}
 		parsed = append(parsed, ip)

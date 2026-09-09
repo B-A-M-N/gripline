@@ -200,8 +200,7 @@ func TestIPv6ZoneHandling(t *testing.T) {
 }
 
 // Scenario 7 — Malformed forwarding entries (garbage, empty, unspecified)
-// must not panic and must degrade safely. Resolve should still succeed and the
-// malformed entry must not become the source identity.
+// must not panic and must be rejected by the strict authoritative resolver.
 func TestMalformedForwardingEntriesDegradeSafely(t *testing.T) {
 	cases := []struct {
 		name string
@@ -220,12 +219,8 @@ func TestMalformedForwardingEntriesDegradeSafely(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			// Direct peer is a trusted proxy, so the (malformed) chain is parsed.
-			src, err := r.Resolve("10.0.0.1:443", hdr("X-Forwarded-For", tc.xff))
-			if err != nil {
-				t.Fatalf("Resolve with malformed XFF: %v", err)
-			}
-			if src.Pseudonym == "" {
-				t.Fatalf("malformed XFF %q produced empty pseudonym", tc.xff)
+			if _, err := r.Resolve("10.0.0.1:443", hdr("X-Forwarded-For", tc.xff)); err == nil {
+				t.Fatalf("Resolve with malformed XFF %q must fail closed", tc.xff)
 			}
 		})
 	}

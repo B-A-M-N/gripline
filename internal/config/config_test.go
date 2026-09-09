@@ -30,7 +30,7 @@ func validConfigJSON() string {
 	return `{
 		"listen": ":8080",
 		"tls": {"cert_file": "/etc/gripline/tls/cert.pem", "key_file": "/etc/gripline/tls/key.pem", "min_version": "1.3"},
-		"backend": {"url": "https://provider.internal:443/v1", "timeout": "30s"},
+		"backend": {"url": "https://provider.internal:443/v1", "trust_mode": "private_network", "timeout": "30s"},
 		"server": {"read_timeout": "30s", "write_timeout": "60s", "idle_timeout": "120s", "read_header_timeout": "10s", "max_header_bytes": 65536, "max_body_bytes": 33554432},
 		"identity": {"audience": "fi-inference"},
 		"paths": {"audit_log": "/var/lib/gripline/audit.jsonl"}
@@ -103,7 +103,7 @@ func TestValidateClusterAuthorityContract(t *testing.T) {
 	c := &Config{
 		Listen:    "127.0.0.1:8080",
 		TLS:       TLSSection{TerminateTLSUpstream: true},
-		Backend:   BackendSection{URL: "https://provider.internal", Timeout: Duration(time.Second)},
+		Backend:   BackendSection{TrustMode: "private_network", URL: "https://provider.internal", Timeout: Duration(time.Second)},
 		Server:    ServerSection{ReadTimeout: Duration(time.Second), WriteTimeout: Duration(time.Second), IdleTimeout: Duration(time.Second), ReadHeaderTimeout: Duration(time.Second)},
 		Identity:  IdentitySection{Audience: "a"},
 		Authority: AuthoritySection{Backend: "postgres", DSNEnv: "GRIPLINE_DSN", NodeID: "node-a", LeaseTTL: Duration(30 * time.Second), RenewEvery: Duration(10 * time.Second)},
@@ -129,7 +129,7 @@ func TestValidateVerifierControlUsesDedicatedAuthentication(t *testing.T) {
 	c := &Config{
 		Listen: "127.0.0.1:8080",
 		TLS:    TLSSection{TerminateTLSUpstream: true},
-		Backend: BackendSection{
+		Backend: BackendSection{TrustMode: "private_network",
 			URL:     "https://provider.internal:443/v1",
 			Timeout: Duration(time.Second),
 			VerifierControl: VerifierControlSection{
@@ -165,10 +165,42 @@ func TestValidateVerifierControlUsesDedicatedAuthentication(t *testing.T) {
 	}
 }
 
+func TestBackendTrustModeIsExplicitForPersistentDeployments(t *testing.T) {
+	base := Config{
+		Listen:   "127.0.0.1:8080",
+		TLS:      TLSSection{TerminateTLSUpstream: true},
+		Backend:  BackendSection{URL: "http://127.0.0.1:18081", Timeout: Duration(time.Second)},
+		Server:   ServerSection{ReadTimeout: Duration(time.Second), WriteTimeout: Duration(time.Second), IdleTimeout: Duration(time.Second), ReadHeaderTimeout: Duration(time.Second)},
+		Identity: IdentitySection{Audience: "a"},
+	}
+	if err := base.Validate(); err == nil {
+		t.Fatal("persistent backend without explicit trust mode must be rejected")
+	}
+	development := base
+	development.Deployment.AllowEphemeralState = true
+	if err := development.Validate(); err != nil {
+		t.Fatalf("loopback development backend rejected: %v", err)
+	}
+	development.Backend.URL = "http://backend.internal:18081"
+	if err := development.Validate(); err == nil {
+		t.Fatal("development trust mode must be restricted to loopback")
+	}
+	mtls := base
+	mtls.Backend.TrustMode = "mtls"
+	if err := mtls.Validate(); err == nil {
+		t.Fatal("mTLS trust mode without authenticated TLS material must be rejected")
+	}
+	private := base
+	private.Backend.TrustMode = "private_network"
+	if err := private.Validate(); err != nil {
+		t.Fatalf("explicit private-network backend rejected: %v", err)
+	}
+}
+
 func TestValidateEndpointRulesCompilesCanonicalRoutes(t *testing.T) {
 	base := &Config{
 		Listen: "127.0.0.1:8080", TLS: TLSSection{TerminateTLSUpstream: true},
-		Backend:  BackendSection{URL: "https://provider.internal", Timeout: Duration(time.Second)},
+		Backend:  BackendSection{TrustMode: "private_network", URL: "https://provider.internal", Timeout: Duration(time.Second)},
 		Server:   ServerSection{ReadTimeout: Duration(time.Second), WriteTimeout: Duration(time.Second), IdleTimeout: Duration(time.Second), ReadHeaderTimeout: Duration(time.Second)},
 		Identity: IdentitySection{Audience: "a"},
 	}
@@ -203,7 +235,7 @@ func TestValidateUsageProfilesSeparateMeteredAndUnmeteredRoutes(t *testing.T) {
 		return Config{
 			Listen:   "127.0.0.1:8080",
 			TLS:      TLSSection{TerminateTLSUpstream: true},
-			Backend:  BackendSection{URL: "https://provider.internal", Timeout: Duration(time.Second)},
+			Backend:  BackendSection{TrustMode: "private_network", URL: "https://provider.internal", Timeout: Duration(time.Second)},
 			Server:   ServerSection{ReadTimeout: Duration(time.Second), WriteTimeout: Duration(time.Second), IdleTimeout: Duration(time.Second), ReadHeaderTimeout: Duration(time.Second)},
 			Identity: IdentitySection{Audience: "a"},
 			Usage:    UsageSection{Mode: mode, InputMicrounitsPerToken: 1, OutputMicrounitsPerToken: 1, MaxOutputTokens: 8},
@@ -249,7 +281,7 @@ func TestValidateExactUsageRequiresProviderCachePricing(t *testing.T) {
 		return Config{
 			Listen:   "127.0.0.1:8080",
 			TLS:      TLSSection{TerminateTLSUpstream: true},
-			Backend:  BackendSection{URL: "https://provider.internal", Timeout: Duration(time.Second)},
+			Backend:  BackendSection{TrustMode: "private_network", URL: "https://provider.internal", Timeout: Duration(time.Second)},
 			Server:   ServerSection{ReadTimeout: Duration(time.Second), WriteTimeout: Duration(time.Second), IdleTimeout: Duration(time.Second), ReadHeaderTimeout: Duration(time.Second)},
 			Identity: IdentitySection{Audience: "a"},
 			Usage:    UsageSection{Mode: mode, CostMode: "exact", InputMicrounitsPerToken: 3, OutputMicrounitsPerToken: 15, MaxOutputTokens: 8},
@@ -279,7 +311,7 @@ func TestValidateUsageCostModeDefaultsAndRejectsUnusedPosture(t *testing.T) {
 	c := Config{
 		Listen:   "127.0.0.1:8080",
 		TLS:      TLSSection{TerminateTLSUpstream: true},
-		Backend:  BackendSection{URL: "https://provider.internal", Timeout: Duration(time.Second)},
+		Backend:  BackendSection{TrustMode: "private_network", URL: "https://provider.internal", Timeout: Duration(time.Second)},
 		Server:   ServerSection{ReadTimeout: Duration(time.Second), WriteTimeout: Duration(time.Second), IdleTimeout: Duration(time.Second), ReadHeaderTimeout: Duration(time.Second)},
 		Identity: IdentitySection{Audience: "a"},
 		Usage:    UsageSection{Mode: "openai", InputMicrounitsPerToken: 3, OutputMicrounitsPerToken: 15, MaxOutputTokens: 8},
@@ -293,7 +325,7 @@ func TestValidateUsageCostModeDefaultsAndRejectsUnusedPosture(t *testing.T) {
 	c = Config{
 		Listen:   "127.0.0.1:8080",
 		TLS:      TLSSection{TerminateTLSUpstream: true},
-		Backend:  BackendSection{URL: "https://provider.internal", Timeout: Duration(time.Second)},
+		Backend:  BackendSection{TrustMode: "private_network", URL: "https://provider.internal", Timeout: Duration(time.Second)},
 		Server:   ServerSection{ReadTimeout: Duration(time.Second), WriteTimeout: Duration(time.Second), IdleTimeout: Duration(time.Second), ReadHeaderTimeout: Duration(time.Second)},
 		Identity: IdentitySection{Audience: "a"},
 		Usage:    UsageSection{Mode: "none", CostMode: "exact"},
@@ -307,7 +339,7 @@ func TestValidateClusterAdminUsesPostgresAuditAuthority(t *testing.T) {
 	c := &Config{
 		Listen:   "127.0.0.1:8080",
 		TLS:      TLSSection{TerminateTLSUpstream: true},
-		Backend:  BackendSection{URL: "https://provider.internal", Timeout: Duration(time.Second)},
+		Backend:  BackendSection{TrustMode: "private_network", URL: "https://provider.internal", Timeout: Duration(time.Second)},
 		Server:   ServerSection{ReadTimeout: Duration(time.Second), WriteTimeout: Duration(time.Second), IdleTimeout: Duration(time.Second), ReadHeaderTimeout: Duration(time.Second)},
 		Identity: IdentitySection{Audience: "a"},
 		Authority: AuthoritySection{
@@ -336,7 +368,7 @@ func TestValidateStandaloneEphemeralAdminRequiresAuditPath(t *testing.T) {
 	c := &Config{
 		Listen:     "127.0.0.1:8080",
 		TLS:        TLSSection{TerminateTLSUpstream: true},
-		Backend:    BackendSection{URL: "https://provider.internal", Timeout: Duration(time.Second)},
+		Backend:    BackendSection{TrustMode: "private_network", URL: "https://provider.internal", Timeout: Duration(time.Second)},
 		Server:     ServerSection{ReadTimeout: Duration(time.Second), WriteTimeout: Duration(time.Second), IdleTimeout: Duration(time.Second), ReadHeaderTimeout: Duration(time.Second)},
 		Identity:   IdentitySection{Audience: "a"},
 		Deployment: DeploymentSection{AllowEphemeralState: true},
@@ -447,9 +479,9 @@ func TestValidateRejectsMissingSecurityDecisions(t *testing.T) {
 		"no audience":            `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"https://b","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{}}`,
 		"admin without audit":    `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"https://b","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"},"admin":{"listen":":9090","operator_tokens":{"t":"op:posture.control"}}}`,
 		"admin without tokens":   `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"https://b","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"},"admin":{"listen":":9090"},"paths":{"audit_log":"a.jsonl"}}`,
-		"state and audit mirror": `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"https://b","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"},"paths":{"state":"state.db","audit_log":"audit.jsonl"}}`,
-		"unknown capability":     `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"https://b","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"},"admin":{"listen":"127.0.0.1:9090","operator_tokens":{"01234567890123456789012345678901":"op:posture.typo"}},"paths":{"audit_log":"audit.jsonl"}}`,
-		"bad min version":        `{"listen":":8080","tls":{"terminate_tls_upstream":true,"min_version":"1.1"},"backend":{"url":"https://b","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"}}`,
+		"state and audit mirror": `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"https://b","trust_mode":"private_network","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"},"paths":{"state":"state.db","audit_log":"audit.jsonl"}}`,
+		"unknown capability":     `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"https://b","trust_mode":"private_network","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"},"admin":{"listen":"127.0.0.1:9090","operator_tokens":{"01234567890123456789012345678901":"op:posture.typo"}},"paths":{"audit_log":"audit.jsonl"}}`,
+		"bad min version":        `{"listen":":8080","tls":{"terminate_tls_upstream":true,"min_version":"1.1"},"backend":{"url":"https://b","trust_mode":"private_network","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"}}`,
 	}
 	for name, body := range cases {
 		if _, err := Load(writeCfg(t, body)); err == nil {
@@ -460,7 +492,7 @@ func TestValidateRejectsMissingSecurityDecisions(t *testing.T) {
 
 // TLS-vs-upstream-termination is exclusive.
 func TestTLSExclusivity(t *testing.T) {
-	base := `{"listen":":8080","tls":{"cert_file":"c.pem","key_file":"k.pem","terminate_tls_upstream":true},"backend":{"url":"https://b","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"}}`
+	base := `{"listen":":8080","tls":{"cert_file":"c.pem","key_file":"k.pem","terminate_tls_upstream":true},"backend":{"url":"https://b","trust_mode":"private_network","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"}}`
 	if _, err := Load(writeCfg(t, base)); err == nil {
 		t.Fatal("cert files + terminate_tls_upstream are mutually exclusive")
 	}
@@ -470,7 +502,7 @@ func TestTLSExclusivity(t *testing.T) {
 func TestEnvExpansion(t *testing.T) {
 	t.Setenv("GP_BACKEND", "https://real.internal/v1")
 	t.Setenv("GP_TOKEN", "op-secret-0123456789abcdef0123456789abcdef")
-	body := `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"${GP_BACKEND}","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"},"admin":{"listen":"127.0.0.1:9090","operator_tokens":{"${GP_TOKEN}":"op:posture.control"}},"paths":{"audit_log":"audit.jsonl"}}`
+	body := `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"${GP_BACKEND}","trust_mode":"private_network","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"},"admin":{"listen":"127.0.0.1:9090","operator_tokens":{"${GP_TOKEN}":"op:posture.control"}},"paths":{"audit_log":"audit.jsonl"}}`
 	c, err := Load(writeCfg(t, body))
 	if err != nil {
 		t.Fatal(err)
@@ -561,7 +593,7 @@ func TestAdminBindValidation(t *testing.T) {
 		if allowPublic {
 			ap = `,"allow_public":true`
 		}
-		return `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"https://b","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"},"admin":{"listen":"` + listen + `","operator_tokens":{"test-token-0123456789abcdef0123456789abcdef":"op:posture.control"}` + ap + `},"paths":{"audit_log":"a.jsonl"}}`
+		return `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"https://b","trust_mode":"private_network","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"},"admin":{"listen":"` + listen + `","operator_tokens":{"test-token-0123456789abcdef0123456789abcdef":"op:posture.control"}` + ap + `},"paths":{"audit_log":"a.jsonl"}}`
 	}
 
 	// Valid: IPv4 and IPv6 loopback only.
@@ -586,7 +618,7 @@ func TestAdminBindValidation(t *testing.T) {
 // hatch is GONE from the config surface: admin.allow_public must not exist as
 // an accepted field that disables the private-bind requirement.
 func TestNoPublicAdminOverride(t *testing.T) {
-	body := `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"https://b","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"},"admin":{"listen":"8.8.8.8:9090","allow_public":true,"operator_tokens":{"t":"op:posture.control"}},"paths":{"audit_log":"a.jsonl"}}`
+	body := `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"https://b","trust_mode":"private_network","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"},"admin":{"listen":"8.8.8.8:9090","allow_public":true,"operator_tokens":{"t":"op:posture.control"}},"paths":{"audit_log":"a.jsonl"}}`
 	if _, err := Load(writeCfg(t, body)); err == nil {
 		t.Fatal("admin.allow_public must NOT permit a public admin bind (P0-14)")
 	}
@@ -600,7 +632,7 @@ func TestNoPublicAdminOverride(t *testing.T) {
 // listener is only legitimate on a private network behind a trusted proxy.
 func TestTerminateUpstreamRequiresPrivateBind(t *testing.T) {
 	base := func(listen string) string {
-		return `{"listen":"` + listen + `","tls":{"terminate_tls_upstream":true},"backend":{"url":"https://b","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"}}`
+		return `{"listen":"` + listen + `","tls":{"terminate_tls_upstream":true},"backend":{"url":"https://b","trust_mode":"private_network","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"}}`
 	}
 	for _, l := range []string{"127.0.0.1:8080", "10.0.0.5:8080", "192.168.1.2:8080", "[::1]:8080"} {
 		if _, err := Load(writeCfg(t, base(l))); err != nil {
@@ -613,7 +645,7 @@ func TestTerminateUpstreamRequiresPrivateBind(t *testing.T) {
 		}
 	}
 	// With REAL TLS the public bind is fine (encryption is end-to-end).
-	tlsBody := `{"listen":"0.0.0.0:8443","tls":{"cert_file":"c.pem","key_file":"k.pem"},"backend":{"url":"https://b","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"}}`
+	tlsBody := `{"listen":"0.0.0.0:8443","tls":{"cert_file":"c.pem","key_file":"k.pem"},"backend":{"url":"https://b","trust_mode":"private_network","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"a"}}`
 	if _, err := Load(writeCfg(t, tlsBody)); err != nil {
 		t.Errorf("real-TLS public bind must be accepted, got %v", err)
 	}

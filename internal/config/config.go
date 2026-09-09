@@ -61,7 +61,7 @@ func (d Duration) D() time.Duration { return time.Duration(d) }
 // security consequence is REQUIRED (no implicit defaults for TLS posture,
 // backend target, or limits); Validate enforces the cross-field invariants.
 type Config struct {
-	// Listen is the public listener address, e.g. ":8080".
+	// Listen is the public listener address, e.g. ":8585".
 	Listen string `json:"listen"`
 
 	// TLS is the public-side TLS configuration. TLS is REQUIRED for the
@@ -256,10 +256,23 @@ type TLSSection struct {
 	MinVersion string `json:"min_version,omitempty"`
 }
 
+// BackendTrustMode makes the upstream security boundary explicit.
+type BackendTrustMode string
+
+const (
+	BackendTrustMTLS           BackendTrustMode = "mtls"
+	BackendTrustPrivateNetwork BackendTrustMode = "private_network"
+	BackendTrustDevelopment    BackendTrustMode = "development"
+)
+
 // BackendSection is the fixed upstream (P0.7).
 type BackendSection struct {
 	// URL is the upstream origin, e.g. "https://provider.internal:443".
 	URL string `json:"url"`
+	// TrustMode is the explicit trust boundary for the fixed backend. Persistent
+	// deployments must declare either mTLS or a private-network boundary;
+	// development mode is reserved for ephemeral loopback fixtures.
+	TrustMode BackendTrustMode `json:"trust_mode,omitempty"`
 	// VerifierControl is a separately authenticated backend control channel used
 	// by the clustered signer-rotation handshake. It must not reuse the
 	// data-plane transport identity.
@@ -537,6 +550,39 @@ func (c *Config) Validate() error {
 	if backendURL.User != nil || backendURL.RawQuery != "" || backendURL.Fragment != "" {
 		return fmt.Errorf("backend.url must not contain userinfo, query, or fragment")
 	}
+	trustMode := strings.ToLower(strings.TrimSpace(string(c.Backend.TrustMode)))
+	if trustMode == "" {
+		if !c.Deployment.AllowEphemeralState {
+			return fmt.Errorf("backend.trust_mode is required for persistent deployments (mtls or private_network)")
+		}
+		trustMode = "development"
+	}
+	switch trustMode {
+	case "mtls":
+		if backendURL.Scheme != "https" {
+			return fmt.Errorf("backend.trust_mode mtls requires an https backend")
+		}
+		if c.Backend.TLS.CAFile == "" || c.Backend.TLS.ClientCertFile == "" || c.Backend.TLS.ClientKeyFile == "" || strings.TrimSpace(c.Backend.TLS.ServerName) == "" {
+			return fmt.Errorf("backend.trust_mode mtls requires backend.tls.ca_file, client_cert_file, client_key_file, and server_name")
+		}
+		if c.Backend.TLS.MinVersion != "1.2" && c.Backend.TLS.MinVersion != "1.3" {
+			return fmt.Errorf("backend.trust_mode mtls requires backend.tls.min_version 1.2 or 1.3")
+		}
+	case "private_network":
+		// The operator is explicitly asserting that the backend hop is inside a
+		// private network boundary. This mode permits local HTTP fixtures and
+		// private HTTPS deployments whose network policy supplies the boundary.
+	case "development":
+		if !c.Deployment.AllowEphemeralState {
+			return fmt.Errorf("backend.trust_mode development requires deployment.allow_ephemeral_state=true")
+		}
+		if !backendHostnameIsLoopback(backendURL.Hostname()) {
+			return fmt.Errorf("backend.trust_mode development requires a loopback backend")
+		}
+	default:
+		return fmt.Errorf("backend.trust_mode must be mtls, private_network, or development")
+	}
+	c.Backend.TrustMode = BackendTrustMode(trustMode)
 	if backendURL.Scheme != "https" && (c.Backend.TLS.CAFile != "" || c.Backend.TLS.ClientCertFile != "" || c.Backend.TLS.ClientKeyFile != "" || c.Backend.TLS.ServerName != "" || c.Backend.TLS.MinVersion != "") {
 		return fmt.Errorf("backend.tls requires an https backend")
 	}
@@ -913,6 +959,14 @@ func (c *Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+func backendHostnameIsLoopback(host string) bool {
+	if strings.EqualFold(strings.TrimSpace(host), "localhost") {
+		return true
+	}
+	addr, err := netip.ParseAddr(strings.TrimSpace(host))
+	return err == nil && addr.IsLoopback()
 }
 
 // requirePrivateBind enforces that a listener address binds loopback or a

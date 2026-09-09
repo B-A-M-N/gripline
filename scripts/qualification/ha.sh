@@ -170,7 +170,7 @@ cat >"$live_config" <<EOF
 {
   "listen": "127.0.0.1:${live_port}",
   "tls": {"terminate_tls_upstream": true},
-  "backend": {"url": "http://127.0.0.1:${live_backend_port}", "timeout": "5s", "allowed_endpoints": [{"method":"POST","path":"/v1/messages"}]},
+  "backend": {"url": "http://127.0.0.1:${live_backend_port}", "trust_mode": "private_network", "timeout": "5s", "allowed_endpoints": [{"method":"POST","path":"/v1/messages"}]},
   "server": {"read_timeout":"10s","write_timeout":"10s","idle_timeout":"10s","read_header_timeout":"5s"},
   "identity": {"audience":"ha-live-qualification"},
   "secrets": {"pepper_versions":{"1":"${pepper_one}","2":"${pepper_two}"}},

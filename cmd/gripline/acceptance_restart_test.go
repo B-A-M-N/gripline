@@ -29,7 +29,7 @@ func writeStatefulConfig(t *testing.T, dir string, backendURL string, extraAdmin
 	if extraAdmin {
 		admin = `,"admin":{"listen":"127.0.0.1:0","operator_tokens":{"op-tok-restart-0123456789abcdef0123456789abcdef":"operator:posture.control,credential.lifecycle,lane.lifecycle,audit.read"}}`
 	}
-	cfgJSON := `{"listen":"127.0.0.1:0","backend":{"url":"` + backendURL + `","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"test-audience"}` + admin + `,"tls":{"terminate_tls_upstream":true},"paths":{"state":"` + filepath.Join(dir, "state.db") + `","signer_keyring":"` + filepath.Join(dir, "keyring.json") + `"}}`
+	cfgJSON := `{"listen":"127.0.0.1:0","backend":{"url":"` + backendURL + `","trust_mode":"private_network","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"test-audience"}` + admin + `,"tls":{"terminate_tls_upstream":true},"paths":{"state":"` + filepath.Join(dir, "state.db") + `","signer_keyring":"` + filepath.Join(dir, "keyring.json") + `"}}`
 	if err := os.WriteFile(cfgPath, []byte(cfgJSON), 0o640); err != nil {
 		t.Fatal(err)
 	}
@@ -235,7 +235,7 @@ func TestAcceptanceRejectSplitAuthorities(t *testing.T) {
 	t.Setenv("GRIPLINE_PEPPER_V1", testPepperEnv)
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.json")
-	cfgJSON := `{"listen":"127.0.0.1:0","backend":{"url":"http://127.0.0.1:1","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"test-audience"},"tls":{"terminate_tls_upstream":true},"paths":{"state":"` + filepath.Join(dir, "state.db") + `","evidence":"` + filepath.Join(dir, "evidence.gob") + `","signer_keyring":"` + filepath.Join(dir, "keyring.json") + `"}}`
+	cfgJSON := `{"listen":"127.0.0.1:0","backend":{"url":"http://127.0.0.1:1","trust_mode":"private_network","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"test-audience"},"tls":{"terminate_tls_upstream":true},"paths":{"state":"` + filepath.Join(dir, "state.db") + `","evidence":"` + filepath.Join(dir, "evidence.gob") + `","signer_keyring":"` + filepath.Join(dir, "keyring.json") + `"}}`
 	if err := os.WriteFile(cfgPath, []byte(cfgJSON), 0o640); err != nil {
 		t.Fatal(err)
 	}
@@ -256,7 +256,7 @@ func TestAcceptanceRejectSplitAuthorities(t *testing.T) {
 func TestAcceptanceMandatoryPersistentState(t *testing.T) {
 	t.Setenv("GRIPLINE_PEPPER_V1", testPepperEnv)
 	dir := t.TempDir()
-	base := `"listen":"127.0.0.1:0","backend":{"url":"http://127.0.0.1:1","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"test-audience"},"tls":{"terminate_tls_upstream":true},`
+	base := `"listen":"127.0.0.1:0","backend":{"url":"http://127.0.0.1:1","trust_mode":"private_network","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"test-audience"},"tls":{"terminate_tls_upstream":true},`
 
 	load := func(t *testing.T, paths, deployment string) (*config.Config, error) {
 		t.Helper()

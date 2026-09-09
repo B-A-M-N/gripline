@@ -54,7 +54,7 @@ func (s *IngressSourceResolver) ResolvePreAuthSource(obs Observation) (string, e
 	if s == nil || s.inner == nil {
 		return "", nil
 	}
-	ip, err := ingress.CanonicalClientIP(obs.RemoteAddr, obs.Header, s.inner.TrustedProxies)
+	ip, err := ingress.CanonicalPreAuthClientIP(obs.RemoteAddr, obs.Header, s.inner.TrustedProxies)
 	if err != nil {
 		return "", err
 	}

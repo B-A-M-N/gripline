@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/B-A-M-N/gripline/internal/pgtransport"
 	"github.com/B-A-M-N/gripline/verify"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -32,7 +33,14 @@ func OpenPostgresGuard(ctx context.Context, dsn string) (*PostgresGuard, error) 
 	if strings.TrimSpace(dsn) == "" {
 		return nil, errors.New("replay: empty PostgreSQL DSN")
 	}
-	pool, err := pgxpool.New(ctx, dsn)
+	config, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("replay: parse DSN: %w", err)
+	}
+	if err := pgtransport.Validate(config); err != nil {
+		return nil, fmt.Errorf("replay: %w", err)
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
 		return nil, err
 	}
@@ -56,7 +64,14 @@ func MigratePostgresGuard(ctx context.Context, dsn string) error {
 	if strings.TrimSpace(dsn) == "" {
 		return errors.New("replay: empty PostgreSQL DSN")
 	}
-	pool, err := pgxpool.New(ctx, dsn)
+	config, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return fmt.Errorf("replay: parse DSN: %w", err)
+	}
+	if err := pgtransport.Validate(config); err != nil {
+		return fmt.Errorf("replay: %w", err)
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
 		return err
 	}

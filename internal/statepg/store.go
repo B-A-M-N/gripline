@@ -10,11 +10,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
-	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/B-A-M-N/gripline/internal/pgtransport"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -99,7 +98,7 @@ var ErrMigrationRequired = errors.New("statepg: database schema requires migrati
 // expand/contract schema range is implemented.
 var ErrMigrationRequiresQuiescence = errors.New("statepg: schema migration requires all serving nodes to be stopped")
 var ErrDSNRequired = errors.New("statepg: DSN required")
-var ErrInsecureTransport = errors.New("statepg: remote PostgreSQL requires authenticated TLS")
+var ErrInsecureTransport = pgtransport.ErrInsecureTransport
 
 // SupportedSchemaVersion is the schema marker expected by serving nodes.
 func SupportedSchemaVersion() int { return currentSchemaVersion }
@@ -274,39 +273,10 @@ func InspectSchema(ctx context.Context, opts Options) (SchemaStatus, error) {
 // boundary; every other host must use a TLS configuration that authenticates
 // the server (verify-full, or verify-ca with a peer-verification callback).
 func validateTransport(config *pgxpool.Config) error {
-	if config == nil {
-		return errors.New("statepg: nil PostgreSQL connection config")
-	}
-	configs := []*pgconn.Config{{
-		Host:      config.ConnConfig.Host,
-		Port:      config.ConnConfig.Port,
-		TLSConfig: config.ConnConfig.TLSConfig,
-	}}
-	for _, fallback := range config.ConnConfig.Fallbacks {
-		configs = append(configs, &pgconn.Config{Host: fallback.Host, Port: fallback.Port, TLSConfig: fallback.TLSConfig})
-	}
-	for _, candidate := range configs {
-		if candidate == nil {
-			continue
-		}
-		network, _ := pgconn.NetworkAddress(candidate.Host, candidate.Port)
-		if network == "unix" || isLoopbackDatabaseHost(candidate.Host) {
-			continue
-		}
-		if candidate.TLSConfig == nil || (candidate.TLSConfig.InsecureSkipVerify && candidate.TLSConfig.VerifyPeerCertificate == nil) {
-			return fmt.Errorf("%w: host %q", ErrInsecureTransport, candidate.Host)
-		}
+	if err := pgtransport.Validate(config); err != nil {
+		return fmt.Errorf("statepg: %w", err)
 	}
 	return nil
-}
-
-func isLoopbackDatabaseHost(host string) bool {
-	host = strings.TrimSpace(host)
-	if strings.EqualFold(host, "localhost") {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
 }
 
 // CheckSchemaCompatibility verifies that a serving node can use the

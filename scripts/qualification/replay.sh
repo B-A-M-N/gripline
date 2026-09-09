@@ -22,16 +22,27 @@ docker compose version >/dev/null || { echo "replay qualification: docker compos
 command -v go >/dev/null || { echo "replay qualification: go is required" >&2; exit 2; }
 command -v curl >/dev/null || { echo "replay qualification: curl is required" >&2; exit 2; }
 compose=(docker compose -p "$project" -f "$fixture_dir/compose.yaml")
-"${compose[@]}" up -d >/dev/null
-for _ in $(seq 1 60); do
-	if "${compose[@]}" exec -T postgres pg_isready -U gripline -d gripline >/dev/null 2>&1; then break; fi
-	sleep 1
-done
 replay_port="${GRIPLINE_REPLAY_POSTGRES_PORT:-$(pick_free_port 27434 28434)}"
 export GRIPLINE_REPLAY_POSTGRES_PORT="$replay_port"
 dsn="postgres://gripline:gripline@127.0.0.1:${replay_port}/gripline?sslmode=disable"
 GOCACHE="${GOCACHE:-/tmp/gripline-go-cache}" go build -trimpath -o "$work_dir/replay" ./cmd/gripline-test-replay
-"$work_dir/replay" -migrate -dsn "$dsn"
+"${compose[@]}" up -d >/dev/null
+# The host-facing port is selected before Compose starts. Use the repository's
+# compiled migration command as the readiness probe so the check exercises the
+# same mapped socket and credentials as the actual authority.
+migrated=0
+for _ in $(seq 1 60); do
+	if "$work_dir/replay" -migrate -dsn "$dsn" >"$work_dir/migrate.log" 2>&1; then
+		migrated=1
+		break
+	fi
+	sleep 1
+done
+if [[ "$migrated" != 1 ]]; then
+	cat "$work_dir/migrate.log" >&2
+	echo "replay qualification: PostgreSQL did not become ready on host port ${replay_port}" >&2
+	exit 1
+fi
 "$work_dir/replay" -listen 127.0.0.1:19601 -dsn "$dsn" >"$work_dir/a.log" 2>&1 & pids+=("$!")
 "$work_dir/replay" -listen 127.0.0.1:19602 -dsn "$dsn" >"$work_dir/b.log" 2>&1 & pids+=("$!")
 for port in 19601 19602; do

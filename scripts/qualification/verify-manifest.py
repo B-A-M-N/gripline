@@ -88,6 +88,14 @@ def main() -> None:
         if record.get("result") != "pass" or record.get("exit_code") != 0:
             fail(f"{gate_name} record is not a passing result")
 
+        record_log = record.get("log")
+        manifest_log = entry.get("log")
+        if not isinstance(manifest_log, dict) or not isinstance(record_log, dict):
+            fail(f"{gate_name} sanitized log metadata is required")
+        if manifest_log != record_log:
+            fail(f"{gate_name} log metadata differs between record and manifest")
+        verify_hash(root, manifest_log, f"{gate_name}.log")
+
         record_telemetry = record.get("telemetry")
         manifest_telemetry = entry.get("telemetry")
         if manifest_telemetry is not None:

@@ -127,9 +127,9 @@ else
 fi
 cat >"$work_dir/gateway.json" <<EOF
 {
-  "listen": "${public_ip}:8080",
+  "listen": "${public_ip}:8585",
   "tls": {"terminate_tls_upstream": true},
-  "backend": {"url": "https://backend.internal:8443", "timeout": "5s", "tls": {"ca_file":"/fixture/ca.pem","client_cert_file":"/fixture/gateway.pem","client_key_file":"/fixture/gateway.key","server_name":"backend.internal","min_version":"1.2"}, "allowed_endpoints": [{"method":"POST","path":"/v1/messages"}]},
+  "backend": {"url": "https://backend.internal:8443", "trust_mode": "mtls", "timeout": "5s", "tls": {"ca_file":"/fixture/ca.pem","client_cert_file":"/fixture/gateway.pem","client_key_file":"/fixture/gateway.key","server_name":"backend.internal","min_version":"1.2"}, "allowed_endpoints": [{"method":"POST","path":"/v1/messages"}]},
   "server": {"read_timeout":"10s","write_timeout":"10s","idle_timeout":"10s","read_header_timeout":"5s"},
   "identity": {"audience":"perimeter-qualification"},
 ${authority_config}
@@ -182,10 +182,10 @@ docker network connect "${lab}-private" "${lab}-control-client"
 credential_secret="perimeter-qualification-secret-0123456789abcdef"
 operator_token="perimeter-qualification-operator-0123456789abcdef"
 for _ in $(seq 1 60); do
-	if docker exec "${lab}-attacker" curl --fail --silent --connect-timeout 2 http://gateway.internal:8080/readyz >/dev/null 2>&1; then break; fi
+	if docker exec "${lab}-attacker" curl --fail --silent --connect-timeout 2 http://gateway.internal:8585/readyz >/dev/null 2>&1; then break; fi
 	sleep 0.25
 done
-docker exec "${lab}-attacker" curl --fail --silent --connect-timeout 2 http://gateway.internal:8080/readyz >/dev/null
+docker exec "${lab}-attacker" curl --fail --silent --connect-timeout 2 http://gateway.internal:8585/readyz >/dev/null
 if [[ "$mode" == clustered ]]; then
 	docker exec "${lab}-gateway" env GRIPLINE_DB_DSN="$db_dsn" /fixture/gripline keys export --config /fixture/gateway.json >"$work_dir/keys.json"
 		printf '%s\n' "$credential_secret" | docker exec -i "${lab}-gateway" env GRIPLINE_DB_DSN="$db_dsn" GRIPLINE_OPERATOR_TOKEN="$operator_token" /fixture/gripline credential add --config /fixture/gateway.json --id perimeter-credential --account perimeter --policy gripline-default-v1 --plan perimeter --reason "perimeter qualification" --operation-id "perimeter-credential-add-${$}" --secret-stdin >/dev/null
@@ -199,8 +199,8 @@ docker run -d --name "${lab}-backend" --network "${lab}-private" --network-alias
 	-v "$work_dir:/fixture" debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 \
 	/fixture/backend -listen 0.0.0.0:8443 -tls-cert /fixture/backend.pem -tls-key /fixture/backend.key -client-ca /fixture/ca.pem -require-client-dns gripline-gateway.internal -audience perimeter-qualification -keys /fixture/keys.json >/dev/null
 
-gateway_curl=(docker exec "${lab}-attacker" curl --fail --silent --show-error --connect-timeout 3 http://gateway.internal:8080/v1/messages -H "Authorization: Bearer ${credential_secret}" -H 'Content-Type: application/json' --data '{}')
-inference_gateway_curl=(docker exec "${lab}-inference-client" curl --fail --silent --show-error --connect-timeout 3 http://gateway.internal:8080/v1/messages -H "Authorization: Bearer ${credential_secret}" -H 'Content-Type: application/json' --data '{}')
+gateway_curl=(docker exec "${lab}-attacker" curl --fail --silent --show-error --connect-timeout 3 http://gateway.internal:8585/v1/messages -H "Authorization: Bearer ${credential_secret}" -H 'Content-Type: application/json' --data '{}')
+inference_gateway_curl=(docker exec "${lab}-inference-client" curl --fail --silent --show-error --connect-timeout 3 http://gateway.internal:8585/v1/messages -H "Authorization: Bearer ${credential_secret}" -H 'Content-Type: application/json' --data '{}')
 inference_curl=(docker exec "${lab}-inference-client" curl --fail --silent --show-error --connect-timeout 3 --cacert /tls/ca.pem --cert /tls/gateway.pem --key /tls/gateway.key)
 control_curl=(docker exec "${lab}-control-client" curl --fail --silent --show-error --connect-timeout 3 --cacert /tls/ca.pem --cert /tls/control.pem --key /tls/control.key)
 attacker_curl=(docker exec "${lab}-attacker" curl --fail --silent --show-error --connect-timeout 2 --cacert /tls/ca.pem --cert /tls/attacker.pem --key /tls/attacker.key)

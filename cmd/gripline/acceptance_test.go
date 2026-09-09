@@ -39,7 +39,7 @@ func TestAcceptanceBuildRuntime(t *testing.T) {
 	cfgPath := filepath.Join(dir, "config.json")
 	cfgJSON := `{
 		"listen": "127.0.0.1:0",
-		"backend": {"url": "` + backend.URL + `", "timeout": "5s"},
+		"backend": {"url": "` + backend.URL + `", "trust_mode": "private_network", "timeout": "5s"},
 		"server": {
 			"read_timeout": "5s",
 			"write_timeout": "5s",

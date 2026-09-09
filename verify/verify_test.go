@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
@@ -35,6 +36,48 @@ func TestRequireMTLSChecksVerifiedServiceIdentity(t *testing.T) {
 	request.TLS.VerifiedChains = nil
 	if trust.Trusted(request) {
 		t.Fatal("unverified client certificate must be rejected")
+	}
+}
+
+type productionTransportTrust bool
+
+func (productionTransportTrust) Trusted(*http.Request) bool { return true }
+
+type productionRevisionSource struct{}
+
+func (productionRevisionSource) CredentialRevision(string) (int, bool) { return 1, true }
+func (productionRevisionSource) PolicyEpoch() (uint64, bool)           { return 1, true }
+
+func TestNewProductionRequiresSecurityAuthorities(t *testing.T) {
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	set, err := NewKeySet(map[int]ed25519.PublicKey{1: pub}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid := ProductionOptions{
+		KeySet: set, Audience: "provider", Transport: productionTransportTrust(true),
+		Replay: NewMemoryReplayGuard(16), CredentialRevisions: productionRevisionSource{},
+		PolicyEpochs: productionRevisionSource{}, MinPolicyRevision: 1, MinPolicyEpoch: 1,
+	}
+	if _, err := NewProduction(valid); err != nil {
+		t.Fatalf("valid production verifier rejected: %v", err)
+	}
+	for name, mutate := range map[string]func(*ProductionOptions){
+		"transport": func(v *ProductionOptions) { v.Transport = nil },
+		"replay":    func(v *ProductionOptions) { v.Replay = nil },
+		"revision":  func(v *ProductionOptions) { v.CredentialRevisions = nil },
+		"epoch":     func(v *ProductionOptions) { v.PolicyEpochs = nil },
+	} {
+		t.Run(name, func(t *testing.T) {
+			copy := valid
+			mutate(&copy)
+			if _, err := NewProduction(copy); err == nil {
+				t.Fatal("missing production authority must be rejected")
+			}
+		})
 	}
 }
 
