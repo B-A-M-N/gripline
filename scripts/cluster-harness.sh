@@ -235,7 +235,7 @@ pids+=("$!")
 
 wait_status() {
 	local url=$1 expected=${2:-200}
-	for _ in $(seq 1 "${GRIPLINE_CLUSTER_HARNESS_READY_ATTEMPTS:-600}"); do
+	for _ in $(seq 1 "${GRIPLINE_CLUSTER_HARNESS_READY_ATTEMPTS:-1800}"); do
 		if [[ "$(curl -sS --max-time 2 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)" == "$expected" ]]; then
 			return 0
 		fi
