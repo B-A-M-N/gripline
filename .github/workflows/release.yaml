@@ -40,9 +40,7 @@ jobs:
       - name: Verify qualification manifest
         id: manifest
         run: |
-          grep -Fq "\"commit\": \"$GITHUB_SHA\"" qualification-release-results/manifest.json
-          grep -Fq '"result": "pass"' qualification-release-results/manifest.json
-          (cd qualification-release-results && sha256sum -c manifest.sha256)
+          bash scripts/qualification/verify-manifest.sh qualification-release-results "$GITHUB_SHA"
           echo "commit=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
           echo "sha256=$(sha256sum qualification-release-results/manifest.json | awk '{print $1}')" >> "$GITHUB_OUTPUT"
       - if: always()
@@ -83,9 +81,7 @@ jobs:
           path: qualification-release-results
       - name: Verify exact qualification evidence for this release
         run: |
-          grep -Fq "\"commit\": \"$GITHUB_SHA\"" qualification-release-results/manifest.json
-          grep -Fq '"result": "pass"' qualification-release-results/manifest.json
-          (cd qualification-release-results && sha256sum -c manifest.sha256)
+          bash scripts/qualification/verify-manifest.sh qualification-release-results "$GITHUB_SHA"
           test "$(sha256sum qualification-release-results/manifest.json | awk '{print $1}')" = "${{ needs.qualification.outputs.manifest_sha256 }}"
       - name: Assert toolchain
         run: test "$(go env GOVERSION)" = "go1.25.13"

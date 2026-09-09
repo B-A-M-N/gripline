@@ -95,6 +95,27 @@ func TestBaselineDeferredUntilFinalize(t *testing.T) {
 	}
 }
 
+// Deferred completion accounting must receive its own authority budget. A
+// request that streams longer than the admission budget still gets one bounded
+// attempt to record its final clean observation.
+func TestBaselineFinalizeAfterAdmissionBudget(t *testing.T) {
+	term, raw, store := baselineTestTerminator(t, evidence.NewMemoryStore())
+
+	out := term.Admit(bearerHeaders(raw), lane.Features{NetworkASN: "AS1"})
+	if !out.Authorized {
+		t.Fatalf("should authorize: %s", out.Reason)
+	}
+	time.Sleep(deferredAuthorityTimeout + 100*time.Millisecond)
+	if !out.FinalizeBaseline() {
+		t.Fatal("baseline token must remain spendable after a long stream")
+	}
+	ids := store.ListLaneIDs("cred_base")
+	rec, _ := store.Get("cred_base", ids[0])
+	if rec.AuthorizedCleanRequests != 1 {
+		t.Fatalf("long-stream baseline was not recorded: got %d", rec.AuthorizedCleanRequests)
+	}
+}
+
 // P0.27/P0.1: a degraded admission (evidence store outage at admit time) may
 // authorize but its baseline token is ineligible — unreliable history must not
 // build trust.

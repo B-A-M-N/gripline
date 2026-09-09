@@ -65,7 +65,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-declare -A status exit_code duration_seconds evidence_sha256
+declare -A status exit_code duration_seconds evidence_sha256 telemetry_sha256
 overall=0
 
 safe_version() {
@@ -98,14 +98,14 @@ run_gate() {
 	status[$name]=$([[ "$rc" == 0 ]] && echo pass || echo fail)
 	exit_code[$name]=$rc
 	duration_seconds[$name]=$((ended_epoch - started_epoch))
-	local summary summary_json telemetry_file
+	local summary summary_json telemetry_file telemetry_hash
 	summary="$( (rg -i 'qualification.*(passed|metrics|samples=)|cluster harness: capacity load metrics=' "$log" || true) | tail -5 | tr '\n' ' ' | tr -cd '[:print:]' | cut -c1-1200)"
 	summary_json="$(json_escape "$summary")"
 	telemetry_file=""
 	if [[ -f "$result_dir/${name}-telemetry.json" ]]; then telemetry_file="${name}-telemetry.json"; fi
 	cat >"$result_dir/${name}.json" <<EOF
 {
-  "schema": 1,
+	  "schema": 2,
   "suite": "gripline-reference-qualification-v1",
   "gate": "${name}",
   "commit": "${commit}",
@@ -120,10 +120,13 @@ run_gate() {
   },
   "measurements": {
     "sanitized_summary": "${summary_json}"
-  }$(if [[ -n "$telemetry_file" ]]; then printf ',\n  "telemetry_file": "%s"' "$telemetry_file"; fi)
+	}$(if [[ -n "$telemetry_file" ]]; then printf ',\n  "telemetry": {"path": "%s", "sha256": "%s"}' "$telemetry_file" "$(sha256sum "$result_dir/$telemetry_file" | awk '{print $1}')"; fi)
 }
 EOF
 	evidence_sha256[$name]="$(sha256sum "$result_dir/${name}.json" | awk '{print $1}')"
+	telemetry_hash=""
+	if [[ -n "$telemetry_file" ]]; then telemetry_hash="$(sha256sum "$result_dir/$telemetry_file" | awk '{print $1}')"; fi
+	telemetry_sha256[$name]="$telemetry_hash"
 	if [[ "$rc" != 0 ]]; then
 		overall=1
 		cat "$log" >&2
@@ -150,9 +153,41 @@ gate_status() {
 	printf '%s' "${status[$key]:-skipped}"
 }
 
+manifest_evidence_entry() {
+	local key=$1
+	local record_hash=${evidence_sha256[$key]:-}
+	local telemetry_hash=${telemetry_sha256[$key]:-}
+	printf '    "%s": {"record": {"path": "%s.json", "sha256": "%s"}' "$key" "$key" "$record_hash"
+	if [[ -n "$telemetry_hash" ]]; then
+		printf ', "telemetry": {"path": "%s-telemetry.json", "sha256": "%s"}' "$key" "$key" "$telemetry_hash"
+	fi
+	printf '}'
+}
+
+manifest_evidence_json() {
+	local key first=1
+	for key in postgres-ha postgres-pitr perimeter clustered-perimeter replay http2 sdk exact-cost soak capacity-load; do
+		if [[ "${status[$key]:-skipped}" == skipped ]]; then
+			continue
+		fi
+		if [[ "$first" == 0 ]]; then printf ',\n'; fi
+		manifest_evidence_entry "$key"
+		first=0
+	done
+}
+
+required_gates='["postgres-ha", "postgres-pitr", "perimeter", "clustered-perimeter", "replay", "http2", "sdk", "exact-cost", "soak", "capacity-load"]'
+if [[ "$only_soak" == 1 ]]; then
+	required_gates='["soak"]'
+fi
+h2load_provenance="$(safe_version h2load --version)"
+if [[ -z "$h2load_provenance" ]]; then
+	h2load_provenance="pinned Docker fixture: scripts/qualification/fixtures/http2/Dockerfile"
+fi
+
 cat >"$result_dir/manifest.json" <<EOF
 {
-  "schema": 1,
+  "schema": 2,
   "suite": "gripline-reference-qualification-v1",
   "commit": "${commit}",
   "result": "$([[ "$overall" == 0 ]] && echo pass || echo fail)",
@@ -160,6 +195,8 @@ cat >"$result_dir/manifest.json" <<EOF
   "soak_duration": "${soak_duration}",
   "capacity_duration": "${capacity_duration}",
   "workers": ${workers},
+  "qualification_mode": "$([[ "$only_soak" == 1 ]] && echo only-soak || echo full)",
+  "required_gates": ${required_gates},
   "gates": {
     "postgres-ha": "$(gate_status postgres-ha)",
     "postgres-pitr": "$(gate_status postgres-pitr)",
@@ -180,26 +217,28 @@ cat >"$result_dir/manifest.json" <<EOF
     "h2load": "scripts/qualification/fixtures/http2/Dockerfile (nghttp2-client)"
   },
   "evidence": {
-    "postgres-ha": {"path": "postgres-ha.json", "sha256": "${evidence_sha256[postgres-ha]:-}"},
-    "postgres-pitr": {"path": "postgres-pitr.json", "sha256": "${evidence_sha256[postgres-pitr]:-}"},
-    "perimeter": {"path": "perimeter.json", "sha256": "${evidence_sha256[perimeter]:-}"},
-    "clustered-perimeter": {"path": "clustered-perimeter.json", "sha256": "${evidence_sha256[clustered-perimeter]:-}"},
-    "replay": {"path": "replay.json", "sha256": "${evidence_sha256[replay]:-}"},
-    "http2": {"path": "http2.json", "sha256": "${evidence_sha256[http2]:-}"},
-    "sdk": {"path": "sdk.json", "sha256": "${evidence_sha256[sdk]:-}"},
-    "exact-cost": {"path": "exact-cost.json", "sha256": "${evidence_sha256[exact-cost]:-}"},
-    "soak": {"path": "soak.json", "sha256": "${evidence_sha256[soak]:-}"},
-    "capacity-load": {"path": "capacity-load.json", "sha256": "${evidence_sha256[capacity-load]:-}"}
+$(manifest_evidence_json)
   },
   "tool_versions": {
     "go": "$(safe_version go version)",
     "python": "$(safe_version python3 --version)",
     "node": "$(safe_version node --version)",
     "npm": "$(safe_version npm --version)",
-    "docker": "$(safe_version docker version --format '{{.Server.Version}}')"
+    "docker": "$(safe_version docker version --format '{{.Server.Version}}')",
+    "openssl": "$(safe_version openssl version)",
+    "curl": "$(safe_version curl --version)",
+    "nghttp": "$(safe_version nghttp --version)",
+    "h2load": "$(json_escape "$h2load_provenance")",
+    "psql": "$(safe_version psql --version)",
+    "kernel": "$(safe_version uname -sr)",
+    "architecture": "$(safe_version uname -m)"
   }
 }
 EOF
 
 (cd "$result_dir" && sha256sum manifest.json >manifest.sha256)
+if ! bash "$repo_dir/scripts/qualification/verify-manifest.sh" "$result_dir" "$commit"; then
+	echo "qualification suite: manifest verification failed" >&2
+	overall=1
+fi
 exit "$overall"

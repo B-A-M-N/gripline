@@ -683,7 +683,7 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		mux.HandleFunc("/admin/crypto", adminClusterStatus(svc, postgres))
 		mux.HandleFunc("/admin/crypto/activate", adminCryptoActivate(svc, postgres, signer, peppers, pseudonyms, cfg.Paths.SignerKeyring, verifierAcceptor))
 		mux.HandleFunc("/admin/crypto/retire", adminCryptoRetire(svc, postgres, signer, peppers, pseudonyms, cfg.Paths.SignerKeyring, verifierAcceptor))
-		mux.HandleFunc("/admin/metrics", adminMetrics(svc, dp, governor, state, postgres, spray, decisionObserver, policyManager, signer, adaptiveHealth))
+		mux.HandleFunc("/admin/metrics", adminMetrics(svc, dp, governor, state, postgres, spray, decisionObserver, policyManager, signer, term, adaptiveHealth))
 		adminSrv = &http.Server{
 			Addr:              cfg.Admin.Listen,
 			Handler:           mux,
@@ -912,6 +912,10 @@ type sourcePseudonymAliasLookup interface {
 	ResolveExistingSourcePseudonym(context.Context, []string) (string, error)
 }
 
+type sourcePseudonymAliasRegistrar interface {
+	ResolveOrRegisterSource(context.Context, []statepg.SourcePseudonymAlias, statepg.SourcePseudonymAlias) (string, error)
+}
+
 func (a *pseudonymRingAdapter) Derive(family []byte, raw []byte) (string, error) {
 	return a.DeriveContext(context.Background(), family, raw)
 }
@@ -923,22 +927,50 @@ func (a *pseudonymRingAdapter) DeriveContext(ctx context.Context, family []byte,
 	a.mu.RLock()
 	ring := a.ring
 	aliases := a.sourceAliases
-	var candidates []string
+	var candidates []statepg.SourcePseudonymAlias
+	var active statepg.SourcePseudonymAlias
+	var activeValue string
 	var err error
 	if string(family) == string(pseudonym.FamilySource) && ring != nil && aliases != nil {
-		candidates, err = ring.DeriveAll(pseudonym.FamilySource, raw)
+		versioned, deriveErr := ring.DeriveAllVersioned(pseudonym.FamilySource, raw)
+		err = deriveErr
+		if err == nil {
+			candidates = make([]statepg.SourcePseudonymAlias, 0, len(versioned))
+			for _, candidate := range versioned {
+				candidates = append(candidates, statepg.SourcePseudonymAlias{Alias: candidate.Value, Generation: candidate.Version})
+			}
+			activeValue, err = ring.Derive(pseudonym.FamilySource, raw)
+			if err == nil {
+				active = statepg.SourcePseudonymAlias{Alias: activeValue, Generation: ring.ActiveVersion()}
+			}
+		}
 	}
 	a.mu.RUnlock()
 	if err != nil {
 		return "", err
 	}
 	if len(candidates) > 0 {
-		if stable, lookupErr := aliases.ResolveExistingSourcePseudonym(ctx, candidates); lookupErr != nil {
+		if registrar, ok := aliases.(sourcePseudonymAliasRegistrar); ok {
+			return registrar.ResolveOrRegisterSource(ctx, candidates, active)
+		}
+		candidateValues := make([]string, 0, len(candidates))
+		for _, candidate := range candidates {
+			candidateValues = append(candidateValues, candidate.Alias)
+		}
+		if stable, lookupErr := aliases.ResolveExistingSourcePseudonym(ctx, candidateValues); lookupErr != nil {
 			return "", lookupErr
 		} else if stable != "" {
 			return stable, nil
 		}
-		return candidates[len(candidates)-1], nil
+		// DeriveAll is only a historical-alias lookup. A cache miss must mint
+		// under the explicitly active generation, never under whichever loaded
+		// generation happens to sort last.
+		a.mu.RLock()
+		defer a.mu.RUnlock()
+		if a.ring == nil {
+			return "", errors.New("gripline: pseudonym ring unavailable")
+		}
+		return a.ring.Derive(pseudonym.FamilySource, raw)
 	}
 	a.mu.RLock()
 	defer a.mu.RUnlock()

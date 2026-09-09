@@ -20,7 +20,7 @@ import (
 // adminMetrics is kept in its own module because it is an observability
 // projection, not part of the control-plane mutation/read handlers. The
 // projection remains intentionally low-cardinality and request-context aware.
-func adminMetrics(svc *control.Service, dp *proxy.DataPlane, governor resource.Authority, state *statebolt.Store, postgres *statepg.Store, spray *anomaly.Detector, observer *jsonlObserver, policyManager *policy.Manager, signer *terminator.Keyring, adaptiveHealth []terminator.AdaptivePersistenceHealth) http.HandlerFunc {
+func adminMetrics(svc *control.Service, dp *proxy.DataPlane, governor resource.Authority, state *statebolt.Store, postgres *statepg.Store, spray *anomaly.Detector, observer *jsonlObserver, policyManager *policy.Manager, signer *terminator.Keyring, term *terminator.Terminator, adaptiveHealth []terminator.AdaptivePersistenceHealth) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			adminMethodNotAllowed(w)
@@ -179,6 +179,9 @@ func adminMetrics(svc *control.Service, dp *proxy.DataPlane, governor resource.A
 			}
 		}
 		writeMetric("adaptive_persistence_healthy", adaptiveHealthy)
+		if term != nil {
+			writeMetric("evidence_append_failures_total", term.EvidenceAppendFailures())
+		}
 		if observer != nil {
 			m := observer.Stats()
 			writeMetric("telemetry_drops_total", m.Dropped)

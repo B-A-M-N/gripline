@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/B-A-M-N/gripline/internal/credential"
@@ -116,5 +117,39 @@ func TestClusterPseudonymRotationPreservesExistingSourceIdentity(t *testing.T) {
 	}
 	if len(lookup.seen) != 2 || lookup.seen[0] == lookup.seen[1] {
 		t.Fatalf("source alias lookup candidates=%v, want both loaded generations", lookup.seen)
+	}
+}
+
+func TestClusterPseudonymRotationMintsOnlyActiveGenerationOnAliasMiss(t *testing.T) {
+	ring, err := pseudonym.NewRing(
+		&pseudonym.Key{Version: 1, Secret: []byte("pseudonym-generation-one-0123456789")},
+		&pseudonym.Key{Version: 2, Secret: []byte("pseudonym-generation-two-0123456789")},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ring.SetActiveVersion(1); err != nil {
+		t.Fatal(err)
+	}
+	lookup := &sourceAliasTestLookup{}
+	adapter := &pseudonymRingAdapter{ring: ring, sourceAliases: lookup}
+	resolver := &ingress.Resolver{Pseudonyms: adapter}
+
+	first, err := resolver.ResolveContext(context.Background(), "198.51.100.89:443", http.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(first.Pseudonym, "v1.") {
+		t.Fatalf("alias miss minted %q, want active v1 generation", first.Pseudonym)
+	}
+	if err := ring.SetActiveVersion(2); err != nil {
+		t.Fatal(err)
+	}
+	second, err := resolver.ResolveContext(context.Background(), "198.51.100.90:443", http.Header{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(second.Pseudonym, "v2.") {
+		t.Fatalf("post-activation alias miss minted %q, want active v2 generation", second.Pseudonym)
 	}
 }

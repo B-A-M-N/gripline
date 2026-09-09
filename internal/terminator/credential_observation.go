@@ -36,15 +36,20 @@ func (t *Terminator) observeCredentialRisk(ctx context.Context, requestID string
 		transitionMeta := credential.TransitionMetadata{
 			RequestID: requestID, PolicyRevision: t.pol.Revision, EvidenceCodes: evidenceCodes,
 		}
+		observeCtx, observeCancel := ctxForRequestWithMetadata(ctx, transitionMeta)
 		transition, err := t.dep.Registry.ObserveAndCommit(
-			ctxForRequestWithMetadata(ctx, transitionMeta), cred.CredentialID,
+			observeCtx, cred.CredentialID,
 			credentialRisk, hy, now,
 		)
+		observeCancel()
 		if err != nil {
 			// The observation could not be committed authoritatively. Preserve
 			// the persisted state; never fuse a local result with stale storage.
 			result.adaptive = AdaptiveDegraded
-			if record, readErr := t.dep.Registry.LookupAuthoritative(ctxForRequest(ctx, requestID), cred.CredentialID); readErr == nil {
+			readCtx, readCancel := ctxForRequest(ctx, requestID)
+			record, readErr := t.dep.Registry.LookupAuthoritative(readCtx, cred.CredentialID)
+			readCancel()
+			if readErr == nil {
 				result.status = record.Status
 				result.credential = credFrom(record)
 				markLastSeen(t.dep.Registry, cred.CredentialID, now)
@@ -62,15 +67,19 @@ func (t *Terminator) observeCredentialRisk(ctx context.Context, requestID string
 			// A concurrent writer advanced the revision. Re-read the
 			// authoritative record, then retry the same observation once. If
 			// the second write loses again, retain the stricter writer's state.
-			record, readErr := t.dep.Registry.LookupAuthoritative(ctxForRequest(ctx, requestID), cred.CredentialID)
+			readCtx, readCancel := ctxForRequest(ctx, requestID)
+			record, readErr := t.dep.Registry.LookupAuthoritative(readCtx, cred.CredentialID)
+			readCancel()
 			if readErr != nil {
 				result.adaptive = AdaptiveDegraded
 				return result
 			}
+			retryCtx, retryCancel := ctxForRequestWithMetadata(ctx, transitionMeta)
 			retry, retryErr := t.dep.Registry.ObserveAndCommit(
-				ctxForRequestWithMetadata(ctx, transitionMeta), cred.CredentialID,
+				retryCtx, cred.CredentialID,
 				credentialRisk, hy, now,
 			)
+			retryCancel()
 			switch {
 			case retryErr == nil:
 				result.status = retry.Record.Status

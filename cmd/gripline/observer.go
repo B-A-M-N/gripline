@@ -19,7 +19,8 @@ type jsonlObserver struct {
 	queue        chan any
 	done         chan struct{}
 	wg           sync.WaitGroup
-	drops        atomic.Uint64
+	dropsTotal   atomic.Uint64
+	dropsPending atomic.Uint64
 	sinkFailures atomic.Uint64
 	once         sync.Once
 }
@@ -50,7 +51,7 @@ func (o *jsonlObserver) run() {
 		}
 	}
 	reportDrops := func() {
-		if dropped := o.drops.Swap(0); dropped > 0 {
+		if dropped := o.dropsPending.Swap(0); dropped > 0 {
 			write(struct {
 				Type    string `json:"type"`
 				Dropped uint64 `json:"dropped"`
@@ -87,16 +88,18 @@ type TelemetryStats struct {
 }
 
 func (o *jsonlObserver) Stats() TelemetryStats {
-	return TelemetryStats{Dropped: o.drops.Load(), SinkFailures: o.sinkFailures.Load()}
+	return TelemetryStats{Dropped: o.dropsTotal.Load(), SinkFailures: o.sinkFailures.Load()}
 }
 
 func (o *jsonlObserver) enqueue(ev any) {
 	select {
 	case <-o.done:
-		o.drops.Add(1)
+		o.dropsTotal.Add(1)
+		o.dropsPending.Add(1)
 	case o.queue <- ev:
 	default:
-		o.drops.Add(1)
+		o.dropsTotal.Add(1)
+		o.dropsPending.Add(1)
 	}
 }
 

@@ -61,7 +61,7 @@ func (t *Terminator) pruneEvidence(ctx context.Context, now time.Time, credSubje
 // advance and promotion is evaluated — including the P0.26 disqualifying-
 // evidence veto, computed NOW (at completion) against live evidence, not at
 // admission. Called only from BaselineToken.Finalize, which owns idempotency.
-func (t *Terminator) finalizeBaseline(b *BaselineToken) {
+func (t *Terminator) finalizeBaseline(ctx context.Context, b *BaselineToken) {
 	now := t.dep.RiskNow()
 	pol := b.policy
 	if pol == nil {
@@ -74,16 +74,12 @@ func (t *Terminator) finalizeBaseline(b *BaselineToken) {
 		MaxEstablishmentRisk:     pol.Learning.MaxEstablishmentRisk,
 		AllowNewLanes:            pol.Learning.AllowNewLanes,
 		AllowSuspicious:          pol.Learning.AllowSuspiciousLanes,
-		HasDisqualifyingEvidence: t.hasActiveDisqualifyingEvidence(b.runtimeCtx, pol, b.CredentialID, b.LaneID, now),
+		HasDisqualifyingEvidence: t.hasActiveDisqualifyingEvidence(ctx, pol, b.CredentialID, b.LaneID, now),
 	}
 	meta := lane.TransitionMetadata{RequestID: b.RequestID, PolicyRevision: b.PolicyRevision, EvidenceCodes: b.EvidenceCodes}
 	lanePolicy := lanePolicyContext(pol)
 	if aware, ok := t.dep.Lanes.(lane.PolicyAwareRepository); ok {
-		settlementCtx := b.runtimeCtx
-		if settlementCtx == nil {
-			settlementCtx = context.Background()
-		}
-		_, _, _ = aware.RecordCleanAuthorizedAndPromoteWithPolicy(settlementCtx, b.CredentialID, b.LaneID, b.LaneRisk, promCrit, now, lanePolicy, meta)
+		_, _, _ = aware.RecordCleanAuthorizedAndPromoteWithPolicy(ctx, b.CredentialID, b.LaneID, b.LaneRisk, promCrit, now, lanePolicy, meta)
 	} else if aware, ok := t.dep.Lanes.(lane.MetadataAwareRepository); ok {
 		_, _, _ = aware.RecordCleanAuthorizedAndPromoteWithMetadata(b.CredentialID, b.LaneID, b.LaneRisk, promCrit, now, meta)
 	} else if aware, ok := t.dep.Lanes.(lane.RequestAwareRepository); ok {
@@ -217,6 +213,8 @@ func (t *Terminator) observeCompletion(ctx context.Context, pol *policy.Compiled
 	if len(minted) > 0 {
 		if err := appendEvidenceContext(ctx, t.dep.Evidence, minted...); err == nil {
 			persisted = true
+		} else if t.evidenceAppendFailure != nil {
+			t.evidenceAppendFailure.Add(1)
 		}
 	}
 	result := CompletionResult{EvidenceCodes: codes, Persisted: persisted}

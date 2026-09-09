@@ -100,10 +100,6 @@ type BaselineToken struct {
 	// term is the issuing terminator (back-pointer, set at issuance) — the
 	// completion event lands on the same authority that admitted the request.
 	term *Terminator
-	// runtimeCtx is detached from client cancellation but bounded. Completion
-	// accounting must finish even when the downstream disconnects, without
-	// allowing a remote authority call to live forever.
-	runtimeCtx context.Context
 }
 
 // Finalize records ONE clean successful observation against the lane baseline.
@@ -115,7 +111,9 @@ func (b *BaselineToken) Finalize() bool {
 	if !b.done.CompareAndSwap(false, true) {
 		return false
 	}
-	b.term.finalizeBaseline(b)
+	ctx, cancel := boundedRuntimeContext(context.Background())
+	defer cancel()
+	b.term.finalizeBaseline(ctx, b)
 	return true
 }
 
@@ -149,11 +147,10 @@ type CompletionResult struct {
 // fabricate completion evidence for a request it was never given the token for.
 // Complete is idempotent.
 type CompletionToken struct {
-	subjects   producers.SubjectContext
-	policy     *policy.CompiledPolicy
-	done       atomic.Bool
-	term       *Terminator
-	runtimeCtx context.Context
+	subjects producers.SubjectContext
+	policy   *policy.CompiledPolicy
+	done     atomic.Bool
+	term     *Terminator
 }
 
 // Complete records the ACTUAL resource consumption and outcome of a finished
@@ -168,7 +165,9 @@ func (c *CompletionToken) Complete(actual resource.UsageEstimate, success bool) 
 	if !c.done.CompareAndSwap(false, true) {
 		return CompletionResult{} // already observed
 	}
-	return c.term.observeCompletion(c.runtimeCtx, c.policy, c.subjects, actual, success)
+	ctx, cancel := boundedRuntimeContext(context.Background())
+	defer cancel()
+	return c.term.observeCompletion(ctx, c.policy, c.subjects, actual, success)
 }
 
 // Complete is the Outcome convenience for the proxy lifecycle (P0.4A): spend the
@@ -348,7 +347,8 @@ type Terminator struct {
 	pol         *policy.CompiledPolicy
 	policyEpoch uint64
 	// pruneCounter triggers pruning every N admissions (optimization only).
-	pruneCounter *atomic.Int64
+	pruneCounter          *atomic.Int64
+	evidenceAppendFailure *atomic.Uint64
 }
 
 // New builds a Terminator and validates the critical seams for the requested
@@ -424,13 +424,24 @@ func New(dep Dependencies) (*Terminator, error) {
 		return nil, fmt.Errorf("terminator: compile policy: %w", err)
 	}
 	return &Terminator{
-		dep:          dep,
-		policies:     dep.Policies,
-		rand:         newRequestID,
-		pol:          compiled,
-		policyEpoch:  initialPolicyEpoch,
-		pruneCounter: &atomic.Int64{},
+		dep:                   dep,
+		policies:              dep.Policies,
+		rand:                  newRequestID,
+		pol:                   compiled,
+		policyEpoch:           initialPolicyEpoch,
+		pruneCounter:          &atomic.Int64{},
+		evidenceAppendFailure: &atomic.Uint64{},
 	}, nil
+}
+
+// EvidenceAppendFailures reports durable evidence writes that failed after a
+// signal was observed. It is monotonic so operators can alert on lost adaptive
+// history without depending on log retention.
+func (t *Terminator) EvidenceAppendFailures() uint64 {
+	if t == nil || t.evidenceAppendFailure == nil {
+		return 0
+	}
+	return t.evidenceAppendFailure.Load()
 }
 
 func (t *Terminator) currentPolicySnapshot() (*policy.CompiledPolicy, uint64) {
@@ -608,18 +619,8 @@ func (t *Terminator) AdmitUsageContext(ctx context.Context, reqID string, header
 	// Keep the existing implementation's receiver-local policy references while
 	// ensuring every request uses the one snapshot selected above. The view
 	// shares mutable counters and dependencies but has no independent authority.
-	view := &Terminator{dep: t.dep, rand: t.rand, pol: compiled, policyEpoch: policyEpoch, pruneCounter: t.pruneCounter}
-	out := view.admitUsageWithRequestID(ctx, reqID, headers, feat, src, est)
-	if out.Baseline != nil || out.Completion != nil {
-		runtimeCtx, _ := boundedRuntimeContext(ctx)
-		if out.Baseline != nil {
-			out.Baseline.runtimeCtx = runtimeCtx
-		}
-		if out.Completion != nil {
-			out.Completion.runtimeCtx = runtimeCtx
-		}
-	}
-	return out
+	view := &Terminator{dep: t.dep, rand: t.rand, pol: compiled, policyEpoch: policyEpoch, pruneCounter: t.pruneCounter, evidenceAppendFailure: t.evidenceAppendFailure}
+	return view.admitUsageWithRequestID(ctx, reqID, headers, feat, src, est)
 }
 
 // AdmitUsageWithRequestIDContext is the explicit-name compatibility variant of
@@ -729,13 +730,23 @@ func (t *Terminator) admitUsageWithRequestID(ctx context.Context, reqID string, 
 							continue
 						}
 						if ev, merr := evidence.Mint(t.pol.EvidenceRules, sig.Code, sid, now, t.pol.Revision); merr == nil && t.dep.Evidence != nil {
-							_ = appendEvidenceContext(ctx, t.dep.Evidence, ev)
+							if appendErr := appendEvidenceContext(ctx, t.dep.Evidence, ev); appendErr != nil {
+								if t.evidenceAppendFailure != nil {
+									t.evidenceAppendFailure.Add(1)
+								}
+								out.Adaptive = AdaptiveDegraded
+								out.Degraded = true
+							}
 							tr.EvidenceIDs = append(tr.EvidenceIDs, ev.EvidenceID)
 							tr.EvidenceCodes = append(tr.EvidenceCodes, ev.Code)
 						}
 					}
 				}
 			}
+		}
+		if t.adaptivePersistenceFailed() {
+			out.Adaptive = AdaptiveDegraded
+			out.Degraded = true
 		}
 		return out
 	}
@@ -936,6 +947,13 @@ func (t *Terminator) admitUsageWithRequestID(ctx context.Context, reqID string, 
 			}
 		}
 	}
+	// A producer may discover a checkpoint failure while handling this request.
+	// Re-read health before risk observation so this request itself enters the
+	// degraded posture; waiting for the next admission would allow a trust
+	// transition using state that is already known to be non-durable.
+	if t.adaptivePersistenceFailed() {
+		adaptivePersistenceFailed = true
+	}
 
 	if (len(syncEv) > 0 || len(persistOnly) > 0) && t.dep.Evidence != nil {
 		// Append is an observation, not enforcement. A failure neither fails
@@ -944,7 +962,15 @@ func (t *Terminator) admitUsageWithRequestID(ctx context.Context, reqID string, 
 		// evaluated below via the synchronous dedup path whether or not the
 		// append landed.
 		allEv := append(append([]evidence.Evidence{}, syncEv...), persistOnly...)
-		_ = appendEvidenceContext(ctx, t.dep.Evidence, allEv...)
+		if err := appendEvidenceContext(ctx, t.dep.Evidence, allEv...); err != nil {
+			if t.evidenceAppendFailure != nil {
+				t.evidenceAppendFailure.Add(1)
+			}
+			adaptivePersistenceFailed = true
+		}
+	}
+	if t.adaptivePersistenceFailed() {
+		adaptivePersistenceFailed = true
 	}
 
 	// 6. Snapshot evidence by subject (credential + lane + source
@@ -1016,11 +1042,8 @@ func (t *Terminator) admitUsageWithRequestID(ctx context.Context, reqID string, 
 		tr.EvidenceIDs = append(tr.EvidenceIDs, ev.EvidenceID)
 		tr.EvidenceCodes = append(tr.EvidenceCodes, ev.Code)
 	}
-	// P0.45: only evidence minted under the CURRENT policy revision may drive the
-	// authoritative state machine. Evidence from an older revision was scored
-	// under a different rule table; evaluating it after a policy change would
-	// apply old-era risk to new-era thresholds. Filter fail-closed (stale-revision
-	// evidence is dropped); current-request sync evidence is always current-rev.
+	// Evidence remains active across policy revisions until its own TTL expires;
+	// the minting revision is retained for audit but does not erase abuse history.
 	credentialEvidence = activeEvidenceAcrossPolicyRevisions(credentialEvidence, t.pol.Revision)
 	laneEvidence = activeEvidenceAcrossPolicyRevisions(laneEvidence, t.pol.Revision)
 	// P0.7 fix: source evidence must also be filtered by policy revision.

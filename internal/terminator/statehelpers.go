@@ -21,24 +21,20 @@ func boundedRuntimeContext(parent context.Context) (context.Context, context.Can
 	return context.WithTimeout(context.WithoutCancel(parent), deferredAuthorityTimeout)
 }
 
-func ctxForRequest(parent context.Context, requestID string) context.Context {
+func ctxForRequest(parent context.Context, requestID string) (context.Context, context.CancelFunc) {
 	return ctxForRequestWithMetadata(parent, credential.TransitionMetadata{RequestID: requestID})
 }
 
-func ctxForRequestWithMetadata(parent context.Context, meta credential.TransitionMetadata) context.Context {
+func ctxForRequestWithMetadata(parent context.Context, meta credential.TransitionMetadata) (context.Context, context.CancelFunc) {
 	if parent == nil {
 		parent = context.Background()
 	}
-	// Use one timer for the child budget. The helper intentionally returns only
-	// the context for compatibility with legacy call sites; the timer releases
-	// its cancellation resources at the same bound.
-	ctx, cancel := context.WithCancel(parent)
-	time.AfterFunc(5*time.Second, cancel)
+	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	if meta.RequestID != "" {
 		ctx = credential.WithRequestID(ctx, meta.RequestID)
 	}
 	ctx = credential.WithTransitionMetadata(ctx, meta)
-	return ctx
+	return ctx, cancel
 }
 
 // markLastSeen records the credential's LastSeenAt on successful authentication

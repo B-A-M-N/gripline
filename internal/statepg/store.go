@@ -81,10 +81,12 @@ type Store struct {
 // 10 adds per-node policy observations used as an activation barrier. Version
 // 11 adds explicit creation timestamps to retention-managed receipts and
 // policy audit. Version 13 adds a singleton guard for concurrent source-scope
-// cardinality decisions. Keep the marker versioned even though the DDL below is
-// idempotent: CREATE TABLE IF NOT EXISTS cannot add columns to an already
+// cardinality decisions. Version 14 adds durable source-pseudonym aliases so
+// every derived generation, including invalid-only traffic, resolves to one
+// stable source identity. Keep the marker versioned even though the DDL below
+// is idempotent: CREATE TABLE IF NOT EXISTS cannot add columns to an already
 // initialized database.
-const currentSchemaVersion = 13
+const currentSchemaVersion = 14
 
 const maxTransactionAttempts = 3
 
@@ -561,6 +563,15 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			singleton BOOLEAN PRIMARY KEY CHECK (singleton=TRUE)
 		)`,
 		`INSERT INTO gripline_resource_source_scope_guard (singleton) VALUES (TRUE) ON CONFLICT (singleton) DO NOTHING`,
+		`CREATE TABLE IF NOT EXISTS gripline_source_aliases (
+			canonical_source_id TEXT NOT NULL,
+			alias TEXT PRIMARY KEY,
+			generation INTEGER NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL,
+			last_seen_at TIMESTAMPTZ NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS gripline_source_aliases_canonical_idx ON gripline_source_aliases (canonical_source_id, generation)`,
+		`CREATE INDEX IF NOT EXISTS gripline_source_aliases_seen_idx ON gripline_source_aliases (last_seen_at, alias)`,
 		`CREATE TABLE IF NOT EXISTS gripline_resource_leases (
 			lease_id TEXT PRIMARY KEY,
 			request_id TEXT NOT NULL UNIQUE,
@@ -823,6 +834,26 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 		// Version 13 adds the source-scope cardinality guard. The idempotent DDL
 		// above creates and seeds it for both fresh and upgraded databases.
 		version = 13
+	}
+	if version == 13 {
+		// Version 14 gives source identity its own durable alias authority. Seed
+		// aliases for every source-bearing state table so an upgrade preserves
+		// existing history before new requests use ResolveOrRegisterSource.
+		if _, err := tx.Exec(ctx, `WITH candidates(alias) AS (
+			SELECT scope_id FROM gripline_resource_source_scopes WHERE scope_id ~ '^v[0-9]+\.'
+			UNION SELECT subject_id FROM gripline_evidence WHERE scope='SOURCE' AND subject_id ~ '^v[0-9]+\.'
+			UNION SELECT subject_id FROM gripline_evidence_guards WHERE scope='SOURCE' AND subject_id ~ '^v[0-9]+\.'
+			UNION SELECT subject FROM gripline_adaptive_window_subjects WHERE subject ~ '^v[0-9]+\.'
+			UNION SELECT subject FROM gripline_adaptive_baselines WHERE subject ~ '^v[0-9]+\.'
+		)
+		INSERT INTO gripline_source_aliases
+			(canonical_source_id, alias, generation, created_at, last_seen_at)
+		SELECT alias, alias, substring(alias FROM '^v([0-9]+)\.')::INTEGER, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+		FROM candidates
+		ON CONFLICT (alias) DO NOTHING`); err != nil {
+			return fmt.Errorf("statepg: migrate source aliases: %w", mapDBError(err))
+		}
+		version = 14
 	}
 	if version != currentSchemaVersion {
 		return fmt.Errorf("%w: unsupported migration state %d", ErrMigrationRequired, version)

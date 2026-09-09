@@ -454,7 +454,7 @@ func TestPepperRingNegativeVersionAndCopySafety(t *testing.T) {
 	m := hmac.New(sha256.New, []byte("mutable-key"))
 	m.Write([]byte("gripline:secret:digest:v1"))
 	m.Write([]byte("raw"))
-	if !bytes.Equal(s.DigestHMAC(r.active[1]), m.Sum(nil)) {
+	if !bytes.Equal(r.DeriveVerifier(s, 1), m.Sum(nil)) {
 		t.Fatal("ring must copy key material on ingestion")
 	}
 }

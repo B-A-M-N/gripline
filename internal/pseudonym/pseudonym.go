@@ -243,21 +243,45 @@ func (r *Ring) Derive(family Family, raw []byte) (string, error) {
 // pre-rotation source scope and preserve that source identity while the active
 // key changes. The active Derive method remains the only default minting path.
 func (r *Ring) DeriveAll(family Family, raw []byte) ([]string, error) {
+	versioned, err := r.DeriveAllVersioned(family, raw)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(versioned))
+	for _, candidate := range versioned {
+		out = append(out, candidate.Value)
+	}
+	return out, nil
+}
+
+// VersionedPseudonym keeps the generation metadata beside a derived alias so
+// the authority can register rotation mappings without parsing identity text.
+type VersionedPseudonym struct {
+	Version int
+	Value   string
+}
+
+// DeriveAllVersioned returns one candidate per loaded generation in ascending
+// version order.
+func (r *Ring) DeriveAllVersioned(family Family, raw []byte) ([]VersionedPseudonym, error) {
 	if len(raw) == 0 {
 		return nil, fmt.Errorf("pseudonym: empty input")
+	}
+	if r == nil {
+		return nil, fmt.Errorf("pseudonym: nil ring")
 	}
 	versions := make([]int, 0, len(r.active))
 	for version := range r.active {
 		versions = append(versions, version)
 	}
 	sort.Ints(versions)
-	out := make([]string, 0, len(versions))
+	out := make([]VersionedPseudonym, 0, len(versions))
 	for _, version := range versions {
 		key := r.active[version]
 		if len(key) == 0 {
 			continue
 		}
-		out = append(out, deriveWith(family, raw, version, key))
+		out = append(out, VersionedPseudonym{Version: version, Value: deriveWith(family, raw, version, key)})
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("pseudonym: no loaded key for derivation")

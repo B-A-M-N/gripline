@@ -15,20 +15,17 @@ cleanup() {
 	rm -rf "$work_dir"
 }
 trap cleanup EXIT
-for command_name in go openssl curl python3 nghttp; do
+for command_name in go openssl curl python3 nghttp docker; do
 	command -v "$command_name" >/dev/null || { echo "HTTP2 qualification: $command_name is required" >&2; exit 2; }
 done
-if ! command -v h2load >/dev/null; then
-	command -v docker >/dev/null || { echo "HTTP2 qualification: docker is required to build the pinned h2load fixture" >&2; exit 2; }
-	h2load_image="gripline-qualification-h2load-${$}"
-	docker build --quiet --tag "$h2load_image" --file "$repo_dir/scripts/qualification/fixtures/http2/Dockerfile" "$repo_dir/scripts/qualification/fixtures/http2" >/dev/null
-	cat >"$work_dir/h2load" <<EOF
+h2load_image="gripline-qualification-h2load-$$"
+docker build --quiet --tag "$h2load_image" --file "$repo_dir/scripts/qualification/fixtures/http2/Dockerfile" "$repo_dir/scripts/qualification/fixtures/http2" >/dev/null
+cat >"$work_dir/h2load" <<EOF
 #!/usr/bin/env bash
 exec docker run --rm --network host -v "$work_dir:/fixture:ro" -v "$work_dir:$work_dir:ro" "$h2load_image" sh -c 'cp /fixture/server.pem /usr/local/share/ca-certificates/gripline-qualification.crt && update-ca-certificates >/dev/null && exec h2load "\$@"' h2load-wrapper "\$@"
 EOF
-	chmod 0755 "$work_dir/h2load"
-	PATH="$work_dir:$PATH"
-fi
+chmod 0755 "$work_dir/h2load"
+export PATH="$work_dir:$PATH"
 
 gateway_port=$((19300 + ($$ % 500)))
 backend_port=$((gateway_port + 1))
@@ -69,8 +66,5 @@ TMPDIR="$work_dir" GRIPLINE_H2_QUALIFICATION=1 GRIPLINE_H2_LOAD_REQUIRED="${GRIP
 metrics="$(curl -fsS "http://127.0.0.1:${admin_port}/admin/metrics" -H "Authorization: Bearer ${operator_token}")"
 h2_errors="$(printf '%s\n' "$metrics" | awk '$1 == "gripline_http2_errors_total" {print $2}')"
 [[ "$h2_errors" =~ ^[0-9]+$ ]] || { echo "HTTP2 qualification: missing HTTP/2 error metric" >&2; exit 1; }
-if command -v h2load >/dev/null; then
-	echo "HTTP2 qualification: direct TLS/ALPN, stream bounds, cancellation/recovery, header-table churn, CONTINUATION, error metrics, and h2load cases passed"
-else
-	echo "HTTP2 qualification: direct TLS/ALPN, stream bounds, cancellation/recovery, header-table churn, CONTINUATION, and error metrics passed; h2load deferred"
-fi
+h2load_version="$(h2load --version | head -1)"
+echo "HTTP2 qualification: direct TLS/ALPN, stream bounds, cancellation/recovery, header-table churn, CONTINUATION, error metrics, and pinned h2load (${h2load_version}) cases passed"

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/B-A-M-N/gripline/internal/evidence"
 	"github.com/B-A-M-N/gripline/internal/lane"
 	"github.com/B-A-M-N/gripline/internal/policy"
+	"github.com/B-A-M-N/gripline/internal/producers"
 	"github.com/B-A-M-N/gripline/internal/resource"
 	"github.com/B-A-M-N/gripline/internal/secret"
 )
@@ -23,6 +25,14 @@ type failingEvidenceStore struct {
 	snapshotErr error
 	mu          sync.Mutex
 	stored      []evidence.Evidence
+}
+
+type appendFailureStore struct {
+	evidence.Store
+}
+
+func (appendFailureStore) Append(...evidence.Evidence) error {
+	return errors.New("evidence: append outage")
 }
 
 func (f *failingEvidenceStore) Append(items ...evidence.Evidence) error {
@@ -55,6 +65,73 @@ func evSnapshot(items []evidence.Evidence, subjects []evidence.SubjectKey, now t
 		}
 	}
 	return out
+}
+
+type admissionSignalProducer struct{}
+
+func (admissionSignalProducer) ObserveAdmission(producers.AdmissionBehavior) []producers.Signal {
+	return []producers.Signal{{Code: "CONCURRENCY_OVER_10X_BASELINE"}}
+}
+
+func (admissionSignalProducer) ObserveCompletion(producers.CompletionBehavior) []producers.Signal {
+	return nil
+}
+
+type flippingAdaptiveHealth struct {
+	failed atomic.Bool
+}
+
+func (h *flippingAdaptiveHealth) PersistenceError() error {
+	if h.failed.Load() {
+		return errors.New("adaptive checkpoint failed")
+	}
+	return nil
+}
+
+type healthFlippingProducer struct{ health *flippingAdaptiveHealth }
+
+func (p healthFlippingProducer) ObserveAdmission(producers.AdmissionBehavior) []producers.Signal {
+	p.health.failed.Store(true)
+	return nil
+}
+
+func (healthFlippingProducer) ObserveCompletion(producers.CompletionBehavior) []producers.Signal {
+	return nil
+}
+
+func TestAdaptiveFailureDiscoveredByProducerDegradesCurrentAdmission(t *testing.T) {
+	reg := credential.NewMemoryRegistry()
+	pep, raw := buildCredential(t, reg, "cred_health_flip", credential.StatusNormal, 1)
+	health := &flippingAdaptiveHealth{}
+	term := m1Terminator(t, reg, pep, evidence.NewMemoryStore(), nil)
+	term.dep.AdaptiveHealth = []AdaptivePersistenceHealth{health}
+	term.dep.Producers = []producers.Producer{healthFlippingProducer{health: health}}
+
+	out := term.Admit(bearerHeaders(raw), lane.Features{NetworkASN: "AS1"})
+	if !out.Degraded || out.Adaptive != AdaptiveDegraded {
+		t.Fatalf("producer-discovered failure must degrade current admission: degraded=%v adaptive=%v", out.Degraded, out.Adaptive)
+	}
+}
+
+// A write failure discovered while producing this request must degrade this
+// request immediately, not wait for the next admission to notice the outage.
+func TestEvidenceAppendFailureDegradesCurrentAdmission(t *testing.T) {
+	reg := credential.NewMemoryRegistry()
+	pep, raw := buildCredential(t, reg, "cred_append_failure", credential.StatusNormal, 1)
+	store := appendFailureStore{Store: evidence.NewMemoryStore()}
+	term := m1Terminator(t, reg, pep, store, nil)
+	term.dep.Producers = []producers.Producer{admissionSignalProducer{}}
+
+	out := term.Admit(bearerHeaders(raw), lane.Features{NetworkASN: "AS1"})
+	if !out.Degraded || out.Adaptive != AdaptiveDegraded {
+		t.Fatalf("append failure must degrade current admission: degraded=%v adaptive=%v reason=%s", out.Degraded, out.Adaptive, out.Reason)
+	}
+	if got := term.EvidenceAppendFailures(); got != 1 {
+		t.Fatalf("evidence append failures = %d, want 1", got)
+	}
+	if out.Baseline != nil && out.Baseline.Eligible {
+		t.Fatal("current admission must not mint an eligible baseline after append failure")
+	}
 }
 
 // buildCredential inserts a credential into the registry and returns the sealed

@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/B-A-M-N/gripline/internal/secret"
@@ -210,9 +211,14 @@ var (
 // accept the version recorded on each stored verifier even after rotation
 // introduces a newer one.
 type PepperRing struct {
+	st *pepperRingState
+}
+
+type pepperRingState struct {
+	mu            sync.RWMutex
 	active        map[int][]byte
-	now           func() time.Time
 	activeVersion int
+	now           func() time.Time
 }
 
 // Format implements fmt.Formatter and always redacts (P0.16). VALUE receiver:
@@ -242,7 +248,7 @@ var (
 // live keys. A ring built from only invalid versions errors rather than
 // failing open.
 func NewPepperRing(versions ...*PepperKey) (*PepperRing, error) {
-	r := &PepperRing{active: make(map[int][]byte, len(versions)), now: time.Now}
+	r := &PepperRing{st: &pepperRingState{active: make(map[int][]byte, len(versions)), now: time.Now}}
 	for _, v := range versions {
 		if v == nil {
 			continue
@@ -253,12 +259,12 @@ func NewPepperRing(versions ...*PepperKey) (*PepperRing, error) {
 		if len(v.Key) == 0 {
 			return nil, fmt.Errorf("credential: pepper version %d has empty key", v.Version)
 		}
-		if _, dup := r.active[v.Version]; dup {
+		if _, dup := r.st.active[v.Version]; dup {
 			return nil, fmt.Errorf("credential: duplicate pepper version %d", v.Version)
 		}
-		r.active[v.Version] = append([]byte(nil), v.Key...)
+		r.st.active[v.Version] = append([]byte(nil), v.Key...)
 	}
-	if len(r.active) == 0 {
+	if len(r.st.active) == 0 {
 		return nil, fmt.Errorf("credential: pepper ring requires at least one keyed version")
 	}
 	return r, nil
@@ -277,9 +283,12 @@ func MustPepperRing(versions ...*PepperKey) *PepperRing {
 
 // WithClock injects a clock (tests).
 func (r *PepperRing) WithClock(now func() time.Time) *PepperRing {
-	if now != nil {
-		r.now = now
+	if r == nil || r.st == nil || now == nil {
+		return r
 	}
+	r.st.mu.Lock()
+	r.st.now = now
+	r.st.mu.Unlock()
 	return r
 }
 
@@ -287,7 +296,12 @@ func (r *PepperRing) WithClock(now func() time.Time) *PepperRing {
 // returning a copy of the live key material. It is used for construction-time
 // key-separation checks; the caller owns and can wipe candidate afterward.
 func (r *PepperRing) Matches(version int, candidate []byte) bool {
-	k, ok := r.active[version]
+	if r == nil || r.st == nil {
+		return false
+	}
+	r.st.mu.RLock()
+	defer r.st.mu.RUnlock()
+	k, ok := r.st.active[version]
 	return ok && subtle.ConstantTimeCompare(k, candidate) == 1
 }
 
@@ -297,7 +311,12 @@ func (r *PepperRing) Matches(version int, candidate []byte) bool {
 // digest that a registry persists. Returns nil if the secret or key is unusable
 // (matches SealedSecret.DigestHMAC fail-closed behavior).
 func (r *PepperRing) DeriveVerifier(presented *secret.SealedSecret, version int) []byte {
-	k, ok := r.active[version]
+	if r == nil || r.st == nil {
+		return nil
+	}
+	r.st.mu.RLock()
+	defer r.st.mu.RUnlock()
+	k, ok := r.st.active[version]
 	if !ok || len(k) == 0 {
 		return nil
 	}
@@ -308,7 +327,12 @@ func (r *PepperRing) DeriveVerifier(presented *secret.SealedSecret, version int)
 // transform while keeping pepper bytes inside the ring. Callers receive only
 // the short-lived pseudonym, never a copy of the key material.
 func (r *PepperRing) DeriveSprayPseudonym(presented *secret.SealedSecret, version int) string {
-	k, ok := r.active[version]
+	if r == nil || r.st == nil {
+		return ""
+	}
+	r.st.mu.RLock()
+	defer r.st.mu.RUnlock()
+	k, ok := r.st.active[version]
 	if !ok || len(k) == 0 {
 		return ""
 	}
@@ -319,8 +343,13 @@ func (r *PepperRing) DeriveSprayPseudonym(presented *secret.SealedSecret, versio
 // version, returning a map version->verifier digest. Used at lookup time to
 // test presentation across the rotation window without extracting key bytes.
 func (r *PepperRing) DeriveAllActiveVerifiers(presented *secret.SealedSecret) map[int][]byte {
-	out := make(map[int][]byte, len(r.active))
-	for v, k := range r.active {
+	if r == nil || r.st == nil {
+		return nil
+	}
+	r.st.mu.RLock()
+	defer r.st.mu.RUnlock()
+	out := make(map[int][]byte, len(r.st.active))
+	for v, k := range r.st.active {
 		if len(k) == 0 {
 			continue
 		}
@@ -331,13 +360,18 @@ func (r *PepperRing) DeriveAllActiveVerifiers(presented *secret.SealedSecret) ma
 
 // Latest returns the highest configured version.
 func (r *PepperRing) Latest() int {
-	if r.activeVersion > 0 {
-		if _, ok := r.active[r.activeVersion]; ok {
-			return r.activeVersion
+	if r == nil || r.st == nil {
+		return -1
+	}
+	r.st.mu.RLock()
+	defer r.st.mu.RUnlock()
+	if r.st.activeVersion > 0 {
+		if _, ok := r.st.active[r.st.activeVersion]; ok {
+			return r.st.activeVersion
 		}
 	}
 	best := -1
-	for v := range r.active {
+	for v := range r.st.active {
 		if v > best {
 			best = v
 		}
@@ -349,13 +383,15 @@ func (r *PepperRing) Latest() int {
 // verifiers. Retained generations remain valid for authentication; this only
 // changes which already-loaded key is used for new credentials and migration.
 func (r *PepperRing) SetActiveVersion(version int) error {
-	if r == nil {
+	if r == nil || r.st == nil {
 		return errors.New("credential: nil pepper ring")
 	}
-	if _, ok := r.active[version]; !ok {
+	r.st.mu.Lock()
+	defer r.st.mu.Unlock()
+	if _, ok := r.st.active[version]; !ok {
 		return fmt.Errorf("credential: pepper version %d is not loaded", version)
 	}
-	r.activeVersion = version
+	r.st.activeVersion = version
 	return nil
 }
 
@@ -363,16 +399,18 @@ func (r *PepperRing) SetActiveVersion(version int) error {
 // have migrated away from it. The cluster authority performs that durable
 // usage check first; this local operation only changes the in-process ring.
 func (r *PepperRing) RetireVersion(version int) error {
-	if r == nil {
+	if r == nil || r.st == nil {
 		return errors.New("credential: nil pepper ring")
 	}
-	if version == r.ActiveVersion() {
+	r.st.mu.Lock()
+	defer r.st.mu.Unlock()
+	if version == r.activeVersionLocked() {
 		return fmt.Errorf("credential: cannot retire active pepper version %d", version)
 	}
-	if _, ok := r.active[version]; !ok {
+	if _, ok := r.st.active[version]; !ok {
 		return fmt.Errorf("credential: pepper version %d is not loaded", version)
 	}
-	delete(r.active, version)
+	delete(r.st.active, version)
 	return nil
 }
 
@@ -383,14 +421,16 @@ func (r *PepperRing) ActiveVersion() int { return r.Latest() }
 // safe to publish as cluster metadata: it binds node configuration without
 // exposing key material.
 func (r *PepperRing) Fingerprint() string {
-	if r == nil {
+	if r == nil || r.st == nil {
 		return ""
 	}
+	r.st.mu.RLock()
+	defer r.st.mu.RUnlock()
 	h := sha256.New()
-	for _, version := range r.Versions() {
+	for _, version := range r.versionsLocked() {
 		_, _ = h.Write([]byte(strconv.Itoa(version)))
 		_, _ = h.Write([]byte{0})
-		_, _ = h.Write(r.active[version])
+		_, _ = h.Write(r.st.active[version])
 		_, _ = h.Write([]byte{0})
 	}
 	return hex.EncodeToString(h.Sum(nil))
@@ -400,10 +440,12 @@ func (r *PepperRing) Fingerprint() string {
 // publishing key material. It is the cluster capability fingerprint used
 // while a future generation is staged but not yet active.
 func (r *PepperRing) VersionFingerprint(version int) (string, bool) {
-	if r == nil {
+	if r == nil || r.st == nil {
 		return "", false
 	}
-	key, ok := r.active[version]
+	r.st.mu.RLock()
+	defer r.st.mu.RUnlock()
+	key, ok := r.st.active[version]
 	if !ok || len(key) == 0 {
 		return "", false
 	}
@@ -416,12 +458,14 @@ func (r *PepperRing) VersionFingerprint(version int) (string, bool) {
 
 // VersionFingerprints returns one safe fingerprint per loaded generation.
 func (r *PepperRing) VersionFingerprints() map[int]string {
-	if r == nil {
+	if r == nil || r.st == nil {
 		return nil
 	}
-	out := make(map[int]string, len(r.active))
-	for version := range r.active {
-		if fingerprint, ok := r.VersionFingerprint(version); ok {
+	r.st.mu.RLock()
+	defer r.st.mu.RUnlock()
+	out := make(map[int]string, len(r.st.active))
+	for version := range r.st.active {
+		if fingerprint, ok := r.versionFingerprintLocked(version); ok {
 			out[version] = fingerprint
 		}
 	}
@@ -432,8 +476,17 @@ func (r *PepperRing) VersionFingerprints() map[int]string {
 // iterates THIS list (never the 0..latest integer range, which is pathological
 // for sparse/high version numbers).
 func (r *PepperRing) Versions() []int {
-	out := make([]int, 0, len(r.active))
-	for v := range r.active {
+	if r == nil || r.st == nil {
+		return nil
+	}
+	r.st.mu.RLock()
+	defer r.st.mu.RUnlock()
+	return r.versionsLocked()
+}
+
+func (r *PepperRing) versionsLocked() []int {
+	out := make([]int, 0, len(r.st.active))
+	for v := range r.st.active {
 		out = append(out, v)
 	}
 	sort.Ints(out)
@@ -447,10 +500,16 @@ func (r *PepperRing) Validate(presented *secret.SealedSecret, rec *CredentialRec
 	if rec == nil || presented == nil || presented.Zeroed() {
 		return nil, ErrUnknown
 	}
-	if err := rec.Authenticatable(r.now()); err != nil {
+	if err := rec.Authenticatable(r.clock()); err != nil {
 		return nil, err
 	}
-	if _, ok := r.active[rec.PepperVersion]; !ok {
+	if r == nil || r.st == nil {
+		return nil, errors.New("credential: nil pepper ring")
+	}
+	r.st.mu.RLock()
+	_, ok := r.st.active[rec.PepperVersion]
+	r.st.mu.RUnlock()
+	if !ok {
 		return nil, fmt.Errorf("credential: no pepper for version %d", rec.PepperVersion)
 	}
 	derived := r.DeriveVerifier(presented, rec.PepperVersion)
@@ -465,6 +524,46 @@ func (r *PepperRing) Validate(presented *secret.SealedSecret, rec *CredentialRec
 		Status:       rec.Status,
 		Revision:     rec.Revision,
 	}, nil
+}
+
+func (r *PepperRing) activeVersionLocked() int {
+	if r.st.activeVersion > 0 {
+		if _, ok := r.st.active[r.st.activeVersion]; ok {
+			return r.st.activeVersion
+		}
+	}
+	best := -1
+	for version := range r.st.active {
+		if version > best {
+			best = version
+		}
+	}
+	return best
+}
+
+func (r *PepperRing) versionFingerprintLocked(version int) (string, bool) {
+	key, ok := r.st.active[version]
+	if !ok || len(key) == 0 {
+		return "", false
+	}
+	h := sha256.New()
+	_, _ = h.Write([]byte(strconv.Itoa(version)))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write(key)
+	return hex.EncodeToString(h.Sum(nil)), true
+}
+
+func (r *PepperRing) clock() time.Time {
+	if r == nil || r.st == nil {
+		return time.Now()
+	}
+	r.st.mu.RLock()
+	now := r.st.now
+	r.st.mu.RUnlock()
+	if now == nil {
+		return time.Now()
+	}
+	return now()
 }
 
 // --- Credential status state machine with hysteresis (spec §31) -------------

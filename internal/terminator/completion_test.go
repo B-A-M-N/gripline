@@ -108,6 +108,33 @@ func TestOutcomeCompleteDrivesCompletionProducers(t *testing.T) {
 	}
 }
 
+type alwaysCompletionSignalProducer struct{}
+
+func (alwaysCompletionSignalProducer) ObserveAdmission(producers.AdmissionBehavior) []producers.Signal {
+	return nil
+}
+
+func (alwaysCompletionSignalProducer) ObserveCompletion(producers.CompletionBehavior) []producers.Signal {
+	return []producers.Signal{{Code: "TOKEN_VELOCITY_OVER_10X_BASELINE"}}
+}
+
+// Completion authority must be bounded from the completion event, not from
+// admission. This exercises the >5s stream case that previously reused an
+// already-expired detached context.
+func TestCompletionAfterAdmissionBudgetPersistsEvidence(t *testing.T) {
+	term, _, raw := completionTerminator(t, time.Now)
+	term.dep.Producers = []producers.Producer{alwaysCompletionSignalProducer{}}
+	out := term.AdmitUsage(bearerHeaders(raw), lane.Features{NetworkASN: "AS1"}, TrustedSource{}, resource.UsageEstimate{Requests: 1})
+	if !out.Authorized || out.Completion == nil {
+		t.Fatalf("expected authorized completion token: authorized=%v token=%v reason=%s", out.Authorized, out.Completion != nil, out.Reason)
+	}
+	time.Sleep(deferredAuthorityTimeout + 100*time.Millisecond)
+	result := out.Complete(resource.UsageEstimate{Requests: 1, CombinedTokens: 100}, true)
+	if result.Err != nil || !result.Persisted {
+		t.Fatalf("completion after long stream was not persisted: %+v", result)
+	}
+}
+
 // TestOutcomeCompleteIdempotent proves a second Complete on the same outcome is
 // a no-op (CAS), so a proxy that completes + double-releases never double-counts
 // completion evidence.
