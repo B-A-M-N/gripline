@@ -151,7 +151,12 @@ Provider metering overlays are available as separate examples:
 They show the bounded reference adapters and must be merged into the selected
 standalone or PostgreSQL configuration with deployment-specific pricing. The
 default `usage.mode=none` configuration counts requests/concurrency only and
-does not claim token or cost enforcement.
+does not claim token or cost enforcement. `usage.cost_mode=conservative`
+prices unknown provider cache splits at the highest configured input/cache rate;
+`usage.cost_mode=exact` is fail-closed and requires the provider's cache pricing
+dimensions (including Anthropic's 5-minute and 1-hour cache-write rates).
+Provider usage envelopes that exceed the bounded parser are settled
+conservatively rather than claimed as exact monetary accounting.
 
 Operator lifecycle:
 

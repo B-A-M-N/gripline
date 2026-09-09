@@ -707,9 +707,32 @@ func (c *Config) Validate() error {
 	if c.Usage.Mode == "" || c.Usage.Mode == "none" {
 		if c.Usage.CostMode == "" {
 			c.Usage.CostMode = "none"
+		} else if c.Usage.CostMode != "none" {
+			return fmt.Errorf("usage.cost_mode %q requires usage.mode openai or anthropic", c.Usage.CostMode)
 		}
 	} else if c.Usage.CostMode == "" {
 		c.Usage.CostMode = "conservative"
+	}
+	if c.Usage.CostMode == "exact" {
+		if c.Usage.InputMicrounitsPerToken <= 0 || c.Usage.OutputMicrounitsPerToken <= 0 {
+			return fmt.Errorf("usage.cost_mode exact requires positive input and output pricing")
+		}
+		switch c.Usage.Mode {
+		case "openai":
+			// Chat and Responses can expose cached input independently of
+			// ordinary input. An exact monetary posture must configure that
+			// dimension rather than silently billing it at zero.
+			if c.Usage.CacheReadMicrounitsPerToken <= 0 {
+				return fmt.Errorf("usage.cost_mode exact with usage.mode openai requires positive cache_read_microunits_per_token")
+			}
+		case "anthropic":
+			// Anthropic exposes separate 5-minute and 1-hour cache creation
+			// prices. The legacy aggregate rate is insufficient for exact
+			// billing when both TTL classes occur in one response.
+			if c.Usage.CacheReadMicrounitsPerToken <= 0 || c.Usage.CacheCreation5mMicrounitsPerToken <= 0 || c.Usage.CacheCreation1hMicrounitsPerToken <= 0 {
+				return fmt.Errorf("usage.cost_mode exact with usage.mode anthropic requires positive cache_read_microunits_per_token, cache_creation_5m_microunits_per_token, and cache_creation_1h_microunits_per_token")
+			}
+		}
 	}
 	if c.Ingress != nil {
 		for version, value := range c.Ingress.PseudonymKeys {

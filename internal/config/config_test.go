@@ -165,6 +165,65 @@ func TestValidateEndpointRulesCompilesCanonicalRoutes(t *testing.T) {
 	}
 }
 
+func TestValidateExactUsageRequiresProviderCachePricing(t *testing.T) {
+	base := func(mode string) Config {
+		return Config{
+			Listen:   "127.0.0.1:8080",
+			TLS:      TLSSection{TerminateTLSUpstream: true},
+			Backend:  BackendSection{URL: "https://provider.internal", Timeout: Duration(time.Second)},
+			Server:   ServerSection{ReadTimeout: Duration(time.Second), WriteTimeout: Duration(time.Second), IdleTimeout: Duration(time.Second), ReadHeaderTimeout: Duration(time.Second)},
+			Identity: IdentitySection{Audience: "a"},
+			Usage:    UsageSection{Mode: mode, CostMode: "exact", InputMicrounitsPerToken: 3, OutputMicrounitsPerToken: 15, MaxOutputTokens: 8},
+		}
+	}
+	openai := base("openai")
+	if err := openai.Validate(); err == nil {
+		t.Fatal("exact OpenAI cost posture must require cached-input pricing")
+	}
+	openai.Usage.CacheReadMicrounitsPerToken = 1
+	if err := openai.Validate(); err != nil {
+		t.Fatalf("exact OpenAI pricing rejected: %v", err)
+	}
+	anthropic := base("anthropic")
+	anthropic.Usage.CacheReadMicrounitsPerToken = 1
+	anthropic.Usage.CacheCreation5mMicrounitsPerToken = 4
+	if err := anthropic.Validate(); err == nil {
+		t.Fatal("exact Anthropic cost posture must require both cache creation TTL prices")
+	}
+	anthropic.Usage.CacheCreation1hMicrounitsPerToken = 8
+	if err := anthropic.Validate(); err != nil {
+		t.Fatalf("exact Anthropic pricing rejected: %v", err)
+	}
+}
+
+func TestValidateUsageCostModeDefaultsAndRejectsUnusedPosture(t *testing.T) {
+	c := Config{
+		Listen:   "127.0.0.1:8080",
+		TLS:      TLSSection{TerminateTLSUpstream: true},
+		Backend:  BackendSection{URL: "https://provider.internal", Timeout: Duration(time.Second)},
+		Server:   ServerSection{ReadTimeout: Duration(time.Second), WriteTimeout: Duration(time.Second), IdleTimeout: Duration(time.Second), ReadHeaderTimeout: Duration(time.Second)},
+		Identity: IdentitySection{Audience: "a"},
+		Usage:    UsageSection{Mode: "openai", InputMicrounitsPerToken: 3, OutputMicrounitsPerToken: 15, MaxOutputTokens: 8},
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("conservative usage default rejected: %v", err)
+	}
+	if c.Usage.CostMode != "conservative" {
+		t.Fatalf("usage cost mode default=%q, want conservative", c.Usage.CostMode)
+	}
+	c = Config{
+		Listen:   "127.0.0.1:8080",
+		TLS:      TLSSection{TerminateTLSUpstream: true},
+		Backend:  BackendSection{URL: "https://provider.internal", Timeout: Duration(time.Second)},
+		Server:   ServerSection{ReadTimeout: Duration(time.Second), WriteTimeout: Duration(time.Second), IdleTimeout: Duration(time.Second), ReadHeaderTimeout: Duration(time.Second)},
+		Identity: IdentitySection{Audience: "a"},
+		Usage:    UsageSection{Mode: "none", CostMode: "exact"},
+	}
+	if err := c.Validate(); err == nil {
+		t.Fatal("cost posture without a usage adapter must be rejected")
+	}
+}
+
 func TestValidateClusterAdminUsesPostgresAuditAuthority(t *testing.T) {
 	c := &Config{
 		Listen:   "127.0.0.1:8080",

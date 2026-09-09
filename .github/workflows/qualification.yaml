@@ -35,29 +35,18 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes nghttp2-client
-      - name: HA promotion and rejoin
-        run: bash scripts/qualification/ha.sh
-      - name: PITR target-time restore
-        run: bash scripts/qualification/pitr.sh
-      - name: Network perimeter and mTLS
-        run: bash scripts/qualification/perimeter.sh
-      - name: Shared replay across processes
-        run: bash scripts/qualification/replay.sh
-      - name: Direct TLS and HTTP/2
-        run: bash scripts/qualification/http2.sh
-      - name: Official SDK compatibility
-        run: bash scripts/qualification/sdk.sh
-      - name: Active/active short soak
+      - name: Repository-owned reference qualification suite
         env:
-          GRIPLINE_SOAK_EVIDENCE_FILE: qualification-smoke-evidence.json
-        run: bash scripts/qualification/soak.sh --duration "${{ inputs.soak_duration || '30s' }}" --workers 8
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+          GRIPLINE_QUALIFICATION_RESULT_DIR: qualification-results
+        run: bash scripts/qualification/suite.sh --soak-duration "${{ inputs.soak_duration || '30s' }}" --workers 8
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: gripline-reference-smoke-evidence
-          path: qualification-smoke-evidence.json
+          path: qualification-results/
       - uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517141b2
         with:
-          subject-path: qualification-smoke-evidence.json
+          subject-path: qualification-results/manifest.json
 
   long-soak:
     name: long reference qualification soak
@@ -71,12 +60,13 @@ jobs:
           cache: true
       - name: Long active/active qualification
         env:
-          GRIPLINE_SOAK_EVIDENCE_FILE: qualification-long-soak-evidence.json
-        run: bash scripts/qualification/soak.sh --duration "${{ inputs.soak_duration || '24h' }}" --workers 24
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+          GRIPLINE_QUALIFICATION_RESULT_DIR: qualification-long-soak-results
+        run: bash scripts/qualification/suite.sh --only-soak --soak-duration "${{ inputs.soak_duration || '24h' }}" --workers 24
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: gripline-reference-long-soak-evidence
-          path: qualification-long-soak-evidence.json
+          path: qualification-long-soak-results/
       - uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517141b2
         with:
-          subject-path: qualification-long-soak-evidence.json
+          subject-path: qualification-long-soak-results/manifest.json

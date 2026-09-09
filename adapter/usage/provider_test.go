@@ -145,6 +145,22 @@ func TestJSONProviderUsesEndpointSpecificOpenAIProfiles(t *testing.T) {
 	}
 }
 
+func TestJSONProviderChargesOpenAICachedInput(t *testing.T) {
+	p, err := NewJSONProvider(FormatOpenAI, Pricing{
+		InputMicrounitsPerToken: 2, OutputMicrounitsPerToken: 3,
+		CacheReadMicrounitsPerToken: 1,
+	}, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := p.Begin(Observation{Method: "POST", URLPath: "/v1/chat/completions"}, nil)
+	s.ObserveChunk([]byte(`{"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"prompt_tokens_details":{"cached_tokens":4}}}`))
+	got := s.Finish(nil)
+	if got.InputTokens != 10 || got.OutputTokens != 2 || got.CombinedTokens != 12 || got.CacheReadInputTokens != 4 || got.CostMicrounits != 22 {
+		t.Fatalf("cached OpenAI usage=%+v", got)
+	}
+}
+
 func TestJSONProviderChargesAnthropicCacheDimensions(t *testing.T) {
 	p, err := NewJSONProvider(FormatAnthropic, Pricing{
 		InputMicrounitsPerToken: 2, OutputMicrounitsPerToken: 3,
@@ -157,7 +173,7 @@ func TestJSONProviderChargesAnthropicCacheDimensions(t *testing.T) {
 	s.ObserveChunk([]byte(`data: {"type":"message_start","message":{"usage":{"input_tokens":10,"cache_read_input_tokens":4,"cache_creation_input_tokens":3}}}` + "\n"))
 	s.ObserveChunk([]byte(`data: {"type":"message_delta","usage":{"input_tokens":10,"output_tokens":2,"cache_read_input_tokens":4,"cache_creation_input_tokens":3}}` + "\n"))
 	got := s.Finish(nil)
-	if got.InputTokens != 17 || got.OutputTokens != 2 || got.CombinedTokens != 19 || got.CacheReadInputTokens != 4 || got.CacheCreationInputTokens != 3 || got.CostMicrounits != 67 {
+	if got.InputTokens != 17 || got.OutputTokens != 2 || got.CombinedTokens != 19 || got.CacheReadInputTokens != 4 || got.CacheCreationInputTokens != 3 || got.CostMicrounits != 125 || !got.CostConservative {
 		t.Fatalf("cached Anthropic usage=%+v", got)
 	}
 }
@@ -187,8 +203,25 @@ func TestJSONProviderAnthropicCacheCreationSubtypes(t *testing.T) {
 	s := p.Begin(Observation{URLPath: "/v1/messages", BodySize: 10}, nil)
 	s.ObserveChunk([]byte(`{"usage":{"input_tokens":10,"output_tokens":2,"cache_read_input_tokens":4,"cache_creation":{"ephemeral_5m_input_tokens":3,"ephemeral_1h_input_tokens":5}}}`))
 	got := s.Finish(nil)
-	if got.InputTokens != 22 || got.CacheCreation5mInputTokens != 3 || got.CacheCreation1hInputTokens != 5 || got.CostMicrounits != 122 {
+	if got.InputTokens != 22 || got.CacheCreation5mInputTokens != 3 || got.CacheCreation1hInputTokens != 5 || got.CostMicrounits != 122 || got.CostConservative {
 		t.Fatalf("Anthropic cache subtype usage=%+v", got)
+	}
+}
+
+func TestJSONProviderAggregateAnthropicCacheCreationIsConservative(t *testing.T) {
+	p, err := NewJSONProvider(FormatAnthropic, Pricing{
+		InputMicrounitsPerToken: 2, OutputMicrounitsPerToken: 3,
+		CacheReadMicrounitsPerToken: 5, CacheCreation5mMicrounitsPerToken: 7,
+		CacheCreation1hMicrounitsPerToken: 11,
+	}, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := p.Begin(Observation{Method: "POST", URLPath: "/v1/messages"}, nil)
+	s.ObserveChunk([]byte(`{"usage":{"input_tokens":10,"output_tokens":2,"cache_read_input_tokens":4,"cache_creation_input_tokens":3}}`))
+	got := s.Finish(nil)
+	if !got.CostConservative || got.InputTokens != 17 || got.CostMicrounits != 193 {
+		t.Fatalf("aggregate Anthropic cache creation must use conservative cost: %+v", got)
 	}
 }
 

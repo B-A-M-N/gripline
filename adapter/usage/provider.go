@@ -351,7 +351,7 @@ func (s *jsonSession) Finish(streamErr error) Estimate {
 			}
 			actual.CacheCreation5mInputTokens = s.cacheCreate5m
 			actual.CacheCreation1hInputTokens = s.cacheCreate1h
-			actual.CostConservative = !(s.cacheCreate5mSeen || s.cacheCreate1hSeen)
+			actual.CostConservative = s.cacheCreateSeen && !(s.cacheCreate5mSeen || s.cacheCreate1hSeen)
 		}
 		actual.CombinedTokens = safeAdd(actual.InputTokens, actual.OutputTokens)
 		if s.combinedSeen && s.combined > actual.CombinedTokens {
@@ -374,7 +374,7 @@ func (s *jsonSession) Finish(streamErr error) Estimate {
 	actual := Estimate{Requests: 1, InputTokens: actualInput, OutputTokens: s.output, CombinedTokens: s.combined,
 		CacheReadInputTokens: s.cacheRead, CacheCreationInputTokens: s.cacheCreate,
 		CacheCreation5mInputTokens: s.cacheCreate5m, CacheCreation1hInputTokens: s.cacheCreate1h,
-		CostConservative: false}
+		CostConservative: s.cacheCreateSeen && !(s.cacheCreate5mSeen || s.cacheCreate1hSeen)}
 	if actual.CombinedTokens < safeAdd(actual.InputTokens, actual.OutputTokens) {
 		actual.CombinedTokens = safeAdd(actual.InputTokens, actual.OutputTokens)
 	}
@@ -402,16 +402,21 @@ func (p *JSONProvider) withCost(e Estimate, profile UsageProfile, conservative b
 	}
 	conservative = conservative || e.CostConservative || p.CostMode == CostModeConservative
 	inputRate := p.Pricing.InputMicrounitsPerToken
-	if conservative && profile == ProfileAnthropicMessages {
-		// Before execution the cache split is unknowable. Reserve the highest
-		// configured input rate against the bounded input estimate so cached
-		// requests cannot become free or under-reserved.
+	if conservative {
+		e.CostConservative = true
+		// The estimate may contain total input tokens while the provider has not
+		// exposed a trustworthy cache split. Price every input token at the
+		// highest configured input/cache rate. This is conservative without
+		// double-counting cache dimensions as both regular and cache input.
 		inputRate = maxInt64(inputRate, p.Pricing.CacheReadMicrounitsPerToken)
 		inputRate = maxInt64(inputRate, p.cacheCreationRate(false))
 		inputRate = maxInt64(inputRate, p.cacheCreationRate(true))
+		e.CostMicrounits = safeMulAdd(e.InputTokens, inputRate,
+			e.OutputTokens, p.Pricing.OutputMicrounitsPerToken)
+		return e
 	}
 	regularInput := e.InputTokens
-	if !conservative && profile == ProfileAnthropicMessages {
+	if profile == ProfileAnthropicMessages || e.CacheReadInputTokens > 0 || e.CacheCreationInputTokens > 0 || e.CacheCreation5mInputTokens > 0 || e.CacheCreation1hInputTokens > 0 {
 		cacheTotal := safeAdd(e.CacheReadInputTokens, safeAdd(e.CacheCreation5mInputTokens, e.CacheCreation1hInputTokens))
 		if e.CacheCreation5mInputTokens == 0 && e.CacheCreation1hInputTokens == 0 {
 			cacheTotal = safeAdd(cacheTotal, e.CacheCreationInputTokens)
@@ -504,10 +509,20 @@ func parseUsageRecord(record []byte, profile UsageProfile) (usageRecord, bool) {
 		out.input, out.inputSeen = requiredNonNegativeInt(usage, "prompt_tokens")
 		out.output, out.outputSeen = requiredNonNegativeInt(usage, "completion_tokens")
 		out.combined, out.combinedSeen = requiredNonNegativeInt(usage, "total_tokens")
+		if cache, seen, ok := openAICacheRead(usage, "prompt_tokens_details"); !ok {
+			return usageRecord{}, false
+		} else if seen {
+			out.cacheRead, out.cacheReadSeen = cache, true
+		}
 	case ProfileOpenAIResponses:
 		out.input, out.inputSeen = requiredNonNegativeInt(usage, "input_tokens")
 		out.output, out.outputSeen = requiredNonNegativeInt(usage, "output_tokens")
 		out.combined, out.combinedSeen = requiredNonNegativeInt(usage, "total_tokens")
+		if cache, seen, ok := openAICacheRead(usage, "input_tokens_details"); !ok {
+			return usageRecord{}, false
+		} else if seen {
+			out.cacheRead, out.cacheReadSeen = cache, true
+		}
 	case ProfileOpenAIEmbeddings:
 		out.input, out.inputSeen = requiredNonNegativeInt(usage, "prompt_tokens")
 		out.combined, out.combinedSeen = requiredNonNegativeInt(usage, "total_tokens")
@@ -557,6 +572,30 @@ func parseUsageRecord(record []byte, profile UsageProfile) (usageRecord, bool) {
 		return usageRecord{}, false
 	}
 	return out, out.inputSeen || out.outputSeen || out.combinedSeen || out.cacheReadSeen || out.cacheCreateSeen || out.cacheCreate5mSeen || out.cacheCreate1hSeen
+}
+
+// openAICacheRead parses the optional provider usage detail without treating
+// arbitrary nested token-looking content as metering data. A missing detail
+// object means zero cached tokens for this record; a malformed detail object
+// invalidates the record and forces conservative settlement.
+func openAICacheRead(usage map[string]json.RawMessage, detailsKey string) (int64, bool, bool) {
+	raw, exists := usage[detailsKey]
+	if !exists {
+		return 0, false, true
+	}
+	details, err := decodeUniqueObject(raw)
+	if err != nil {
+		return 0, false, false
+	}
+	cached, exists := details["cached_tokens"]
+	if !exists {
+		return 0, false, true
+	}
+	value, ok := optionalNonNegativeInt(cached)
+	if !ok {
+		return 0, false, false
+	}
+	return value, true, true
 }
 
 func usageObject(top map[string]json.RawMessage, profile UsageProfile) (map[string]json.RawMessage, bool) {

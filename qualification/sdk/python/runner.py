@@ -54,7 +54,8 @@ def usage_or_fail(usage: Any) -> dict[str, int]:
 
 def scenario_request(model: str) -> tuple[str, dict[str, Any]]:
     scenario = os.environ.get("GRIPLINE_SDK_SCENARIO", "")
-    wire_model = f"{model}-{scenario}" if scenario else model
+    suffix = os.environ.get("GRIPLINE_SDK_MODEL_SUFFIX", "")
+    wire_model = f"{model}{suffix}-{scenario}" if scenario else f"{model}{suffix}"
     content = "qualification ping"
     if scenario == "large":
         content = "qualification large input " + ("x" * 65536)

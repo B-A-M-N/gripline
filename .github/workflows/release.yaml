@@ -14,6 +14,9 @@ jobs:
   qualification:
     name: release long-soak qualification evidence
     runs-on: [self-hosted, linux, gripline-qualification]
+    outputs:
+      qualification_commit: ${{ steps.manifest.outputs.commit }}
+      manifest_sha256: ${{ steps.manifest.outputs.sha256 }}
     permissions:
       contents: read
       id-token: write
@@ -26,17 +29,30 @@ jobs:
           cache: true
       - name: Require the exact tagged tree
         run: test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
-      - name: Run release qualification soak
+      - name: Install reference lab protocol clients
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes nghttp2-client
+      - name: Run exact-SHA reference qualification suite
         env:
-          GRIPLINE_SOAK_EVIDENCE_FILE: qualification-release-soak-evidence.json
-        run: bash scripts/qualification/soak.sh --duration 24h --workers 24
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+          GRIPLINE_QUALIFICATION_RESULT_DIR: qualification-release-results
+        run: bash scripts/qualification/suite.sh --soak-duration 24h --workers 24
+      - name: Verify qualification manifest
+        id: manifest
+        run: |
+          grep -Fq "\"commit\": \"$GITHUB_SHA\"" qualification-release-results/manifest.json
+          grep -Fq '"result": "pass"' qualification-release-results/manifest.json
+          (cd qualification-release-results && sha256sum -c manifest.sha256)
+          echo "commit=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(sha256sum qualification-release-results/manifest.json | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: gripline-release-qualification-evidence
-          path: qualification-release-soak-evidence.json
+          path: qualification-release-results/
       - uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517141b2
         with:
-          subject-path: qualification-release-soak-evidence.json
+          subject-path: qualification-release-results/manifest.json
 
   release:
     needs: qualification
@@ -61,6 +77,16 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: gripline-release-qualification-evidence
+          path: qualification-release-results
+      - name: Verify exact qualification evidence for this release
+        run: |
+          grep -Fq "\"commit\": \"$GITHUB_SHA\"" qualification-release-results/manifest.json
+          grep -Fq '"result": "pass"' qualification-release-results/manifest.json
+          (cd qualification-release-results && sha256sum -c manifest.sha256)
+          test "$(sha256sum qualification-release-results/manifest.json | awk '{print $1}')" = "${{ needs.qualification.outputs.manifest_sha256 }}"
       - name: Assert toolchain
         run: test "$(go env GOVERSION)" = "go1.25.13"
       - name: Set build metadata
@@ -94,16 +120,6 @@ jobs:
           go run ./cmd/gripline-demo --headless
           bash scripts/release-harness.sh
           bash scripts/chaos-smoke.sh
-      - name: Run repository-owned reference qualification lab
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes nghttp2-client
-          bash scripts/qualification/ha.sh
-          bash scripts/qualification/pitr.sh
-          bash scripts/qualification/perimeter.sh
-          bash scripts/qualification/replay.sh
-          bash scripts/qualification/http2.sh
-          bash scripts/qualification/sdk.sh
       - name: Build and smoke-test release container
         run: |
           docker build \

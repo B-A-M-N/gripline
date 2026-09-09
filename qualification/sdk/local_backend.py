@@ -23,6 +23,16 @@ def response_for(path: str, stream: bool, request: dict) -> tuple[int, bytes, st
         if attempt == 1:
             return 429, b'{"error":{"type":"rate_limit_error","message":"qualification retry"}}', "application/json", {"Retry-After": "0.05"}
     if path.endswith("/messages"):
+        cache_usage = {}
+        if model.endswith("-cache"):
+            cache_usage = {
+                "cache_read_input_tokens": 4,
+                "cache_creation_input_tokens": 3,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 2,
+                    "ephemeral_1h_input_tokens": 1,
+                },
+            }
         if request.get("tools"):
             body = {
                 "id": "msg_qualification_tool",
@@ -31,7 +41,7 @@ def response_for(path: str, stream: bool, request: dict) -> tuple[int, bytes, st
                 "content": [{"type": "tool_use", "id": "toolu_qualification", "name": "lookup", "input": {"ok": True}}],
                 "model": "local-qualification",
                 "stop_reason": "tool_use",
-                "usage": {"input_tokens": 3, "output_tokens": 2},
+                "usage": {"input_tokens": 3, "output_tokens": 2, **cache_usage},
             }
             return 200, json.dumps(body).encode(), "application/json", {}
         body = {
@@ -41,11 +51,12 @@ def response_for(path: str, stream: bool, request: dict) -> tuple[int, bytes, st
             "content": [{"type": "text", "text": "qualification ok"}],
             "model": "local-qualification",
             "stop_reason": "end_turn",
-            "usage": {"input_tokens": 3, "output_tokens": 2},
+            "usage": {"input_tokens": 3, "output_tokens": 2, **cache_usage},
         }
         if stream:
+            stream_usage = {"input_tokens": 3, "output_tokens": 0, **cache_usage}
             events = [
-                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
+                "event: message_start\ndata: " + json.dumps({"type": "message_start", "message": {"usage": stream_usage}}) + "\n\n",
                 "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"qualification ok\"}}\n\n",
                 "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":2}}\n\n",
                 "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",

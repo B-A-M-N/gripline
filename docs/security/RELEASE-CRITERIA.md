@@ -37,8 +37,9 @@ exceptions are line-local and documented in `GOSEC-BASELINE.md`.
 ## Layer 2 — repository reference production lab
 
 These are reproducible local qualification gates, not placeholders for hosted
-infrastructure. The release workflow runs the short functional set and gates
-publication on a 24-hour self-hosted reference soak on the exact tagged SHA.
+infrastructure. The qualification workflow runs the short functional set; the
+release workflow runs the full reference suite and gates publication on a
+24-hour self-hosted reference soak on the exact tagged SHA.
 The scheduled/manual qualification record must additionally retain the long
 soak evidence:
 
@@ -53,7 +54,11 @@ soak evidence:
 | Long-running active/active behavior | `bash scripts/qualification/soak.sh --duration 24h` | Replica/policy continuity, bounded active leases/holds/source scopes, retention checks, RSS/goroutine/heap snapshots, outage recovery, post-soak promotion |
 
 The lab uses disposable containers, generated keys, and local
-provider-shaped fixtures; it requires no provider account.
+provider-shaped fixtures; it requires no provider account. Each suite run emits
+sanitized per-gate JSON plus `manifest.json` and `manifest.sha256` under the
+qualification result directory. The manifest records the exact commit,
+fixture image digests, tool versions, and gate outcomes; release publication
+verifies that manifest before building artifacts and attests it.
 The qualification workflow's manual `soak_duration` input accepts `24h` or
 `72h` for the long reference record; only short smoke runs use a GitHub-hosted
 runner.

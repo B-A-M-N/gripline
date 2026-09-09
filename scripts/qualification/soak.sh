@@ -14,6 +14,8 @@ harness_artifact="$work_dir/harness.env"
 snapshot_file="$work_dir/soak.tsv"
 relation_file="$work_dir/relations.tsv"
 maintenance_file="$work_dir/maintenance.tsv"
+row_file="$work_dir/rows.tsv"
+maintenance_bin="$work_dir/maintenance"
 duration_text="5m"
 workers="${GRIPLINE_CLUSTER_SOAK_WORKERS:-24}"
 while [[ $# -gt 0 ]]; do
@@ -42,6 +44,7 @@ command -v docker >/dev/null || { echo "soak qualification: docker is required" 
 docker compose version >/dev/null || { echo "soak qualification: docker compose is required" >&2; exit 2; }
 command -v go >/dev/null || { echo "soak qualification: go is required" >&2; exit 2; }
 command -v curl >/dev/null || { echo "soak qualification: curl is required" >&2; exit 2; }
+GOCACHE="${GOCACHE:-/tmp/gripline-go-cache}" go build -trimpath -o "$maintenance_bin" ./cmd/gripline-test-pg-maintenance
 compose=(docker compose -p "$project" -f "$fixture_dir/compose.yaml")
 "${compose[@]}" up -d >/dev/null
 for _ in $(seq 1 90); do
@@ -52,6 +55,34 @@ monitor_failure="$work_dir/monitor.failure"
 promotion_file="$work_dir/promotion.expected"
 pause_file="$work_dir/harness.pause"
 release_file="$work_dir/harness.release"
+dsn="postgres://gripline:gripline@127.0.0.1:${GRIPLINE_HA_PRIMARY_PORT:-25432}/gripline?sslmode=disable"
+table_counts() {
+	"${compose[@]}" exec -T primary psql -U gripline -d gripline -X -Atqc "
+		SELECT 'gripline_credentials=' || count(*) FROM gripline_credentials
+		UNION ALL SELECT 'gripline_security_transitions=' || count(*) FROM gripline_security_transitions
+		UNION ALL SELECT 'gripline_lanes=' || count(*) FROM gripline_lanes
+		UNION ALL SELECT 'gripline_lane_operator_audit=' || count(*) FROM gripline_lane_operator_audit
+		UNION ALL SELECT 'gripline_operator_audit=' || count(*) FROM gripline_operator_audit
+		UNION ALL SELECT 'gripline_control_operations=' || count(*) FROM gripline_control_operations
+		UNION ALL SELECT 'gripline_admission_audit=' || count(*) FROM gripline_admission_audit
+		UNION ALL SELECT 'gripline_policy_artifacts=' || count(*) FROM gripline_policy_artifacts
+		UNION ALL SELECT 'gripline_policy_audit=' || count(*) FROM gripline_policy_audit
+		UNION ALL SELECT 'gripline_adaptive_state=' || count(*) FROM gripline_adaptive_state
+		UNION ALL SELECT 'gripline_adaptive_window_subjects=' || count(*) FROM gripline_adaptive_window_subjects
+		UNION ALL SELECT 'gripline_adaptive_window_keys=' || count(*) FROM gripline_adaptive_window_keys
+		UNION ALL SELECT 'gripline_adaptive_baselines=' || count(*) FROM gripline_adaptive_baselines
+		UNION ALL SELECT 'gripline_resource_buckets=' || count(*) FROM gripline_resource_buckets
+		UNION ALL SELECT 'gripline_resource_source_scopes=' || count(*) FROM gripline_resource_source_scopes
+		UNION ALL SELECT 'gripline_resource_leases=' || count(*) FROM gripline_resource_leases
+		UNION ALL SELECT 'gripline_resource_holds=' || count(*) FROM gripline_resource_holds
+		UNION ALL SELECT 'gripline_credential_receipts=' || count(*) FROM gripline_credential_receipts
+		UNION ALL SELECT 'gripline_membership=' || count(*) FROM gripline_membership
+		UNION ALL SELECT 'gripline_cluster_crypto_generations=' || count(*) FROM gripline_cluster_crypto_generations
+		UNION ALL SELECT 'gripline_cluster_crypto_acks=' || count(*) FROM gripline_cluster_crypto_acks
+		UNION ALL SELECT 'gripline_policy_node_state=' || count(*) FROM gripline_policy_node_state
+		UNION ALL SELECT 'gripline_evidence=' || count(*) FROM gripline_evidence
+		UNION ALL SELECT 'gripline_evidence_guards=' || count(*) FROM gripline_evidence_guards" | tr '\n' ';'
+}
 monitor() {
 	last_maintenance=0
 	while [[ -z "$harness_pid" ]] || kill -0 "$harness_pid" >/dev/null 2>&1; do
@@ -88,12 +119,18 @@ monitor() {
 				if (( BASH_REMATCH[1] > 5 || BASH_REMATCH[2] > 64 || BASH_REMATCH[3] > 100000 )); then echo "retention-bounds" >"$monitor_failure"; return 1; fi
 			fi
 			now="$(date +%s)"
+			rows="$(table_counts 2>/dev/null || true)"
+			[[ -n "$rows" ]] && printf '%s\t%s\n' "$now" "$rows" >>"$row_file"
 			if (( now >= last_maintenance + 60 )) && [[ ! -f "$promotion_file" ]]; then
-				"${compose[@]}" exec -T primary psql -U gripline -d gripline -X -v ON_ERROR_STOP=1 -c 'VACUUM (ANALYZE) gripline_resource_leases, gripline_resource_holds, gripline_evidence, gripline_admission_audit, gripline_operator_audit, gripline_control_operations, gripline_credential_receipts' >/dev/null 2>&1 || { echo maintenance-failed >"$monitor_failure"; return 1; }
-				printf '%s\t%s\n' "$now" maintenance >>"$maintenance_file"
+				before="$rows"
+				maintenance_start="$now"
+				maintenance_json="$($maintenance_bin -dsn "$dsn" -batch-size 256 2>/dev/null)" || { echo maintenance-failed >"$monitor_failure"; return 1; }
+				"${compose[@]}" exec -T primary psql -U gripline -d gripline -X -v ON_ERROR_STOP=1 -c 'VACUUM (ANALYZE)' >/dev/null 2>&1 || { echo vacuum-failed >"$monitor_failure"; return 1; }
+				after="$(table_counts 2>/dev/null || true)"
+				printf '%s\t%s\t%s\t%s\t%s\n' "$now" "$(( $(date +%s) - maintenance_start ))" "$before" "$after" "$maintenance_json" >>"$maintenance_file"
 				last_maintenance=$now
 			fi
-			relation_bytes="$("${compose[@]}" exec -T primary psql -U gripline -d gripline -X -Atqc "SELECT COALESCE(SUM(pg_total_relation_size(to_regclass(name))),0) FROM unnest(ARRAY['gripline_resource_leases','gripline_resource_holds','gripline_evidence','gripline_admission_audit','gripline_operator_audit','gripline_control_operations','gripline_credential_receipts']) AS names(name)" 2>/dev/null || true)"
+			relation_bytes="$("${compose[@]}" exec -T primary psql -U gripline -d gripline -X -Atqc "SELECT COALESCE(SUM(pg_total_relation_size(relid)),0) FROM pg_stat_user_tables WHERE relname LIKE 'gripline_%'" 2>/dev/null || true)"
 			if [[ "$relation_bytes" =~ ^[0-9]+$ ]]; then
 				printf '%s\t%s\n' "$now" "$relation_bytes" >>"$relation_file"
 				if (( relation_bytes > ${GRIPLINE_SOAK_MAX_TERMINAL_BYTES:-67108864} )); then echo terminal-relation-size >"$monitor_failure"; return 1; fi
@@ -104,7 +141,6 @@ monitor() {
 }
 monitor &
 monitor_pid=$!
-dsn="postgres://gripline:gripline@127.0.0.1:${GRIPLINE_HA_PRIMARY_PORT:-25432}/gripline?sslmode=disable"
 GRIPLINE_CLUSTER_HARNESS_ARTIFACT_FILE="$harness_artifact" GRIPLINE_CLUSTER_HARNESS_PAUSE_FILE="$pause_file" GRIPLINE_CLUSTER_HARNESS_RELEASE_FILE="$release_file" GRIPLINE_TEST_POSTGRES_DSN="$dsn" GRIPLINE_TEST_POSTGRES_CONTAINER="${project}-primary-1" GRIPLINE_CLUSTER_HARNESS_REQUIRE_DB_OUTAGE=1 GRIPLINE_CLUSTER_HARNESS_LOAD_SECONDS="$duration" GRIPLINE_CLUSTER_HARNESS_LOAD_WORKERS="$workers" bash "$repo_dir/scripts/cluster-harness.sh" >"$work_dir/harness.log" 2>&1 &
 harness_pid=$!
 for _ in $(seq 1 120); do
@@ -178,7 +214,9 @@ if [[ -n "${GRIPLINE_SOAK_EVIDENCE_FILE:-}" ]]; then
   "max_rss_kb": ${max_rss},
   "max_goroutines": ${max_goroutines},
   "max_heap_bytes": ${max_heap},
-  "maintenance_samples": $(wc -l <"$maintenance_file" 2>/dev/null || echo 0),
+	"maintenance_samples": $(wc -l <"$maintenance_file" 2>/dev/null || echo 0),
+	"retention_row_samples": $(wc -l <"$row_file" 2>/dev/null || echo 0),
+	"maintenance_failures": 0,
   "max_terminal_relation_bytes": ${relation_max:-0},
   "generated_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }

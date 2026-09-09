@@ -28,7 +28,7 @@ GRIPLINE_SDK_PROFILE=chat|responses|embeddings|models|messages
 GRIPLINE_SDK_STREAM=0|1
 GRIPLINE_SDK_EXPECT_USAGE=1
 GRIPLINE_SDK_MAX_SECONDS=30
-GRIPLINE_SDK_SCENARIO=tool|large|retry|server-error|cancel|connection|parallel
+GRIPLINE_SDK_SCENARIO=tool|large|retry|server-error|cancel|connection|parallel|cache
 GRIPLINE_SDK_REQUESTS=4          # same-client sequential reuse
 GRIPLINE_SDK_PARALLEL=4          # same-client concurrent calls
 ```
@@ -56,4 +56,8 @@ node runner.mjs anthropic
 The repository does not commit provider API keys or claim that a local fake
 backend is provider-behavior evidence. A release record must retain the pinned
 SDK versions, provider/model, stream mode, retry policy, cancellation result,
-and the authoritative usage/cost comparison for each case.
+and the authoritative usage/cost comparison for each case. The reference
+matrix invokes OpenAI Chat Completions, Responses, Embeddings, and Models, plus
+Anthropic Messages, in both streaming and non-streaming forms where supported;
+the Anthropic `cache` scenario exercises read and 5-minute/1-hour creation
+dimensions through the local provider-shaped backend.

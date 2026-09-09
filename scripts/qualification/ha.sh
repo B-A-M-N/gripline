@@ -141,7 +141,7 @@ cat >"$live_config" <<EOF
   "server": {"read_timeout":"10s","write_timeout":"10s","idle_timeout":"10s","read_header_timeout":"5s"},
   "identity": {"audience":"ha-live-qualification"},
   "secrets": {"pepper_versions":{"1":"${pepper_one}","2":"${pepper_two}"}},
-  "admin": {"listen":"127.0.0.1:${live_admin_port}","operator_tokens":{"${live_operator}":"harness:credential.lifecycle,audit.read"}},
+  "admin": {"listen":"127.0.0.1:${live_admin_port}","operator_tokens":{"${live_operator}":"harness:credential.lifecycle,posture.control,audit.read"}},
   "paths": {"signer_keyring":"${work_dir}/keyring.json"},
   "policy": {"file":"${work_dir}/policy.json","verifier_key_file":"${work_dir}/verifier.key"},
   "authority": {"backend":"postgres","dsn_env":"GRIPLINE_HA_WRITER_DSN","node_id":"ha-live-node","lease_ttl":"5s","renew_every":"1s","connect_timeout":"3s","operation_timeout":"1s","max_conns":4,"min_conns":1},
@@ -162,8 +162,24 @@ done
 curl -fsS "http://127.0.0.1:${live_port}/readyz" >/dev/null
 printf '%s\n' "$live_secret" | GRIPLINE_OPERATOR_TOKEN="$live_operator" "$work_dir/gripline" credential add --config "$live_config" --id ha-live-credential --account ha-live --policy gripline-default-v1 --plan ha-live --reason "HA reference qualification" --secret-stdin >/dev/null
 curl -fsS "http://127.0.0.1:${live_port}/v1/messages" -H "Authorization: Bearer ${live_secret}" >/dev/null
+live_expected_state="$(state_fingerprint primary)"
+for _ in $(seq 1 60); do
+	if [[ "$(state_fingerprint replica 2>/dev/null || true)" == "$live_expected_state" ]]; then break; fi
+	sleep 1
+done
+[[ "$(state_fingerprint replica)" == "$live_expected_state" ]] || {
+	echo "ha qualification: live Gripline state did not replicate before failover" >&2
+	exit 1
+}
 
 echo "ha qualification: stopping primary and promoting replica"
+ambiguous_operation="ha-unknown-commit-${$}"
+ambiguous_reason="HA unknown-commit posture mutation"
+ambiguous_url="http://127.0.0.1:${live_admin_port}/admin/posture"
+curl -sS --max-time 3 -o "$work_dir/ambiguous-first.json" -X POST "$ambiguous_url" \
+	-H "Authorization: Bearer ${live_operator}" -H "Idempotency-Key: ${ambiguous_operation}" \
+	-H 'Content-Type: application/json' --data "{\"on\":true,\"reason\":\"${ambiguous_reason}\"}" & ambiguous_pid=$!
+sleep 0.02
 "${compose[@]}" stop primary >/dev/null
 "${compose[@]}" exec -T replica gosu postgres pg_ctl promote -D /var/lib/postgresql/data >/dev/null
 for _ in $(seq 1 60); do
@@ -173,10 +189,32 @@ for _ in $(seq 1 60); do
 	sleep 1
 done
 [[ "$(sql replica 'SELECT pg_is_in_recovery()')" == f ]] || { echo "ha qualification: replica did not promote" >&2; exit 1; }
-[[ "$(state_fingerprint replica)" == "$expected_state" ]] || {
+[[ "$(state_fingerprint replica)" == "$live_expected_state" ]] || {
 	echo "ha qualification: promoted authority lost reference security state" >&2
 	exit 1
 }
+wait "$ambiguous_pid" >/dev/null 2>&1 || true
+ambiguous_status=000
+for _ in $(seq 1 90); do
+	ambiguous_status="$(curl -sS --max-time 3 -o "$work_dir/ambiguous-retry.json" -w '%{http_code}' -X POST "$ambiguous_url" \
+		-H "Authorization: Bearer ${live_operator}" -H "Idempotency-Key: ${ambiguous_operation}" \
+		-H 'Content-Type: application/json' --data "{\"on\":true,\"reason\":\"${ambiguous_reason}\"}" 2>/dev/null || true)"
+	if [[ "$ambiguous_status" == 200 ]]; then break; fi
+	sleep 1
+done
+[[ "$ambiguous_status" == 200 ]] || { echo "ha qualification: idempotent retry after failover did not complete (status ${ambiguous_status})" >&2; exit 1; }
+[[ "$(sql replica "SELECT COUNT(*) FROM gripline_control_operations WHERE operation_id='${ambiguous_operation}'")" == 1 ]] || {
+	echo "ha qualification: unknown-commit retry created more than one operation receipt" >&2
+	exit 1
+}
+curl -fsS --max-time 3 -X POST "$ambiguous_url" \
+	-H "Authorization: Bearer ${live_operator}" -H "Idempotency-Key: ha-unknown-commit-clear-${$}" \
+	-H 'Content-Type: application/json' --data '{"on":false,"reason":"HA unknown-commit posture clear"}' >/dev/null
+[[ "$(sql replica 'SELECT posture FROM gripline_operator_posture WHERE singleton=TRUE')" == 0 ]] || {
+	echo "ha qualification: posture mutation did not converge after failover" >&2
+	exit 1
+}
+final_expected_state="$(state_fingerprint replica)"
 for _ in $(seq 1 90); do
 	if curl -fsS "http://127.0.0.1:${live_port}/readyz" >/dev/null 2>&1; then
 		break
@@ -202,7 +240,7 @@ for _ in $(seq 1 60); do
 	sleep 1
 done
 [[ "$(sql primary 'SELECT pg_is_in_recovery()')" == t ]] || { echo "ha qualification: failed node did not rejoin as standby" >&2; exit 1; }
-[[ "$(state_fingerprint primary)" == "$expected_state" ]] || {
+[[ "$(state_fingerprint primary)" == "$final_expected_state" ]] || {
 	echo "ha qualification: rejoined standby lost complete reference state" >&2
 	exit 1
 }
