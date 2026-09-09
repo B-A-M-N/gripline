@@ -246,39 +246,51 @@ func (s *Store) resolveResourceScope(ctx context.Context, tx pgx.Tx, sp resource
 	if sp.Scope != resource.ScopeSource || sp.ID == "" {
 		return sp, nil
 	}
-	var exists bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM gripline_resource_source_scopes WHERE scope_id=$1)`, sp.ID).Scan(&exists); err != nil {
+	var lockedScope string
+	err := tx.QueryRow(ctx, `SELECT scope_id FROM gripline_resource_source_scopes
+		WHERE scope_id=$1 FOR UPDATE`, sp.ID).Scan(&lockedScope)
+	if err == nil {
+		if _, err := tx.Exec(ctx, `UPDATE gripline_resource_source_scopes
+			SET last_used_at=$2 WHERE scope_id=$1`, sp.ID, now); err != nil {
+			return sp, mapDBError(err)
+		}
+		return sp, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
 		return sp, mapDBError(err)
 	}
-	if !exists {
-		// Serialize only the bounded source-cardinality decision. Existing source
-		// rows update normally; first writers take the singleton guard and then
-		// re-check after any concurrent creator has committed.
-		if err := tx.QueryRow(ctx, `SELECT singleton FROM gripline_resource_source_scope_guard WHERE singleton=TRUE FOR UPDATE`).Scan(&exists); err != nil {
+
+	// Serialize only the bounded source-cardinality decision. Existing source
+	// rows are locked above; first writers take the singleton guard and then
+	// re-check after any concurrent creator has committed.
+	var guard bool
+	if err := tx.QueryRow(ctx, `SELECT singleton FROM gripline_resource_source_scope_guard WHERE singleton=TRUE FOR UPDATE`).Scan(&guard); err != nil {
+		return sp, mapDBError(err)
+	}
+	err = tx.QueryRow(ctx, `SELECT scope_id FROM gripline_resource_source_scopes
+		WHERE scope_id=$1 FOR UPDATE`, sp.ID).Scan(&lockedScope)
+	if err == nil {
+		if _, err := tx.Exec(ctx, `UPDATE gripline_resource_source_scopes
+			SET last_used_at=$2 WHERE scope_id=$1`, sp.ID, now); err != nil {
 			return sp, mapDBError(err)
 		}
-		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM gripline_resource_source_scopes WHERE scope_id=$1)`, sp.ID).Scan(&exists); err != nil {
-			return sp, mapDBError(err)
-		}
-		if exists {
-			if _, err := tx.Exec(ctx, `INSERT INTO gripline_resource_source_scopes (scope_id, last_used_at) VALUES ($1,$2)
-				ON CONFLICT (scope_id) DO UPDATE SET last_used_at=EXCLUDED.last_used_at`, sp.ID, now); err != nil {
-				return sp, mapDBError(err)
-			}
-			return sp, nil
-		}
-		if err := s.evictIdleSourceScopes(ctx, tx, now); err != nil {
-			return sp, err
-		}
-		var count int
-		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_resource_source_scopes`).Scan(&count); err != nil {
-			return sp, mapDBError(err)
-		}
-		if count >= s.maxSourceScopes {
-			h := sha256.Sum256([]byte(sp.ID))
-			sp.ID = "__source_overflow_" + fmt.Sprintf("%d", uint64(h[0])%resourceOverflowBuckets)
-			return sp, nil
-		}
+		return sp, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return sp, mapDBError(err)
+	}
+
+	if err := s.evictIdleSourceScopes(ctx, tx, now); err != nil {
+		return sp, err
+	}
+	var count int
+	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_resource_source_scopes`).Scan(&count); err != nil {
+		return sp, mapDBError(err)
+	}
+	if count >= s.maxSourceScopes {
+		h := sha256.Sum256([]byte(sp.ID))
+		sp.ID = "__source_overflow_" + fmt.Sprintf("%d", uint64(h[0])%resourceOverflowBuckets)
+		return sp, nil
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO gripline_resource_source_scopes (scope_id, last_used_at) VALUES ($1,$2)
 		ON CONFLICT (scope_id) DO UPDATE SET last_used_at=EXCLUDED.last_used_at`, sp.ID, now); err != nil {

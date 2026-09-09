@@ -737,15 +737,42 @@ if [[ "$load_seconds" -gt 0 ]]; then
 		serialization_retries="$(fleet_metric_delta postgres_serialization_retries_total)"
 		deadlock_retries="$(fleet_metric_delta postgres_deadlock_retries_total)"
 		transaction_retries="$(awk -v serialization="$serialization_retries" -v deadlock="$deadlock_retries" 'BEGIN {printf "%.0f", serialization + deadlock}')"
+		adaptive_window_retries="$(fleet_metric_delta postgres_transaction_retries_adaptive_window_total)"
+		adaptive_baseline_retries="$(fleet_metric_delta postgres_transaction_retries_adaptive_baseline_total)"
+		lane_borrow_retries="$(fleet_metric_delta postgres_transaction_retries_lane_borrow_total)"
+		lane_risk_retries="$(fleet_metric_delta postgres_transaction_retries_lane_risk_total)"
+		credential_retries="$(fleet_metric_delta postgres_transaction_retries_credential_total)"
+		resource_retries="$(fleet_metric_delta postgres_transaction_retries_resource_total)"
+		other_retries="$(fleet_metric_delta postgres_transaction_retries_other_total)"
+		cat >"$load_dir/postgres-metrics.json" <<EOF
+{
+  "serialization_retries": ${serialization_retries},
+  "deadlock_retries": ${deadlock_retries},
+  "transaction_retries": ${transaction_retries},
+  "operation_retries": {
+    "adaptive_window": ${adaptive_window_retries},
+    "adaptive_baseline": ${adaptive_baseline_retries},
+    "lane_borrow": ${lane_borrow_retries},
+    "lane_risk": ${lane_risk_retries},
+    "credential": ${credential_retries},
+    "resource": ${resource_retries},
+    "other": ${other_retries}
+  }
+}
+EOF
 		printf 'cluster harness: capacity load metrics=%s pg_pool_wait_seconds=%s transaction_retries=%s transaction_latency_seconds=%s\n' \
 			"$(cat "$load_dir/capacity.json")" \
 			"$(fleet_metric_delta postgres_pool_empty_acquire_wait_seconds)" \
 			"$transaction_retries" \
 			"$(fleet_metric_delta postgres_transaction_latency_seconds_total)"
+		capacity_validation_rc=0
+		python3 "$repo_dir/scripts/qualification/validate-capacity.py" "$load_dir/capacity.json" "$capacity_min_success_ratio" "$load_dir/postgres-metrics.json" || capacity_validation_rc=$?
 		if [[ -n "${GRIPLINE_CLUSTER_HARNESS_CAPACITY_EVIDENCE_FILE:-}" ]]; then
 			install -D -m 0600 "$load_dir/capacity.json" "$GRIPLINE_CLUSTER_HARNESS_CAPACITY_EVIDENCE_FILE"
 		fi
-		python3 "$repo_dir/scripts/qualification/validate-capacity.py" "$load_dir/capacity.json" "$capacity_min_success_ratio"
+		if (( capacity_validation_rc != 0 )); then
+			exit "$capacity_validation_rc"
+		fi
 	fi
 fi
 

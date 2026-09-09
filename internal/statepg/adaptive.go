@@ -40,7 +40,11 @@ func (s *Store) ObserveWindow(ctx context.Context, obs adaptive.WindowObservatio
 }
 
 func (s *Store) observeWindowOnce(ctx context.Context, obs adaptive.WindowObservation) (bool, error) {
-	tx, err := begin(ctx, s.pool)
+	// Existing subjects are serialized by their own FOR UPDATE row below. A
+	// detector-scoped advisory lock is needed only when a new subject changes
+	// the bounded-cardinality decision; using SERIALIZABLE for every adaptive
+	// observation made unrelated subjects collide on the detector index.
+	tx, err := beginResource(ctx, s.pool)
 	if err != nil {
 		return false, mapDBError(err)
 	}
@@ -53,30 +57,44 @@ func (s *Store) observeWindowOnce(ctx context.Context, obs adaptive.WindowObserv
 		return false, err
 	}
 
-	var exists bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM gripline_adaptive_window_subjects WHERE detector=$1 AND subject=$2)`, obs.Detector, obs.Subject).Scan(&exists); err != nil {
-		return false, mapDBError(err)
-	}
-	if !exists {
-		var count int
-		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_adaptive_window_subjects WHERE detector=$1`, obs.Detector).Scan(&count); err != nil {
+	var lockedSubject string
+	err = tx.QueryRow(ctx, `SELECT subject FROM gripline_adaptive_window_subjects
+		WHERE detector=$1 AND subject=$2 FOR UPDATE`, obs.Detector, obs.Subject).Scan(&lockedSubject)
+	if errors.Is(err, pgx.ErrNoRows) {
+		tag, err := tx.Exec(ctx, `INSERT INTO gripline_adaptive_window_subjects (detector, subject, last_seen_at)
+			VALUES ($1,$2,$3) ON CONFLICT (detector, subject) DO NOTHING`, obs.Detector, obs.Subject, now)
+		if err != nil {
 			return false, mapDBError(err)
 		}
-		if count >= obs.MaxSubjects {
-			var evict string
-			err := tx.QueryRow(ctx, `SELECT subject FROM gripline_adaptive_window_subjects
-				WHERE detector=$1 ORDER BY last_seen_at, subject LIMIT 1 FOR UPDATE SKIP LOCKED`, obs.Detector).Scan(&evict)
-			if err == nil {
+		if err := tx.QueryRow(ctx, `SELECT subject FROM gripline_adaptive_window_subjects
+			WHERE detector=$1 AND subject=$2 FOR UPDATE`, obs.Detector, obs.Subject).Scan(&lockedSubject); err != nil {
+			return false, mapDBError(err)
+		}
+		if tag.RowsAffected() != 0 {
+			if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, obs.Detector); err != nil {
+				return false, mapDBError(err)
+			}
+			var count int
+			if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_adaptive_window_subjects WHERE detector=$1`, obs.Detector).Scan(&count); err != nil {
+				return false, mapDBError(err)
+			}
+			for count > obs.MaxSubjects {
+				var evict string
+				err := tx.QueryRow(ctx, `SELECT subject FROM gripline_adaptive_window_subjects
+					WHERE detector=$1 AND subject<>$2 ORDER BY last_seen_at, subject LIMIT 1 FOR UPDATE`, obs.Detector, obs.Subject).Scan(&evict)
+				if errors.Is(err, pgx.ErrNoRows) {
+					break
+				}
+				if err != nil {
+					return false, mapDBError(err)
+				}
 				if _, err := tx.Exec(ctx, `DELETE FROM gripline_adaptive_window_subjects WHERE detector=$1 AND subject=$2`, obs.Detector, evict); err != nil {
 					return false, mapDBError(err)
 				}
-			} else if !errors.Is(err, pgx.ErrNoRows) {
-				return false, mapDBError(err)
+				count--
 			}
 		}
-	}
-	if _, err := tx.Exec(ctx, `INSERT INTO gripline_adaptive_window_subjects (detector, subject, last_seen_at)
-		VALUES ($1,$2,$3) ON CONFLICT (detector, subject) DO NOTHING`, obs.Detector, obs.Subject, now); err != nil {
+	} else if err != nil {
 		return false, mapDBError(err)
 	}
 	var lastEmit *time.Time
@@ -147,7 +165,7 @@ func (s *Store) ObserveBaseline(ctx context.Context, obs adaptive.BaselineObserv
 }
 
 func (s *Store) observeBaselineOnce(ctx context.Context, obs adaptive.BaselineObservation) (string, error) {
-	tx, err := begin(ctx, s.pool)
+	tx, err := beginResource(ctx, s.pool)
 	if err != nil {
 		return "", mapDBError(err)
 	}

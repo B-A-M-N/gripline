@@ -892,8 +892,10 @@ func withTransactionRetryObserved(ctx context.Context, operation string, fn func
 				switch pgErr.Code {
 				case "40001":
 					metrics.serializationRetries.Add(1)
+					metrics.recordTransactionRetry(operation)
 				case "40P01":
 					metrics.deadlockRetries.Add(1)
+					metrics.recordTransactionRetry(operation)
 				}
 			}
 		}

@@ -4,14 +4,34 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 
 
+def threshold(name: str, default: float) -> float:
+    value = os.environ.get(name, "")
+    return default if value == "" else float(value)
+
+
 def main() -> int:
-    path, minimum_text = sys.argv[1:]
+    args = sys.argv[1:]
+    if len(args) not in (2, 3):
+        raise SystemExit("usage: validate-capacity.py RESULT MIN_RATIO [POSTGRES_METRICS]")
+    path, minimum_text = args[:2]
     minimum = float(minimum_text)
     with open(path, encoding="utf-8") as stream:
         result = json.load(stream)
+    postgres = {}
+    if len(args) == 3:
+        with open(args[2], encoding="utf-8") as stream:
+            postgres = json.load(stream)
+        result["postgres"] = postgres
+
+    min_success_rps = threshold("GRIPLINE_CAPACITY_MIN_SUCCESS_RPS", 10.0)
+    max_p95_ms = threshold("GRIPLINE_CAPACITY_MAX_P95_MS", 5000.0)
+    max_p99_ms = threshold("GRIPLINE_CAPACITY_MAX_P99_MS", 8000.0)
+    max_retries_per_1000 = threshold("GRIPLINE_CAPACITY_MAX_RETRIES_PER_1000", 1000.0)
+    max_deadlocks = threshold("GRIPLINE_CAPACITY_MAX_DEADLOCKS", 0.0)
 
     counts = {
         str(key): int(value)
@@ -43,6 +63,10 @@ def main() -> int:
     failures = []
     if ratio < minimum:
         failures.append(f"success ratio {ratio:.6f} < {minimum:.6f}")
+    if result.get("successful_rps", 0.0) < min_success_rps:
+        failures.append(
+            f"successful RPS {result.get('successful_rps', 0.0):.6f} < {min_success_rps:.6f}"
+        )
     if request_errors:
         failures.append(f"request_error={request_errors}")
     if response_errors:
@@ -56,12 +80,41 @@ def main() -> int:
     latency = result.get("latency", {})
     if not latency.get("all") or not latency.get("successful"):
         failures.append("structured latency is incomplete")
+    successful_latency = latency.get("successful", {})
+    p95_ms = float(successful_latency.get("p95_ms", 0.0))
+    p99_ms = float(successful_latency.get("p99_ms", 0.0))
+    if p95_ms > max_p95_ms:
+        failures.append(f"successful p95 {p95_ms:.3f}ms > {max_p95_ms:.3f}ms")
+    if p99_ms > max_p99_ms:
+        failures.append(f"successful p99 {p99_ms:.3f}ms > {max_p99_ms:.3f}ms")
+    if postgres:
+        serialization_retries = float(postgres.get("serialization_retries", 0))
+        deadlock_retries = float(postgres.get("deadlock_retries", 0))
+        retries_per_1000 = (serialization_retries + deadlock_retries) / total * 1000
+        if retries_per_1000 > max_retries_per_1000:
+            failures.append(
+                f"transaction retries/1000 {retries_per_1000:.3f} > {max_retries_per_1000:.3f}"
+            )
+        if deadlock_retries > max_deadlocks:
+            failures.append(f"deadlock retries {deadlock_retries:.0f} > {max_deadlocks:.0f}")
+        result["qualification"] = {
+            "min_success_rps": min_success_rps,
+            "max_successful_p95_ms": max_p95_ms,
+            "max_successful_p99_ms": max_p99_ms,
+            "max_transaction_retries_per_1000": max_retries_per_1000,
+            "max_deadlocks": max_deadlocks,
+            "transaction_retries_per_1000": retries_per_1000,
+        }
+    with open(path, "w", encoding="utf-8") as stream:
+        json.dump(result, stream, indent=2, sort_keys=True)
+        stream.write("\n")
     if failures:
         raise SystemExit("capacity qualification failed: " + "; ".join(failures))
 
     print(
         f"capacity qualification: total={total} successful={successful} "
-        f"ratio={ratio:.6f} statuses={counts}"
+        f"ratio={ratio:.6f} successful_rps={result.get('successful_rps', 0.0):.6f} "
+        f"p95_ms={p95_ms:.3f} p99_ms={p99_ms:.3f} statuses={counts}"
     )
     return 0
 

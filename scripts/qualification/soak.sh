@@ -272,7 +272,7 @@ for node in a b c; do
 	leak_trends_json+="\"${node}\": {\"rss_kb\": {\"warm_median\": ${rss_warm}, \"final_median\": ${rss_final}, \"slope_per_second\": ${rss_slope}}, \"goroutines\": {\"warm_median\": ${goroutines_warm}, \"final_median\": ${goroutines_final}, \"slope_per_second\": ${goroutines_slope}}, \"heap_alloc_bytes\": {\"warm_median\": ${heap_warm}, \"final_median\": ${heap_final}, \"slope_per_second\": ${heap_slope}}, \"heap_objects\": {\"warm_median\": ${objects_warm}, \"final_median\": ${objects_final}, \"slope_per_second\": ${objects_slope}}}"
 done
 printf 'soak qualification: snapshots=%s max_rss_kb=%s max_goroutines=%s max_heap_bytes=%s max_heap_objects=%s\n' "$(wc -l <"$snapshot_file")" "$max_rss" "$max_goroutines" "$max_heap" "$max_heap_objects"
-if (( duration >= 120 )) && [[ ! -s "$maintenance_file" ]]; then
+if [[ "$external_maintenance_enabled" == 1 ]] && (( duration >= 120 )) && [[ ! -s "$maintenance_file" ]]; then
 	echo "soak qualification: long soak did not execute scheduled maintenance" >&2
 	exit 1
 fi

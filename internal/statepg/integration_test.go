@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1469,6 +1470,234 @@ func TestPostgresSourceScopeEvictsOnlySafeIdleScopes(t *testing.T) {
 	}
 	if newCount != 0 {
 		t.Fatal("overflow source must not consume a bounded source-scope row")
+	}
+}
+
+func TestPostgresSourceScopeConcurrentReuseCannotBeEvicted(t *testing.T) {
+	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("GRIPLINE_TEST_POSTGRES_DSN is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resetIntegrationAuthority(t, ctx, dsn)
+	store, err := Open(ctx, Options{
+		DSN: dsn, NodeID: "source-scope-reuse-race", LeaseTTL: 10 * time.Second,
+		RenewEvery: 2 * time.Second, MaxSourceScopes: 1, SourceScopeIdle: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("open source-scope authority: %v", err)
+	}
+	defer store.Close()
+	if _, err := store.SynchronizeCrypto(ctx, CryptoIdentity{
+		SignerActiveKID: 1, SignerFingerprint: "source-reuse-signer",
+		PepperActiveVersion: 1, PepperFingerprint: "source-reuse-pepper",
+		PseudonymVersion: 0, PseudonymFingerprint: "disabled",
+	}); err != nil {
+		t.Fatalf("synchronize source-scope authority: %v", err)
+	}
+	scope := func(id string) resource.ScopeSpec {
+		return resource.ScopeSpec{Scope: resource.ScopeSource, ID: id, Buckets: resource.BucketSpec{
+			RequestsBurst: resource.BucketConfig{Capacity: 10},
+		}}
+	}
+	first, err := store.Reserve(ctx, resource.ReserveRequest{
+		RequestID: "source-reuse-seed", Scopes: []resource.ScopeSpec{scope("source-reused")},
+		Estimate: resource.UsageEstimate{Requests: 1},
+	})
+	if err != nil {
+		t.Fatalf("seed source scope: %v", err)
+	}
+	first.Release()
+	if _, err := store.pool.Exec(ctx, `UPDATE gripline_resource_source_scopes
+		SET last_used_at=CURRENT_TIMESTAMP - INTERVAL '1 hour' WHERE scope_id='source-reused'`); err != nil {
+		t.Fatalf("age source scope: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE gripline_resource_buckets
+		SET available=0, updated_at=CURRENT_TIMESTAMP
+		WHERE scope=$1 AND scope_id='source-reused' AND dimension=$2`, resource.ScopeSource, resource.DimRequests); err != nil {
+		t.Fatalf("seed spent source balance: %v", err)
+	}
+
+	ownerTx, err := beginResource(ctx, store.pool)
+	if err != nil {
+		t.Fatalf("begin reuse transaction: %v", err)
+	}
+	defer ownerTx.Rollback(ctx)
+	reused, err := store.resolveResourceScope(ctx, ownerTx, scope("source-reused"), time.Now().UTC())
+	if err != nil {
+		t.Fatalf("lock existing source scope: %v", err)
+	}
+	if reused.ID != "source-reused" {
+		t.Fatalf("resolved source=%q, want source-reused", reused.ID)
+	}
+
+	newResult := make(chan struct {
+		resolved resource.ScopeSpec
+		err      error
+	}, 1)
+	go func() {
+		tx, beginErr := beginResource(ctx, store.pool)
+		if beginErr != nil {
+			newResult <- struct {
+				resolved resource.ScopeSpec
+				err      error
+			}{err: beginErr}
+			return
+		}
+		resolved, resolveErr := store.resolveResourceScope(ctx, tx, scope("source-new"), time.Now().UTC())
+		if resolveErr == nil {
+			resolveErr = tx.Commit(ctx)
+		} else {
+			_ = tx.Rollback(ctx)
+		}
+		newResult <- struct {
+			resolved resource.ScopeSpec
+			err      error
+		}{resolved: resolved, err: resolveErr}
+	}()
+
+	select {
+	case result := <-newResult:
+		if result.err != nil {
+			t.Fatalf("concurrent new source resolution: %v", result.err)
+		}
+		if !strings.HasPrefix(result.resolved.ID, "__source_overflow_") {
+			t.Fatalf("new source resolved to %q, want bounded overflow while reused source is locked", result.resolved.ID)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("new source resolution did not complete while reused source was locked")
+	}
+
+	row, err := store.loadResourceBucket(ctx, ownerTx, reused, resource.DimRequests, resource.BucketConfig{Capacity: 10}, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("reload reused source bucket: %v", err)
+	}
+	if row.available != 0 {
+		t.Fatalf("reused source balance=%v, want spent balance preserved", row.available)
+	}
+	if err := ownerTx.Commit(ctx); err != nil {
+		t.Fatalf("commit reused source transaction: %v", err)
+	}
+
+	var sourceCount int
+	var bucketBalance float64
+	if err := store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_resource_source_scopes WHERE scope_id='source-reused'`).Scan(&sourceCount); err != nil {
+		t.Fatalf("count reused source: %v", err)
+	}
+	if err := store.pool.QueryRow(ctx, `SELECT available FROM gripline_resource_buckets
+		WHERE scope=$1 AND scope_id='source-reused' AND dimension=$2`, resource.ScopeSource, resource.DimRequests).Scan(&bucketBalance); err != nil {
+		t.Fatalf("read reused source balance: %v", err)
+	}
+	if sourceCount != 1 || bucketBalance != 0 {
+		t.Fatalf("reused source count=%v balance=%v, want count=1 balance=0", sourceCount, bucketBalance)
+	}
+}
+
+func TestPostgresNodeOwnershipSharedLocksAndReplacementFencing(t *testing.T) {
+	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("GRIPLINE_TEST_POSTGRES_DSN is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resetIntegrationAuthority(t, ctx, dsn)
+	const nodeID = "membership-shared-locks"
+	old := openIntegrationStore(t, ctx, dsn, nodeID)
+	defer old.Close()
+	if _, err := old.SynchronizeCrypto(ctx, CryptoIdentity{
+		SignerActiveKID: 1, SignerFingerprint: "membership-shared-signer",
+		PepperActiveVersion: 1, PepperFingerprint: "membership-shared-pepper",
+		PseudonymVersion: 0, PseudonymFingerprint: "disabled",
+	}); err != nil {
+		t.Fatalf("synchronize ownership test node: %v", err)
+	}
+	close(old.membershipStop)
+	<-old.membershipDone
+
+	firstTx, err := begin(ctx, old.pool)
+	if err != nil {
+		t.Fatalf("begin first owner transaction: %v", err)
+	}
+	defer firstTx.Rollback(ctx)
+	if err := old.requireNodeOwnership(ctx, firstTx, false); err != nil {
+		t.Fatalf("first owner lock: %v", err)
+	}
+	secondTx, err := begin(ctx, old.pool)
+	if err != nil {
+		t.Fatalf("begin second owner transaction: %v", err)
+	}
+	secondResult := make(chan error, 1)
+	go func() {
+		secondResult <- old.requireNodeOwnership(ctx, secondTx, false)
+	}()
+	select {
+	case err := <-secondResult:
+		if err != nil {
+			t.Fatalf("second current-owner lock: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second current-owner transaction blocked behind shared ownership lock")
+	}
+	if err := secondTx.Rollback(ctx); err != nil {
+		t.Fatalf("rollback second owner transaction: %v", err)
+	}
+	if err := firstTx.Rollback(ctx); err != nil {
+		t.Fatalf("rollback first owner transaction: %v", err)
+	}
+
+	if _, err := old.pool.Exec(ctx, `UPDATE gripline_membership SET last_seen_at=CURRENT_TIMESTAMP - INTERVAL '1 hour' WHERE node_id=$1`, nodeID); err != nil {
+		t.Fatalf("expire old membership: %v", err)
+	}
+	ownerTx, err := begin(ctx, old.pool)
+	if err != nil {
+		t.Fatalf("begin fenced owner transaction: %v", err)
+	}
+	defer ownerTx.Rollback(ctx)
+	var lockedNode string
+	if err := ownerTx.QueryRow(ctx, `SELECT node_id FROM gripline_membership WHERE node_id=$1 FOR SHARE`, nodeID).Scan(&lockedNode); err != nil {
+		t.Fatalf("hold old membership share lock: %v", err)
+	}
+
+	replacementResult := make(chan struct {
+		store *Store
+		err   error
+	}, 1)
+	go func() {
+		replacement, openErr := Open(ctx, Options{DSN: dsn, NodeID: nodeID, LeaseTTL: 10 * time.Second, RenewEvery: 2 * time.Second, MaxSourceScopes: 64})
+		replacementResult <- struct {
+			store *Store
+			err   error
+		}{store: replacement, err: openErr}
+	}()
+	select {
+	case result := <-replacementResult:
+		if result.store != nil {
+			result.store.Close()
+		}
+		t.Fatal("replacement advanced node epoch while old owner held a share lock")
+	case <-time.After(250 * time.Millisecond):
+	}
+	if err := ownerTx.Commit(ctx); err != nil {
+		t.Fatalf("commit old owner share lock: %v", err)
+	}
+	result := <-replacementResult
+	if result.err != nil {
+		t.Fatalf("replacement registration after owner commit: %v", result.err)
+	}
+	replacement := result.store
+	defer replacement.Close()
+	if replacement.nodeEpoch <= old.nodeEpoch {
+		t.Fatalf("replacement epoch=%d did not advance old epoch=%d", replacement.nodeEpoch, old.nodeEpoch)
+	}
+
+	nextTx, err := begin(ctx, old.pool)
+	if err != nil {
+		t.Fatalf("begin fenced follow-up transaction: %v", err)
+	}
+	defer nextTx.Rollback(ctx)
+	if err := old.requireNodeOwnership(ctx, nextTx, false); !errors.Is(err, ErrNodeFenced) {
+		t.Fatalf("old owner follow-up error=%v, want ErrNodeFenced", err)
 	}
 }
 
