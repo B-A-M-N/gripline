@@ -36,6 +36,7 @@ import (
 	"github.com/B-A-M-N/gripline/internal/statebolt"
 	"github.com/B-A-M-N/gripline/internal/statepg"
 	"github.com/B-A-M-N/gripline/internal/terminator"
+	"golang.org/x/term"
 )
 
 // runMigrateCLI is deliberately separate from the serving runtime. The
@@ -48,8 +49,12 @@ func runMigrateCLI(args []string) error {
 	fs := flag.NewFlagSet("migrate", flag.ContinueOnError)
 	cfgPath := fs.String("config", "/etc/gripline/config.json", "path to the deployment configuration")
 	migrationTimeout := fs.Duration("timeout", 5*time.Minute, "maximum time for schema inspection or migration")
+	output := fs.String("output", "", "output format: table, json, or jsonl")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
+	}
+	if _, err := parseCLIOutput(*output); err != nil {
+		return fmt.Errorf("migrate: %w", err)
 	}
 	if *migrationTimeout <= 0 {
 		return fmt.Errorf("migrate: --timeout must be positive")
@@ -117,8 +122,13 @@ func runPolicyCLI(args []string) error {
 	if args[0] == "verify" {
 		fs := flag.NewFlagSet("policy verify", flag.ContinueOnError)
 		cfgPath := fs.String("config", "/etc/gripline/config.json", "path to the deployment configuration")
+		output := fs.String("output", "table", "output format: table, json, or jsonl")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
+		}
+		format, err := parseCLIOutput(*output)
+		if err != nil {
+			return fmt.Errorf("policy verify: %w", err)
 		}
 		cfg, err := config.Load(*cfgPath)
 		if err != nil {
@@ -132,7 +142,13 @@ func runPolicyCLI(args []string) error {
 		if err != nil {
 			return fmt.Errorf("policy verify: %w", err)
 		}
-		fmt.Printf("policy verified: %s revision=%d digest=%s\n", pol.ID, pol.Revision, digest)
+		if format == outputTable {
+			fmt.Printf("policy verified: %s revision=%d digest=%s\n", pol.ID, pol.Revision, digest)
+		} else {
+			if err := encodeCLIOutput(format, map[string]any{"id": pol.ID, "revision": pol.Revision, "digest": digest}); err != nil {
+				return err
+			}
+		}
 		return errSubcommand
 	}
 	fs := flag.NewFlagSet("policy", flag.ContinueOnError)
@@ -143,8 +159,13 @@ func runPolicyCLI(args []string) error {
 	operationID := fs.String("operation-id", "", "stable Idempotency-Key for retrying the lifecycle mutation")
 	token := fs.String("token", "", "operator token (env GRIPLINE_OPERATOR_TOKEN)")
 	tokenFile := fs.String("token-file", "", "read the operator token from this file")
+	output := fs.String("output", "", "output format: table, json, or jsonl")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
+	}
+	format, err := parseCLIOutput(*output)
+	if err != nil {
+		return fmt.Errorf("policy: %w", err)
 	}
 	tok, err := operatorTokenFromFile(*token, *tokenFile)
 	if err != nil {
@@ -163,9 +184,10 @@ func runPolicyCLI(args []string) error {
 		if err := client.request(http.MethodGet, "/admin/policy", tok, nil, &status); err != nil {
 			return fmt.Errorf("policy status: %w", err)
 		}
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		if err := enc.Encode(status); err != nil {
+		if format == outputTable || format == "" {
+			return printPolicyStatusTable(status)
+		}
+		if err := encodeCLIOutput(format, status); err != nil {
 			return err
 		}
 	case "prepare":
@@ -185,6 +207,9 @@ func runPolicyCLI(args []string) error {
 		}, &result); err != nil {
 			return fmt.Errorf("policy prepare: %w", err)
 		}
+		if format == outputJSON || format == outputJSONL {
+			return encodeCLIOutput(format, result)
+		}
 		fmt.Printf("policy candidate prepared\n")
 	case "activate":
 		if strings.TrimSpace(*reason) == "" {
@@ -193,6 +218,9 @@ func runPolicyCLI(args []string) error {
 		if err := client.requestWithOperationID(http.MethodPost, "/admin/policy/activate", tok, *operationID, map[string]string{"reason": *reason}, nil); err != nil {
 			return fmt.Errorf("policy activate: %w", err)
 		}
+		if format == outputJSON || format == outputJSONL {
+			return encodeCLIOutput(format, map[string]string{"result": "policy candidate activated"})
+		}
 		fmt.Println("policy candidate activated")
 	case "rollback":
 		if *revision < 1 || strings.TrimSpace(*reason) == "" {
@@ -200,6 +228,9 @@ func runPolicyCLI(args []string) error {
 		}
 		if err := client.requestWithOperationID(http.MethodPost, "/admin/policy/rollback", tok, *operationID, map[string]any{"revision": *revision, "reason": *reason}, nil); err != nil {
 			return fmt.Errorf("policy rollback: %w", err)
+		}
+		if format == outputJSON || format == outputJSONL {
+			return encodeCLIOutput(format, map[string]any{"result": "policy rolled back", "revision": *revision})
 		}
 		fmt.Printf("policy rolled back to revision %d\n", *revision)
 	default:
@@ -245,36 +276,88 @@ func runCryptoCLI(args []string) error {
 	operationID := fs.String("operation-id", "", "stable Idempotency-Key for retrying the activation")
 	token := fs.String("token", "", "operator token (env GRIPLINE_OPERATOR_TOKEN)")
 	tokenFile := fs.String("token-file", "", "read the operator token from this file")
+	output := fs.String("output", "table", "output format: table, json, or jsonl")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
+	}
+	format, err := parseCLIOutput(*output)
+	if err != nil {
+		return fmt.Errorf("crypto %s: %w", action, err)
 	}
 	tok, err := operatorTokenFromFile(*token, *tokenFile)
 	if err != nil {
 		return err
 	}
-	if tok == "" || strings.TrimSpace(*kind) == "" || *generation < 1 || strings.TrimSpace(*fingerprint) == "" || strings.TrimSpace(*reason) == "" || strings.TrimSpace(*operationID) == "" {
-		return fmt.Errorf("crypto %s: --kind, --generation, --fingerprint, --reason, --operation-id, and --token (or --token-file/GRIPLINE_OPERATOR_TOKEN) are required", action)
+	if tok == "" {
+		return fmt.Errorf("crypto %s: no operator credential found; set GRIPLINE_OPERATOR_TOKEN, GRIPLINE_OPERATOR_TOKEN_FILE, or pass --token-file", action)
 	}
-	body := map[string]any{"kind": *kind, "generation": *generation, "fingerprint": *fingerprint, "reason": *reason}
-	endpoint := "/admin/crypto/activate"
-	if action == "retire" {
-		parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(*notBefore))
-		if err != nil {
-			return fmt.Errorf("crypto retire: --not-before must be RFC3339: %w", err)
-		}
-		body["not_before"] = parsed.UTC()
-		endpoint = "/admin/crypto/retire"
+	if strings.TrimSpace(*kind) == "" || *generation < 1 || strings.TrimSpace(*reason) == "" {
+		return fmt.Errorf("crypto %s: usage is `gripline crypto %s <kind> <generation> -r <reason>`", action, action)
+	}
+	operation, err := newOperationID(*operationID)
+	if err != nil {
+		return err
 	}
 	client, err := newAdminClient(*cfgPath)
 	if err != nil {
 		return err
 	}
-	var result map[string]any
-	if err := client.requestWithOperationID(http.MethodPost, endpoint, tok, *operationID, body, &result); err != nil {
+	resolved, err := resolveCryptoGeneration(context.Background(), client, tok, *kind, *generation)
+	if err != nil {
 		return fmt.Errorf("crypto %s: %w", action, err)
 	}
-	fmt.Printf("%s %s generation %d\n", action, *kind, *generation)
+	if strings.TrimSpace(*fingerprint) != "" && *fingerprint != resolved.Fingerprint {
+		return fmt.Errorf("crypto %s: explicit fingerprint does not match authoritative %s/%d fingerprint", action, *kind, *generation)
+	}
+	*fingerprint = resolved.Fingerprint
+	body := map[string]any{"kind": *kind, "generation": *generation, "fingerprint": *fingerprint, "reason": *reason}
+	endpoint := "/admin/crypto/activate"
+	if action == "retire" {
+		if strings.TrimSpace(*notBefore) != "" {
+			parsed, parseErr := time.Parse(time.RFC3339, strings.TrimSpace(*notBefore))
+			if parseErr != nil {
+				return fmt.Errorf("crypto retire: --not-before must be RFC3339: %w", parseErr)
+			}
+			body["not_before"] = parsed.UTC()
+		}
+		endpoint = "/admin/crypto/retire"
+	}
+	var result map[string]any
+	if err := client.requestWithOperationID(http.MethodPost, endpoint, tok, operation, body, &result); err != nil {
+		return fmt.Errorf("crypto %s: %w", action, err)
+	}
+	if format == outputJSON || format == outputJSONL {
+		if err := encodeCLIOutput(format, result); err != nil {
+			return err
+		}
+	} else {
+		fmt.Printf("%s %s generation %d\n", action, *kind, *generation)
+	}
 	return nil
+}
+
+func resolveCryptoGeneration(ctx context.Context, client *adminClient, token, kind string, generation int) (statepg.ClusterCryptoGenerationStatus, error) {
+	if client == nil {
+		return statepg.ClusterCryptoGenerationStatus{}, errors.New("crypto authority client unavailable")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var status struct {
+		Crypto statepg.ClusterCryptoStatus `json:"crypto"`
+	}
+	if err := client.request(http.MethodGet, "/admin/crypto", token, nil, &status); err != nil {
+		return statepg.ClusterCryptoGenerationStatus{}, err
+	}
+	for _, candidate := range status.Crypto.Generations {
+		if candidate.Kind == kind && candidate.Generation == generation {
+			if strings.TrimSpace(candidate.Fingerprint) == "" {
+				return statepg.ClusterCryptoGenerationStatus{}, fmt.Errorf("generation %s/%d has no authoritative fingerprint", kind, generation)
+			}
+			return candidate, nil
+		}
+	}
+	return statepg.ClusterCryptoGenerationStatus{}, fmt.Errorf("generation %s/%d is not present in the authoritative crypto status", kind, generation)
 }
 
 // runCryptoSignerPrepareCLI creates one durable local candidate. In a cluster
@@ -285,8 +368,12 @@ func runCryptoSignerPrepareCLI(args []string) error {
 	fs := flag.NewFlagSet("crypto signer-prepare", flag.ContinueOnError)
 	cfgPath := fs.String("config", "/etc/gripline/config.json", "path to the deployment configuration")
 	offline := fs.Bool("offline", false, "confirm the serving deployment is stopped")
+	output := fs.String("output", "", "output format: table, json, or jsonl")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if _, err := parseCLIOutput(*output); err != nil {
+		return fmt.Errorf("crypto signer-prepare: %w", err)
 	}
 	if !*offline {
 		return fmt.Errorf("crypto signer-prepare: --offline is required; prepare and distribute keyrings while the cluster is stopped")
@@ -319,8 +406,13 @@ func runRemoteStatusCLI(command, endpoint string, args []string) error {
 	cfgPath := fs.String("config", "/etc/gripline/config.json", "path to the deployment configuration")
 	token := fs.String("token", "", "operator token (env GRIPLINE_OPERATOR_TOKEN)")
 	tokenFile := fs.String("token-file", "", "read the operator token from this file")
+	output := fs.String("output", "", "output format: table, json, or jsonl")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	format, err := parseCLIOutput(*output)
+	if err != nil {
+		return fmt.Errorf("%s: %w", command, err)
 	}
 	tok, err := operatorTokenFromFile(*token, *tokenFile)
 	if err != nil {
@@ -337,9 +429,7 @@ func runRemoteStatusCLI(command, endpoint string, args []string) error {
 	if err := client.request(http.MethodGet, endpoint, tok, nil, &status); err != nil {
 		return fmt.Errorf("%s: %w", command, err)
 	}
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(status); err != nil {
+	if err := encodeRemoteStatus(format, command, status); err != nil {
 		return err
 	}
 	return nil
@@ -350,7 +440,7 @@ func runCredentialCLI(args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("credential: expected 'list', 'add', or 'revoke' (use --token-file; add --offline only for stopped maintenance)")
 	}
-	fs := flag.NewFlagSet("credential", flag.ExitOnError)
+	fs := flag.NewFlagSet("credential", flag.ContinueOnError)
 	cfgPath := fs.String("config", "/etc/gripline/config.json", "path to the deployment configuration")
 	credID := fs.String("id", "", "credential id (revoke)")
 	reason := fs.String("reason", "", "audit reason (revoke, required)")
@@ -358,13 +448,19 @@ func runCredentialCLI(args []string) error {
 	account := fs.String("account", "", "account id (add, required)")
 	policyID := fs.String("policy", "", "policy id (add; defaults to the active policy)")
 	planID := fs.String("plan", "plan-default", "plan id (add)")
-	secretStdin := fs.Bool("secret-stdin", false, "read the raw credential from stdin (add, required)")
+	secretStdin := fs.Bool("secret-stdin", false, "deprecated compatibility flag; stdin is detected automatically")
+	secretFile := fs.String("secret-file", "", "read the raw credential from this file (add)")
 	token := fs.String("token", "", "operator token (env GRIPLINE_OPERATOR_TOKEN)")
 	tokenFile := fs.String("token-file", "", "read the operator token from this file")
 	offline := fs.Bool("offline", false, "operate directly on a stopped state database")
+	output := fs.String("output", "table", "output format: table, json, or jsonl")
 	switch args[0] {
 	case "list":
 		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		format, err := parseCLIOutput(*output)
+		if err != nil {
 			return err
 		}
 		tok, err := operatorTokenFromFile(*token, *tokenFile)
@@ -374,9 +470,13 @@ func runCredentialCLI(args []string) error {
 		if *offline {
 			return runCredentialList(*cfgPath)
 		}
-		return runCredentialListLive(*cfgPath, tok)
+		return runCredentialListLiveWithOutput(*cfgPath, tok, format)
 	case "pepper-status":
 		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		format, err := parseCLIOutput(*output)
+		if err != nil {
 			return err
 		}
 		tok, err := operatorTokenFromFile(*token, *tokenFile)
@@ -386,9 +486,13 @@ func runCredentialCLI(args []string) error {
 		if *offline {
 			return fmt.Errorf("credential pepper-status: offline mode is not supported; use the authenticated live authority")
 		}
-		return runCredentialPepperStatusLive(*cfgPath, tok)
+		return runCredentialPepperStatusLiveWithOutput(*cfgPath, tok, format)
 	case "revoke":
 		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		format, err := parseCLIOutput(*output)
+		if err != nil {
 			return err
 		}
 		tok, err := operatorTokenFromFile(*token, *tokenFile)
@@ -398,19 +502,21 @@ func runCredentialCLI(args []string) error {
 		if *offline {
 			return runCredentialRevoke(*cfgPath, *credID, *reason, tok)
 		}
-		return runCredentialRevokeLiveWithOperationID(*cfgPath, *credID, *reason, tok, *operationID)
+		return runCredentialRevokeLiveWithOperationIDAndOutput(*cfgPath, *credID, *reason, tok, *operationID, format)
 	case "add":
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
-		if !*secretStdin {
-			return fmt.Errorf("credential add: --secret-stdin is required; raw secrets are never accepted as flags")
+		format, err := parseCLIOutput(*output)
+		if err != nil {
+			return err
 		}
+		_ = *secretStdin
 		tok, err := operatorTokenFromFile(*token, *tokenFile)
 		if err != nil {
 			return err
 		}
-		return runCredentialAddLiveWithOperationID(*cfgPath, *credID, *account, *policyID, *planID, *reason, tok, *operationID)
+		return runCredentialAddLiveWithOperationIDAndSecretFileAndOutput(*cfgPath, *credID, *account, *policyID, *planID, *reason, tok, *operationID, *secretFile, format)
 	default:
 		return fmt.Errorf("credential: unknown action %q (expected list|pepper-status|add|revoke)", args[0])
 	}
@@ -421,7 +527,7 @@ func runLaneCLI(args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("lane: expected 'list' or 'unblock' (use --token-file; add --offline only for stopped maintenance)")
 	}
-	fs := flag.NewFlagSet("lane", flag.ExitOnError)
+	fs := flag.NewFlagSet("lane", flag.ContinueOnError)
 	cfgPath := fs.String("config", "/etc/gripline/config.json", "path to the deployment configuration")
 	credID := fs.String("credential", "", "credential id (required)")
 	laneID := fs.String("id", "", "lane id (unblock)")
@@ -430,7 +536,12 @@ func runLaneCLI(args []string) error {
 	token := fs.String("token", "", "operator token (env GRIPLINE_OPERATOR_TOKEN)")
 	tokenFile := fs.String("token-file", "", "read the operator token from this file")
 	offline := fs.Bool("offline", false, "operate directly on a stopped state database")
+	output := fs.String("output", "table", "output format: table, json, or jsonl")
 	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	format, err := parseCLIOutput(*output)
+	if err != nil {
 		return err
 	}
 	switch args[0] {
@@ -445,8 +556,12 @@ func runLaneCLI(args []string) error {
 		if *offline {
 			return runLaneList(*cfgPath, *credID)
 		}
-		return runLaneListLive(*cfgPath, *credID, tok)
+		return runLaneListLiveWithOutput(*cfgPath, *credID, tok, format)
 	case "unblock":
+		format, err := parseCLIOutput(*output)
+		if err != nil {
+			return err
+		}
 		tok, err := operatorTokenFromFile(*token, *tokenFile)
 		if err != nil {
 			return err
@@ -454,7 +569,7 @@ func runLaneCLI(args []string) error {
 		if *offline {
 			return runLaneUnblock(*cfgPath, *credID, *laneID, *reason, tok)
 		}
-		return runLaneUnblockLiveWithOperationID(*cfgPath, *credID, *laneID, *reason, tok, *operationID)
+		return runLaneUnblockLiveWithOperationIDAndOutput(*cfgPath, *credID, *laneID, *reason, tok, *operationID, format)
 	default:
 		return fmt.Errorf("lane: unknown action %q (expected list|unblock)", args[0])
 	}
@@ -462,7 +577,13 @@ func runLaneCLI(args []string) error {
 
 func operatorTokenFromFile(flagValue, path string) (string, error) {
 	if flagValue != "" {
-		return flagValue, nil
+		return strings.TrimSpace(flagValue), nil
+	}
+	if path == "" {
+		if token := strings.TrimSpace(os.Getenv("GRIPLINE_OPERATOR_TOKEN")); token != "" {
+			return token, nil
+		}
+		path = strings.TrimSpace(os.Getenv("GRIPLINE_OPERATOR_TOKEN_FILE"))
 	}
 	if path != "" {
 		b, err := os.ReadFile(path) // #nosec G304 -- token file path is an explicit operator input.
@@ -471,7 +592,7 @@ func operatorTokenFromFile(flagValue, path string) (string, error) {
 		}
 		return strings.TrimSpace(string(b)), nil
 	}
-	return os.Getenv("GRIPLINE_OPERATOR_TOKEN"), nil
+	return strings.TrimSpace(os.Getenv("GRIPLINE_OPERATOR_TOKEN")), nil
 }
 
 type adminClient struct {
@@ -487,9 +608,17 @@ func newAdminClient(cfgPath string) (*adminClient, error) {
 	if cfg.Admin == nil || cfg.Admin.Listen == "" {
 		return nil, fmt.Errorf("deployment has no private admin listener configured")
 	}
+	timeout := 30 * time.Second
+	if raw := strings.TrimSpace(os.Getenv("GRIPLINE_CLI_TIMEOUT")); raw != "" {
+		parsed, parseErr := time.ParseDuration(raw)
+		if parseErr != nil || parsed <= 0 {
+			return nil, fmt.Errorf("invalid GRIPLINE_CLI_TIMEOUT %q", raw)
+		}
+		timeout = parsed
+	}
 	return &adminClient{
 		base:   "http://" + cfg.Admin.Listen,
-		client: &http.Client{Timeout: 30 * time.Second},
+		client: &http.Client{Timeout: timeout},
 	}, nil
 }
 
@@ -498,48 +627,75 @@ func (c *adminClient) request(method, path, token string, body any, out any) err
 }
 
 func (c *adminClient) requestWithOperationID(method, path, token, operationID string, body any, out any) error {
-	var reader io.Reader
+	var data []byte
 	if body != nil {
-		data, err := json.Marshal(body)
+		var err error
+		data, err = json.Marshal(body)
 		if err != nil {
 			return err
 		}
-		reader = bytes.NewReader(data)
 	}
-	req, err := http.NewRequest(method, c.base+path, reader)
-	if err != nil {
-		return err
-	}
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
+	attempts := 1
 	if operationID != "" {
-		req.Header.Set("Idempotency-Key", operationID)
+		// A transport error leaves commit status ambiguous. A stable operation
+		// ID makes one bounded retry safe; responses are never retried because
+		// the server has already made the outcome observable.
+		attempts = 2
 	}
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("admin request: %w", err)
-	}
-	defer resp.Body.Close()
-	data, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if readErr != nil {
-		return fmt.Errorf("admin response: %w", readErr)
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("admin request %s %s: %s", method, path, strings.TrimSpace(string(data)))
-	}
-	if out != nil && len(data) > 0 {
-		if err := json.Unmarshal(data, out); err != nil {
-			return fmt.Errorf("admin response: decode: %w", err)
+	for attempt := 0; attempt < attempts; attempt++ {
+		var reader io.Reader
+		if body != nil {
+			reader = bytes.NewReader(data)
 		}
+		req, err := http.NewRequest(method, c.base+path, reader)
+		if err != nil {
+			return err
+		}
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		if operationID != "" {
+			req.Header.Set("Idempotency-Key", operationID)
+		}
+		resp, err := c.client.Do(req)
+		if err != nil {
+			if attempt+1 < attempts {
+				continue
+			}
+			if operationID != "" {
+				return fmt.Errorf("request outcome is uncertain; operation ID: %s; re-run with --operation-id %s: %w", operationID, operationID, err)
+			}
+			return fmt.Errorf("admin request: %w", err)
+		}
+		responseData, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		closeErr := resp.Body.Close()
+		if readErr != nil {
+			return fmt.Errorf("admin response: %w", readErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("admin response close: %w", closeErr)
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return fmt.Errorf("admin request %s %s: %s", method, path, strings.TrimSpace(string(responseData)))
+		}
+		if out != nil && len(responseData) > 0 {
+			if err := json.Unmarshal(responseData, out); err != nil {
+				return fmt.Errorf("admin response: decode: %w", err)
+			}
+		}
+		return nil
 	}
-	return nil
+	return fmt.Errorf("admin request failed")
 }
 
 func runCredentialListLive(cfgPath, token string) error {
+	return runCredentialListLiveWithOutput(cfgPath, token, outputTable)
+}
+
+func runCredentialListLiveWithOutput(cfgPath, token string, format outputFormat) error {
 	if token == "" {
 		return fmt.Errorf("credential list: --token (or GRIPLINE_OPERATOR_TOKEN) is required")
 	}
@@ -551,6 +707,9 @@ func runCredentialListLive(cfgPath, token string) error {
 	if err := c.request(http.MethodGet, "/admin/credentials", token, nil, &rows); err != nil {
 		return fmt.Errorf("credential list: %w", err)
 	}
+	if format == outputJSON || format == outputJSONL {
+		return encodeCLIOutputRows(format, rows)
+	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(w, "CREDENTIAL\tACCOUNT\tSTATUS\tPOLICY\tCREATED\tREV")
 	for _, s := range rows {
@@ -560,6 +719,10 @@ func runCredentialListLive(cfgPath, token string) error {
 }
 
 func runCredentialPepperStatusLive(cfgPath, token string) error {
+	return runCredentialPepperStatusLiveWithOutput(cfgPath, token, outputTable)
+}
+
+func runCredentialPepperStatusLiveWithOutput(cfgPath, token string, format outputFormat) error {
 	if token == "" {
 		return fmt.Errorf("credential pepper-status: --token (or GRIPLINE_OPERATOR_TOKEN) is required")
 	}
@@ -580,6 +743,9 @@ func runCredentialPepperStatusLive(cfgPath, token string) error {
 		versions = append(versions, version)
 	}
 	sort.Ints(versions)
+	if format == outputJSON || format == outputJSONL {
+		return encodeCLIOutput(format, counts)
+	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(w, "VERSION\tCREDENTIALS")
 	for _, version := range versions {
@@ -589,6 +755,10 @@ func runCredentialPepperStatusLive(cfgPath, token string) error {
 }
 
 func runCredentialRevokeLiveWithOperationID(cfgPath, credID, reason, token, operationID string) error {
+	return runCredentialRevokeLiveWithOperationIDAndOutput(cfgPath, credID, reason, token, operationID, outputTable)
+}
+
+func runCredentialRevokeLiveWithOperationIDAndOutput(cfgPath, credID, reason, token, operationID string, format outputFormat) error {
 	if credID == "" || reason == "" || token == "" {
 		return fmt.Errorf("credential revoke: --id, --reason, and --token (or GRIPLINE_OPERATOR_TOKEN) are required")
 	}
@@ -601,6 +771,9 @@ func runCredentialRevokeLiveWithOperationID(cfgPath, credID, reason, token, oper
 	}, nil); err != nil {
 		return fmt.Errorf("credential revoke: %w", err)
 	}
+	if format == outputJSON || format == outputJSONL {
+		return encodeCLIOutput(format, map[string]string{"result": "revoked", "credential_id": credID})
+	}
 	fmt.Printf("revoked %s (mutation + audit committed atomically)\n", credID)
 	return nil
 }
@@ -609,7 +782,33 @@ func runCredentialAddLive(cfgPath, credID, accountID, policyID, planID, reason, 
 	return runCredentialAddLiveWithOperationID(cfgPath, credID, accountID, policyID, planID, reason, token, "")
 }
 
+func readCredentialInput(secretFile string) ([]byte, error) {
+	if strings.TrimSpace(secretFile) != "" {
+		file, err := os.Open(secretFile) // #nosec G304 -- the operator explicitly supplied the secret file.
+		if err != nil {
+			return nil, err
+		}
+		defer file.Close()
+		return io.ReadAll(io.LimitReader(file, terminator.MaxExternalCredentialBytes+1))
+	}
+	if info, err := os.Stdin.Stat(); err == nil && info.Mode()&os.ModeCharDevice != 0 && term.IsTerminal(int(os.Stdin.Fd())) {
+		fmt.Fprint(os.Stderr, "External credential: ")
+		secret, readErr := term.ReadPassword(int(os.Stdin.Fd()))
+		fmt.Fprintln(os.Stderr)
+		return secret, readErr
+	}
+	return io.ReadAll(io.LimitReader(os.Stdin, terminator.MaxExternalCredentialBytes+1))
+}
+
 func runCredentialAddLiveWithOperationID(cfgPath, credID, accountID, policyID, planID, reason, token, operationID string) error {
+	return runCredentialAddLiveWithOperationIDAndSecretFileAndOutput(cfgPath, credID, accountID, policyID, planID, reason, token, operationID, "", outputTable)
+}
+
+func runCredentialAddLiveWithOperationIDAndSecretFile(cfgPath, credID, accountID, policyID, planID, reason, token, operationID, secretFile string) error {
+	return runCredentialAddLiveWithOperationIDAndSecretFileAndOutput(cfgPath, credID, accountID, policyID, planID, reason, token, operationID, secretFile, outputTable)
+}
+
+func runCredentialAddLiveWithOperationIDAndSecretFileAndOutput(cfgPath, credID, accountID, policyID, planID, reason, token, operationID, secretFile string, format outputFormat) error {
 	if credID == "" || accountID == "" || planID == "" || reason == "" || token == "" {
 		return fmt.Errorf("credential add: --id, --account, --reason, and --token (or --token-file/GRIPLINE_OPERATOR_TOKEN) are required")
 	}
@@ -670,9 +869,9 @@ func runCredentialAddLiveWithOperationID(cfgPath, credID, accountID, policyID, p
 	if _, ok := peppers.VersionFingerprint(pepperVersion); !ok {
 		return fmt.Errorf("credential add: active pepper generation %d is not loaded locally", pepperVersion)
 	}
-	raw, err := io.ReadAll(io.LimitReader(os.Stdin, terminator.MaxExternalCredentialBytes+1))
+	raw, err := readCredentialInput(secretFile)
 	if err != nil {
-		return fmt.Errorf("credential add: read --secret-stdin: %w", err)
+		return fmt.Errorf("credential add: read external credential: %w", err)
 	}
 	defer func() {
 		for i := range raw {
@@ -706,6 +905,9 @@ func runCredentialAddLiveWithOperationID(cfgPath, credID, accountID, policyID, p
 	}, nil); err != nil {
 		return fmt.Errorf("credential add: %w", err)
 	}
+	if format == outputJSON || format == outputJSONL {
+		return encodeCLIOutput(format, map[string]string{"result": "added", "credential_id": credID})
+	}
 	fmt.Printf("added %s (verifier derived locally; raw secret not sent)\n", credID)
 	return nil
 }
@@ -722,6 +924,10 @@ type adminLaneSummary struct {
 }
 
 func runLaneListLive(cfgPath, credID, token string) error {
+	return runLaneListLiveWithOutput(cfgPath, credID, token, outputTable)
+}
+
+func runLaneListLiveWithOutput(cfgPath, credID, token string, format outputFormat) error {
 	if credID == "" || token == "" {
 		return fmt.Errorf("lane list: --credential and --token (or GRIPLINE_OPERATOR_TOKEN) are required")
 	}
@@ -732,6 +938,9 @@ func runLaneListLive(cfgPath, credID, token string) error {
 	var rows []adminLaneSummary
 	if err := c.request(http.MethodGet, "/admin/lanes?credential="+url.QueryEscape(credID), token, nil, &rows); err != nil {
 		return fmt.Errorf("lane list: %w", err)
+	}
+	if format == outputJSON || format == outputJSONL {
+		return encodeCLIOutputRows(format, rows)
 	}
 	if len(rows) == 0 {
 		fmt.Printf("no lanes for credential %s\n", credID)
@@ -746,6 +955,10 @@ func runLaneListLive(cfgPath, credID, token string) error {
 }
 
 func runLaneUnblockLiveWithOperationID(cfgPath, credID, laneID, reason, token, operationID string) error {
+	return runLaneUnblockLiveWithOperationIDAndOutput(cfgPath, credID, laneID, reason, token, operationID, outputTable)
+}
+
+func runLaneUnblockLiveWithOperationIDAndOutput(cfgPath, credID, laneID, reason, token, operationID string, format outputFormat) error {
 	if credID == "" || laneID == "" || reason == "" || token == "" {
 		return fmt.Errorf("lane unblock: --credential, --id, --reason, and --token (or GRIPLINE_OPERATOR_TOKEN) are required")
 	}
@@ -758,6 +971,9 @@ func runLaneUnblockLiveWithOperationID(cfgPath, credID, laneID, reason, token, o
 	}, nil); err != nil {
 		return fmt.Errorf("lane unblock: %w", err)
 	}
+	if format == outputJSON || format == outputJSONL {
+		return encodeCLIOutput(format, map[string]string{"result": "unblocked", "credential_id": credID, "lane_id": laneID})
+	}
 	fmt.Printf("unblocked %s/%s (mutation + audit committed atomically)\n", credID, laneID)
 	return nil
 }
@@ -769,11 +985,16 @@ func runAuditCLI(args []string) error {
 	if len(args) == 0 || (args[0] != "list" && args[0] != "export") {
 		return fmt.Errorf("audit: expected list, export, or security list|export")
 	}
-	fs := flag.NewFlagSet("audit", flag.ExitOnError)
+	fs := flag.NewFlagSet("audit", flag.ContinueOnError)
 	cfgPath := fs.String("config", "/etc/gripline/config.json", "path to deployment configuration")
 	token := fs.String("token", "", "operator token (env GRIPLINE_OPERATOR_TOKEN)")
 	tokenFile := fs.String("token-file", "", "read the operator token from this file")
+	output := fs.String("output", "table", "output format: table, json, or jsonl")
 	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	format, err := parseCLIOutput(*output)
+	if err != nil {
 		return err
 	}
 	tok, err := operatorTokenFromFile(*token, *tokenFile)
@@ -791,14 +1012,11 @@ func runAuditCLI(args []string) error {
 	if err != nil {
 		return fmt.Errorf("audit: %w", err)
 	}
-	if args[0] == "export" {
-		enc := json.NewEncoder(os.Stdout)
-		for _, row := range rows {
-			if err := enc.Encode(row); err != nil {
-				return err
-			}
-		}
-		return nil
+	if args[0] == "export" || format == outputJSONL {
+		return encodeCLIOutputRows(formatOrJSONL(format), rows)
+	}
+	if format == outputJSON {
+		return encodeCLIOutput(outputJSON, rows)
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(w, "AT\tACTOR\tACTION\tTARGET\tREASON\tCOMMITTED")
@@ -812,11 +1030,16 @@ func runSecurityAuditCLI(args []string) error {
 	if len(args) == 0 || (args[0] != "list" && args[0] != "export") {
 		return fmt.Errorf("audit security: expected list or export")
 	}
-	fs := flag.NewFlagSet("audit security", flag.ExitOnError)
+	fs := flag.NewFlagSet("audit security", flag.ContinueOnError)
 	cfgPath := fs.String("config", "/etc/gripline/config.json", "path to deployment configuration")
 	token := fs.String("token", "", "operator token (env GRIPLINE_OPERATOR_TOKEN)")
 	tokenFile := fs.String("token-file", "", "read the operator token from this file")
+	output := fs.String("output", "table", "output format: table, json, or jsonl")
 	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	format, err := parseCLIOutput(*output)
+	if err != nil {
 		return err
 	}
 	tok, err := operatorTokenFromFile(*token, *tokenFile)
@@ -834,14 +1057,11 @@ func runSecurityAuditCLI(args []string) error {
 	if err != nil {
 		return fmt.Errorf("audit security: %w", err)
 	}
-	if args[0] == "export" {
-		enc := json.NewEncoder(os.Stdout)
-		for _, row := range rows {
-			if err := enc.Encode(row); err != nil {
-				return err
-			}
-		}
-		return nil
+	if args[0] == "export" || format == outputJSONL {
+		return encodeCLIOutputRows(formatOrJSONL(format), rows)
+	}
+	if format == outputJSON {
+		return encodeCLIOutput(outputJSON, rows)
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(w, "SEQ\tAT\tKIND\tCREDENTIAL\tLANE\tBEFORE\tAFTER\tRISK\tREV\tPOLICY_REV\tREQUEST_ID\tEVIDENCE")
@@ -860,12 +1080,17 @@ func runStateCLI(args []string) error {
 	if len(args) == 0 || (args[0] != "check" && args[0] != "backup" && args[0] != "restore" && args[0] != "compact") {
 		return fmt.Errorf("state: expected check, backup, restore, or compact")
 	}
-	fs := flag.NewFlagSet("state", flag.ExitOnError)
+	fs := flag.NewFlagSet("state", flag.ContinueOnError)
 	cfgPath := fs.String("config", "/etc/gripline/config.json", "path to deployment configuration")
 	outPath := fs.String("out", "", "backup output path")
 	fromPath := fs.String("from", "", "backup input path")
 	manifestPath := fs.String("manifest", "", "backup recovery manifest path (default: <out>.manifest.json)")
+	output := fs.String("output", "table", "output format: table, json, or jsonl")
 	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	format, err := parseCLIOutput(*output)
+	if err != nil {
 		return err
 	}
 	cfg, err := config.Load(*cfgPath)
@@ -879,6 +1104,9 @@ func runStateCLI(args []string) error {
 	case "check":
 		if err := statebolt.CheckFile(cfg.Paths.State); err != nil {
 			return err
+		}
+		if format == outputJSON || format == outputJSONL {
+			return encodeCLIOutput(format, map[string]string{"result": "healthy", "state": cfg.Paths.State})
 		}
 		fmt.Printf("state healthy: %s\n", cfg.Paths.State)
 		return nil
@@ -901,6 +1129,9 @@ func runStateCLI(args []string) error {
 		manifest := *manifestPath
 		if manifest == "" {
 			manifest = *outPath + ".manifest.json"
+		}
+		if format == outputJSON || format == outputJSONL {
+			return encodeCLIOutput(format, map[string]string{"result": "backup verified", "path": *outPath, "manifest": manifest})
 		}
 		fmt.Printf("state backup verified: %s (manifest %s)\n", *outPath, manifest)
 		return nil
@@ -942,11 +1173,17 @@ func runStateCLI(args []string) error {
 		if err != nil {
 			return err
 		}
+		if format == outputJSON || format == outputJSONL {
+			return encodeCLIOutput(format, map[string]string{"result": "restored and verified", "state": cfg.Paths.State})
+		}
 		fmt.Printf("state restored and verified: %s\n", cfg.Paths.State)
 		return nil
 	case "compact":
 		if err := statebolt.CompactFile(cfg.Paths.State); err != nil {
 			return err
+		}
+		if format == outputJSON || format == outputJSONL {
+			return encodeCLIOutput(format, map[string]string{"result": "compacted and verified", "state": cfg.Paths.State})
 		}
 		fmt.Printf("state compacted and verified: %s\n", cfg.Paths.State)
 		return nil
@@ -1240,6 +1477,10 @@ func runLaneUnblock(cfgPath, credID, laneID, reason, token string) error {
 // durable, which are shadow-only, and which are disabled — the honest
 // deployment picture an operator needs before trusting the gateway.
 func runStatusCLI(cfgPath string) error {
+	return runStatusCLIWithOutput(cfgPath, outputTable)
+}
+
+func runStatusCLIWithOutput(cfgPath string, format outputFormat) error {
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		return err
@@ -1315,9 +1556,9 @@ func runStatusCLI(cfgPath string) error {
 		}
 	}
 	type row struct {
-		capability string
-		state      string
-		note       string
+		Capability string `json:"capability"`
+		State      string `json:"state"`
+		Note       string `json:"note"`
 	}
 	maxSourceScopes := cfg.Server.MaxSourceScopes
 	if maxSourceScopes == 0 {
@@ -1357,10 +1598,13 @@ func runStatusCLI(cfgPath string) error {
 		{"pepper versions", pepperVersions, "version identifiers only; key material is never displayed"},
 		{"pseudonym versions", pseudonymVersions, "active and overlap versions; key material is never displayed"},
 	}
+	if format == outputJSON || format == outputJSONL {
+		return encodeCLIOutputRows(format, rows)
+	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(w, "CAPABILITY\tSTATE\tNOTE")
 	for _, r := range rows {
-		fmt.Fprintf(w, "%s\t%s\t%s\n", r.capability, r.state, r.note)
+		fmt.Fprintf(w, "%s\t%s\t%s\n", r.Capability, r.State, r.Note)
 	}
 	return w.Flush()
 }

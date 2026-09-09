@@ -8,7 +8,6 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"log"
 	"net"
@@ -39,96 +38,15 @@ var (
 )
 
 func main() {
-	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-version") {
-		fmt.Println(versionString())
-		return
-	}
-	sub, rest := parseSubcommand(os.Args[1:])
-	if sub != "" {
-		if err := dispatchSubcommand(sub, rest); err != nil && !errors.Is(err, errSubcommand) {
-			log.Fatalf("gripline: %v", err)
-		}
-		return
-	}
-	cfgPath := flag.String("config", "/etc/gripline/config.json", "path to the deployment configuration")
-	flag.Parse()
-	if err := run(*cfgPath); err != nil {
+	serve, cfgPath, err := runCLIInvocation(os.Args[1:])
+	if err != nil {
 		log.Fatalf("gripline: %v", err)
 	}
-}
-
-// parseSubcommand peeks os.Args for a leading non-flag subcommand token.
-// args is os.Args[1:].
-func parseSubcommand(args []string) (string, []string) {
-	if len(args) == 0 || len(args[0]) == 0 || args[0][0] == '-' {
-		return "", nil
+	if !serve {
+		return
 	}
-	return args[0], args[1:]
-}
-
-// dispatchSubcommand runs a non-server subcommand. Supported:
-//
-//	gripline keys export --config path.json
-//	gripline credential list|revoke --config path.json [...]
-//	gripline lane list|unblock --config path.json [...]
-//	gripline audit list|export --config path.json
-//	gripline state check|backup|restore|compact --config path.json
-//	gripline policy verify|status|prepare|activate|rollback --config path.json
-//	gripline migrate plan|apply --config path.json
-//	gripline cluster status --config path.json
-//	gripline crypto status|activate|retire|signer-prepare --config path.json
-//	gripline status --config path.json
-//	gripline version
-//
-// keys export prints the PUBLIC backend verification material (active kid +
-// all retained public keys) as JSON to stdout — never any private/signing
-// material (P0.15). The lifecycle subcommands operate through the control
-// plane's authorization + atomic mutation/audit seams and never touch raw
-// credential secrets (P1-26).
-func dispatchSubcommand(sub string, args []string) error {
-	switch sub {
-	case "keys":
-		// gripline keys export --config path.json
-		if len(args) == 0 || args[0] != "export" {
-			return fmt.Errorf("keys: expected 'gripline keys export --config path.json'")
-		}
-		fs := flag.NewFlagSet("keys export", flag.ExitOnError)
-		cfgPath := fs.String("config", "/etc/gripline/config.json", "path to the deployment configuration")
-		if err := fs.Parse(args[1:]); err != nil {
-			return err
-		}
-		return runKeysExport(*cfgPath)
-	case "credential":
-		return runCredentialCLI(args)
-	case "lane":
-		return runLaneCLI(args)
-	case "audit":
-		return runAuditCLI(args)
-	case "state":
-		return runStateCLI(args)
-	case "policy":
-		return runPolicyCLI(args)
-	case "migrate":
-		return runMigrateCLI(args)
-	case "cluster":
-		return runClusterCLI(args)
-	case "crypto":
-		return runCryptoCLI(args)
-	case "status":
-		fs := flag.NewFlagSet("status", flag.ExitOnError)
-		cfgPath := fs.String("config", "/etc/gripline/config.json", "path to the deployment configuration")
-		if err := fs.Parse(args); err != nil {
-			return err
-		}
-		return runStatusCLI(*cfgPath)
-	case "version":
-		if len(args) != 0 {
-			return fmt.Errorf("version: does not accept arguments")
-		}
-		fmt.Println(versionString())
-		return errSubcommand
-	default:
-		return fmt.Errorf("unknown subcommand %q (expected: keys, credential, lane, audit, state, policy, migrate, cluster, crypto, status, version)", sub)
+	if err := run(cfgPath); err != nil {
+		log.Fatalf("gripline: %v", err)
 	}
 }
 
