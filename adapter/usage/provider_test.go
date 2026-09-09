@@ -1,6 +1,7 @@
 package usage
 
 import (
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -158,6 +159,36 @@ func TestJSONProviderChargesAnthropicCacheDimensions(t *testing.T) {
 	got := s.Finish(nil)
 	if got.InputTokens != 17 || got.OutputTokens != 2 || got.CombinedTokens != 19 || got.CacheReadInputTokens != 4 || got.CacheCreationInputTokens != 3 || got.CostMicrounits != 67 {
 		t.Fatalf("cached Anthropic usage=%+v", got)
+	}
+}
+
+func TestJSONProviderIncompleteAnthropicSettlementIncludesCacheInput(t *testing.T) {
+	p, err := NewJSONProvider(FormatAnthropic, Pricing{}, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := p.Begin(Observation{Method: "POST", URLPath: "/v1/messages", BodySize: 10}, nil)
+	s.ObserveChunk([]byte(`data: {"type":"message_start","message":{"usage":{"input_tokens":10,"cache_read_input_tokens":4,"cache_creation_input_tokens":3}}}` + "\n"))
+	got := s.Finish(io.ErrUnexpectedEOF)
+	if got.InputTokens != 17 || got.CacheReadInputTokens != 4 || got.CacheCreationInputTokens != 3 || got.CombinedTokens != 25 {
+		t.Fatalf("incomplete Anthropic usage dropped cache dimensions: %+v", got)
+	}
+}
+
+func TestJSONProviderAnthropicCacheCreationSubtypes(t *testing.T) {
+	p, err := NewJSONProvider(FormatAnthropic, Pricing{
+		InputMicrounitsPerToken: 2, OutputMicrounitsPerToken: 3,
+		CacheReadMicrounitsPerToken:       5,
+		CacheCreation5mMicrounitsPerToken: 7, CacheCreation1hMicrounitsPerToken: 11,
+	}, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := p.Begin(Observation{URLPath: "/v1/messages", BodySize: 10}, nil)
+	s.ObserveChunk([]byte(`{"usage":{"input_tokens":10,"output_tokens":2,"cache_read_input_tokens":4,"cache_creation":{"ephemeral_5m_input_tokens":3,"ephemeral_1h_input_tokens":5}}}`))
+	got := s.Finish(nil)
+	if got.InputTokens != 22 || got.CacheCreation5mInputTokens != 3 || got.CacheCreation1hInputTokens != 5 || got.CostMicrounits != 122 {
+		t.Fatalf("Anthropic cache subtype usage=%+v", got)
 	}
 }
 

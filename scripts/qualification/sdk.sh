@@ -33,11 +33,11 @@ backend_pid=$!
 IFS=',' read -r -a providers <<<"${GRIPLINE_SDK_PROVIDERS:-openai,anthropic}"
 venv="$work_dir/venv"
 python3 -m venv "$venv"
-"$venv/bin/pip" install --disable-pip-version-check -q -r "$repo_dir/qualification/sdk/python/requirements.txt"
+"$venv/bin/pip" install --disable-pip-version-check -q -r "$repo_dir/qualification/sdk/python/requirements.lock"
 
 ts_dir="$work_dir/typescript"
 cp -R "$repo_dir/qualification/sdk/typescript" "$ts_dir"
-npm install --prefix "$ts_dir" --no-package-lock --ignore-scripts --silent
+npm ci --prefix "$ts_dir" --ignore-scripts --no-audit --no-fund --silent
 for index in "${!providers[@]}"; do
 	provider="${providers[$index]}"
 	case "$provider" in
@@ -45,11 +45,13 @@ for index in "${!providers[@]}"; do
 			mode=openai
 			allowed='{"method":"POST","path":"/v1/chat/completions"},{"method":"POST","path":"/v1/responses"},{"method":"POST","path":"/v1/embeddings"},{"method":"GET","path":"/v1/models"}'
 			expected_usage='{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}'
+			profiles=(chat responses embeddings models)
 		;;
 		anthropic)
 			mode=anthropic
 			allowed='{"method":"POST","path":"/v1/messages"}'
 			expected_usage='{"input_tokens":3,"output_tokens":2}'
+			profiles=(messages)
 		;;
 		*) echo "SDK qualification: unsupported provider $provider" >&2; exit 2 ;;
 	esac
@@ -64,7 +66,7 @@ for index in "${!providers[@]}"; do
   "server": {"read_timeout": "10s", "write_timeout": "10s", "idle_timeout": "10s", "read_header_timeout": "5s", "stream_write_idle_timeout": "2s", "max_body_bytes": 1048576, "spool_dir": "${work_dir}/spool-${provider}", "spool_max_bytes": 1048576, "spool_max_files": 8},
   "identity": {"audience": "sdk-qualification-${provider}"},
   "secrets": {"pepper_versions": {"1": "${pepper}"}},
-  "usage": {"mode": "${mode}", "input_microunits_per_token": 2, "output_microunits_per_token": 3, "cache_read_microunits_per_token": 5, "cache_creation_microunits_per_token": 7, "default_output_tokens": 2, "max_output_tokens": 64},
+	  "usage": {"mode": "${mode}", "cost_mode": "conservative", "input_microunits_per_token": 2, "output_microunits_per_token": 3, "cache_read_microunits_per_token": 5, "cache_creation_microunits_per_token": 7, "cache_creation_5m_microunits_per_token": 7, "cache_creation_1h_microunits_per_token": 9, "default_output_tokens": 2, "max_output_tokens": 64},
   "admin": {"listen": "127.0.0.1:${admin_port}", "operator_tokens": {"${operator_token}": "harness:credential.lifecycle,audit.read"}},
   "paths": {"state": "${work_dir}/state-${provider}.db", "signer_keyring": "${work_dir}/keyring-${provider}.json"},
   "deployment": {"allow_ephemeral_state": false}
@@ -79,11 +81,40 @@ EOF
 	curl -fsS "http://127.0.0.1:${gateway_port}/readyz" >/dev/null || { cat "$work_dir/gateway-${provider}.log" >&2; exit 1; }
 	printf '%s\n' "$secret" | GRIPLINE_OPERATOR_TOKEN="$operator_token" "$work_dir/gripline" credential add --config "$config" --id sdk-qualification --account sdk-qualification --policy gripline-default-v1 --plan sdk-qualification --reason "reference SDK qualification" --secret-stdin >/dev/null
 	sdk_env=(GRIPLINE_SDK_BASE_URL="http://127.0.0.1:${gateway_port}/v1" GRIPLINE_SDK_ANTHROPIC_BASE_URL="http://127.0.0.1:${gateway_port}" GRIPLINE_SDK_API_KEY="$secret" GRIPLINE_SDK_MODEL="local-qualification" GRIPLINE_SDK_EXPECT_USAGE=1 GRIPLINE_SDK_EXPECT_USAGE_JSON="$expected_usage" GRIPLINE_SDK_MAX_SECONDS=30)
-	for stream in 0 1; do
-		GRIPLINE_SDK_STREAM="$stream" env "${sdk_env[@]}" "$venv/bin/python" "$repo_dir/qualification/sdk/python/runner.py" "$provider"
-	done
-	for stream in 0 1; do
-		GRIPLINE_SDK_STREAM="$stream" env "${sdk_env[@]}" node "$ts_dir/runner.mjs" "$provider"
+	metric_value() { awk -v name="gripline_$2" '$1 == name {print $2}' "$1"; }
+	run_sdk_case() {
+		local label=$1 expect_input=$2 expect_output=$3
+		shift 3
+		local before="$work_dir/${provider}-${label}-before.metrics" after="$work_dir/${provider}-${label}-after.metrics"
+		curl -fsS "http://127.0.0.1:${admin_port}/admin/metrics" -H "Authorization: Bearer ${operator_token}" >"$before"
+		"$@"
+		curl -fsS "http://127.0.0.1:${admin_port}/admin/metrics" -H "Authorization: Bearer ${operator_token}" >"$after"
+		local sessions_before sessions_after input_before input_after output_before output_after
+		sessions_before="$(metric_value "$before" usage_sessions_total)"; sessions_after="$(metric_value "$after" usage_sessions_total)"
+		input_before="$(metric_value "$before" usage_input_tokens_total)"; input_after="$(metric_value "$after" usage_input_tokens_total)"
+		output_before="$(metric_value "$before" usage_output_tokens_total)"; output_after="$(metric_value "$after" usage_output_tokens_total)"
+		[[ "$sessions_before" =~ ^[0-9]+$ && "$sessions_after" =~ ^[0-9]+$ && $((sessions_after - sessions_before)) -ge 1 ]] || { echo "SDK qualification: ${label} did not create a settled per-case session" >&2; exit 1; }
+		if (( expect_input > 0 )); then [[ $((input_after - input_before)) -ge expect_input ]] || { echo "SDK qualification: ${label} input delta was too small" >&2; exit 1; }; fi
+		if (( expect_output > 0 )); then [[ $((output_after - output_before)) -ge expect_output ]] || { echo "SDK qualification: ${label} output delta was too small" >&2; exit 1; }; fi
+	}
+	for profile in "${profiles[@]}"; do
+		case "$profile" in
+			chat) profile_usage="$expected_usage"; streams=(0 1) ;;
+			responses) profile_usage='{"input_tokens":3,"output_tokens":2,"total_tokens":5}'; streams=(0 1) ;;
+			embeddings) profile_usage='{"prompt_tokens":3,"total_tokens":3}'; streams=(0) ;;
+			models) profile_usage=''; streams=(0) ;;
+			messages) profile_usage="$expected_usage"; streams=(0 1) ;;
+			*) echo "SDK qualification: unsupported profile $profile" >&2; exit 2 ;;
+		esac
+		for stream in "${streams[@]}"; do
+			profile_env=(GRIPLINE_SDK_PROFILE="$profile" GRIPLINE_SDK_STREAM="$stream" GRIPLINE_SDK_EXPECT_USAGE_JSON="$profile_usage")
+			[[ "$profile" == models ]] && profile_env+=(GRIPLINE_SDK_EXPECT_USAGE=0) || profile_env+=(GRIPLINE_SDK_EXPECT_USAGE=1)
+			expect_input=3; expect_output=2
+			[[ "$profile" == models ]] && expect_input=0 && expect_output=0
+			[[ "$profile" == embeddings ]] && expect_output=0
+			run_sdk_case "profile-${profile}-py-${stream}" "$expect_input" "$expect_output" env "${sdk_env[@]}" "${profile_env[@]}" "$venv/bin/python" "$repo_dir/qualification/sdk/python/runner.py" "$provider"
+			run_sdk_case "profile-${profile}-ts-${stream}" "$expect_input" "$expect_output" env "${sdk_env[@]}" "${profile_env[@]}" node "$ts_dir/runner.mjs" "$provider"
+		done
 	done
 	# Failure and concurrency cases use the same pinned official clients. The
 	# local backend selects the deterministic case by model suffix, so no

@@ -1,8 +1,12 @@
 {
   "usage": {
     "mode": "anthropic",
+    "cost_mode": "conservative",
     "input_microunits_per_token": 3,
     "output_microunits_per_token": 15,
+    "cache_read_microunits_per_token": 1,
+    "cache_creation_5m_microunits_per_token": 4,
+    "cache_creation_1h_microunits_per_token": 8,
     "default_output_tokens": 1024,
     "max_output_tokens": 4096
   }

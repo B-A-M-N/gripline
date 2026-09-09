@@ -25,7 +25,14 @@ type request struct {
 func main() {
 	listen := flag.String("listen", "127.0.0.1:19601", "listen address")
 	dsn := flag.String("dsn", "", "shared PostgreSQL replay DSN")
+	migrate := flag.Bool("migrate", false, "apply the repository-owned replay schema and exit")
 	flag.Parse()
+	if *migrate {
+		if err := replay.MigratePostgresGuard(context.Background(), *dsn); err != nil {
+			log.Fatalf("migrate replay guard: %v", err)
+		}
+		return
+	}
 	guard, err := replay.OpenPostgresGuard(context.Background(), *dsn)
 	if err != nil {
 		log.Fatalf("open replay guard: %v", err)

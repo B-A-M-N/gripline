@@ -51,7 +51,7 @@ for _ in $(seq 1 60); do
 done
 curl --cacert "$work_dir/server.pem" -fsS "https://127.0.0.1:${gateway_port}/readyz" >/dev/null || { cat "$work_dir/gateway.log" >&2; exit 1; }
 printf '%s\n' "$secret" | GRIPLINE_OPERATOR_TOKEN="$operator_token" "$work_dir/gripline" credential add --config "$work_dir/config.json" --id http2-qualification --account http2-qualification --policy gripline-default-v1 --plan http2-qualification --reason "reference HTTP2 qualification" --secret-stdin >/dev/null
-GRIPLINE_H2_QUALIFICATION=1 GRIPLINE_H2_LOAD_REQUIRED="${GRIPLINE_H2_LOAD_REQUIRED:-1}" GRIPLINE_H2_EXPECT_MAX_STREAMS=64 bash "$repo_dir/scripts/security-http2-harness.sh" "https://127.0.0.1:${gateway_port}/v1/messages" "$secret" "$work_dir/server.pem"
+GRIPLINE_H2_QUALIFICATION=1 GRIPLINE_H2_LOAD_REQUIRED="${GRIPLINE_H2_LOAD_REQUIRED:-1}" GRIPLINE_H2_EXPECT_MAX_STREAMS=64 GRIPLINE_H2_EXPECT_HEADER_TABLE=65536 bash "$repo_dir/scripts/security-http2-harness.sh" "https://127.0.0.1:${gateway_port}/v1/messages" "$secret" "$work_dir/server.pem"
 "$work_dir/http2-client" -url "https://127.0.0.1:${gateway_port}/v1/messages" -ca "$work_dir/server.pem" -bearer "$secret"
 metrics="$(curl -fsS "http://127.0.0.1:${admin_port}/admin/metrics" -H "Authorization: Bearer ${operator_token}")"
 h2_errors="$(printf '%s\n' "$metrics" | awk '$1 == "gripline_http2_errors_total" {print $2}')"

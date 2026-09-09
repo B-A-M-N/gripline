@@ -23,8 +23,12 @@ type Observation struct {
 	Header     http.Header
 	RemoteAddr string
 	ProtoMajor int
+	Method     string
 	URLPath    string
 	BodySize   int64
+	// UsageProfile is an explicit route-level schema selection. When empty,
+	// the adapter retains its provider/path compatibility defaults.
+	UsageProfile UsageProfile
 	// MaxBodyBytes is the gateway's enforced body ceiling. Adapters use it
 	// when BodySize is unknown so chunked requests reserve conservatively.
 	MaxBodyBytes int64
@@ -40,9 +44,14 @@ type Estimate struct {
 	// CacheReadInputTokens and CacheCreationInputTokens preserve Anthropic's
 	// separately priced input dimensions. InputTokens remains the total input
 	// dimension used for quota accounting.
-	CacheReadInputTokens     int64
-	CacheCreationInputTokens int64
-	CostMicrounits           int64
+	CacheReadInputTokens       int64
+	CacheCreationInputTokens   int64
+	CacheCreation5mInputTokens int64
+	CacheCreation1hInputTokens int64
+	// CostConservative is true when the provider did not expose enough cache
+	// detail to price the record exactly.
+	CostConservative bool
+	CostMicrounits   int64
 }
 
 // Session observes bounded response chunks and returns settled usage exactly
@@ -83,11 +92,22 @@ const (
 // Pricing is expressed in micro-units per token. Zero pricing is valid when a
 // provider wants token enforcement without cost enforcement.
 type Pricing struct {
-	InputMicrounitsPerToken         int64
-	OutputMicrounitsPerToken        int64
-	CacheReadMicrounitsPerToken     int64
-	CacheCreationMicrounitsPerToken int64
+	InputMicrounitsPerToken           int64
+	OutputMicrounitsPerToken          int64
+	CacheReadMicrounitsPerToken       int64
+	CacheCreationMicrounitsPerToken   int64
+	CacheCreation5mMicrounitsPerToken int64
+	CacheCreation1hMicrounitsPerToken int64
 }
+
+// CostMode controls whether the adapter emits provider cost estimates.
+type CostMode string
+
+const (
+	CostModeConservative CostMode = "conservative"
+	CostModeExact        CostMode = "exact"
+	CostModeNone         CostMode = "none"
+)
 
 // JSONProvider is a bounded adapter for the usage fields emitted by OpenAI- or
 // Anthropic-compatible JSON/SSE APIs. It scans only a small carry window plus
@@ -95,6 +115,7 @@ type Pricing struct {
 type JSONProvider struct {
 	Format              Format
 	Pricing             Pricing
+	CostMode            CostMode
 	DefaultOutputTokens int64
 	// MaxOutputTokens is the hard, conservative output reservation. When set,
 	// client-provided metadata may not lower it before execution.
@@ -114,15 +135,20 @@ func NewJSONProvider(format Format, pricing Pricing, defaultOutputTokens int64) 
 		return nil, errors.New("usage: format must be openai or anthropic")
 	}
 	if pricing.InputMicrounitsPerToken < 0 || pricing.OutputMicrounitsPerToken < 0 ||
-		pricing.CacheReadMicrounitsPerToken < 0 || pricing.CacheCreationMicrounitsPerToken < 0 {
+		pricing.CacheReadMicrounitsPerToken < 0 || pricing.CacheCreationMicrounitsPerToken < 0 ||
+		pricing.CacheCreation5mMicrounitsPerToken < 0 || pricing.CacheCreation1hMicrounitsPerToken < 0 {
 		return nil, errors.New("usage: pricing must be non-negative")
 	}
 	if defaultOutputTokens < 0 {
 		return nil, errors.New("usage: default output tokens must be non-negative")
 	}
 	return &JSONProvider{
-		Format:              format,
-		Pricing:             pricing,
+		Format:  format,
+		Pricing: pricing,
+		// Direct users historically received exact settlement pricing while
+		// admission remains conservative via withCost(..., true). Deployments
+		// should set this explicitly when they want conservative settlement.
+		CostMode:            CostModeExact,
 		DefaultOutputTokens: defaultOutputTokens,
 		InputBytesPerToken:  1,
 		MaxEstimatedTokens:  1 << 31,
@@ -133,7 +159,7 @@ func (p *JSONProvider) Estimate(obs Observation) Estimate {
 	if p == nil {
 		return Estimate{Requests: 1}
 	}
-	return p.estimate(obs, profileFor(p.Format, obs.URLPath))
+	return p.estimate(obs, profileFor(p.Format, obs.Method, obs.URLPath, obs.UsageProfile))
 }
 
 func (p *JSONProvider) estimate(obs Observation, profile UsageProfile) Estimate {
@@ -173,37 +199,43 @@ func (p *JSONProvider) estimate(obs Observation, profile UsageProfile) Estimate 
 }
 
 func (p *JSONProvider) Begin(obs Observation, _ *http.Response) Session {
-	profile := profileFor(p.Format, obs.URLPath)
+	profile := profileFor(p.Format, obs.Method, obs.URLPath, obs.UsageProfile)
 	return &jsonSession{provider: p, profile: profile, estimate: p.estimate(obs, profile), knownZero: profile == ProfileOpenAIModels}
 }
 
 type jsonSession struct {
-	provider        *JSONProvider
-	profile         UsageProfile
-	estimate        Estimate
-	input           int64
-	output          int64
-	combined        int64
-	cacheRead       int64
-	cacheCreate     int64
-	inputSeen       bool
-	outputSeen      bool
-	combinedSeen    bool
-	cacheReadSeen   bool
-	cacheCreateSeen bool
-	seen            bool
-	knownZero       bool
-	carry           []byte
-	overflow        bool
+	provider          *JSONProvider
+	profile           UsageProfile
+	estimate          Estimate
+	input             int64
+	output            int64
+	combined          int64
+	cacheRead         int64
+	cacheCreate       int64
+	cacheCreate5m     int64
+	cacheCreate1h     int64
+	inputSeen         bool
+	outputSeen        bool
+	combinedSeen      bool
+	cacheReadSeen     bool
+	cacheCreateSeen   bool
+	cacheCreate5mSeen bool
+	cacheCreate1hSeen bool
+	seen              bool
+	knownZero         bool
+	carry             []byte
+	overflow          bool
 }
 
 const usageCarryBytes = 64 << 10
 
 type usageRecord struct {
-	input, output, combined             int64
-	cacheRead, cacheCreate              int64
-	inputSeen, outputSeen, combinedSeen bool
-	cacheReadSeen, cacheCreateSeen      bool
+	input, output, combined              int64
+	cacheRead, cacheCreate               int64
+	cacheCreate5m, cacheCreate1h         int64
+	inputSeen, outputSeen, combinedSeen  bool
+	cacheReadSeen, cacheCreateSeen       bool
+	cacheCreate5mSeen, cacheCreate1hSeen bool
 }
 
 func (s *jsonSession) ObserveChunk(chunk []byte) {
@@ -258,12 +290,20 @@ func (s *jsonSession) merge(rec usageRecord) {
 	if rec.cacheCreateSeen && (!s.cacheCreateSeen || rec.cacheCreate > s.cacheCreate) {
 		s.cacheCreate = rec.cacheCreate
 	}
+	if rec.cacheCreate5mSeen && (!s.cacheCreate5mSeen || rec.cacheCreate5m > s.cacheCreate5m) {
+		s.cacheCreate5m = rec.cacheCreate5m
+	}
+	if rec.cacheCreate1hSeen && (!s.cacheCreate1hSeen || rec.cacheCreate1h > s.cacheCreate1h) {
+		s.cacheCreate1h = rec.cacheCreate1h
+	}
 	s.inputSeen = s.inputSeen || rec.inputSeen
 	s.outputSeen = s.outputSeen || rec.outputSeen
 	s.combinedSeen = s.combinedSeen || rec.combinedSeen
 	s.cacheReadSeen = s.cacheReadSeen || rec.cacheReadSeen
 	s.cacheCreateSeen = s.cacheCreateSeen || rec.cacheCreateSeen
-	s.seen = s.seen || rec.inputSeen || rec.outputSeen || rec.combinedSeen || rec.cacheReadSeen || rec.cacheCreateSeen
+	s.cacheCreate5mSeen = s.cacheCreate5mSeen || rec.cacheCreate5mSeen
+	s.cacheCreate1hSeen = s.cacheCreate1hSeen || rec.cacheCreate1hSeen
+	s.seen = s.seen || rec.inputSeen || rec.outputSeen || rec.combinedSeen || rec.cacheReadSeen || rec.cacheCreateSeen || rec.cacheCreate5mSeen || rec.cacheCreate1hSeen
 }
 
 func (s *jsonSession) Finish(streamErr error) Estimate {
@@ -290,12 +330,28 @@ func (s *jsonSession) Finish(streamErr error) Estimate {
 			actual.OutputTokens = s.output
 		}
 		if s.profile == ProfileAnthropicMessages {
+			// Cache dimensions are part of Anthropic input quota. Preserve them
+			// even when a stream is interrupted; otherwise partial settlement
+			// can under-charge a request that already consumed cached input.
+			observedInput := s.input
+			observedInput = safeAdd(observedInput, s.cacheRead)
+			if s.cacheCreate5mSeen || s.cacheCreate1hSeen {
+				observedInput = safeAdd(observedInput, safeAdd(s.cacheCreate5m, s.cacheCreate1h))
+			} else {
+				observedInput = safeAdd(observedInput, s.cacheCreate)
+			}
+			if observedInput > actual.InputTokens {
+				actual.InputTokens = observedInput
+			}
 			if s.cacheReadSeen {
 				actual.CacheReadInputTokens = s.cacheRead
 			}
 			if s.cacheCreateSeen {
 				actual.CacheCreationInputTokens = s.cacheCreate
 			}
+			actual.CacheCreation5mInputTokens = s.cacheCreate5m
+			actual.CacheCreation1hInputTokens = s.cacheCreate1h
+			actual.CostConservative = !(s.cacheCreate5mSeen || s.cacheCreate1hSeen)
 		}
 		actual.CombinedTokens = safeAdd(actual.InputTokens, actual.OutputTokens)
 		if s.combinedSeen && s.combined > actual.CombinedTokens {
@@ -308,10 +364,17 @@ func (s *jsonSession) Finish(streamErr error) Estimate {
 	}
 	actualInput := s.input
 	if s.profile == ProfileAnthropicMessages {
-		actualInput = safeAdd(actualInput, safeAdd(s.cacheRead, s.cacheCreate))
+		actualInput = safeAdd(actualInput, s.cacheRead)
+		if s.cacheCreate5mSeen || s.cacheCreate1hSeen {
+			actualInput = safeAdd(actualInput, safeAdd(s.cacheCreate5m, s.cacheCreate1h))
+		} else {
+			actualInput = safeAdd(actualInput, s.cacheCreate)
+		}
 	}
 	actual := Estimate{Requests: 1, InputTokens: actualInput, OutputTokens: s.output, CombinedTokens: s.combined,
-		CacheReadInputTokens: s.cacheRead, CacheCreationInputTokens: s.cacheCreate}
+		CacheReadInputTokens: s.cacheRead, CacheCreationInputTokens: s.cacheCreate,
+		CacheCreation5mInputTokens: s.cacheCreate5m, CacheCreation1hInputTokens: s.cacheCreate1h,
+		CostConservative: false}
 	if actual.CombinedTokens < safeAdd(actual.InputTokens, actual.OutputTokens) {
 		actual.CombinedTokens = safeAdd(actual.InputTokens, actual.OutputTokens)
 	}
@@ -333,17 +396,26 @@ func (p *JSONProvider) clamp(n int64) int64 {
 }
 
 func (p *JSONProvider) withCost(e Estimate, profile UsageProfile, conservative bool) Estimate {
+	if p.CostMode == CostModeNone {
+		e.CostMicrounits = 0
+		return e
+	}
+	conservative = conservative || e.CostConservative || p.CostMode == CostModeConservative
 	inputRate := p.Pricing.InputMicrounitsPerToken
 	if conservative && profile == ProfileAnthropicMessages {
 		// Before execution the cache split is unknowable. Reserve the highest
 		// configured input rate against the bounded input estimate so cached
 		// requests cannot become free or under-reserved.
 		inputRate = maxInt64(inputRate, p.Pricing.CacheReadMicrounitsPerToken)
-		inputRate = maxInt64(inputRate, p.Pricing.CacheCreationMicrounitsPerToken)
+		inputRate = maxInt64(inputRate, p.cacheCreationRate(false))
+		inputRate = maxInt64(inputRate, p.cacheCreationRate(true))
 	}
 	regularInput := e.InputTokens
 	if !conservative && profile == ProfileAnthropicMessages {
-		cacheTotal := safeAdd(e.CacheReadInputTokens, e.CacheCreationInputTokens)
+		cacheTotal := safeAdd(e.CacheReadInputTokens, safeAdd(e.CacheCreation5mInputTokens, e.CacheCreation1hInputTokens))
+		if e.CacheCreation5mInputTokens == 0 && e.CacheCreation1hInputTokens == 0 {
+			cacheTotal = safeAdd(cacheTotal, e.CacheCreationInputTokens)
+		}
 		if regularInput >= cacheTotal {
 			regularInput -= cacheTotal
 		} else {
@@ -354,8 +426,25 @@ func (p *JSONProvider) withCost(e Estimate, profile UsageProfile, conservative b
 		e.OutputTokens, p.Pricing.OutputMicrounitsPerToken)
 	e.CostMicrounits = safeAdd(e.CostMicrounits,
 		safeMulAdd(e.CacheReadInputTokens, p.Pricing.CacheReadMicrounitsPerToken,
-			e.CacheCreationInputTokens, p.Pricing.CacheCreationMicrounitsPerToken))
+			e.CacheCreation5mInputTokens, p.cacheCreationRate(false)))
+	aggregateCreate := e.CacheCreationInputTokens
+	if e.CacheCreation5mInputTokens != 0 || e.CacheCreation1hInputTokens != 0 {
+		aggregateCreate = 0
+	}
+	e.CostMicrounits = safeAdd(e.CostMicrounits,
+		safeMulAdd(e.CacheCreation1hInputTokens, p.cacheCreationRate(true),
+			aggregateCreate, p.Pricing.CacheCreationMicrounitsPerToken))
 	return e
+}
+
+func (p *JSONProvider) cacheCreationRate(hour bool) int64 {
+	if hour && p.Pricing.CacheCreation1hMicrounitsPerToken != 0 {
+		return p.Pricing.CacheCreation1hMicrounitsPerToken
+	}
+	if !hour && p.Pricing.CacheCreation5mMicrounitsPerToken != 0 {
+		return p.Pricing.CacheCreation5mMicrounitsPerToken
+	}
+	return p.Pricing.CacheCreationMicrounitsPerToken
 }
 
 func maxInt64(a, b int64) int64 {
@@ -365,7 +454,10 @@ func maxInt64(a, b int64) int64 {
 	return b
 }
 
-func profileFor(format Format, path string) UsageProfile {
+func profileFor(format Format, method, path string, explicit UsageProfile) UsageProfile {
+	if explicit != "" {
+		return explicit
+	}
 	switch format {
 	case FormatAnthropic:
 		return ProfileAnthropicMessages
@@ -437,12 +529,34 @@ func parseUsageRecord(record []byte, profile UsageProfile) (usageRecord, bool) {
 				return usageRecord{}, false
 			}
 		}
+		if raw, exists := usage["cache_creation"]; exists {
+			cache, err := decodeUniqueObject(raw)
+			if err != nil {
+				return usageRecord{}, false
+			}
+			if value, ok := cache["ephemeral_5m_input_tokens"]; ok {
+				out.cacheCreate5m, out.cacheCreate5mSeen = optionalNonNegativeInt(value)
+				if !out.cacheCreate5mSeen {
+					return usageRecord{}, false
+				}
+			}
+			if value, ok := cache["ephemeral_1h_input_tokens"]; ok {
+				out.cacheCreate1h, out.cacheCreate1hSeen = optionalNonNegativeInt(value)
+				if !out.cacheCreate1hSeen {
+					return usageRecord{}, false
+				}
+			}
+			if out.cacheCreate5mSeen || out.cacheCreate1hSeen {
+				out.cacheCreate = safeAdd(out.cacheCreate5m, out.cacheCreate1h)
+				out.cacheCreateSeen = true
+			}
+		}
 		// Anthropic's message usage has no total_tokens field; the adapter
 		// derives total input from the three documented input dimensions.
 	default:
 		return usageRecord{}, false
 	}
-	return out, out.inputSeen || out.outputSeen || out.combinedSeen || out.cacheReadSeen || out.cacheCreateSeen
+	return out, out.inputSeen || out.outputSeen || out.combinedSeen || out.cacheReadSeen || out.cacheCreateSeen || out.cacheCreate5mSeen || out.cacheCreate1hSeen
 }
 
 func usageObject(top map[string]json.RawMessage, profile UsageProfile) (map[string]json.RawMessage, bool) {

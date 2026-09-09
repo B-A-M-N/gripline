@@ -59,6 +59,7 @@ node_a_pid=${pids[0]:-}
 node_b_pid=${pids[1]:-}
 node_c_pid=${pids[2]:-}
 operator_token=${operator_token}
+request_secret=${secret_two}
 EOF
 	fi
 }
@@ -702,6 +703,17 @@ fi
 if curl -sS "http://127.0.0.1:$((base + 12))/readyz" >/dev/null 2>&1; then
 	echo "cluster harness: killed node remained reachable" >&2
 	exit 1
+fi
+
+# A long-soak coordinator can hold the complete live cluster here, promote its
+# PostgreSQL replica, and send protected traffic through the still-running
+# Gripline nodes before allowing this harness to exit. This keeps failover
+# qualification attached to real gateway processes rather than a DB-only test.
+if [[ -n "${GRIPLINE_CLUSTER_HARNESS_PAUSE_FILE:-}" ]]; then
+	touch "$GRIPLINE_CLUSTER_HARNESS_PAUSE_FILE"
+	while [[ ! -f "${GRIPLINE_CLUSTER_HARNESS_RELEASE_FILE:-}" ]]; do
+		sleep 1
+	done
 fi
 
 echo "cluster harness: three-node PostgreSQL invariants passed"

@@ -1,6 +1,6 @@
 services:
   primary:
-    image: postgres:16
+    image: postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
     environment:
       POSTGRES_USER: gripline
       POSTGRES_PASSWORD: gripline
@@ -19,7 +19,7 @@ services:
       timeout: 2s
       retries: 30
   replica:
-    image: postgres:16
+    image: postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
     environment:
       PGDATA: /var/lib/postgresql/data
       PGPASSWORD: gripline

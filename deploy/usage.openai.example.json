@@ -1,6 +1,7 @@
 {
   "usage": {
     "mode": "openai",
+    "cost_mode": "exact",
     "input_microunits_per_token": 3,
     "output_microunits_per_token": 15,
     "default_output_tokens": 1024,

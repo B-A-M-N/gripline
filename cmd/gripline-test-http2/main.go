@@ -15,7 +15,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -52,7 +51,7 @@ func main() {
 		MinVersion: tls.VersionTLS12,
 	}}
 	client := &http.Client{Transport: transport}
-	payload := []byte(`{"prompt":"http2-cancellation-qualification"}`)
+	payload := []byte(`{"model":"local-qualification-cancel","prompt":"http2-cancellation-qualification"}`)
 	var canceled atomic.Int64
 	var unexpected atomic.Int64
 	var wg sync.WaitGroup
@@ -69,7 +68,6 @@ func main() {
 			}
 			req.Header.Set("Authorization", "Bearer "+*bearer)
 			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set("X-Gripline-Qualification-Delay", strconv.FormatInt((*backendDelay).Milliseconds(), 10))
 			resp, doErr := client.Do(req)
 			if doErr != nil {
 				if ctx.Err() != nil {
@@ -96,7 +94,8 @@ func main() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(payload))
+	recoveryPayload := []byte(`{"model":"local-qualification-recovery","prompt":"http2-recovery-qualification"}`)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(recoveryPayload))
 	if err != nil {
 		fatal("build recovery request: %v", err)
 	}

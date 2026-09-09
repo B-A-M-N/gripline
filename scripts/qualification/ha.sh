@@ -10,8 +10,11 @@ repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 fixture_dir="$repo_dir/scripts/qualification/fixtures/postgres-ha"
 project="gripline-ha-${$}"
 work_dir="$(mktemp -d)"
+live_pids=()
 keep="${GRIPLINE_QUALIFICATION_KEEP:-0}"
 cleanup() {
+	for pid in "${live_pids[@]}"; do kill -TERM "$pid" >/dev/null 2>&1 || true; done
+	for pid in "${live_pids[@]}"; do wait "$pid" >/dev/null 2>&1 || true; done
 	rm -rf "$work_dir"
 	if [[ "$keep" == 1 ]]; then
 		echo "HA lab retained: docker compose -p $project -f $fixture_dir/compose.yaml" >&2
@@ -115,6 +118,51 @@ done
 	exit 1
 }
 
+# Start a real Gripline node against a repository-owned writer endpoint. The
+# writer endpoint probes both PostgreSQL instances and only routes to the
+# non-recovery authority, so the server process survives a primary kill while
+# its shared-authority connection is re-established through the same address.
+GOCACHE="${GOCACHE:-/tmp/gripline-go-cache}" go build -trimpath -o "$work_dir/gripline" ./cmd/gripline
+GOCACHE="${GOCACHE:-/tmp/gripline-go-cache}" go build -trimpath -o "$work_dir/pg-writer" ./cmd/gripline-test-pg-writer
+GOCACHE="${GOCACHE:-/tmp/gripline-go-cache}" go build -trimpath -o "$work_dir/backend" ./cmd/gripline-test-backend
+writer_port=$((25434 + ($$ % 100)))
+live_port=$((25600 + ($$ % 100)))
+live_backend_port=$((live_port + 1))
+live_admin_port=$((live_port + 2))
+live_secret="ha-live-qualification-secret-0123456789abcdef"
+live_operator="ha-live-qualification-operator-0123456789abcdef"
+live_config="$work_dir/live-config.json"
+writer_dsn="postgres://gripline:gripline@127.0.0.1:${writer_port}/gripline?sslmode=disable"
+cat >"$live_config" <<EOF
+{
+  "listen": "127.0.0.1:${live_port}",
+  "tls": {"terminate_tls_upstream": true},
+  "backend": {"url": "http://127.0.0.1:${live_backend_port}", "timeout": "5s", "allowed_endpoints": [{"method":"POST","path":"/v1/messages"}]},
+  "server": {"read_timeout":"10s","write_timeout":"10s","idle_timeout":"10s","read_header_timeout":"5s"},
+  "identity": {"audience":"ha-live-qualification"},
+  "secrets": {"pepper_versions":{"1":"${pepper_one}","2":"${pepper_two}"}},
+  "admin": {"listen":"127.0.0.1:${live_admin_port}","operator_tokens":{"${live_operator}":"harness:credential.lifecycle,audit.read"}},
+  "paths": {"signer_keyring":"${work_dir}/keyring.json"},
+  "policy": {"file":"${work_dir}/policy.json","verifier_key_file":"${work_dir}/verifier.key"},
+  "authority": {"backend":"postgres","dsn_env":"GRIPLINE_HA_WRITER_DSN","node_id":"ha-live-node","lease_ttl":"5s","renew_every":"1s","connect_timeout":"3s","operation_timeout":"1s","max_conns":4,"min_conns":1},
+  "deployment": {"allow_ephemeral_state":false}
+}
+EOF
+"$work_dir/pg-writer" -listen "127.0.0.1:${writer_port}" \
+	-backend-dsn "postgres://gripline:gripline@127.0.0.1:${GRIPLINE_HA_PRIMARY_PORT:-25432}/gripline?sslmode=disable" \
+	-backend-dsn "postgres://gripline:gripline@127.0.0.1:${GRIPLINE_HA_REPLICA_PORT:-25433}/gripline?sslmode=disable" \
+	>"$work_dir/pg-writer.log" 2>&1 & live_pids+=("$!")
+GRIPLINE_HA_WRITER_DSN="$writer_dsn" "$work_dir/gripline" keys export --config "$live_config" >"$work_dir/live-keys.json"
+"$work_dir/backend" -listen "127.0.0.1:${live_backend_port}" -keys "$work_dir/live-keys.json" -audience ha-live-qualification >"$work_dir/live-backend.log" 2>&1 & live_pids+=("$!")
+GRIPLINE_HA_WRITER_DSN="$writer_dsn" "$work_dir/gripline" -config "$live_config" >"$work_dir/live-gripline.log" 2>&1 & live_pids+=("$!")
+for _ in $(seq 1 60); do
+	if curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${live_port}/readyz" 2>/dev/null | rg -qx 200; then break; fi
+	sleep 0.25
+done
+curl -fsS "http://127.0.0.1:${live_port}/readyz" >/dev/null
+printf '%s\n' "$live_secret" | GRIPLINE_OPERATOR_TOKEN="$live_operator" "$work_dir/gripline" credential add --config "$live_config" --id ha-live-credential --account ha-live --policy gripline-default-v1 --plan ha-live --reason "HA reference qualification" --secret-stdin >/dev/null
+curl -fsS "http://127.0.0.1:${live_port}/v1/messages" -H "Authorization: Bearer ${live_secret}" >/dev/null
+
 echo "ha qualification: stopping primary and promoting replica"
 "${compose[@]}" stop primary >/dev/null
 "${compose[@]}" exec -T replica gosu postgres pg_ctl promote -D /var/lib/postgresql/data >/dev/null
@@ -129,6 +177,16 @@ done
 	echo "ha qualification: promoted authority lost reference security state" >&2
 	exit 1
 }
+for _ in $(seq 1 90); do
+	if curl -fsS "http://127.0.0.1:${live_port}/readyz" >/dev/null 2>&1; then
+		break
+	fi
+	sleep 1
+done
+kill -0 "${live_pids[2]}"
+curl -fsS "http://127.0.0.1:${live_port}/readyz" >/dev/null
+curl -fsS "http://127.0.0.1:${live_port}/v1/messages" -H "Authorization: Bearer ${live_secret}" >/dev/null
+echo "ha qualification: live Gripline node recovered through stable writer endpoint"
 
 # Rejoin the failed node from the promoted authority. pg_basebackup -R writes
 # standby.signal and primary_conninfo, proving the node came back as a

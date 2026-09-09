@@ -17,6 +17,9 @@ func TestPostgresReplayGuardParallelAcrossInstances(t *testing.T) {
 		t.Skip("set GRIPLINE_REPLAY_POSTGRES_DSN for PostgreSQL replay qualification")
 	}
 	ctx := context.Background()
+	if err := MigratePostgresGuard(ctx, dsn); err != nil {
+		t.Fatal(err)
+	}
 	first, err := OpenPostgresGuard(ctx, dsn)
 	if err != nil {
 		t.Fatal(err)

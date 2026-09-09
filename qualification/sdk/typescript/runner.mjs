@@ -15,6 +15,7 @@ const required = (name) => {
 const baseURL = required('GRIPLINE_SDK_BASE_URL');
 const apiKey = required('GRIPLINE_SDK_API_KEY');
 const model = required('GRIPLINE_SDK_MODEL');
+const profile = process.env.GRIPLINE_SDK_PROFILE || 'chat';
 const scenario = process.env.GRIPLINE_SDK_SCENARIO || '';
 const wireModel = scenario ? `${model}-${scenario}` : model;
 const stream = process.env.GRIPLINE_SDK_STREAM === '1';
@@ -69,6 +70,29 @@ try {
       fetchOptions: { signal: controller.signal },
     });
     const callOnce = async () => {
+      if (profile === 'models') {
+        const response = await client.models.list();
+        if (!response.data?.length) throw new Error('OpenAI models profile returned no models');
+        return { usage: {} };
+      }
+      if (profile === 'embeddings') {
+        const response = await client.embeddings.create({ model: wireModel, input: content });
+        return { usage: usageOrFail(response.usage) };
+      }
+      if (profile === 'responses') {
+        const request = { model: wireModel, input: content, stream };
+        if (stream) {
+          let events = 0;
+          let usage;
+          for await (const event of await client.responses.create(request)) {
+            events += 1;
+            if (event.type === 'response.completed') usage = event.response?.usage;
+          }
+          return { events, usage: usageOrFail(usage) };
+        }
+        const response = await client.responses.create(request);
+        return { usage: usageOrFail(response.usage) };
+      }
       const request = {
         model: wireModel,
         messages: [{ role: 'user', content }],

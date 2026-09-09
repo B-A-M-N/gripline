@@ -78,6 +78,16 @@ run_h2() {
 		cat "$output" >&2
 		exit 1
 	fi
+	if ! rg -q 'SETTINGS_HEADER_TABLE_SIZE' "$output"; then
+		echo "security HTTP/2 harness: ${name} did not expose header-table settings" >&2
+		cat "$output" >&2
+		exit 1
+	fi
+	if [[ -n "${GRIPLINE_H2_EXPECT_HEADER_TABLE:-}" ]] && ! rg -q "SETTINGS_HEADER_TABLE_SIZE.*${GRIPLINE_H2_EXPECT_HEADER_TABLE}" "$output"; then
+		echo "security HTTP/2 harness: ${name} advertised an unexpected header-table bound" >&2
+		cat "$output" >&2
+		exit 1
+	fi
 	if [[ -n "${GRIPLINE_H2_EXPECT_MAX_STREAMS:-}" ]] && ! rg -q "SETTINGS_MAX_CONCURRENT_STREAMS.*${GRIPLINE_H2_EXPECT_MAX_STREAMS}" "$output"; then
 		echo "security HTTP/2 harness: ${name} advertised an unexpected stream bound" >&2
 		cat "$output" >&2
@@ -139,7 +149,12 @@ if command -v h2load >/dev/null; then
 		-H "authorization: Bearer ${secret}" \
 		-H 'content-type: application/json' \
 		-d "$payload" "$h2load_url" >"$load_output" 2>&1
-	if ! rg -q '2xx' "$load_output"; then
+	done_count="$(rg -o '[0-9]+ done' "$load_output" | awk '{print $1}' | tail -1)"
+	succeeded_count="$(rg -o '[0-9]+ succeeded' "$load_output" | awk '{print $1}' | tail -1)"
+	two_xx_count="$(rg -o '[0-9]+ 2xx' "$load_output" | awk '{print $1}' | tail -1)"
+	error_count="$(rg -o '[0-9]+ errored' "$load_output" | awk '{print $1}' | tail -1)"
+	timeout_count="$(rg -o '[0-9]+ timeout' "$load_output" | awk '{print $1}' | tail -1)"
+	if [[ ! "$done_count" =~ ^[0-9]+$ || ! "$succeeded_count" =~ ^[0-9]+$ || ! "$two_xx_count" =~ ^[0-9]+$ || "$done_count" == 0 || "$succeeded_count" != "$done_count" || "$two_xx_count" != "$done_count" || "${error_count:-0}" != 0 || "${timeout_count:-0}" != 0 ]]; then
 		echo "security HTTP/2 harness: h2load did not report successful responses" >&2
 		cat "$load_output" >&2
 		exit 1

@@ -12,6 +12,8 @@ monitor_pid=""
 harness_pid=""
 harness_artifact="$work_dir/harness.env"
 snapshot_file="$work_dir/soak.tsv"
+relation_file="$work_dir/relations.tsv"
+maintenance_file="$work_dir/maintenance.tsv"
 duration_text="5m"
 workers="${GRIPLINE_CLUSTER_SOAK_WORKERS:-24}"
 while [[ $# -gt 0 ]]; do
@@ -47,9 +49,13 @@ for _ in $(seq 1 90); do
 	sleep 1
 done
 monitor_failure="$work_dir/monitor.failure"
+promotion_file="$work_dir/promotion.expected"
+pause_file="$work_dir/harness.pause"
+release_file="$work_dir/harness.release"
 monitor() {
+	last_maintenance=0
 	while [[ -z "$harness_pid" ]] || kill -0 "$harness_pid" >/dev/null 2>&1; do
-		if ! "${compose[@]}" exec -T replica psql -U gripline -d gripline -X -Atqc 'SELECT pg_is_in_recovery()' 2>/dev/null | rg -qx t; then echo replica-not-in-recovery >"$monitor_failure"; return 1; fi
+		if [[ ! -f "$promotion_file" ]] && ! "${compose[@]}" exec -T replica psql -U gripline -d gripline -X -Atqc 'SELECT pg_is_in_recovery()' 2>/dev/null | rg -qx t; then echo replica-not-in-recovery >"$monitor_failure"; return 1; fi
 		schema="$("${compose[@]}" exec -T replica psql -U gripline -d gripline -X -Atqc "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='gripline_policy_manifest')" 2>/dev/null || true)"
 		if [[ "$schema" != t ]]; then sleep 5; continue; fi
 		if ! "${compose[@]}" exec -T replica psql -U gripline -d gripline -X -Atqc 'SELECT singleton FROM gripline_policy_manifest WHERE singleton=TRUE' 2>/dev/null | rg -qx t; then echo replica-policy-missing >"$monitor_failure"; return 1; fi
@@ -81,6 +87,17 @@ monitor() {
 			if [[ "$retention" =~ ^([0-9]+)\|([0-9]+)\|([0-9]+)$ ]]; then
 				if (( BASH_REMATCH[1] > 5 || BASH_REMATCH[2] > 64 || BASH_REMATCH[3] > 100000 )); then echo "retention-bounds" >"$monitor_failure"; return 1; fi
 			fi
+			now="$(date +%s)"
+			if (( now >= last_maintenance + 60 )) && [[ ! -f "$promotion_file" ]]; then
+				"${compose[@]}" exec -T primary psql -U gripline -d gripline -X -v ON_ERROR_STOP=1 -c 'VACUUM (ANALYZE) gripline_resource_leases, gripline_resource_holds, gripline_evidence, gripline_admission_audit, gripline_operator_audit, gripline_control_operations, gripline_credential_receipts' >/dev/null 2>&1 || { echo maintenance-failed >"$monitor_failure"; return 1; }
+				printf '%s\t%s\n' "$now" maintenance >>"$maintenance_file"
+				last_maintenance=$now
+			fi
+			relation_bytes="$("${compose[@]}" exec -T primary psql -U gripline -d gripline -X -Atqc "SELECT COALESCE(SUM(pg_total_relation_size(to_regclass(name))),0) FROM unnest(ARRAY['gripline_resource_leases','gripline_resource_holds','gripline_evidence','gripline_admission_audit','gripline_operator_audit','gripline_control_operations','gripline_credential_receipts']) AS names(name)" 2>/dev/null || true)"
+			if [[ "$relation_bytes" =~ ^[0-9]+$ ]]; then
+				printf '%s\t%s\n' "$now" "$relation_bytes" >>"$relation_file"
+				if (( relation_bytes > ${GRIPLINE_SOAK_MAX_TERMINAL_BYTES:-67108864} )); then echo terminal-relation-size >"$monitor_failure"; return 1; fi
+			fi
 		fi
 		sleep 5
 	done
@@ -88,7 +105,7 @@ monitor() {
 monitor &
 monitor_pid=$!
 dsn="postgres://gripline:gripline@127.0.0.1:${GRIPLINE_HA_PRIMARY_PORT:-25432}/gripline?sslmode=disable"
-GRIPLINE_CLUSTER_HARNESS_ARTIFACT_FILE="$harness_artifact" GRIPLINE_TEST_POSTGRES_DSN="$dsn" GRIPLINE_TEST_POSTGRES_CONTAINER="${project}-primary-1" GRIPLINE_CLUSTER_HARNESS_REQUIRE_DB_OUTAGE=1 GRIPLINE_CLUSTER_HARNESS_LOAD_SECONDS="$duration" GRIPLINE_CLUSTER_HARNESS_LOAD_WORKERS="$workers" bash "$repo_dir/scripts/cluster-harness.sh" >"$work_dir/harness.log" 2>&1 &
+GRIPLINE_CLUSTER_HARNESS_ARTIFACT_FILE="$harness_artifact" GRIPLINE_CLUSTER_HARNESS_PAUSE_FILE="$pause_file" GRIPLINE_CLUSTER_HARNESS_RELEASE_FILE="$release_file" GRIPLINE_TEST_POSTGRES_DSN="$dsn" GRIPLINE_TEST_POSTGRES_CONTAINER="${project}-primary-1" GRIPLINE_CLUSTER_HARNESS_REQUIRE_DB_OUTAGE=1 GRIPLINE_CLUSTER_HARNESS_LOAD_SECONDS="$duration" GRIPLINE_CLUSTER_HARNESS_LOAD_WORKERS="$workers" bash "$repo_dir/scripts/cluster-harness.sh" >"$work_dir/harness.log" 2>&1 &
 harness_pid=$!
 for _ in $(seq 1 120); do
 	if [[ -s "$harness_artifact" ]]; then break; fi
@@ -96,12 +113,14 @@ for _ in $(seq 1 120); do
 	sleep 0.25
 done
 [[ -s "$harness_artifact" ]] || { echo "soak qualification: cluster harness did not publish its runtime fixture" >&2; cat "$work_dir/harness.log" >&2; exit 1; }
-if ! wait "$harness_pid"; then cat "$work_dir/harness.log" >&2; exit 1; fi
-harness_pid=""
+
+for _ in $(seq 1 120); do
+	[[ -f "$pause_file" ]] && break
+	if ! kill -0 "$harness_pid" >/dev/null 2>&1; then cat "$work_dir/harness.log" >&2; exit 1; fi
+	sleep 0.25
+done
+[[ -f "$pause_file" ]] || { echo "soak qualification: live cluster did not reach failover handoff" >&2; exit 1; }
 if [[ -f "$monitor_failure" ]]; then echo "soak qualification: invariant monitor failed: $(<"$monitor_failure")" >&2; exit 1; fi
-kill "$monitor_pid" >/dev/null 2>&1 || true
-wait "$monitor_pid" >/dev/null 2>&1 || true
-monitor_pid=""
 [[ -s "$snapshot_file" ]] || { echo "soak qualification: no process/resource snapshots captured" >&2; exit 1; }
 for node in a b c; do
 	[[ "$(awk -F '\t' -v want="$node" '$2 == want {n++} END {print n+0}' "$snapshot_file")" -gt 0 ]] || { echo "soak qualification: no complete runtime snapshot for node $node" >&2; exit 1; }
@@ -110,6 +129,20 @@ max_rss="$(awk -F '\t' 'BEGIN {m=0} {if ($3 > m) m=$3} END {print m+0}' "$snapsh
 max_goroutines="$(awk -F '\t' 'BEGIN {m=0} {if ($4 > m) m=$4} END {print m+0}' "$snapshot_file")"
 max_heap="$(awk -F '\t' 'BEGIN {m=0} {if ($5 > m) m=$5} END {print m+0}' "$snapshot_file")"
 printf 'soak qualification: snapshots=%s max_rss_kb=%s max_goroutines=%s max_heap_bytes=%s\n' "$(wc -l <"$snapshot_file")" "$max_rss" "$max_goroutines" "$max_heap"
+if (( duration >= 120 )) && [[ ! -s "$maintenance_file" ]]; then
+	echo "soak qualification: long soak did not execute scheduled maintenance" >&2
+	exit 1
+fi
+for node in a b c; do
+	read -r rss_start rss_end <<<"$(awk -F '\t' -v want="$node" '$2 == want {if (!first) first=$3; last=$3} END {print first+0, last+0}' "$snapshot_file")"
+	if (( rss_end > rss_start + ${GRIPLINE_SOAK_MAX_RSS_GROWTH_KB:-131072} )); then
+		echo "soak qualification: RSS trend grew beyond bound for node $node" >&2
+		exit 1
+	fi
+done
+base="$(awk -F= '$1 == "base" {print $2}' "$harness_artifact")"
+request_secret="$(awk -F= '$1 == "request_secret" {print $2}' "$harness_artifact")"
+touch "$promotion_file"
 "${compose[@]}" stop primary >/dev/null
 "${compose[@]}" exec -T replica gosu postgres pg_ctl promote -D /var/lib/postgresql/data >/dev/null
 for _ in $(seq 1 60); do
@@ -118,4 +151,37 @@ for _ in $(seq 1 60); do
 done
 "${compose[@]}" exec -T replica psql -U gripline -d gripline -X -Atqc 'SELECT pg_is_in_recovery()' | rg -qx f
 "${compose[@]}" exec -T replica psql -U gripline -d gripline -X -Atqc 'SELECT singleton FROM gripline_policy_manifest WHERE singleton=TRUE' | rg -qx t
-echo "soak qualification: ${duration_text} self-contained cluster soak, invariant monitoring, outage recovery, and post-soak promotion passed"
+for port in $((base + 10)) $((base + 11)); do
+	for _ in $(seq 1 90); do
+		if curl -fsS "http://127.0.0.1:${port}/readyz" >/dev/null 2>&1; then break; fi
+		sleep 1
+	done
+	curl -fsS "http://127.0.0.1:${port}/readyz" >/dev/null
+	curl -fsS "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${request_secret}" >/dev/null
+done
+touch "$release_file"
+if ! wait "$harness_pid"; then cat "$work_dir/harness.log" >&2; exit 1; fi
+harness_pid=""
+kill "$monitor_pid" >/dev/null 2>&1 || true
+wait "$monitor_pid" >/dev/null 2>&1 || true
+monitor_pid=""
+if [[ -n "${GRIPLINE_SOAK_EVIDENCE_FILE:-}" ]]; then
+	relation_max="$(awk '{if ($2 > m) m=$2} END {print m+0}' "$relation_file" 2>/dev/null || true)"
+	cat >"$GRIPLINE_SOAK_EVIDENCE_FILE" <<EOF
+{
+  "qualification": "reference-production-soak",
+  "status": "passed",
+  "commit": "$(git rev-parse HEAD)",
+  "duration_seconds": ${duration},
+  "workers": ${workers},
+  "snapshots": $(wc -l <"$snapshot_file"),
+  "max_rss_kb": ${max_rss},
+  "max_goroutines": ${max_goroutines},
+  "max_heap_bytes": ${max_heap},
+  "maintenance_samples": $(wc -l <"$maintenance_file" 2>/dev/null || echo 0),
+  "max_terminal_relation_bytes": ${relation_max:-0},
+  "generated_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
+fi
+echo "soak qualification: ${duration_text} self-contained cluster soak, invariant monitoring, outage recovery, live-node promotion traffic, and post-soak promotion passed"

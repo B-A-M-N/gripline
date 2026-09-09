@@ -5,7 +5,7 @@ the third is specific to the operator's deployment.
 
 ```yaml
 repository_status: layer_1_worktree_passed_pending_exact_release_record
-reference_lab_status: local_smoke_passed_pending_tagged_record_and_long_soak
+reference_lab_status: repository-owned_smoke_and_long_soak_required_on_exact_sha
 operator_deployment_status: separate_per_deployment
 production_qualification_status: pending_exact_release_record
 production_stable: false
@@ -37,9 +37,10 @@ exceptions are line-local and documented in `GOSEC-BASELINE.md`.
 ## Layer 2 — repository reference production lab
 
 These are reproducible local qualification gates, not placeholders for hosted
-infrastructure. The release workflow runs the short smoke set on the tagged
-SHA; the scheduled/manual qualification record must additionally retain the
-long soak evidence:
+infrastructure. The release workflow runs the short functional set and gates
+publication on a 24-hour self-hosted reference soak on the exact tagged SHA.
+The scheduled/manual qualification record must additionally retain the long
+soak evidence:
 
 | Control | Owned entrypoint | Evidence required |
 |---|---|---|
@@ -54,8 +55,8 @@ long soak evidence:
 The lab uses disposable containers, generated keys, and local
 provider-shaped fixtures; it requires no provider account.
 The qualification workflow's manual `soak_duration` input accepts `24h` or
-`72h` for the long reference record; scheduled and tag-triggered runs use the
-short smoke duration.
+`72h` for the long reference record; only short smoke runs use a GitHub-hosted
+runner.
 
 ## Layer 3 — operator-specific deployment validation
 

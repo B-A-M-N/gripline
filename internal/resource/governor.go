@@ -411,13 +411,16 @@ type ProvisionAmt struct {
 // SETTLED with the actual usage after execution — refunding only reserved-
 // but-unused amounts (P0.36: ownership-complete settlement).
 type UsageEstimate struct {
-	Requests                 int64
-	InputTokens              int64
-	OutputTokens             int64
-	CombinedTokens           int64
-	CacheReadInputTokens     int64
-	CacheCreationInputTokens int64
-	CostMicrounits           int64
+	Requests                   int64
+	InputTokens                int64
+	OutputTokens               int64
+	CombinedTokens             int64
+	CacheReadInputTokens       int64
+	CacheCreationInputTokens   int64
+	CacheCreation5mInputTokens int64
+	CacheCreation1hInputTokens int64
+	CostConservative           bool
+	CostMicrounits             int64
 }
 
 // amountFor returns the reserved amount for one gauge dimension.

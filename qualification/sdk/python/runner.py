@@ -77,11 +77,33 @@ def scenario_request(model: str) -> tuple[str, dict[str, Any]]:
 def run_openai(base_url: str, api_key: str, model: str, stream: bool) -> dict[str, Any]:
     from openai import OpenAI
 
+    profile = os.environ.get("GRIPLINE_SDK_PROFILE", "chat")
     scenario, request = scenario_request(model)
     retries = 1 if scenario == "retry" else 0
     client = OpenAI(base_url=base_url, api_key=api_key, max_retries=retries, timeout=float(env("GRIPLINE_SDK_MAX_SECONDS", "30")))
 
     def call_once() -> dict[str, Any]:
+        if profile == "models":
+            response = client.models.list()
+            if not getattr(response, "data", None):
+                raise RuntimeError("OpenAI models profile returned no models")
+            return {"usage": {}}
+        if profile == "embeddings":
+            response = client.embeddings.create(model=request["model"], input=request["messages"][0]["content"])
+            return {"usage": usage_or_fail(response.usage)}
+        if profile == "responses":
+            current = {"model": request["model"], "input": request["messages"][0]["content"], "stream": stream}
+            if stream:
+                events = 0
+                usage = None
+                for event in client.responses.create(**current):
+                    events += 1
+                    if getattr(event, "type", "") == "response.completed":
+                        response = getattr(event, "response", None)
+                        usage = getattr(response, "usage", None)
+                return {"events": events, "usage": usage_or_fail(usage)}
+            response = client.responses.create(**current)
+            return {"usage": usage_or_fail(response.usage)}
         current = dict(request)
         current["stream"] = stream
         if stream:

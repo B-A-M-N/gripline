@@ -541,7 +541,7 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		proxyCfg.EndpointRules = make([]proxy.EndpointRule, 0, len(cfg.Backend.AllowedEndpoints))
 		for _, rule := range cfg.Backend.AllowedEndpoints {
 			proxyCfg.EndpointRules = append(proxyCfg.EndpointRules, proxy.EndpointRule{
-				Method: rule.Method, Path: rule.Path, RequiredScope: rule.RequiredScope,
+				Method: rule.Method, Path: rule.Path, RequiredScope: rule.RequiredScope, UsageProfile: rule.UsageProfile,
 			})
 		}
 	}
@@ -556,15 +556,18 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 			format = publicusage.FormatAnthropic
 		}
 		provider, err := publicusage.NewJSONProvider(format, publicusage.Pricing{
-			InputMicrounitsPerToken:         cfg.Usage.InputMicrounitsPerToken,
-			OutputMicrounitsPerToken:        cfg.Usage.OutputMicrounitsPerToken,
-			CacheReadMicrounitsPerToken:     cfg.Usage.CacheReadMicrounitsPerToken,
-			CacheCreationMicrounitsPerToken: cfg.Usage.CacheCreationMicrounitsPerToken,
+			InputMicrounitsPerToken:           cfg.Usage.InputMicrounitsPerToken,
+			OutputMicrounitsPerToken:          cfg.Usage.OutputMicrounitsPerToken,
+			CacheReadMicrounitsPerToken:       cfg.Usage.CacheReadMicrounitsPerToken,
+			CacheCreationMicrounitsPerToken:   cfg.Usage.CacheCreationMicrounitsPerToken,
+			CacheCreation5mMicrounitsPerToken: cfg.Usage.CacheCreation5mMicrounitsPerToken,
+			CacheCreation1hMicrounitsPerToken: cfg.Usage.CacheCreation1hMicrounitsPerToken,
 		}, cfg.Usage.DefaultOutputTokens)
 		if err != nil {
 			return nil, fmt.Errorf("gripline: usage adapter: %w", err)
 		}
 		provider.MaxOutputTokens = cfg.Usage.MaxOutputTokens
+		provider.CostMode = publicusage.CostMode(cfg.Usage.CostMode)
 		proxyCfg.Usage = proxy.AdaptUsageProvider(provider)
 	}
 	// Admission and completion decisions are shipped as bounded JSONL events

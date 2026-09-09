@@ -57,8 +57,12 @@ type Observation struct {
 	RemoteAddr string
 	// ProtoMajor is the HTTP major version of the inbound request.
 	ProtoMajor int
+	// Method is the normalized HTTP method used for route/profile selection.
+	Method string
 	// URLPath is the request path (no query), for endpoint-family features.
 	URLPath string
+	// UsageProfile binds metering to an explicit route schema when configured.
+	UsageProfile string
 	// BodySize is the declared request size, or -1 when unknown. It lets a
 	// provider adapter make a bounded pre-execution estimate without receiving
 	// the body itself.
@@ -371,6 +375,7 @@ type EndpointRule struct {
 	Method        string
 	Path          string
 	RequiredScope string
+	UsageProfile  string
 }
 
 func defaultEndpointRules() []EndpointRule {
@@ -682,7 +687,7 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		terminator.StripSecretHeaders(preAuthHeaders)
 		preAuthObs := Observation{
 			Header: preAuthHeaders, RemoteAddr: r.RemoteAddr,
-			ProtoMajor: r.ProtoMajor, URLPath: r.URL.Path,
+			ProtoMajor: r.ProtoMajor, Method: r.Method, URLPath: r.URL.Path,
 			BodySize: r.ContentLength, MaxBodyBytes: d.cfg.MaxBodyBytes,
 		}
 		if key, err := d.cfg.PreAuthSource.ResolvePreAuthSource(preAuthObs); err == nil && strings.TrimSpace(key) != "" {
@@ -724,9 +729,13 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Header:       obsHeaders,
 		RemoteAddr:   remoteIP(r),
 		ProtoMajor:   r.ProtoMajor,
+		Method:       r.Method,
 		URLPath:      r.URL.Path,
 		BodySize:     r.ContentLength,
 		MaxBodyBytes: d.cfg.MaxBodyBytes,
+	}
+	if route, ok := d.routeRule(r.Method, r.URL.Path); ok {
+		obs.UsageProfile = route.UsageProfile
 	}
 	// P0.11-fix: a configured source resolver that FAILS must fail the request
 	// closed, not silently degrade to "no source" (which would disable the
@@ -1077,6 +1086,7 @@ func normalizeEndpointRule(rule EndpointRule) (EndpointRule, error) {
 	rule.Method = strings.ToUpper(strings.TrimSpace(rule.Method))
 	rule.Path = strings.TrimSpace(rule.Path)
 	rule.RequiredScope = strings.TrimSpace(rule.RequiredScope)
+	rule.UsageProfile = strings.TrimSpace(rule.UsageProfile)
 	if rule.Method == "" || strings.ContainsAny(rule.Method, " \t\r\n") || rule.Path == "" ||
 		!strings.HasPrefix(rule.Path, "/v1/") || strings.ContainsAny(rule.Path, "?#*") {
 		return EndpointRule{}, fmt.Errorf("must contain an exact method and /v1/ path")
@@ -1088,6 +1098,17 @@ func normalizeEndpointRule(rule EndpointRule) (EndpointRule, error) {
 	case "", "inference", "REQUEST", "LANE", "CREDENTIAL", "ACCOUNT":
 	default:
 		return EndpointRule{}, fmt.Errorf("unsupported required scope %q", rule.RequiredScope)
+	}
+	switch rule.UsageProfile {
+	case "", "openai-chat", "openai-responses", "openai-embeddings", "openai-models", "anthropic-messages":
+	default:
+		return EndpointRule{}, fmt.Errorf("unsupported usage profile %q", rule.UsageProfile)
+	}
+	if rule.UsageProfile == "openai-models" && rule.Method != http.MethodGet {
+		return EndpointRule{}, fmt.Errorf("usage profile openai-models requires GET")
+	}
+	if rule.UsageProfile != "" && rule.UsageProfile != "openai-models" && rule.Method != http.MethodPost {
+		return EndpointRule{}, fmt.Errorf("usage profile %q requires POST", rule.UsageProfile)
 	}
 	return rule, nil
 }

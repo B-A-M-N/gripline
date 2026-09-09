@@ -28,6 +28,7 @@ for _ in $(seq 1 60); do
 done
 dsn="postgres://gripline:gripline@127.0.0.1:${GRIPLINE_REPLAY_POSTGRES_PORT:-25436}/gripline?sslmode=disable"
 GOCACHE="${GOCACHE:-/tmp/gripline-go-cache}" go build -trimpath -o "$work_dir/replay" ./cmd/gripline-test-replay
+"$work_dir/replay" -migrate -dsn "$dsn"
 "$work_dir/replay" -listen 127.0.0.1:19601 -dsn "$dsn" >"$work_dir/a.log" 2>&1 & pids+=("$!")
 "$work_dir/replay" -listen 127.0.0.1:19602 -dsn "$dsn" >"$work_dir/b.log" 2>&1 & pids+=("$!")
 for port in 19601 19602; do

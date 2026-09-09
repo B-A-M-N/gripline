@@ -17,13 +17,15 @@ import (
 
 // PostgresGuard records a namespaced assertion claim in a shared authority.
 // The primary key makes concurrent claims across independent verifier
-// processes atomic; expired rows are indexed and removed before insertion.
+// processes atomic. Schema ownership belongs to the explicit migration
+// command; serving processes only verify the schema and perform DML.
 type PostgresGuard struct {
 	pool *pgxpool.Pool
 }
 
-// OpenPostgresGuard connects to and initializes the shared replay table.
+// OpenPostgresGuard connects to an already-migrated shared replay table.
 func OpenPostgresGuard(ctx context.Context, dsn string) (*PostgresGuard, error) {
+	ctx = nonNilContext(ctx)
 	if strings.TrimSpace(dsn) == "" {
 		return nil, errors.New("replay: empty PostgreSQL DSN")
 	}
@@ -36,11 +38,49 @@ func OpenPostgresGuard(ctx context.Context, dsn string) (*PostgresGuard, error) 
 		pool.Close()
 		return nil, err
 	}
-	if err := guard.ensureSchema(ctx); err != nil {
+	if err := guard.checkSchema(ctx); err != nil {
 		pool.Close()
 		return nil, err
 	}
 	return guard, nil
+}
+
+// MigratePostgresGuard applies the repository-owned replay schema. It is
+// intentionally separate from OpenPostgresGuard so a serving role never needs
+// CREATE/ALTER privileges.
+func MigratePostgresGuard(ctx context.Context, dsn string) error {
+	ctx = nonNilContext(ctx)
+	if strings.TrimSpace(dsn) == "" {
+		return errors.New("replay: empty PostgreSQL DSN")
+	}
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	if err := pool.Ping(ctx); err != nil {
+		return err
+	}
+	return (&PostgresGuard{pool: pool}).ensureSchema(ctx)
+}
+
+func (g *PostgresGuard) checkSchema(ctx context.Context) error {
+	ctx = nonNilContext(ctx)
+	var table string
+	if err := g.pool.QueryRow(ctx, `SELECT to_regclass('public.gripline_replay_claims')`).Scan(&table); err != nil {
+		return err
+	}
+	if table == "" {
+		return errors.New("replay: schema is not migrated")
+	}
+	var index string
+	if err := g.pool.QueryRow(ctx, `SELECT to_regclass('public.gripline_replay_claims_expiry_idx')`).Scan(&index); err != nil {
+		return err
+	}
+	if index == "" {
+		return errors.New("replay: expiry index is not migrated")
+	}
+	return nil
 }
 
 func (g *PostgresGuard) ensureSchema(ctx context.Context) error {
@@ -72,6 +112,7 @@ func (g *PostgresGuard) Close() {
 
 // Accept atomically claims one issuer/audience/JTI namespace until expiry.
 func (g *PostgresGuard) Accept(ctx context.Context, claim verify.ReplayClaim) (bool, error) {
+	ctx = nonNilContext(ctx)
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
@@ -82,12 +123,14 @@ func (g *PostgresGuard) Accept(ctx context.Context, claim verify.ReplayClaim) (b
 		return false, errors.New("replay: claim expired")
 	}
 	key := claimKey(claim)
-	if _, err := g.pool.Exec(ctx, `DELETE FROM gripline_replay_claims WHERE expires_at <= CURRENT_TIMESTAMP`); err != nil {
-		return false, err
-	}
 	var inserted int
 	err := g.pool.QueryRow(ctx, `INSERT INTO gripline_replay_claims (claim_key, expires_at)
-		VALUES ($1,$2) ON CONFLICT (claim_key) DO NOTHING RETURNING 1`, key, claim.ExpiresAt.UTC()).Scan(&inserted)
+		SELECT $1, $2
+		WHERE $2 > CURRENT_TIMESTAMP
+		ON CONFLICT (claim_key) DO UPDATE
+		SET expires_at = EXCLUDED.expires_at
+		WHERE gripline_replay_claims.expires_at <= CURRENT_TIMESTAMP
+		RETURNING 1`, key, claim.ExpiresAt.UTC()).Scan(&inserted)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}
@@ -95,6 +138,37 @@ func (g *PostgresGuard) Accept(ctx context.Context, claim verify.ReplayClaim) (b
 		return false, err
 	}
 	return inserted == 1, nil
+}
+
+// CleanupExpired removes at most limit rows. It is deliberately separate from
+// Accept so request admission never performs an unbounded table-wide delete.
+func (g *PostgresGuard) CleanupExpired(ctx context.Context, limit int) (int64, error) {
+	ctx = nonNilContext(ctx)
+	if g == nil || g.pool == nil {
+		return 0, errors.New("replay: unavailable")
+	}
+	if limit <= 0 {
+		return 0, errors.New("replay: cleanup limit must be positive")
+	}
+	tag, err := g.pool.Exec(ctx, `WITH expired AS (
+		SELECT claim_key FROM gripline_replay_claims
+		WHERE expires_at <= CURRENT_TIMESTAMP
+		ORDER BY expires_at
+		LIMIT $1
+	)
+	DELETE FROM gripline_replay_claims c USING expired
+	WHERE c.claim_key = expired.claim_key`, limit)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+func nonNilContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
 }
 
 func claimKey(claim verify.ReplayClaim) []byte {

@@ -54,6 +54,18 @@ def response_for(path: str, stream: bool, request: dict) -> tuple[int, bytes, st
         return 200, json.dumps(body).encode(), "application/json", {}
     if path.endswith("/embeddings"):
         return 200, json.dumps({"object": "list", "data": [{"object": "embedding", "index": 0, "embedding": [0.0]}], "usage": {"prompt_tokens": 3, "total_tokens": 3}}).encode(), "application/json", {}
+    if path.endswith("/responses"):
+        response = {
+            "id": "resp_qualification",
+            "object": "response",
+            "status": "completed",
+            "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "qualification ok"}]}],
+            "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
+        }
+        if stream:
+            event = {"type": "response.completed", "response": response}
+            return 200, ("event: response.completed\ndata: " + json.dumps(event) + "\n\n").encode(), "text/event-stream", {}
+        return 200, json.dumps(response).encode(), "application/json", {}
     body = {
         "id": "chatcmpl_qualification",
         "object": "chat.completion",
@@ -106,6 +118,22 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         for name, value in extra_headers.items():
             self.send_header(name, value)
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_GET(self) -> None:  # noqa: N802
+        assertion = self.headers.get("X-Gripline-Assertion")
+        expected = os.environ.get("GRIPLINE_INTERNAL_ASSERTION")
+        if assertion is None and (not expected or self.headers.get("Authorization") != f"Bearer {expected}"):
+            self.send_error(401, "gateway assertion required")
+            return
+        if self.path.rstrip("/") != "/v1/models":
+            self.send_error(404, "qualification endpoint not found")
+            return
+        payload = json.dumps({"object": "list", "data": [{"id": "local-qualification", "object": "model", "owned_by": "gripline-qualification"}]}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
 

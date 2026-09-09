@@ -189,12 +189,18 @@ type NetworkSection struct {
 // UsageSection selects the built-in provider-compatible usage adapter.
 type UsageSection struct {
 	// Mode is "none", "openai", or "anthropic". The empty value means none.
-	Mode                            string `json:"mode,omitempty"`
-	InputMicrounitsPerToken         int64  `json:"input_microunits_per_token,omitempty"`
-	OutputMicrounitsPerToken        int64  `json:"output_microunits_per_token,omitempty"`
-	CacheReadMicrounitsPerToken     int64  `json:"cache_read_microunits_per_token,omitempty"`
-	CacheCreationMicrounitsPerToken int64  `json:"cache_creation_microunits_per_token,omitempty"`
-	DefaultOutputTokens             int64  `json:"default_output_tokens,omitempty"`
+	Mode string `json:"mode,omitempty"`
+	// CostMode is "none", "conservative", or "exact". Deployments should
+	// choose explicitly; conservative is the safe posture when provider cache
+	// pricing details are unavailable in a response.
+	CostMode                          string `json:"cost_mode,omitempty"`
+	InputMicrounitsPerToken           int64  `json:"input_microunits_per_token,omitempty"`
+	OutputMicrounitsPerToken          int64  `json:"output_microunits_per_token,omitempty"`
+	CacheReadMicrounitsPerToken       int64  `json:"cache_read_microunits_per_token,omitempty"`
+	CacheCreationMicrounitsPerToken   int64  `json:"cache_creation_microunits_per_token,omitempty"`
+	CacheCreation5mMicrounitsPerToken int64  `json:"cache_creation_5m_microunits_per_token,omitempty"`
+	CacheCreation1hMicrounitsPerToken int64  `json:"cache_creation_1h_microunits_per_token,omitempty"`
+	DefaultOutputTokens               int64  `json:"default_output_tokens,omitempty"`
 	// MaxOutputTokens is the conservative pre-execution output reservation.
 	// It must be explicit when token/cost enforcement is enabled; request
 	// headers cannot lower this hard ceiling safely.
@@ -270,6 +276,7 @@ type EndpointRule struct {
 	Method        string `json:"method"`
 	Path          string `json:"path"`
 	RequiredScope string `json:"required_scope,omitempty"`
+	UsageProfile  string `json:"usage_profile,omitempty"`
 }
 
 // BackendTLSSection configures upstream TLS authentication.
@@ -559,6 +566,43 @@ func (c *Config) Validate() error {
 		seenRoutes[key] = struct{}{}
 		c.Backend.AllowedEndpoints[i].Method = method
 		c.Backend.AllowedEndpoints[i].Path = endpointPath
+		profile := strings.TrimSpace(rule.UsageProfile)
+		if profile == "" {
+			switch endpointPath {
+			case "/v1/responses":
+				profile = "openai-responses"
+			case "/v1/embeddings":
+				profile = "openai-embeddings"
+			case "/v1/models":
+				profile = "openai-models"
+			case "/v1/chat/completions", "/v1/completions":
+				profile = "openai-chat"
+			case "/v1/messages":
+				profile = "anthropic-messages"
+			default:
+				if c.Usage.Mode == "openai" || c.Usage.Mode == "anthropic" {
+					return fmt.Errorf("backend.allowed_endpoints[%d] requires usage_profile for custom path %q", i, endpointPath)
+				}
+			}
+		}
+		switch profile {
+		case "", "openai-chat", "openai-responses", "openai-embeddings", "openai-models", "anthropic-messages":
+		default:
+			return fmt.Errorf("backend.allowed_endpoints[%d].usage_profile %q is unsupported", i, profile)
+		}
+		if c.Usage.Mode == "openai" && strings.HasPrefix(profile, "anthropic-") {
+			return fmt.Errorf("backend.allowed_endpoints[%d].usage_profile %q is incompatible with usage.mode openai", i, profile)
+		}
+		if c.Usage.Mode == "anthropic" && strings.HasPrefix(profile, "openai-") {
+			return fmt.Errorf("backend.allowed_endpoints[%d].usage_profile %q is incompatible with usage.mode anthropic", i, profile)
+		}
+		if profile == "openai-models" && method != "GET" {
+			return fmt.Errorf("backend.allowed_endpoints[%d].usage_profile openai-models requires GET", i)
+		}
+		if profile != "openai-models" && profile != "" && method != "POST" {
+			return fmt.Errorf("backend.allowed_endpoints[%d].usage_profile %q requires POST", i, profile)
+		}
+		c.Backend.AllowedEndpoints[i].UsageProfile = profile
 	}
 	if _, err := c.BackendTLSConfig(); err != nil {
 		return err
@@ -651,11 +695,21 @@ func (c *Config) Validate() error {
 	if c.Usage.Mode != "" && c.Usage.Mode != "none" && c.Usage.Mode != "openai" && c.Usage.Mode != "anthropic" {
 		return fmt.Errorf("usage.mode must be none, openai, or anthropic, got %q", c.Usage.Mode)
 	}
-	if c.Usage.InputMicrounitsPerToken < 0 || c.Usage.OutputMicrounitsPerToken < 0 || c.Usage.CacheReadMicrounitsPerToken < 0 || c.Usage.CacheCreationMicrounitsPerToken < 0 || c.Usage.DefaultOutputTokens < 0 || c.Usage.MaxOutputTokens < 0 {
+	if c.Usage.CostMode != "" && c.Usage.CostMode != "none" && c.Usage.CostMode != "conservative" && c.Usage.CostMode != "exact" {
+		return fmt.Errorf("usage.cost_mode must be none, conservative, or exact, got %q", c.Usage.CostMode)
+	}
+	if c.Usage.InputMicrounitsPerToken < 0 || c.Usage.OutputMicrounitsPerToken < 0 || c.Usage.CacheReadMicrounitsPerToken < 0 || c.Usage.CacheCreationMicrounitsPerToken < 0 || c.Usage.CacheCreation5mMicrounitsPerToken < 0 || c.Usage.CacheCreation1hMicrounitsPerToken < 0 || c.Usage.DefaultOutputTokens < 0 || c.Usage.MaxOutputTokens < 0 {
 		return fmt.Errorf("usage pricing and output-token bounds must be non-negative")
 	}
 	if (c.Usage.Mode == "openai" || c.Usage.Mode == "anthropic") && c.Usage.MaxOutputTokens == 0 {
 		return fmt.Errorf("usage.max_output_tokens is required when usage.mode enables token metering")
+	}
+	if c.Usage.Mode == "" || c.Usage.Mode == "none" {
+		if c.Usage.CostMode == "" {
+			c.Usage.CostMode = "none"
+		}
+	} else if c.Usage.CostMode == "" {
+		c.Usage.CostMode = "conservative"
 	}
 	if c.Ingress != nil {
 		for version, value := range c.Ingress.PseudonymKeys {

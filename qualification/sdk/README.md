@@ -24,6 +24,7 @@ GRIPLINE_SDK_BASE_URL=https://gateway.example/v1
 GRIPLINE_SDK_ANTHROPIC_BASE_URL=https://gateway.example
 GRIPLINE_SDK_API_KEY=<disposable gateway credential>
 GRIPLINE_SDK_MODEL=<provider model accepted by the backend>
+GRIPLINE_SDK_PROFILE=chat|responses|embeddings|models|messages
 GRIPLINE_SDK_STREAM=0|1
 GRIPLINE_SDK_EXPECT_USAGE=1
 GRIPLINE_SDK_MAX_SECONDS=30
@@ -38,7 +39,7 @@ manifest installed first:
 ```sh
 python3 -m venv .venv
 . .venv/bin/activate
-pip install -r qualification/sdk/python/requirements.txt
+pip install --require-hashes -r qualification/sdk/python/requirements.lock
 python qualification/sdk/python/runner.py openai
 python qualification/sdk/python/runner.py anthropic
 ```
@@ -47,7 +48,7 @@ Run the TypeScript client with the exact versions pinned in `package.json`:
 
 ```sh
 cd qualification/sdk/typescript
-npm install
+npm ci --ignore-scripts
 node runner.mjs openai
 node runner.mjs anthropic
 ```

@@ -11,11 +11,39 @@ permissions:
   attestations: write
 
 jobs:
+  qualification:
+    name: release long-soak qualification evidence
+    runs-on: [self-hosted, linux, gripline-qualification]
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Require the exact tagged tree
+        run: test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+      - name: Run release qualification soak
+        env:
+          GRIPLINE_SOAK_EVIDENCE_FILE: qualification-release-soak-evidence.json
+        run: bash scripts/qualification/soak.sh --duration 24h --workers 24
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: gripline-release-qualification-evidence
+          path: qualification-release-soak-evidence.json
+      - uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517141b2
+        with:
+          subject-path: qualification-release-soak-evidence.json
+
   release:
+    needs: qualification
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16
+        image: postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
         env:
           POSTGRES_USER: gripline
           POSTGRES_PASSWORD: gripline
@@ -76,7 +104,6 @@ jobs:
           bash scripts/qualification/replay.sh
           bash scripts/qualification/http2.sh
           bash scripts/qualification/sdk.sh
-          bash scripts/qualification/soak.sh --duration 30s --workers 8
       - name: Build and smoke-test release container
         run: |
           docker build \
