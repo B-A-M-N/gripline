@@ -184,7 +184,7 @@ manifest_evidence_entry() {
 	local log_hash=${log_sha256[$key]:-}
 	printf '    "%s": {"record": {"path": "%s.json", "sha256": "%s"}, "log": {"path": "%s-log.txt", "sha256": "%s"}' "$key" "$key" "$record_hash" "$key" "$log_hash"
 	if [[ -n "$telemetry_hash" ]]; then
-		printf ', "telemetry": {"path": "%s-telemetry.json", "sha256": "%s"}' "$key" "$key" "$telemetry_hash"
+		printf ', "telemetry": {"path": "%s-telemetry.json", "sha256": "%s"}' "$key" "$telemetry_hash"
 	fi
 	printf '}'
 }
