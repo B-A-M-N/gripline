@@ -18,7 +18,7 @@ import (
 
 func main() {
 	headless := flag.Bool("headless", false, "run the full causal scenario and exit non-zero on any failed proof")
-	listen := flag.String("listen", "127.0.0.1:8080", "address for the demo web UI")
+	listen := flag.String("listen", "127.0.0.1:8585", "address for the demo web UI")
 	flag.Parse()
 
 	scenario, err := NewScenario()
