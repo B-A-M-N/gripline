@@ -83,7 +83,7 @@ type Store struct {
 // policy audit. Keep the marker versioned even though the DDL below is
 // idempotent: CREATE TABLE IF NOT EXISTS cannot add columns to an already
 // initialized database.
-const currentSchemaVersion = 11
+const currentSchemaVersion = 12
 
 const maxTransactionAttempts = 3
 
@@ -430,6 +430,7 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			evidence_codes JSONB NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS gripline_security_transitions_cursor_idx ON gripline_security_transitions (sequence)`,
+		`CREATE INDEX IF NOT EXISTS gripline_security_transitions_retention_idx ON gripline_security_transitions (at, sequence)`,
 		`CREATE TABLE IF NOT EXISTS gripline_lanes (
 			credential_id TEXT NOT NULL,
 			lane_id TEXT NOT NULL,
@@ -452,6 +453,7 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			revision BIGINT NOT NULL,
 			reason TEXT NOT NULL
 		)`,
+		`CREATE INDEX IF NOT EXISTS gripline_lane_operator_audit_retention_idx ON gripline_lane_operator_audit (at, id)`,
 		`CREATE TABLE IF NOT EXISTS gripline_operator_posture (
 			singleton BOOLEAN PRIMARY KEY,
 			posture INTEGER NOT NULL,
@@ -468,12 +470,14 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			committed BOOLEAN NOT NULL,
 			detail TEXT NOT NULL
 		)`,
+		`CREATE INDEX IF NOT EXISTS gripline_operator_audit_retention_idx ON gripline_operator_audit (at, sequence)`,
 		`CREATE TABLE IF NOT EXISTS gripline_control_operations (
 			operation_id TEXT PRIMARY KEY,
 			action TEXT NOT NULL,
 			payload_fingerprint TEXT NOT NULL,
 			created_at TIMESTAMPTZ NOT NULL
 		)`,
+		`CREATE INDEX IF NOT EXISTS gripline_control_operations_retention_idx ON gripline_control_operations (created_at, operation_id)`,
 		`CREATE TABLE IF NOT EXISTS gripline_admission_audit (
 			sequence BIGSERIAL PRIMARY KEY,
 			at TIMESTAMPTZ NOT NULL,
@@ -485,6 +489,7 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			authorized BOOLEAN NOT NULL,
 			reason TEXT NOT NULL
 		)`,
+		`CREATE INDEX IF NOT EXISTS gripline_admission_audit_retention_idx ON gripline_admission_audit (at, sequence)`,
 		`CREATE TABLE IF NOT EXISTS gripline_policy_manifest (
 			singleton BOOLEAN PRIMARY KEY,
 			manifest JSONB NOT NULL,
@@ -593,6 +598,7 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			last_seen_at TIMESTAMPTZ NOT NULL,
 			drain_until TIMESTAMPTZ
 		)`,
+		`CREATE INDEX IF NOT EXISTS gripline_membership_retention_idx ON gripline_membership (state, last_seen_at, node_id)`,
 		`CREATE TABLE IF NOT EXISTS gripline_cluster_crypto (
 			singleton BOOLEAN PRIMARY KEY,
 			signer_active_kid INTEGER NOT NULL,
@@ -628,6 +634,7 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			acknowledged_at TIMESTAMPTZ NOT NULL,
 			PRIMARY KEY (node_id, node_epoch, kind, generation)
 		)`,
+		`CREATE INDEX IF NOT EXISTS gripline_cluster_crypto_acks_retention_idx ON gripline_cluster_crypto_acks (acknowledged_at, node_id, node_epoch)`,
 		`CREATE TABLE IF NOT EXISTS gripline_policy_node_state (
 			node_id TEXT NOT NULL,
 			node_epoch BIGINT NOT NULL,
@@ -642,14 +649,17 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			PRIMARY KEY (node_id, node_epoch)
 		)`,
 		`CREATE INDEX IF NOT EXISTS gripline_policy_node_state_updated_idx ON gripline_policy_node_state (updated_at)`,
+		`CREATE INDEX IF NOT EXISTS gripline_policy_node_state_retention_idx ON gripline_policy_node_state (updated_at, node_id, node_epoch)`,
 		`CREATE TABLE IF NOT EXISTS gripline_evidence (
 			scope TEXT NOT NULL,
 			subject_id TEXT NOT NULL,
 			evidence_id TEXT NOT NULL,
+			expires_at TIMESTAMPTZ,
 			item JSONB NOT NULL,
 			PRIMARY KEY (scope, subject_id, evidence_id)
 		)`,
 		`CREATE INDEX IF NOT EXISTS gripline_evidence_subject_idx ON gripline_evidence (scope, subject_id)`,
+		`CREATE INDEX IF NOT EXISTS gripline_evidence_expiry_idx ON gripline_evidence (expires_at, scope, subject_id, evidence_id) WHERE expires_at IS NOT NULL`,
 		`CREATE TABLE IF NOT EXISTS gripline_evidence_guards (
 			scope TEXT NOT NULL,
 			subject_id TEXT NOT NULL,
@@ -783,6 +793,26 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			}
 		}
 		version = 11
+	}
+	if version == 11 {
+		for _, statement := range []string{
+			`ALTER TABLE gripline_evidence ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ`,
+			`UPDATE gripline_evidence SET expires_at = NULLIF(item->>'ExpiresAt', '0001-01-01T00:00:00Z')::timestamptz WHERE expires_at IS NULL AND item ? 'ExpiresAt' AND item->>'ExpiresAt' <> ''`,
+			`CREATE INDEX IF NOT EXISTS gripline_evidence_expiry_idx ON gripline_evidence (expires_at, scope, subject_id, evidence_id) WHERE expires_at IS NOT NULL`,
+			`CREATE INDEX IF NOT EXISTS gripline_security_transitions_retention_idx ON gripline_security_transitions (at, sequence)`,
+			`CREATE INDEX IF NOT EXISTS gripline_operator_audit_retention_idx ON gripline_operator_audit (at, sequence)`,
+			`CREATE INDEX IF NOT EXISTS gripline_control_operations_retention_idx ON gripline_control_operations (created_at, operation_id)`,
+			`CREATE INDEX IF NOT EXISTS gripline_admission_audit_retention_idx ON gripline_admission_audit (at, sequence)`,
+			`CREATE INDEX IF NOT EXISTS gripline_membership_retention_idx ON gripline_membership (state, last_seen_at, node_id)`,
+			`CREATE INDEX IF NOT EXISTS gripline_lane_operator_audit_retention_idx ON gripline_lane_operator_audit (at, id)`,
+			`CREATE INDEX IF NOT EXISTS gripline_cluster_crypto_acks_retention_idx ON gripline_cluster_crypto_acks (acknowledged_at, node_id, node_epoch)`,
+			`CREATE INDEX IF NOT EXISTS gripline_policy_node_state_retention_idx ON gripline_policy_node_state (updated_at, node_id, node_epoch)`,
+		} {
+			if _, err := tx.Exec(ctx, statement); err != nil {
+				return fmt.Errorf("statepg: migrate retention indexes and evidence expiry: %w", mapDBError(err))
+			}
+		}
+		version = 12
 	}
 	if version != currentSchemaVersion {
 		return fmt.Errorf("%w: unsupported migration state %d", ErrMigrationRequired, version)

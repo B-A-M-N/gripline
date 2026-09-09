@@ -24,7 +24,7 @@
     "max_idle_conns_per_host": 64,
     "max_response_header_bytes": 65536,
     "allowed_endpoints": [
-      {"method": "POST", "path": "/v1/messages", "required_scope": "inference"},
+      {"method": "POST", "path": "/v1/messages", "usage_profile": "none", "required_scope": "inference"},
       {"method": "POST", "path": "/v1/responses", "required_scope": "inference"},
       {"method": "POST", "path": "/v1/chat/completions", "required_scope": "inference"},
       {"method": "POST", "path": "/v1/completions", "required_scope": "inference"},
@@ -103,7 +103,25 @@
     "connect_timeout": "10s",
     "operation_timeout": "2s",
     "max_conns": 16,
-    "min_conns": 2
+    "min_conns": 2,
+    "maintenance": {
+      "interval": "1m",
+      "batch_size": 1024,
+      "evidence_grace": "0s",
+      "released_lease_retention": "24h",
+      "credential_receipt_retention": "24h",
+      "control_operation_retention": "24h",
+      "admission_audit_retention": "2160h",
+      "security_transition_retention": "2160h",
+      "operator_audit_retention": "8760h",
+      "policy_audit_retention": "8760h",
+      "membership_retention": "24h",
+      "adaptive_retention": "168h",
+      "evidence_guard_retention": "24h",
+      "lane_operator_audit_retention": "8760h",
+      "policy_node_state_retention": "24h",
+      "cluster_crypto_ack_retention": "24h"
+    }
   },
 
   "deployment": {

@@ -412,30 +412,31 @@ type routeKey struct {
 // It intentionally contains counts and outcome classes only; request IDs,
 // credentials, paths, and provider content do not belong in a metrics label.
 type MetricsSnapshot struct {
-	Admissions                 uint64
-	Authorizations             uint64
-	Denials                    uint64
-	AuthenticationFail         uint64
-	Degraded                   uint64
-	ResourceDenials            uint64
-	PolicyDenials              uint64
-	PayloadTooLarge            uint64
-	SpoolRejects               uint64
-	CompletionFailures         uint64
-	BackendFailures            uint64
-	Backend4xx                 uint64
-	Backend5xx                 uint64
-	ActiveStreams              uint64
-	EvidenceEvents             uint64
-	UsageSessions              uint64
-	UsageInputTokens           uint64
-	UsageOutputTokens          uint64
-	UsageCombinedTokens        uint64
-	UsageCostMicrounits        uint64
-	HTTP2Errors                uint64
-	ResourceDenialsByScope     [5]uint64
-	ResourceDenialsByDimension [6]uint64
-	Spool                      SpoolStats
+	Admissions                   uint64
+	Authorizations               uint64
+	Denials                      uint64
+	AuthenticationFail           uint64
+	Degraded                     uint64
+	ResourceDenials              uint64
+	PolicyDenials                uint64
+	PayloadTooLarge              uint64
+	SpoolRejects                 uint64
+	CompletionFailures           uint64
+	BackendFailures              uint64
+	Backend4xx                   uint64
+	Backend5xx                   uint64
+	ActiveStreams                uint64
+	EvidenceEvents               uint64
+	UsageSessions                uint64
+	UsageInputTokens             uint64
+	UsageOutputTokens            uint64
+	UsageCombinedTokens          uint64
+	UsageCostMicrounits          uint64
+	UsageConservativeSettlements uint64
+	HTTP2Errors                  uint64
+	ResourceDenialsByScope       [5]uint64
+	ResourceDenialsByDimension   [6]uint64
+	Spool                        SpoolStats
 }
 
 type proxyMetrics struct {
@@ -445,6 +446,7 @@ type proxyMetrics struct {
 	backend4xx, backend5xx, activeStreams, evidenceEvents     atomic.Uint64
 	usageSessions, usageInputTokens, usageOutputTokens        atomic.Uint64
 	usageCombinedTokens, usageCostMicrounits                  atomic.Uint64
+	usageConservativeSettlements                              atomic.Uint64
 	http2Errors                                               atomic.Uint64
 	resourceByScope                                           [5]atomic.Uint64
 	resourceByDim                                             [6]atomic.Uint64
@@ -465,9 +467,10 @@ func (d *DataPlane) Metrics() MetricsSnapshot {
 		EvidenceEvents: d.metrics.evidenceEvents.Load(),
 		UsageSessions:  d.metrics.usageSessions.Load(), UsageInputTokens: d.metrics.usageInputTokens.Load(),
 		UsageOutputTokens: d.metrics.usageOutputTokens.Load(), UsageCombinedTokens: d.metrics.usageCombinedTokens.Load(),
-		UsageCostMicrounits: d.metrics.usageCostMicrounits.Load(),
-		HTTP2Errors:         d.metrics.http2Errors.Load(),
-		Spool:               d.spool.Stats(),
+		UsageCostMicrounits:          d.metrics.usageCostMicrounits.Load(),
+		UsageConservativeSettlements: d.metrics.usageConservativeSettlements.Load(),
+		HTTP2Errors:                  d.metrics.http2Errors.Load(),
+		Spool:                        d.spool.Stats(),
 	}
 	for i := range snapshot.ResourceDenialsByScope {
 		snapshot.ResourceDenialsByScope[i] = d.metrics.resourceByScope[i].Load()
@@ -489,6 +492,9 @@ func (d *DataPlane) RecordHTTP2Error(_ string) {
 
 func (d *DataPlane) recordUsage(actual resource.UsageEstimate) {
 	d.metrics.usageSessions.Add(1)
+	if actual.CostConservative {
+		d.metrics.usageConservativeSettlements.Add(1)
+	}
 	if actual.InputTokens > 0 {
 		d.metrics.usageInputTokens.Add(uint64(actual.InputTokens))
 	}
@@ -1100,14 +1106,14 @@ func normalizeEndpointRule(rule EndpointRule) (EndpointRule, error) {
 		return EndpointRule{}, fmt.Errorf("unsupported required scope %q", rule.RequiredScope)
 	}
 	switch rule.UsageProfile {
-	case "", "openai-chat", "openai-responses", "openai-embeddings", "openai-models", "anthropic-messages":
+	case "", "none", "openai-chat", "openai-responses", "openai-embeddings", "openai-models", "anthropic-messages":
 	default:
 		return EndpointRule{}, fmt.Errorf("unsupported usage profile %q", rule.UsageProfile)
 	}
 	if rule.UsageProfile == "openai-models" && rule.Method != http.MethodGet {
 		return EndpointRule{}, fmt.Errorf("usage profile openai-models requires GET")
 	}
-	if rule.UsageProfile != "" && rule.UsageProfile != "openai-models" && rule.Method != http.MethodPost {
+	if rule.UsageProfile != "none" && rule.UsageProfile != "" && rule.UsageProfile != "openai-models" && rule.Method != http.MethodPost {
 		return EndpointRule{}, fmt.Errorf("usage profile %q requires POST", rule.UsageProfile)
 	}
 	return rule, nil

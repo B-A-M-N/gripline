@@ -492,7 +492,7 @@ func TestPostgresMaintenanceCleansBoundedHistoricalRows(t *testing.T) {
 			t.Fatalf("marshal evidence fixture: %v", marshalErr)
 		}
 		if _, err := store.pool.Exec(ctx, `INSERT INTO gripline_evidence
-			(scope, subject_id, evidence_id, item) VALUES ($1,$2,$3,$4)`, item.Scope.String(), item.SubjectID, item.EvidenceID, raw); err != nil {
+			(scope, subject_id, evidence_id, expires_at, item) VALUES ($1,$2,$3,$4,$5)`, item.Scope.String(), item.SubjectID, item.EvidenceID, zeroTime(item.ExpiresAt), raw); err != nil {
 			t.Fatalf("seed evidence %s: %v", item.EvidenceID, err)
 		}
 	}

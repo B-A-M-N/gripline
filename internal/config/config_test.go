@@ -66,6 +66,39 @@ func TestLoadValid(t *testing.T) {
 	}
 }
 
+func TestDeploymentExamplesValidate(t *testing.T) {
+	for _, name := range []string{"GRIPLINE_OPERATOR_TOKEN", "GRIPLINE_PEPPER_V1", "GRIPLINE_PEPPER_V2", "GRIPLINE_PSEUDONYM_KEY", "GRIPLINE_PSEUDONYM_V1", "GRIPLINE_PSEUDONYM_V2"} {
+		t.Setenv(name, "fixture-"+name+"-0123456789abcdef0123456789abcdef")
+	}
+	paths, err := filepath.Glob(filepath.Join("..", "..", "deploy", "config*.example.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) == 0 {
+		t.Fatal("no deployment examples found")
+	}
+	for _, path := range paths {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fixtureDir := t.TempDir()
+			caCert, clientKey := writeCertificateMaterial(t, fixtureDir, "verifier-control")
+			raw = bytes.ReplaceAll(raw, []byte("/etc/gripline/tls/verifier-control-ca.pem"), []byte(caCert))
+			raw = bytes.ReplaceAll(raw, []byte("/etc/gripline/tls/verifier-control-client.pem"), []byte(caCert))
+			raw = bytes.ReplaceAll(raw, []byte("/etc/gripline/tls/verifier-control-client-key.pem"), []byte(clientKey))
+			fixtureConfig := filepath.Join(fixtureDir, filepath.Base(path))
+			if err := os.WriteFile(fixtureConfig, raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(fixtureConfig); err != nil {
+				t.Fatalf("deployment example rejected: %v", err)
+			}
+		})
+	}
+}
+
 func TestValidateClusterAuthorityContract(t *testing.T) {
 	c := &Config{
 		Listen:    "127.0.0.1:8080",
@@ -162,6 +195,52 @@ func TestValidateEndpointRulesCompilesCanonicalRoutes(t *testing.T) {
 	}
 	if valid.Backend.AllowedEndpoints[0].Method != "POST" {
 		t.Fatalf("method was not canonicalized: %q", valid.Backend.AllowedEndpoints[0].Method)
+	}
+}
+
+func TestValidateUsageProfilesSeparateMeteredAndUnmeteredRoutes(t *testing.T) {
+	base := func(mode string) Config {
+		return Config{
+			Listen:   "127.0.0.1:8080",
+			TLS:      TLSSection{TerminateTLSUpstream: true},
+			Backend:  BackendSection{URL: "https://provider.internal", Timeout: Duration(time.Second)},
+			Server:   ServerSection{ReadTimeout: Duration(time.Second), WriteTimeout: Duration(time.Second), IdleTimeout: Duration(time.Second), ReadHeaderTimeout: Duration(time.Second)},
+			Identity: IdentitySection{Audience: "a"},
+			Usage:    UsageSection{Mode: mode, InputMicrounitsPerToken: 1, OutputMicrounitsPerToken: 1, MaxOutputTokens: 8},
+		}
+	}
+
+	none := base("none")
+	none.Backend.AllowedEndpoints = []EndpointRule{{Method: "GET", Path: "/v1/messages"}}
+	if err := none.Validate(); err != nil {
+		t.Fatalf("unmetered GET /v1/messages rejected: %v", err)
+	}
+	if got := none.Backend.AllowedEndpoints[0].UsageProfile; got != "" {
+		t.Fatalf("unmetered route inferred usage profile %q", got)
+	}
+
+	anthropic := base("anthropic")
+	anthropic.Backend.AllowedEndpoints = []EndpointRule{{Method: "GET", Path: "/v1/messages"}}
+	if err := anthropic.Validate(); err == nil {
+		t.Fatal("metered Anthropic GET /v1/messages must be rejected")
+	}
+
+	explicitNone := base("anthropic")
+	explicitNone.Backend.AllowedEndpoints = []EndpointRule{{Method: "GET", Path: "/v1/health", UsageProfile: "none"}}
+	if err := explicitNone.Validate(); err != nil {
+		t.Fatalf("explicit unmetered route rejected: %v", err)
+	}
+
+	mixed := base("openai")
+	mixed.Backend.AllowedEndpoints = []EndpointRule{
+		{Method: "GET", Path: "/v1/health", UsageProfile: "none"},
+		{Method: "POST", Path: "/v1/chat/completions"},
+	}
+	if err := mixed.Validate(); err != nil {
+		t.Fatalf("mixed metered/unmetered routes rejected: %v", err)
+	}
+	if got := mixed.Backend.AllowedEndpoints[1].UsageProfile; got != "openai-chat" {
+		t.Fatalf("metered route profile=%q, want openai-chat", got)
 	}
 }
 

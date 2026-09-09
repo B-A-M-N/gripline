@@ -82,6 +82,7 @@ const (
 type UsageProfile string
 
 const (
+	ProfileNone              UsageProfile = "none"
 	ProfileOpenAIChat        UsageProfile = "openai-chat"
 	ProfileOpenAIResponses   UsageProfile = "openai-responses"
 	ProfileOpenAIEmbeddings  UsageProfile = "openai-embeddings"
@@ -163,7 +164,7 @@ func (p *JSONProvider) Estimate(obs Observation) Estimate {
 }
 
 func (p *JSONProvider) estimate(obs Observation, profile UsageProfile) Estimate {
-	if profile == ProfileOpenAIModels {
+	if profile == ProfileNone || profile == ProfileOpenAIModels {
 		return Estimate{Requests: 1}
 	}
 	input := int64(0)
@@ -200,8 +201,16 @@ func (p *JSONProvider) estimate(obs Observation, profile UsageProfile) Estimate 
 
 func (p *JSONProvider) Begin(obs Observation, _ *http.Response) Session {
 	profile := profileFor(p.Format, obs.Method, obs.URLPath, obs.UsageProfile)
+	if profile == ProfileNone {
+		return requestOnlySession{}
+	}
 	return &jsonSession{provider: p, profile: profile, estimate: p.estimate(obs, profile), knownZero: profile == ProfileOpenAIModels}
 }
+
+type requestOnlySession struct{}
+
+func (requestOnlySession) ObserveChunk([]byte)   {}
+func (requestOnlySession) Finish(error) Estimate { return Estimate{Requests: 1} }
 
 type jsonSession struct {
 	provider          *JSONProvider
@@ -409,8 +418,10 @@ func (p *JSONProvider) withCost(e Estimate, profile UsageProfile, conservative b
 		// highest configured input/cache rate. This is conservative without
 		// double-counting cache dimensions as both regular and cache input.
 		inputRate = maxInt64(inputRate, p.Pricing.CacheReadMicrounitsPerToken)
-		inputRate = maxInt64(inputRate, p.cacheCreationRate(false))
-		inputRate = maxInt64(inputRate, p.cacheCreationRate(true))
+		if profile == ProfileAnthropicMessages {
+			inputRate = maxInt64(inputRate, p.cacheCreationRate(false))
+			inputRate = maxInt64(inputRate, p.cacheCreationRate(true))
+		}
 		e.CostMicrounits = safeMulAdd(e.InputTokens, inputRate,
 			e.OutputTokens, p.Pricing.OutputMicrounitsPerToken)
 		return e

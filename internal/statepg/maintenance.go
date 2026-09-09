@@ -2,11 +2,9 @@ package statepg
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"time"
 
-	"github.com/B-A-M-N/gripline/internal/evidence"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -27,6 +25,10 @@ type MaintenanceOptions struct {
 	PolicyAuditRetention        time.Duration
 	MembershipRetention         time.Duration
 	AdaptiveRetention           time.Duration
+	EvidenceGuardRetention      time.Duration
+	LaneOperatorAuditRetention  time.Duration
+	PolicyNodeStateRetention    time.Duration
+	ClusterCryptoAckRetention   time.Duration
 }
 
 const (
@@ -41,6 +43,10 @@ const (
 	defaultPolicyAuditRetention        = 365 * 24 * time.Hour
 	defaultMembershipRetention         = 24 * time.Hour
 	defaultAdaptiveRetention           = 7 * 24 * time.Hour
+	defaultEvidenceGuardRetention      = 24 * time.Hour
+	defaultLaneOperatorAuditRetention  = 365 * 24 * time.Hour
+	defaultPolicyNodeStateRetention    = 24 * time.Hour
+	defaultClusterCryptoAckRetention   = 24 * time.Hour
 )
 
 func (o MaintenanceOptions) withDefaults() MaintenanceOptions {
@@ -83,6 +89,18 @@ func (o MaintenanceOptions) withDefaults() MaintenanceOptions {
 	if o.AdaptiveRetention <= 0 {
 		o.AdaptiveRetention = defaultAdaptiveRetention
 	}
+	if o.EvidenceGuardRetention <= 0 {
+		o.EvidenceGuardRetention = defaultEvidenceGuardRetention
+	}
+	if o.LaneOperatorAuditRetention <= 0 {
+		o.LaneOperatorAuditRetention = defaultLaneOperatorAuditRetention
+	}
+	if o.PolicyNodeStateRetention <= 0 {
+		o.PolicyNodeStateRetention = defaultPolicyNodeStateRetention
+	}
+	if o.ClusterCryptoAckRetention <= 0 {
+		o.ClusterCryptoAckRetention = defaultClusterCryptoAckRetention
+	}
 	return o
 }
 
@@ -90,6 +108,7 @@ func (o MaintenanceOptions) withDefaults() MaintenanceOptions {
 // low-cardinality health telemetry and contains no subject identifiers.
 type MaintenanceStats struct {
 	EvidenceDeleted            int
+	EvidenceGuardsDeleted      int
 	ReleasedLeasesDeleted      int
 	CredentialReceiptsDeleted  int
 	ControlOperationsDeleted   int
@@ -99,6 +118,9 @@ type MaintenanceStats struct {
 	PolicyAuditDeleted         int
 	MembershipDeleted          int
 	AdaptiveRowsDeleted        int
+	LaneOperatorAuditDeleted   int
+	PolicyNodeStateDeleted     int
+	ClusterCryptoAcksDeleted   int
 }
 
 // maintenanceLoop runs on serving nodes only. Each pass uses short
@@ -132,7 +154,7 @@ func (s *Store) RunMaintenance(ctx context.Context) (MaintenanceStats, error) {
 	defer cancel()
 	var stats MaintenanceStats
 	var err error
-	if stats.EvidenceDeleted, err = s.maintainExpiredEvidence(ctx); err != nil {
+	if stats.EvidenceDeleted, stats.EvidenceGuardsDeleted, err = s.maintainExpiredEvidence(ctx); err != nil {
 		return stats, err
 	}
 	if stats.ReleasedLeasesDeleted, err = s.maintainReleasedLeases(ctx); err != nil {
@@ -185,6 +207,15 @@ func (s *Store) RunMaintenance(ctx context.Context) (MaintenanceStats, error) {
 		DELETE FROM gripline_operator_audit a USING doomed d WHERE a.sequence=d.sequence`); err != nil {
 		return stats, err
 	}
+	if stats.LaneOperatorAuditDeleted, err = s.maintainCutoff(ctx, s.maintenance.LaneOperatorAuditRetention, `
+		WITH doomed AS (
+			SELECT id FROM gripline_lane_operator_audit
+			WHERE at < $1 ORDER BY at, id
+			LIMIT $2 FOR UPDATE SKIP LOCKED
+		)
+		DELETE FROM gripline_lane_operator_audit a USING doomed d WHERE a.id=d.id`); err != nil {
+		return stats, err
+	}
 	if stats.PolicyAuditDeleted, err = s.maintainCutoff(ctx, s.maintenance.PolicyAuditRetention, `
 		WITH doomed AS (
 			SELECT sequence FROM gripline_policy_audit
@@ -201,6 +232,12 @@ func (s *Store) RunMaintenance(ctx context.Context) (MaintenanceStats, error) {
 			LIMIT $2 FOR UPDATE SKIP LOCKED
 		)
 		DELETE FROM gripline_membership m USING doomed d WHERE m.node_id=d.node_id AND m.state='stopped'`); err != nil {
+		return stats, err
+	}
+	if stats.PolicyNodeStateDeleted, err = s.maintainStaleNodeEpochs(ctx, s.maintenance.PolicyNodeStateRetention, `gripline_policy_node_state`, `updated_at`); err != nil {
+		return stats, err
+	}
+	if stats.ClusterCryptoAcksDeleted, err = s.maintainStaleNodeEpochs(ctx, s.maintenance.ClusterCryptoAckRetention, `gripline_cluster_crypto_acks`, `acknowledged_at`); err != nil {
 		return stats, err
 	}
 	if stats.AdaptiveRowsDeleted, err = s.maintainAdaptive(ctx); err != nil {
@@ -257,70 +294,65 @@ func (s *Store) maintainReleasedLeases(ctx context.Context) (int, error) {
 	return int(tag.RowsAffected()), nil
 }
 
-func (s *Store) maintainExpiredEvidence(ctx context.Context) (int, error) {
+func (s *Store) maintainExpiredEvidence(ctx context.Context) (int, int, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
-		return 0, mapDBError(err)
+		return 0, 0, mapDBError(err)
 	}
 	defer tx.Rollback(ctx)
 	now, err := dbNow(ctx, tx)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	rows, err := tx.Query(ctx, `SELECT scope, subject_id, evidence_id, item
-		FROM gripline_evidence
-		WHERE item ? 'ExpiresAt' AND item->>'ExpiresAt' <> '0001-01-01T00:00:00Z'
-		ORDER BY scope, subject_id, evidence_id
-		LIMIT $1 FOR UPDATE SKIP LOCKED`, s.maintenance.BatchSize)
+	result, err := tx.Exec(ctx, `
+		WITH doomed AS (
+			SELECT scope, subject_id, evidence_id
+			FROM gripline_evidence
+			WHERE expires_at IS NOT NULL AND expires_at <= $1
+			ORDER BY expires_at, scope, subject_id, evidence_id
+			LIMIT $2 FOR UPDATE SKIP LOCKED
+		)
+		DELETE FROM gripline_evidence e USING doomed d
+		WHERE e.scope=d.scope AND e.subject_id=d.subject_id AND e.evidence_id=d.evidence_id`, now.Add(-s.maintenance.EvidenceGrace), s.maintenance.BatchSize)
 	if err != nil {
-		return 0, mapDBError(err)
-	}
-	type evidenceRow struct {
-		scope, subject, id string
-		item               []byte
-	}
-	var candidates []evidenceRow
-	for rows.Next() {
-		var candidate evidenceRow
-		if err := rows.Scan(&candidate.scope, &candidate.subject, &candidate.id, &candidate.item); err != nil {
-			rows.Close()
-			return 0, mapDBError(err)
-		}
-		candidates = append(candidates, candidate)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return 0, mapDBError(err)
-	}
-	rows.Close()
-	deleted := 0
-	cutoff := now.Add(-s.maintenance.EvidenceGrace)
-	for _, candidate := range candidates {
-		var item evidence.Evidence
-		if err := json.Unmarshal(candidate.item, &item); err != nil {
-			return 0, errors.New("statepg: corrupt evidence record during maintenance")
-		}
-		if item.ExpiresAt.IsZero() || item.ExpiresAt.After(cutoff) {
-			continue
-		}
-		result, err := tx.Exec(ctx, `DELETE FROM gripline_evidence
-			WHERE scope=$1 AND subject_id=$2 AND evidence_id=$3`, candidate.scope, candidate.subject, candidate.id)
-		if err != nil {
-			return 0, mapDBError(err)
-		}
-		deleted += int(result.RowsAffected())
+		return 0, 0, mapDBError(err)
 	}
 	// Empty guards would otherwise become an unbounded historical subject
 	// index. An append creates/locks the guard again when the subject reappears.
-	if _, err := tx.Exec(ctx, `DELETE FROM gripline_evidence_guards g
-		WHERE NOT EXISTS (SELECT 1 FROM gripline_evidence e
-			WHERE e.scope=g.scope AND e.subject_id=g.subject_id)`); err != nil {
-		return 0, mapDBError(err)
+	guardResult, err := tx.Exec(ctx, `
+		WITH doomed AS (
+			SELECT g.scope, g.subject_id
+			FROM gripline_evidence_guards g
+			WHERE g.created_at < $1
+			  AND NOT EXISTS (SELECT 1 FROM gripline_evidence e
+				WHERE e.scope=g.scope AND e.subject_id=g.subject_id)
+			ORDER BY g.created_at, g.scope, g.subject_id
+			LIMIT $2 FOR UPDATE SKIP LOCKED
+		)
+		DELETE FROM gripline_evidence_guards g USING doomed d
+		WHERE g.scope=d.scope AND g.subject_id=d.subject_id`, now.Add(-s.maintenance.EvidenceGuardRetention), s.maintenance.BatchSize)
+	if err != nil {
+		return 0, 0, mapDBError(err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return 0, mapDBError(err)
+		return 0, 0, mapDBError(err)
 	}
-	return deleted, nil
+	return int(result.RowsAffected()), int(guardResult.RowsAffected()), nil
+}
+
+func (s *Store) maintainStaleNodeEpochs(ctx context.Context, retention time.Duration, table, timestampColumn string) (int, error) {
+	query := `
+		WITH doomed AS (
+			SELECT t.node_id, t.node_epoch
+			FROM ` + table + ` t
+			LEFT JOIN gripline_membership m ON m.node_id=t.node_id AND m.node_epoch=t.node_epoch
+			WHERE m.node_id IS NULL AND t.` + timestampColumn + ` < $1
+			ORDER BY t.` + timestampColumn + `, t.node_id, t.node_epoch
+			LIMIT $2 FOR UPDATE OF t SKIP LOCKED
+		)
+		DELETE FROM ` + table + ` t USING doomed d
+		WHERE t.node_id=d.node_id AND t.node_epoch=d.node_epoch`
+	return s.maintainCutoff(ctx, retention, query)
 }
 
 func (s *Store) maintainAdaptive(ctx context.Context) (int, error) {

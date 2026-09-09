@@ -130,9 +130,42 @@ type AuthoritySection struct {
 	ConnectTimeout Duration `json:"connect_timeout,omitempty"`
 	// OperationTimeout is the default bound for runtime-owned remote
 	// reconciliation and other ordinary authority operations.
-	OperationTimeout Duration `json:"operation_timeout,omitempty"`
-	MaxConns         int32    `json:"max_conns,omitempty"`
-	MinConns         int32    `json:"min_conns,omitempty"`
+	OperationTimeout Duration           `json:"operation_timeout,omitempty"`
+	MaxConns         int32              `json:"max_conns,omitempty"`
+	MinConns         int32              `json:"min_conns,omitempty"`
+	Maintenance      MaintenanceSection `json:"maintenance,omitempty"`
+}
+
+// MaintenanceSection exposes PostgreSQL historical-data retention to the
+// deployment instead of hiding it in authority implementation defaults.
+type MaintenanceSection struct {
+	Interval                    Duration `json:"interval,omitempty"`
+	BatchSize                   int      `json:"batch_size,omitempty"`
+	EvidenceGrace               Duration `json:"evidence_grace,omitempty"`
+	ReleasedLeaseRetention      Duration `json:"released_lease_retention,omitempty"`
+	CredentialReceiptRetention  Duration `json:"credential_receipt_retention,omitempty"`
+	ControlOperationRetention   Duration `json:"control_operation_retention,omitempty"`
+	AdmissionAuditRetention     Duration `json:"admission_audit_retention,omitempty"`
+	SecurityTransitionRetention Duration `json:"security_transition_retention,omitempty"`
+	OperatorAuditRetention      Duration `json:"operator_audit_retention,omitempty"`
+	PolicyAuditRetention        Duration `json:"policy_audit_retention,omitempty"`
+	MembershipRetention         Duration `json:"membership_retention,omitempty"`
+	AdaptiveRetention           Duration `json:"adaptive_retention,omitempty"`
+	EvidenceGuardRetention      Duration `json:"evidence_guard_retention,omitempty"`
+	LaneOperatorAuditRetention  Duration `json:"lane_operator_audit_retention,omitempty"`
+	PolicyNodeStateRetention    Duration `json:"policy_node_state_retention,omitempty"`
+	ClusterCryptoAckRetention   Duration `json:"cluster_crypto_ack_retention,omitempty"`
+}
+
+func (m MaintenanceSection) configured() bool {
+	return m.Interval.D() != 0 || m.BatchSize != 0 || m.EvidenceGrace.D() != 0 ||
+		m.ReleasedLeaseRetention.D() != 0 || m.CredentialReceiptRetention.D() != 0 ||
+		m.ControlOperationRetention.D() != 0 || m.AdmissionAuditRetention.D() != 0 ||
+		m.SecurityTransitionRetention.D() != 0 || m.OperatorAuditRetention.D() != 0 ||
+		m.PolicyAuditRetention.D() != 0 || m.MembershipRetention.D() != 0 ||
+		m.AdaptiveRetention.D() != 0 || m.EvidenceGuardRetention.D() != 0 ||
+		m.LaneOperatorAuditRetention.D() != 0 || m.PolicyNodeStateRetention.D() != 0 ||
+		m.ClusterCryptoAckRetention.D() != 0
 }
 
 // PolicySection selects the versioned policy artifact for the deployment.
@@ -567,7 +600,8 @@ func (c *Config) Validate() error {
 		c.Backend.AllowedEndpoints[i].Method = method
 		c.Backend.AllowedEndpoints[i].Path = endpointPath
 		profile := strings.TrimSpace(rule.UsageProfile)
-		if profile == "" {
+		meteringEnabled := c.Usage.Mode == "openai" || c.Usage.Mode == "anthropic"
+		if profile == "" && meteringEnabled {
 			switch endpointPath {
 			case "/v1/responses":
 				profile = "openai-responses"
@@ -586,7 +620,7 @@ func (c *Config) Validate() error {
 			}
 		}
 		switch profile {
-		case "", "openai-chat", "openai-responses", "openai-embeddings", "openai-models", "anthropic-messages":
+		case "", "none", "openai-chat", "openai-responses", "openai-embeddings", "openai-models", "anthropic-messages":
 		default:
 			return fmt.Errorf("backend.allowed_endpoints[%d].usage_profile %q is unsupported", i, profile)
 		}
@@ -599,7 +633,7 @@ func (c *Config) Validate() error {
 		if profile == "openai-models" && method != "GET" {
 			return fmt.Errorf("backend.allowed_endpoints[%d].usage_profile openai-models requires GET", i)
 		}
-		if profile != "openai-models" && profile != "" && method != "POST" {
+		if profile != "none" && profile != "openai-models" && profile != "" && method != "POST" {
 			return fmt.Errorf("backend.allowed_endpoints[%d].usage_profile %q requires POST", i, profile)
 		}
 		c.Backend.AllowedEndpoints[i].UsageProfile = profile
@@ -766,7 +800,7 @@ func (c *Config) Validate() error {
 	// authority, and lease timing is part of the cluster's safety contract.
 	switch strings.ToLower(strings.TrimSpace(c.Authority.Backend)) {
 	case "", "standalone":
-		if c.Authority.DSNEnv != "" || c.Authority.NodeID != "" || c.Authority.LeaseTTL.D() != 0 || c.Authority.RenewEvery.D() != 0 || c.Authority.ConnectTimeout.D() != 0 || c.Authority.OperationTimeout.D() != 0 {
+		if c.Authority.DSNEnv != "" || c.Authority.NodeID != "" || c.Authority.LeaseTTL.D() != 0 || c.Authority.RenewEvery.D() != 0 || c.Authority.ConnectTimeout.D() != 0 || c.Authority.OperationTimeout.D() != 0 || c.Authority.Maintenance.configured() {
 			return fmt.Errorf("authority.dsn_env, node_id, lease timings require authority.backend=postgres")
 		}
 	case "postgres":
@@ -796,6 +830,27 @@ func (c *Config) Validate() error {
 		}
 		if c.Authority.MaxConns < 0 || c.Authority.MinConns < 0 || (c.Authority.MaxConns > 0 && c.Authority.MinConns > c.Authority.MaxConns) {
 			return fmt.Errorf("authority min/max connection bounds are invalid")
+		}
+		if c.Authority.Maintenance.BatchSize < 0 {
+			return fmt.Errorf("authority.maintenance.batch_size must be non-negative")
+		}
+		retentions := []struct {
+			name  string
+			value time.Duration
+		}{
+			{"interval", c.Authority.Maintenance.Interval.D()}, {"evidence_grace", c.Authority.Maintenance.EvidenceGrace.D()},
+			{"released_lease_retention", c.Authority.Maintenance.ReleasedLeaseRetention.D()}, {"credential_receipt_retention", c.Authority.Maintenance.CredentialReceiptRetention.D()},
+			{"control_operation_retention", c.Authority.Maintenance.ControlOperationRetention.D()}, {"admission_audit_retention", c.Authority.Maintenance.AdmissionAuditRetention.D()},
+			{"security_transition_retention", c.Authority.Maintenance.SecurityTransitionRetention.D()}, {"operator_audit_retention", c.Authority.Maintenance.OperatorAuditRetention.D()},
+			{"policy_audit_retention", c.Authority.Maintenance.PolicyAuditRetention.D()}, {"membership_retention", c.Authority.Maintenance.MembershipRetention.D()},
+			{"adaptive_retention", c.Authority.Maintenance.AdaptiveRetention.D()}, {"evidence_guard_retention", c.Authority.Maintenance.EvidenceGuardRetention.D()},
+			{"lane_operator_audit_retention", c.Authority.Maintenance.LaneOperatorAuditRetention.D()}, {"policy_node_state_retention", c.Authority.Maintenance.PolicyNodeStateRetention.D()},
+			{"cluster_crypto_ack_retention", c.Authority.Maintenance.ClusterCryptoAckRetention.D()},
+		}
+		for _, retention := range retentions {
+			if retention.value < 0 {
+				return fmt.Errorf("authority.maintenance.%s must be non-negative", retention.name)
+			}
 		}
 	default:
 		return fmt.Errorf("authority.backend must be standalone or postgres")

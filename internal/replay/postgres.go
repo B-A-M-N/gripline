@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -22,6 +23,8 @@ import (
 type PostgresGuard struct {
 	pool *pgxpool.Pool
 }
+
+const replaySchemaVersion = 1
 
 // OpenPostgresGuard connects to an already-migrated shared replay table.
 func OpenPostgresGuard(ctx context.Context, dsn string) (*PostgresGuard, error) {
@@ -66,6 +69,16 @@ func MigratePostgresGuard(ctx context.Context, dsn string) error {
 
 func (g *PostgresGuard) checkSchema(ctx context.Context) error {
 	ctx = nonNilContext(ctx)
+	var version int
+	if err := g.pool.QueryRow(ctx, `SELECT version FROM public.gripline_replay_schema WHERE singleton=TRUE`).Scan(&version); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return errors.New("replay: schema marker is missing")
+		}
+		return err
+	}
+	if version != replaySchemaVersion {
+		return fmt.Errorf("replay: unsupported schema version %d (want %d)", version, replaySchemaVersion)
+	}
 	var table string
 	if err := g.pool.QueryRow(ctx, `SELECT to_regclass('public.gripline_replay_claims')`).Scan(&table); err != nil {
 		return err
@@ -92,13 +105,33 @@ func (g *PostgresGuard) ensureSchema(ctx context.Context) error {
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('gripline_replay_schema', 0))`); err != nil {
 		return err
 	}
+	if _, err := tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS gripline_replay_schema (
+		singleton BOOLEAN PRIMARY KEY,
+		version INTEGER NOT NULL
+	)`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO gripline_replay_schema (singleton, version)
+		VALUES (TRUE, $1)
+		ON CONFLICT (singleton) DO NOTHING`, replaySchemaVersion); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS gripline_replay_claims (
 		claim_key BYTEA PRIMARY KEY,
 		expires_at TIMESTAMPTZ NOT NULL
-);
-	CREATE INDEX IF NOT EXISTS gripline_replay_claims_expiry_idx
-		ON gripline_replay_claims (expires_at);`); err != nil {
+	)`); err != nil {
 		return err
+	}
+	if _, err := tx.Exec(ctx, `CREATE INDEX IF NOT EXISTS gripline_replay_claims_expiry_idx
+		ON gripline_replay_claims (expires_at)`); err != nil {
+		return err
+	}
+	var version int
+	if err := tx.QueryRow(ctx, `SELECT version FROM gripline_replay_schema WHERE singleton=TRUE`).Scan(&version); err != nil {
+		return err
+	}
+	if version != replaySchemaVersion {
+		return fmt.Errorf("replay: unsupported schema version %d (want %d)", version, replaySchemaVersion)
 	}
 	return tx.Commit(ctx)
 }
@@ -155,6 +188,7 @@ func (g *PostgresGuard) CleanupExpired(ctx context.Context, limit int) (int64, e
 		WHERE expires_at <= CURRENT_TIMESTAMP
 		ORDER BY expires_at
 		LIMIT $1
+		FOR UPDATE SKIP LOCKED
 	)
 	DELETE FROM gripline_replay_claims c USING expired
 	WHERE c.claim_key = expired.claim_key`, limit)

@@ -145,6 +145,37 @@ func TestJSONProviderUsesEndpointSpecificOpenAIProfiles(t *testing.T) {
 	}
 }
 
+func TestJSONProviderExplicitNoneCountsOnlyRequests(t *testing.T) {
+	p, err := NewJSONProvider(FormatAnthropic, Pricing{InputMicrounitsPerToken: 9, OutputMicrounitsPerToken: 11}, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	obs := Observation{Method: "GET", URLPath: "/v1/health", UsageProfile: ProfileNone, BodySize: 100}
+	if got := p.Estimate(obs); got != (Estimate{Requests: 1}) {
+		t.Fatalf("none estimate=%+v, want request-only", got)
+	}
+	s := p.Begin(obs, nil)
+	s.ObserveChunk([]byte(`{"usage":{"input_tokens":100,"output_tokens":100}}`))
+	if got := s.Finish(nil); got != (Estimate{Requests: 1}) {
+		t.Fatalf("none settlement=%+v, want request-only", got)
+	}
+}
+
+func TestJSONProviderConservativeCostUsesActiveProviderRates(t *testing.T) {
+	p, err := NewJSONProvider(FormatOpenAI, Pricing{
+		InputMicrounitsPerToken: 2, OutputMicrounitsPerToken: 3,
+		CacheReadMicrounitsPerToken: 5, CacheCreation5mMicrounitsPerToken: 100,
+		CacheCreation1hMicrounitsPerToken: 200,
+	}, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := p.Estimate(Observation{Method: "POST", URLPath: "/v1/chat/completions", BodySize: 10})
+	if got.CostMicrounits != 74 || !got.CostConservative {
+		t.Fatalf("OpenAI conservative pricing=%+v, want cache-read rate only", got)
+	}
+}
+
 func TestJSONProviderChargesOpenAICachedInput(t *testing.T) {
 	p, err := NewJSONProvider(FormatOpenAI, Pricing{
 		InputMicrounitsPerToken: 2, OutputMicrounitsPerToken: 3,

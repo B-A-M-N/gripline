@@ -54,7 +54,16 @@ func openRuntimeAuthorities(cfg *config.Config, connectTimeout, operationTimeout
 		s, err := statepg.Open(connectCtx, statepg.Options{
 			DSN: dsn, MaxConns: cfg.Authority.MaxConns, MinConns: cfg.Authority.MinConns,
 			NodeID: cfg.Authority.NodeID, LeaseTTL: cfg.Authority.LeaseTTL.D(), RenewEvery: cfg.Authority.RenewEvery.D(), MaxSourceScopes: cfg.Server.MaxSourceScopes, SourceScopeIdle: cfg.Server.SourceScopeIdle.D(),
-			ConnectTimeout: connectTimeout, OperationTimeout: operationTimeout, Migrate: false,
+			ConnectTimeout: connectTimeout, OperationTimeout: operationTimeout, Maintenance: statepg.MaintenanceOptions{
+				Interval: cfg.Authority.Maintenance.Interval.D(), BatchSize: cfg.Authority.Maintenance.BatchSize,
+				EvidenceGrace: cfg.Authority.Maintenance.EvidenceGrace.D(), ReleasedLeaseRetention: cfg.Authority.Maintenance.ReleasedLeaseRetention.D(),
+				CredentialReceiptRetention: cfg.Authority.Maintenance.CredentialReceiptRetention.D(), ControlOperationRetention: cfg.Authority.Maintenance.ControlOperationRetention.D(),
+				AdmissionAuditRetention: cfg.Authority.Maintenance.AdmissionAuditRetention.D(), SecurityTransitionRetention: cfg.Authority.Maintenance.SecurityTransitionRetention.D(),
+				OperatorAuditRetention: cfg.Authority.Maintenance.OperatorAuditRetention.D(), PolicyAuditRetention: cfg.Authority.Maintenance.PolicyAuditRetention.D(),
+				MembershipRetention: cfg.Authority.Maintenance.MembershipRetention.D(), AdaptiveRetention: cfg.Authority.Maintenance.AdaptiveRetention.D(),
+				EvidenceGuardRetention: cfg.Authority.Maintenance.EvidenceGuardRetention.D(), LaneOperatorAuditRetention: cfg.Authority.Maintenance.LaneOperatorAuditRetention.D(),
+				PolicyNodeStateRetention: cfg.Authority.Maintenance.PolicyNodeStateRetention.D(), ClusterCryptoAckRetention: cfg.Authority.Maintenance.ClusterCryptoAckRetention.D(),
+			}, Migrate: false,
 		})
 		connectCancel()
 		if err != nil {

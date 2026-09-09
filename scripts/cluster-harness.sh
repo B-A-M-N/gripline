@@ -384,6 +384,29 @@ wait_data_denied() {
 	return 1
 }
 
+wait_assertion_policy() {
+	local port=$1 secret=$2 revision=$3 epoch=$4
+	local response="$harness_dir/policy-${port}-${revision}-${epoch}.json" status=000
+	for _ in $(seq 1 "${GRIPLINE_CLUSTER_HARNESS_POLICY_ATTEMPTS:-120}"); do
+		status="$(curl -sS -o "$response" -w '%{http_code}' -X POST "http://127.0.0.1:${port}/v1/messages" \
+			-H "Authorization: Bearer ${secret}" -d '{}' 2>/dev/null || true)"
+		if [[ "$status" == 200 ]] &&
+			rg -q '"policy_revision":'"${revision}" "$response" &&
+			rg -q '"policy_epoch":'"${epoch}" "$response"; then
+			return 0
+		fi
+		if [[ "$status" != 429 && "$status" != 503 && "$status" != 000 && "$status" != 200 ]]; then
+			echo "cluster harness: policy ${revision}/${epoch} convergence returned unexpected status ${status} on port ${port}" >&2
+			cat "$response" >&2 || true
+			return 1
+		fi
+		sleep 0.1
+	done
+	echo "cluster harness: policy ${revision}/${epoch} did not converge on port ${port} (last status ${status})" >&2
+	cat "$response" >&2 || true
+	return 1
+}
+
 crypto_fingerprint() {
 	local status=$1 kind=$2 generation=$3
 	printf '%s' "$status" | sed -n "s/.*\"kind\":\"${kind}\",\"generation\":${generation},\"fingerprint\":\"\([^\"]*\)\".*/\1/p"
@@ -482,61 +505,6 @@ if [[ "$(awk '$1 == 200 {n++} END {print n+0}' "$harness_dir/codes"/*)" -lt 1 ]]
 	exit 1
 fi
 
-# Short sustained qualification: exercise the shared authority through all
-# three nodes while recording only bounded status/latency data. This is a CI
-# smoke gate for pool/serialization regressions, not a substitute for the
-# hosted 24-72 hour soak and HA workload matrix.
-if [[ "$load_seconds" -gt 0 ]]; then
-	load_dir="$harness_dir/cluster-load"
-	mkdir -p "$load_dir"
-	load_end_epoch=$(( $(date +%s) + load_seconds ))
-	load_secrets=("$secret_one" "$secret_two" "$secret_three")
-	load_worker() {
-		local worker=$1 result_file="$load_dir/worker-${1}.tsv"
-		local secret_index=$(( (worker - 1) % ${#load_secrets[@]} ))
-		local load_secret="${load_secrets[$secret_index]}"
-		local started ended code
-		: >"$result_file"
-		while [[ "$(date +%s)" -lt "$load_end_epoch" ]]; do
-			started="$(date +%s%N)"
-			code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${lb_port}/v1/messages" \
-				-H "Authorization: Bearer ${load_secret}" -d '{}' 2>/dev/null || true)"
-			ended="$(date +%s%N)"
-			printf '%s\t%s\n' "${code:-000}" "$((ended - started))" >>"$result_file"
-		done
-	}
-	load_pids=()
-	for worker in $(seq 1 "$load_workers"); do
-		load_worker "$worker" &
-		load_pids+=("$!")
-	done
-	for pid in "${load_pids[@]}"; do
-		wait "$pid" || true
-	done
-	cat "$load_dir"/*.tsv >"$load_dir/results.tsv"
-	load_samples="$(wc -l <"$load_dir/results.tsv")"
-	if [[ "$load_samples" -lt 1 ]]; then
-		echo "cluster harness: sustained load produced no samples" >&2
-		exit 1
-	fi
-	load_successes="$(awk -F '\t' '$1 == 200 {n++} END {print n+0}' "$load_dir/results.tsv")"
-	awk -F '\t' '$1 == 200 {print $2}' "$load_dir/results.tsv" | sort -n >"$load_dir/success-latencies.ns"
-	success_count="$(wc -l <"$load_dir/success-latencies.ns")"
-	if [[ "$load_successes" -lt 1 ]]; then
-		echo "cluster harness: sustained load had no successful requests" >&2
-		exit 1
-	fi
-	load_p50_ns="$(awk -v n="$success_count" 'NR == int((n * 50 + 99) / 100) {print; exit}' "$load_dir/success-latencies.ns")"
-	load_p95_ns="$(awk -v n="$success_count" 'NR == int((n * 95 + 99) / 100) {print; exit}' "$load_dir/success-latencies.ns")"
-	load_success_rate="$(awk -v successes="$load_successes" -v seconds="$load_seconds" 'BEGIN {printf "%.2f", successes / seconds}')"
-	printf 'cluster harness: sustained load samples=%s successes=%s success_per_sec=%s p50_ns=%s p95_ns=%s workers=%s seconds=%s\n' \
-		"$load_samples" "$load_successes" "$load_success_rate" "$load_p50_ns" "$load_p95_ns" "$load_workers" "$load_seconds"
-	if [[ "$load_p95_ns" -gt "$load_p95_limit_ns" ]]; then
-		echo "cluster harness: sustained-load p95 ${load_p95_ns}ns exceeded ${load_p95_limit_ms}ms limit" >&2
-		exit 1
-	fi
-fi
-
 # A revoke committed through A must deny on the other two authorities.
 provision cluster-credential-four "$secret_four"
 missing_operation_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((base + 20))/admin/credentials/revoke" \
@@ -617,34 +585,72 @@ for _ in $(seq 1 120); do
 done
 test "$activate_code" = 200
 printf '2\n' >"$policy_epoch_file"
-for port in $((base + 10)) $((base + 11)) $((base + 12)); do
-	for _ in $(seq 1 50); do
-		if curl -fsS -X POST "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_four}" -d '{}' 2>/dev/null | rg -q '"policy_revision":2' && \
-			curl -fsS -X POST "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_four}" -d '{}' 2>/dev/null | rg -q '"policy_epoch":2'; then
-			break
-		fi
-		sleep 0.1
+	for port in $((base + 10)) $((base + 11)) $((base + 12)); do
+		wait_assertion_policy "$port" "$secret_four" 2 2
 	done
-	curl -fsS -X POST "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_four}" -d '{}' | rg -q '"policy_revision":2'
-	curl -fsS -X POST "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_four}" -d '{}' | rg -q '"policy_epoch":2'
-done
 rollback_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((base + 20))/admin/policy/rollback" \
 	-H "Authorization: Bearer ${operator_token}" -H 'Content-Type: application/json' \
 	-H 'Idempotency-Key: cluster-policy-rollback' \
 	--data '{"revision":1,"reason":"cluster rollback canary"}')"
 test "$rollback_code" = 200
 printf '3\n' >"$policy_epoch_file"
-for port in $((base + 10)) $((base + 11)) $((base + 12)); do
-	for _ in $(seq 1 50); do
-		if curl -fsS -X POST "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_four}" -d '{}' 2>/dev/null | rg -q '"policy_revision":1' && \
-			curl -fsS -X POST "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_four}" -d '{}' 2>/dev/null | rg -q '"policy_epoch":3'; then
-			break
-		fi
-		sleep 0.1
+	for port in $((base + 10)) $((base + 11)) $((base + 12)); do
+		wait_assertion_policy "$port" "$secret_four" 1 3
 	done
-	curl -fsS -X POST "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_four}" -d '{}' | rg -q '"policy_revision":1'
-	curl -fsS -X POST "http://127.0.0.1:${port}/v1/messages" -H "Authorization: Bearer ${secret_four}" -d '{}' | rg -q '"policy_epoch":3'
-done
+
+# Run the destructive security load only after deterministic lifecycle checks
+# have converged. This keeps rate-limit/resource pressure from making policy,
+# crypto, revoke, and posture assertions nondeterministic.
+if [[ "$load_seconds" -gt 0 ]]; then
+	load_dir="$harness_dir/cluster-load"
+	mkdir -p "$load_dir"
+	load_end_epoch=$(( $(date +%s) + load_seconds ))
+	load_secrets=("$secret_two" "$secret_three" "$secret_four")
+	load_worker() {
+		local worker=$1 result_file="$load_dir/worker-${1}.tsv"
+		local secret_index=$(( (worker - 1) % ${#load_secrets[@]} ))
+		local load_secret="${load_secrets[$secret_index]}"
+		local started ended code
+		: >"$result_file"
+		while [[ "$(date +%s)" -lt "$load_end_epoch" ]]; do
+			started="$(date +%s%N)"
+			code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${lb_port}/v1/messages" \
+				-H "Authorization: Bearer ${load_secret}" -d '{}' 2>/dev/null || true)"
+			ended="$(date +%s%N)"
+			printf '%s\t%s\n' "${code:-000}" "$((ended - started))" >>"$result_file"
+		done
+	}
+	load_pids=()
+	for worker in $(seq 1 "$load_workers"); do
+		load_worker "$worker" &
+		load_pids+=("$!")
+	done
+	for pid in "${load_pids[@]}"; do
+		wait "$pid" || true
+	done
+	cat "$load_dir"/*.tsv >"$load_dir/results.tsv"
+	load_samples="$(wc -l <"$load_dir/results.tsv")"
+	if [[ "$load_samples" -lt 1 ]]; then
+		echo "cluster harness: sustained load produced no samples" >&2
+		exit 1
+	fi
+	load_successes="$(awk -F '\t' '$1 == 200 {n++} END {print n+0}' "$load_dir/results.tsv")"
+	awk -F '\t' '$1 == 200 {print $2}' "$load_dir/results.tsv" | sort -n >"$load_dir/success-latencies.ns"
+	success_count="$(wc -l <"$load_dir/success-latencies.ns")"
+	if [[ "$load_successes" -lt 1 ]]; then
+		echo "cluster harness: sustained load had no successful requests" >&2
+		exit 1
+	fi
+	load_p50_ns="$(awk -v n="$success_count" 'NR == int((n * 50 + 99) / 100) {print; exit}' "$load_dir/success-latencies.ns")"
+	load_p95_ns="$(awk -v n="$success_count" 'NR == int((n * 95 + 99) / 100) {print; exit}' "$load_dir/success-latencies.ns")"
+	load_success_rate="$(awk -v successes="$load_successes" -v seconds="$load_seconds" 'BEGIN {printf "%.2f", successes / seconds}')"
+	printf 'cluster harness: security load samples=%s successes=%s success_per_sec=%s p50_ns=%s p95_ns=%s workers=%s seconds=%s\n' \
+		"$load_samples" "$load_successes" "$load_success_rate" "$load_p50_ns" "$load_p95_ns" "$load_workers" "$load_seconds"
+	if [[ "$load_p95_ns" -gt "$load_p95_limit_ns" ]]; then
+		echo "cluster harness: security-load p95 ${load_p95_ns}ns exceeded ${load_p95_limit_ms}ms limit" >&2
+		exit 1
+	fi
+fi
 
 # The shared authority is a fail-closed dependency. CI supplies the PostgreSQL
 # service container; local runs may omit it when Docker is unavailable, but the

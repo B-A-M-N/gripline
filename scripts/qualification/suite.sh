@@ -40,6 +40,10 @@ if [[ -n "$(git -C "$repo_dir" status --porcelain)" ]]; then
 	exit 2
 fi
 mkdir -p "$result_dir"
+if [[ -n "$(find "$result_dir" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
+	echo "qualification suite: result directory must be empty to prevent stale evidence" >&2
+	exit 2
+fi
 work_dir="$(mktemp -d)"
 cleanup() {
 	if [[ "$keep" == 1 ]]; then

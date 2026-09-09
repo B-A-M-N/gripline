@@ -38,7 +38,7 @@ jobs:
       - name: Repository-owned reference qualification suite
         env:
           GRIPLINE_QUALIFICATION_RESULT_DIR: qualification-results
-        run: bash scripts/qualification/suite.sh --soak-duration "${{ inputs.soak_duration || '30s' }}" --workers 8
+        run: bash scripts/qualification/suite.sh --soak-duration 30s --workers 8
       - if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:

@@ -123,7 +123,7 @@ func (s *Store) appendContextOnce(ctx context.Context, items []evidence.Evidence
 			if err != nil {
 				return err
 			}
-			if _, err := tx.Exec(ctx, `INSERT INTO gripline_evidence (scope, subject_id, evidence_id, item) VALUES ($1,$2,$3,$4)`, scope, id, item.EvidenceID, raw); err != nil {
+			if _, err := tx.Exec(ctx, `INSERT INTO gripline_evidence (scope, subject_id, evidence_id, expires_at, item) VALUES ($1,$2,$3,$4,$5)`, scope, id, item.EvidenceID, zeroTime(item.ExpiresAt), raw); err != nil {
 				return err
 			}
 		}
