@@ -59,7 +59,19 @@ func (rt *Runtime) Ready() error {
 	}
 	for _, health := range rt.adaptiveHealth {
 		if health != nil && health.PersistenceError() != nil {
-			return fmt.Errorf("gripline: adaptive state checkpoint unavailable")
+			if recovery, ok := health.(interface {
+				RecoverPersistence(context.Context) error
+			}); ok {
+				recoveryCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				err := recovery.RecoverPersistence(recoveryCtx)
+				cancel()
+				if err != nil {
+					return fmt.Errorf("gripline: adaptive state checkpoint unavailable: %w", err)
+				}
+			}
+			if health.PersistenceError() != nil {
+				return fmt.Errorf("gripline: adaptive state checkpoint unavailable")
+			}
 		}
 	}
 	if rt.Resource != nil {

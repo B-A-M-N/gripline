@@ -60,8 +60,13 @@ printf '1\n' >"$policy_epoch_file"
 maintenance_config=""
 if [[ "${GRIPLINE_CLUSTER_HARNESS_COMPRESSED_RETENTION:-0}" == "1" ]]; then
 	retention_window="${GRIPLINE_CLUSTER_HARNESS_RETENTION_WINDOW:-1m}"
-	maintenance_config=", \"maintenance\": {\"interval\":\"1h\",\"batch_size\":256,\"max_batches_per_pass\":64,\"max_rows_per_pass\":4096,\"max_runtime_per_pass\":\"5s\",\"evidence_grace\":\"0s\",\"released_lease_retention\":\"${retention_window}\",\"credential_receipt_retention\":\"${retention_window}\",\"control_operation_retention\":\"${retention_window}\",\"admission_audit_retention\":\"${retention_window}\",\"security_transition_retention\":\"${retention_window}\",\"operator_audit_retention\":\"${retention_window}\",\"policy_audit_retention\":\"${retention_window}\",\"membership_retention\":\"1h\",\"adaptive_retention\":\"1h\",\"evidence_guard_retention\":\"${retention_window}\",\"lane_operator_audit_retention\":\"${retention_window}\",\"policy_node_state_retention\":\"1h\",\"cluster_crypto_ack_retention\":\"1h\"}"
+	maintenance_interval="${GRIPLINE_CLUSTER_HARNESS_MAINTENANCE_INTERVAL:-1h}"
+	maintenance_config=", \"maintenance\": {\"interval\":\"${maintenance_interval}\",\"batch_size\":256,\"max_batches_per_pass\":64,\"max_rows_per_pass\":4096,\"max_runtime_per_pass\":\"5s\",\"evidence_grace\":\"0s\",\"released_lease_retention\":\"${retention_window}\",\"credential_receipt_retention\":\"${retention_window}\",\"control_operation_retention\":\"${retention_window}\",\"admission_audit_retention\":\"${retention_window}\",\"security_transition_retention\":\"${retention_window}\",\"operator_audit_retention\":\"${retention_window}\",\"policy_audit_retention\":\"${retention_window}\",\"membership_retention\":\"1h\",\"adaptive_retention\":\"1h\",\"evidence_guard_retention\":\"${retention_window}\",\"lane_operator_audit_retention\":\"${retention_window}\",\"policy_node_state_retention\":\"1h\",\"cluster_crypto_ack_retention\":\"1h\"}"
 fi
+max_conns="${GRIPLINE_CLUSTER_HARNESS_MAX_CONNS:-8}"
+operation_timeout="${GRIPLINE_CLUSTER_HARNESS_OPERATION_TIMEOUT:-2s}"
+load_timeout="${GRIPLINE_CLUSTER_HARNESS_LOAD_TIMEOUT:-10s}"
+load_user_agent="${GRIPLINE_CLUSTER_HARNESS_LOAD_USER_AGENT:-gripline-qualification-load/1}"
 
 write_artifact() {
 	if [[ -n "${GRIPLINE_CLUSTER_HARNESS_ARTIFACT_FILE:-}" ]]; then
@@ -138,6 +143,9 @@ setup_args=(
 if [[ "$load_mode" == capacity ]]; then
 	setup_args+=(-capacity-mode)
 fi
+if [[ "${GRIPLINE_CLUSTER_HARNESS_COMPRESSED_RETENTION:-0}" == "1" ]]; then
+	setup_args+=(-seed-maintenance-fixture)
+fi
 "$harness_dir/setup" "${setup_args[@]}"
 
 export GRIPLINE_CLUSTER_DSN="$dsn"
@@ -174,8 +182,8 @@ for node in a b c; do
   "policy": {"file": "${harness_dir}/policy.json", "verifier_key_file": "${harness_dir}/policy-verifier.key"},
   "authority": {
     "backend": "postgres", "dsn_env": "GRIPLINE_CLUSTER_DSN", "node_id": "cluster-${node}",
-    "lease_ttl": "${lease_ttl}", "renew_every": "${renew_every}", "connect_timeout": "10s", "operation_timeout": "2s",
-    "max_conns": 8, "min_conns": 1${maintenance_config}
+	    "lease_ttl": "${lease_ttl}", "renew_every": "${renew_every}", "connect_timeout": "10s", "operation_timeout": "${operation_timeout}",
+	    "max_conns": ${max_conns}, "min_conns": 1${maintenance_config}
   },
   "deployment": {"allow_ephemeral_state": false}
 }
@@ -267,6 +275,7 @@ control_data_curl() {
 load_seconds="${GRIPLINE_CLUSTER_HARNESS_LOAD_SECONDS:-5}"
 load_workers="${GRIPLINE_CLUSTER_HARNESS_LOAD_WORKERS:-12}"
 load_p95_limit_ms="${GRIPLINE_CLUSTER_HARNESS_LOAD_P95_LIMIT_MS:-5000}"
+capacity_min_success_ratio="${GRIPLINE_CLUSTER_HARNESS_CAPACITY_MIN_SUCCESS_RATIO:-0.99}"
 if ! [[ "$load_seconds" =~ ^[0-9]+$ && "$load_workers" =~ ^[1-9][0-9]*$ && "$load_p95_limit_ms" =~ ^[1-9][0-9]*$ ]]; then
 	echo "cluster harness: load seconds/workers/p95 limit must be non-negative/positive integers" >&2
 	exit 2
@@ -554,14 +563,17 @@ test "$conflict_code" = 409
 test "$(curl_data_code "http://127.0.0.1:$((base + 11))/v1/messages" "$secret_one")" != 200
 test "$(curl_data_code "http://127.0.0.1:$((base + 12))/v1/messages" "$secret_one")" != 200
 
-# Lockdown committed through B must be observed by A, B, and C.
+# Lockdown committed through B must be observed by A, B, and C. Use the
+# freshly provisioned credential: emergency lockdown intentionally denies new
+# lanes, while an already-established lane may continue serving according to
+# the documented posture contract.
 lockdown_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((base + 21))/admin/posture" \
 	-H "Authorization: Bearer ${operator_token}" -H 'Content-Type: application/json' \
 	-H 'Idempotency-Key: cluster-lockdown' \
 	--data '{"on":true,"reason":"cluster lockdown"}')"
 test "$lockdown_code" = 200
 for port in $((base + 10)) $((base + 11)) $((base + 12)); do
-	wait_data_denied "http://127.0.0.1:${port}/v1/messages" "$secret_two"
+	wait_data_denied "http://127.0.0.1:${port}/v1/messages" "$secret_four"
 done
 unlock_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((base + 20))/admin/posture" \
 	-H "Authorization: Bearer ${operator_token}" -H 'Content-Type: application/json' \
@@ -678,28 +690,62 @@ if [[ "$load_seconds" -gt 0 ]]; then
 			exit 1
 		fi
 	else
-		metrics_before="$load_dir/metrics-before.prom"
-		metrics_after="$load_dir/metrics-after.prom"
-		curl -fsS "http://127.0.0.1:$((base + 20))/admin/metrics" -H "Authorization: Bearer ${operator_token}" >"$metrics_before"
-		"$harness_dir/load" -url "http://127.0.0.1:${lb_port}/v1/messages" -secrets "$secret_two,$secret_three,$secret_four" -duration "${load_seconds}s" -workers "$load_workers" >"$load_dir/capacity.json"
-		if ! rg -q '"successful"[[:space:]]*:[[:space:]]*[1-9]' "$load_dir/capacity.json"; then
-			echo "cluster harness: capacity load had no successful requests" >&2
-			cat "$load_dir/capacity.json" >&2
-			exit 1
-		fi
-		curl -fsS "http://127.0.0.1:$((base + 20))/admin/metrics" -H "Authorization: Bearer ${operator_token}" >"$metrics_after"
+		capacity_secrets=()
+		for worker in $(seq 1 "$load_workers"); do
+			capacity_id="cluster-capacity-$(printf '%02d' "$worker")"
+			capacity_secret="cluster-capacity-secret-$(printf '%02d' "$worker")-0123456789abcdef"
+			provision "$capacity_id" "$capacity_secret"
+			capacity_secrets+=("$capacity_secret")
+		done
+		capacity_secret_list="$(IFS=,; printf '%s' "${capacity_secrets[*]}")"
+		# Seed the exact feature vector used by the persistent load clients. The
+		# normal lifecycle probes use curl, while the capacity driver intentionally
+		# identifies itself as a stable qualification client; prewarming avoids
+		# turning throughput measurement into a new-lane/security-classification
+		# test.
+		for secret in "${capacity_secrets[@]}"; do
+			curl -fsS -o /dev/null -X POST "http://127.0.0.1:${lb_port}/v1/messages" \
+				-H "Authorization: Bearer ${secret}" -H "User-Agent: ${load_user_agent}" -d '{}'
+		done
+		for node in a b c; do
+			case "$node" in
+				a) admin_port=$((base + 20));;
+				b) admin_port=$((base + 21));;
+				c) admin_port=$((base + 22));;
+			esac
+			curl -fsS "http://127.0.0.1:${admin_port}/admin/metrics" -H "Authorization: Bearer ${operator_token}" >"$load_dir/metrics-before-${node}.prom"
+		done
+		"$harness_dir/load" -url "http://127.0.0.1:${lb_port}/v1/messages" -secrets "$capacity_secret_list" -duration "${load_seconds}s" -workers "$load_workers" -timeout "$load_timeout" -user-agent "$load_user_agent" >"$load_dir/capacity.json"
+		for node in a b c; do
+			case "$node" in
+				a) admin_port=$((base + 20));;
+				b) admin_port=$((base + 21));;
+				c) admin_port=$((base + 22));;
+			esac
+			curl -fsS "http://127.0.0.1:${admin_port}/admin/metrics" -H "Authorization: Bearer ${operator_token}" >"$load_dir/metrics-after-${node}.prom"
+		done
 		metric_value() { awk -v key="gripline_$1" '$1 == key {print $2; exit}' "$2"; }
-		metric_delta() {
-			awk -v before="$(metric_value "$1" "$metrics_before")" -v after="$(metric_value "$1" "$metrics_after")" 'BEGIN {printf "%.6f", (after+0)-(before+0)}'
+		fleet_metric_delta() {
+			local metric=$1 total=0 before after
+			for node in a b c; do
+				before="$(metric_value "$metric" "$load_dir/metrics-before-${node}.prom")"
+				after="$(metric_value "$metric" "$load_dir/metrics-after-${node}.prom")"
+				total="$(awk -v total="$total" -v before="${before:-0}" -v after="${after:-0}" 'BEGIN {printf "%.6f", total + (after+0) - (before+0)}')"
+			done
+			printf '%s' "$total"
 		}
-		serialization_retries="$(metric_delta postgres_serialization_retries_total)"
-		deadlock_retries="$(metric_delta postgres_deadlock_retries_total)"
+		serialization_retries="$(fleet_metric_delta postgres_serialization_retries_total)"
+		deadlock_retries="$(fleet_metric_delta postgres_deadlock_retries_total)"
 		transaction_retries="$(awk -v serialization="$serialization_retries" -v deadlock="$deadlock_retries" 'BEGIN {printf "%.0f", serialization + deadlock}')"
 		printf 'cluster harness: capacity load metrics=%s pg_pool_wait_seconds=%s transaction_retries=%s transaction_latency_seconds=%s\n' \
 			"$(cat "$load_dir/capacity.json")" \
-			"$(metric_delta postgres_pool_empty_acquire_wait_seconds)" \
+			"$(fleet_metric_delta postgres_pool_empty_acquire_wait_seconds)" \
 			"$transaction_retries" \
-			"$(metric_delta postgres_transaction_latency_seconds_total)"
+			"$(fleet_metric_delta postgres_transaction_latency_seconds_total)"
+		if [[ -n "${GRIPLINE_CLUSTER_HARNESS_CAPACITY_EVIDENCE_FILE:-}" ]]; then
+			install -D -m 0600 "$load_dir/capacity.json" "$GRIPLINE_CLUSTER_HARNESS_CAPACITY_EVIDENCE_FILE"
+		fi
+		python3 "$repo_dir/scripts/qualification/validate-capacity.py" "$load_dir/capacity.json" "$capacity_min_success_ratio"
 	fi
 fi
 
@@ -722,10 +768,13 @@ else
 	if [[ -f "$harness_dir/backend-capture.log" ]]; then
 		backend_capture_before="$(wc -l <"$harness_dir/backend-capture.log")"
 	fi
+	if [[ -n "${GRIPLINE_CLUSTER_HARNESS_OUTAGE_MARKER_FILE:-}" ]]; then
+		printf '%s\n' "$(date +%s)" >"$GRIPLINE_CLUSTER_HARNESS_OUTAGE_MARKER_FILE"
+	fi
 	docker stop "$postgres_container" >/dev/null
 	for port in $((base + 10)) $((base + 11)) $((base + 12)); do
 		for _ in $(seq 1 60); do
-			status="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port}/readyz" 2>/dev/null || true)"
+			status="$(curl --max-time 2 -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port}/readyz" 2>/dev/null || true)"
 			if [[ "$status" != "200" ]]; then
 				break
 			fi

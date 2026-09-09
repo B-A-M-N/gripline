@@ -7,9 +7,10 @@ set -euo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 fixture_dir="$repo_dir/scripts/qualification/fixtures/pitr"
+source "$repo_dir/scripts/qualification/fixtures/postgres-ha/ports.sh"
 project="gripline-pitr-${$}"
-pitr_port="${GRIPLINE_PITR_PORT:-$((25434 + ($$ % 100)))}"
-restore_port="${GRIPLINE_PITR_RESTORE_PORT:-$((25534 + ($$ % 100)))}"
+pitr_port="${GRIPLINE_PITR_PORT:-$(pick_free_port 26434 27434)}"
+restore_port="${GRIPLINE_PITR_RESTORE_PORT:-$(pick_free_port "$((pitr_port + 1))" 27434)}"
 export GRIPLINE_PITR_PORT="$pitr_port" GRIPLINE_PITR_RESTORE_PORT="$restore_port"
 cleanup() {
 	rm -rf "${work_dir:-}"

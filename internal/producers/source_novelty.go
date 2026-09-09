@@ -154,3 +154,25 @@ func (p *SourceNoveltyProducer) PersistenceError() error {
 	defer p.stateMu.Unlock()
 	return p.stateErr
 }
+
+// RecoverPersistence clears a transient distributed-observation error after
+// the shared authority has become healthy again. Without this probe, a node
+// that records one database outage remains unready forever: its load balancer
+// removes it before another admission can retry the observation.
+func (p *SourceNoveltyProducer) RecoverPersistence(ctx context.Context) error {
+	err := recoverAdaptivePersistence(ctx, p.distributed)
+	p.stateMu.Lock()
+	p.stateErr = err
+	p.stateMu.Unlock()
+	return err
+}
+
+func recoverAdaptivePersistence(ctx context.Context, store adaptive.Store) error {
+	if store == nil {
+		return nil
+	}
+	if ready, ok := store.(interface{ Ready(context.Context) error }); ok {
+		return ready.Ready(ctx)
+	}
+	return nil
+}

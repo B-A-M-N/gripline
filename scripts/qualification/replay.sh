@@ -5,6 +5,7 @@ set -euo pipefail
 # authority and race the same namespaced claim. Exactly one process may win.
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 fixture_dir="$repo_dir/scripts/qualification/fixtures/replay"
+source "$repo_dir/scripts/qualification/fixtures/postgres-ha/ports.sh"
 project="gripline-replay-${$}"
 work_dir="$(mktemp -d)"
 pids=()
@@ -26,7 +27,9 @@ for _ in $(seq 1 60); do
 	if "${compose[@]}" exec -T postgres pg_isready -U gripline -d gripline >/dev/null 2>&1; then break; fi
 	sleep 1
 done
-dsn="postgres://gripline:gripline@127.0.0.1:${GRIPLINE_REPLAY_POSTGRES_PORT:-25436}/gripline?sslmode=disable"
+replay_port="${GRIPLINE_REPLAY_POSTGRES_PORT:-$(pick_free_port 27434 28434)}"
+export GRIPLINE_REPLAY_POSTGRES_PORT="$replay_port"
+dsn="postgres://gripline:gripline@127.0.0.1:${replay_port}/gripline?sslmode=disable"
 GOCACHE="${GOCACHE:-/tmp/gripline-go-cache}" go build -trimpath -o "$work_dir/replay" ./cmd/gripline-test-replay
 "$work_dir/replay" -migrate -dsn "$dsn"
 "$work_dir/replay" -listen 127.0.0.1:19601 -dsn "$dsn" >"$work_dir/a.log" 2>&1 & pids+=("$!")

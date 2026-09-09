@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"math/rand"
 	"net/http"
 	"os"
@@ -20,6 +21,13 @@ import (
 )
 
 const maxLatencySamples = 100_000
+const maxLoadResponseDrain = 1 << 20
+
+type percentileSet struct {
+	P50Milliseconds float64 `json:"p50_ms"`
+	P95Milliseconds float64 `json:"p95_ms"`
+	P99Milliseconds float64 `json:"p99_ms"`
+}
 
 type result struct {
 	DurationSeconds float64          `json:"duration_seconds"`
@@ -28,32 +36,54 @@ type result struct {
 	Successful      int64            `json:"successful"`
 	TotalRPS        float64          `json:"total_rps"`
 	SuccessfulRPS   float64          `json:"successful_rps"`
+	SuccessRatio    float64          `json:"success_ratio"`
 	StatusCounts    map[string]int64 `json:"status_counts"`
-	P50Milliseconds float64          `json:"p50_ms"`
-	P95Milliseconds float64          `json:"p95_ms"`
-	P99Milliseconds float64          `json:"p99_ms"`
+	Latency         struct {
+		All        percentileSet `json:"all"`
+		Successful percentileSet `json:"successful"`
+	} `json:"latency"`
+	// Keep the original top-level fields for consumers of the first fixture
+	// format. They describe all completed attempts; the structured latency
+	// object above is authoritative for new qualification gates.
+	P50Milliseconds float64 `json:"p50_ms"`
+	P95Milliseconds float64 `json:"p95_ms"`
+	P99Milliseconds float64 `json:"p99_ms"`
 }
 
 type samples struct {
-	mu        sync.Mutex
-	counts    map[string]int64
-	latencies []int64
-	seen      int64
-	rng       *rand.Rand
+	mu                  sync.Mutex
+	counts              map[string]int64
+	latencies           []int64
+	successfulLatencies []int64
+	seen                int64
+	successfulSeen      int64
+	rng                 *rand.Rand
 }
 
-func (s *samples) record(status string, latency int64) {
+func (s *samples) record(status string, latency int64, successful bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.counts[status]++
 	s.seen++
 	if len(s.latencies) < maxLatencySamples {
 		s.latencies = append(s.latencies, latency)
+	} else {
+		index := s.rng.Int63n(s.seen)
+		if index < maxLatencySamples {
+			s.latencies[index] = latency
+		}
+	}
+	if !successful {
 		return
 	}
-	index := s.rng.Int63n(s.seen)
+	s.successfulSeen++
+	if len(s.successfulLatencies) < maxLatencySamples {
+		s.successfulLatencies = append(s.successfulLatencies, latency)
+		return
+	}
+	index := s.rng.Int63n(s.successfulSeen)
 	if index < maxLatencySamples {
-		s.latencies[index] = latency
+		s.successfulLatencies[index] = latency
 	}
 }
 
@@ -78,6 +108,7 @@ func main() {
 	duration := flag.Duration("duration", 30*time.Second, "load duration")
 	workers := flag.Int("workers", 16, "concurrent persistent clients")
 	timeout := flag.Duration("timeout", 10*time.Second, "per-request timeout")
+	userAgent := flag.String("user-agent", "", "optional deterministic User-Agent header")
 	flag.Parse()
 	credentials := []string{*secret}
 	if *secrets != "" {
@@ -105,6 +136,7 @@ func main() {
 	client := &http.Client{Transport: transport}
 	defer transport.CloseIdleConnections()
 
+	// #nosec G404 -- deterministic reservoir sampling only; this is never used for security or credential material.
 	stats := &samples{counts: make(map[string]int64), rng: rand.New(rand.NewSource(1))}
 	deadline := time.Now().Add(*duration)
 	var wg sync.WaitGroup
@@ -118,21 +150,31 @@ func main() {
 				request, err := http.NewRequestWithContext(ctx, http.MethodPost, *url, bytes.NewReader([]byte("{}")))
 				if err != nil {
 					cancel()
-					stats.record("request_error", 0)
+					stats.record("request_error", 0, false)
 					continue
 				}
 				request.Header.Set("Authorization", "Bearer "+credential)
 				request.Header.Set("Content-Type", "application/json")
+				if *userAgent != "" {
+					request.Header.Set("User-Agent", *userAgent)
+				}
 				started := time.Now()
 				response, err := client.Do(request)
 				latency := time.Since(started).Nanoseconds()
 				status := "request_error"
+				successful := false
 				if err == nil {
 					status = fmt.Sprintf("%d", response.StatusCode)
-					response.Body.Close()
+					read, readErr := io.Copy(io.Discard, io.LimitReader(response.Body, maxLoadResponseDrain+1))
+					closeErr := response.Body.Close()
+					if readErr != nil || closeErr != nil || read > maxLoadResponseDrain {
+						status = "response_error"
+					} else {
+						successful = response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices
+					}
 				}
 				cancel()
-				stats.record(status, latency)
+				stats.record(status, latency, successful)
 			}
 		}(worker)
 	}
@@ -144,10 +186,19 @@ func main() {
 		counts[status] = count
 	}
 	latencies := append([]int64(nil), stats.latencies...)
+	successfulLatencies := append([]int64(nil), stats.successfulLatencies...)
 	seen := stats.seen
+	successfulSeen := stats.successfulSeen
 	stats.mu.Unlock()
 	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
-	successful := counts["200"]
+	sort.Slice(successfulLatencies, func(i, j int) bool { return successfulLatencies[i] < successfulLatencies[j] })
+	successful := int64(0)
+	for code, count := range counts {
+		var statusCode int
+		if _, err := fmt.Sscanf(code, "%d", &statusCode); err == nil && statusCode >= http.StatusOK && statusCode < http.StatusMultipleChoices {
+			successful += count
+		}
+	}
 	seconds := duration.Seconds()
 	output := result{
 		DurationSeconds: seconds,
@@ -156,10 +207,23 @@ func main() {
 		Successful:      successful,
 		TotalRPS:        float64(seen) / seconds,
 		SuccessfulRPS:   float64(successful) / seconds,
+		SuccessRatio:    float64(successful) / float64(seen),
 		StatusCounts:    counts,
 		P50Milliseconds: percentile(latencies, 50),
 		P95Milliseconds: percentile(latencies, 95),
 		P99Milliseconds: percentile(latencies, 99),
+	}
+	output.Latency.All = percentileSet{
+		P50Milliseconds: percentile(latencies, 50),
+		P95Milliseconds: percentile(latencies, 95),
+		P99Milliseconds: percentile(latencies, 99),
+	}
+	if successfulSeen > 0 {
+		output.Latency.Successful = percentileSet{
+			P50Milliseconds: percentile(successfulLatencies, 50),
+			P95Milliseconds: percentile(successfulLatencies, 95),
+			P99Milliseconds: percentile(successfulLatencies, 99),
+		}
 	}
 	if err := json.NewEncoder(os.Stdout).Encode(output); err != nil {
 		fatal("encode result: %v", err)

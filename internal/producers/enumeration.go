@@ -105,3 +105,14 @@ func (p *EnumerationProducer) PersistenceError() error {
 	defer p.stateMu.Unlock()
 	return p.stateErr
 }
+
+// RecoverPersistence clears a transient distributed-observation error after
+// the shared authority has become healthy again. See SourceNoveltyProducer's
+// recovery probe for why readiness must be able to perform this check.
+func (p *EnumerationProducer) RecoverPersistence(ctx context.Context) error {
+	err := recoverAdaptivePersistence(ctx, p.distributed)
+	p.stateMu.Lock()
+	p.stateErr = err
+	p.stateMu.Unlock()
+	return err
+}

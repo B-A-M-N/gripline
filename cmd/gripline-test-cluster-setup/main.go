@@ -39,6 +39,7 @@ func main() {
 	pseudonymOne := flag.String("pseudonym-one", "", "optional base64 pseudonym generation 1 for seeded crypto state")
 	pseudonymTwo := flag.String("pseudonym-two", "", "optional base64 pseudonym generation 2 for seeded crypto state")
 	seedReferenceState := flag.Bool("seed-reference-state", false, "seed valid policy and representative non-secret authority state")
+	seedMaintenanceFixture := flag.Bool("seed-maintenance-fixture", false, "seed one expired disposable row for the runtime maintenance qualification")
 	capacityMode := flag.Bool("capacity-mode", false, "use high test-only resource ceilings for persistent capacity load")
 	flag.Parse()
 	if *keyringPath == "" || *policyPath == "" || *verifierPath == "" {
@@ -87,7 +88,12 @@ func main() {
 		configured.Limits.Normal.Requests = policy.BucketConfig{Capacity: 1 << 30, RefillPer: 1 << 30, RefillIn: time.Minute}
 		configured.Limits.Constrained.ConcurrencyCap = 1024
 		configured.Limits.Constrained.Requests = policy.BucketConfig{Capacity: 1 << 30, RefillPer: 1 << 30, RefillIn: time.Minute}
+		configured.Limits.Emergency.ConcurrencyCap = 1024
+		configured.Limits.Emergency.Requests = policy.BucketConfig{Capacity: 1 << 30, RefillPer: 1 << 30, RefillIn: time.Minute}
 		configured.Global.ConcurrencyCap = 4096
+		configured.LaneLimits.MaxActiveLanesPerCredential = 1024
+		configured.LaneLimits.MaxProvisionalLanes = 1024
+		configured.LaneLimits.Security.EnableAutomaticBlock = false
 	} else {
 		configured.Limits.Normal.ConcurrencyCap = 5
 		configured.Limits.Constrained.ConcurrencyCap = 5
@@ -101,6 +107,26 @@ func main() {
 	}
 	if *dsn != "" && *seedReferenceState {
 		seedReferenceAuthority(*dsn, configured, *pepperOne)
+	}
+	if *dsn != "" && *seedMaintenanceFixture {
+		seedMaintenanceFixtureRows(*dsn)
+	}
+}
+
+func seedMaintenanceFixtureRows(dsn string) {
+	pool, err := pgxpool.New(context.Background(), dsn)
+	if err != nil {
+		fatal("connect maintenance fixture authority: %v", err)
+	}
+	defer pool.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cutoff := time.Now().UTC().Add(-2 * time.Hour)
+	if _, err := pool.Exec(ctx, `INSERT INTO gripline_resource_leases
+		(lease_id, request_id, request_fingerprint, node_id, node_epoch, state, expires_at, created_at, released_at)
+		VALUES ('qualification-maintenance-lease','qualification-maintenance-request','qualification-maintenance-fingerprint','qualification-maintenance-node',1,'released',$1,$1,$1)
+		ON CONFLICT (lease_id) DO NOTHING`, cutoff); err != nil {
+		fatal("seed maintenance fixture lease: %v", err)
 	}
 }
 

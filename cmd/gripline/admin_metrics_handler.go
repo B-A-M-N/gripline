@@ -42,6 +42,7 @@ func adminMetrics(svc *control.Service, dp *proxy.DataPlane, governor resource.A
 		runtime.ReadMemStats(&mem)
 		writeMetric("runtime_goroutines", runtime.NumGoroutine())
 		writeMetric("runtime_heap_alloc_bytes", mem.HeapAlloc)
+		writeMetric("runtime_heap_objects", mem.HeapObjects)
 		if dp != nil {
 			m := dp.Metrics()
 			writeMetric("admissions_total", m.Admissions)

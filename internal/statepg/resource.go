@@ -87,7 +87,11 @@ func (s *Store) provisionDistributed(ctx context.Context, requestID string, scop
 }
 
 func (s *Store) provisionDistributedOnce(ctx context.Context, requestID, fingerprint string, scopes []resource.ScopeSpec, estimate resource.UsageEstimate) (resource.UsageReservation, error) {
-	tx, err := begin(ctx, s.pool)
+	// Resource admission uses Read Committed plus explicit row/guard locks. A
+	// SERIALIZABLE transaction made every first-write race (new buckets and
+	// source scopes) abort the whole admission, even though those writes have a
+	// deterministic lock order and can safely wait for the creator to commit.
+	tx, err := beginResource(ctx, s.pool)
 	if err != nil {
 		return nil, mapDBError(err)
 	}
@@ -247,6 +251,22 @@ func (s *Store) resolveResourceScope(ctx context.Context, tx pgx.Tx, sp resource
 		return sp, mapDBError(err)
 	}
 	if !exists {
+		// Serialize only the bounded source-cardinality decision. Existing source
+		// rows update normally; first writers take the singleton guard and then
+		// re-check after any concurrent creator has committed.
+		if err := tx.QueryRow(ctx, `SELECT singleton FROM gripline_resource_source_scope_guard WHERE singleton=TRUE FOR UPDATE`).Scan(&exists); err != nil {
+			return sp, mapDBError(err)
+		}
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM gripline_resource_source_scopes WHERE scope_id=$1)`, sp.ID).Scan(&exists); err != nil {
+			return sp, mapDBError(err)
+		}
+		if exists {
+			if _, err := tx.Exec(ctx, `INSERT INTO gripline_resource_source_scopes (scope_id, last_used_at) VALUES ($1,$2)
+				ON CONFLICT (scope_id) DO UPDATE SET last_used_at=EXCLUDED.last_used_at`, sp.ID, now); err != nil {
+				return sp, mapDBError(err)
+			}
+			return sp, nil
+		}
 		if err := s.evictIdleSourceScopes(ctx, tx, now); err != nil {
 			return sp, err
 		}
@@ -327,22 +347,23 @@ type resourceBucketRow struct {
 
 func (s *Store) loadResourceBucket(ctx context.Context, tx pgx.Tx, sp resource.ScopeSpec, dim resource.Dimension, cfg resource.BucketConfig, now time.Time) (resourceBucketRow, error) {
 	var row resourceBucketRow
+	capacity := cfg.Capacity
+	if dim == resource.DimConcurrency {
+		capacity = float64(cfgCapacity(sp.Buckets))
+	}
+	// ON CONFLICT waits for a concurrent first writer and then leaves its
+	// durable bucket intact. The following SELECT FOR UPDATE is the single
+	// serialization point for the gauge update, avoiding SERIALIZABLE aborts
+	// while preserving all-or-nothing admission.
+	if _, err := tx.Exec(ctx, `INSERT INTO gripline_resource_buckets
+		(scope, scope_id, dimension, capacity, refill_per, refill_in_ns, available, concurrency_used, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$4,0,$7) ON CONFLICT (scope, scope_id, dimension) DO NOTHING`,
+		sp.Scope, sp.ID, dim, capacity, cfg.RefillPer, cfg.RefillIn.Nanoseconds(), now); err != nil {
+		return row, mapDBError(err)
+	}
 	err := tx.QueryRow(ctx, `SELECT capacity, refill_per, refill_in_ns, available, concurrency_used, updated_at
 		FROM gripline_resource_buckets WHERE scope=$1 AND scope_id=$2 AND dimension=$3 FOR UPDATE`, sp.Scope, sp.ID, dim).
 		Scan(&row.capacity, &row.refillPer, &row.refillInNS, &row.available, &row.concurrencyUsed, &row.updatedAt)
-	if errors.Is(err, pgx.ErrNoRows) {
-		capacity := cfg.Capacity
-		if dim == resource.DimConcurrency {
-			capacity = float64(cfgCapacity(sp.Buckets))
-		}
-		if _, err := tx.Exec(ctx, `INSERT INTO gripline_resource_buckets
-			(scope, scope_id, dimension, capacity, refill_per, refill_in_ns, available, concurrency_used, updated_at)
-			VALUES ($1,$2,$3,$4,$5,$6,$4,0,$7)`, sp.Scope, sp.ID, dim, capacity, cfg.RefillPer, cfg.RefillIn.Nanoseconds(), now); err != nil {
-			return row, mapDBError(err)
-		}
-		row = resourceBucketRow{capacity: capacity, refillPer: cfg.RefillPer, refillInNS: cfg.RefillIn.Nanoseconds(), available: capacity, updatedAt: now}
-		return row, nil
-	}
 	if err != nil {
 		return row, mapDBError(err)
 	}
@@ -353,7 +374,7 @@ func (s *Store) loadResourceBucket(ctx context.Context, tx pgx.Tx, sp resource.S
 			row.available = oldCapacity
 		}
 	}
-	capacity := cfg.Capacity
+	capacity = cfg.Capacity
 	if dim == resource.DimConcurrency {
 		capacity = float64(cfgCapacity(sp.Buckets))
 	}
@@ -472,7 +493,10 @@ func (r *distributedReservation) MarkForwarded(ctx context.Context) error {
 }
 
 func (r *distributedReservation) markForwardedOnce(ctx context.Context) (time.Time, error) {
-	tx, err := begin(ctx, r.store.pool)
+	// Lease lifecycle transitions lock the exact lease row and then validate
+	// ownership. ReadCommitted avoids aborting unrelated forwards merely because
+	// they share the node-membership row used by the fencing check.
+	tx, err := beginResource(ctx, r.store.pool)
 	if err != nil {
 		return time.Time{}, mapDBError(err)
 	}
@@ -530,7 +554,7 @@ func (r *distributedReservation) Renew(ctx context.Context) error {
 }
 
 func (r *distributedReservation) renewOnce(ctx context.Context) (time.Time, error) {
-	tx, err := begin(ctx, r.store.pool)
+	tx, err := beginResource(ctx, r.store.pool)
 	if err != nil {
 		return time.Time{}, mapDBError(err)
 	}
@@ -585,7 +609,7 @@ func (r *distributedReservation) SettleContext(ctx context.Context, actual resou
 }
 
 func (r *distributedReservation) settleOnce(ctx context.Context, actual resource.UsageEstimate) error {
-	tx, err := begin(ctx, r.store.pool)
+	tx, err := beginResource(ctx, r.store.pool)
 	if err != nil {
 		return mapDBError(err)
 	}
@@ -716,7 +740,7 @@ func releaseLease(ctx context.Context, s *Store, leaseID, nodeID string, nodeEpo
 }
 
 func releaseLeaseOnce(ctx context.Context, s *Store, leaseID, nodeID string, nodeEpoch int64) error {
-	tx, err := begin(ctx, s.pool)
+	tx, err := beginResource(ctx, s.pool)
 	if err != nil {
 		return mapDBError(err)
 	}

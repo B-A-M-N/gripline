@@ -1,6 +1,7 @@
 package anomaly
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -193,4 +194,22 @@ func (d *Detector) PersistenceError() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.stateErr
+}
+
+// RecoverPersistence clears a transient distributed-observation error after
+// the shared authority has become healthy again. Readiness must be able to do
+// this probe because an unready node may not receive another admission that
+// would otherwise retry the observation.
+func (d *Detector) RecoverPersistence(ctx context.Context) error {
+	if d == nil || d.distributed == nil {
+		return nil
+	}
+	var err error
+	if ready, ok := d.distributed.(interface{ Ready(context.Context) error }); ok {
+		err = ready.Ready(ctx)
+	}
+	d.mu.Lock()
+	d.stateErr = err
+	d.mu.Unlock()
+	return err
 }

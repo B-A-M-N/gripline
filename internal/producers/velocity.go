@@ -263,6 +263,17 @@ func (p *ResourceVelocityProducer) PersistenceError() error {
 	return p.stateErr
 }
 
+// RecoverPersistence clears a transient distributed-observation error after
+// the shared authority has become healthy again. See SourceNoveltyProducer's
+// recovery probe for why readiness must be able to perform this check.
+func (p *ResourceVelocityProducer) RecoverPersistence(ctx context.Context) error {
+	err := recoverAdaptivePersistence(ctx, p.distributed)
+	p.stateMu.Lock()
+	p.stateErr = err
+	p.stateMu.Unlock()
+	return err
+}
+
 // checkVelocity updates the baseline and returns the appropriate signal code
 // (or empty if no threshold crossed). Compares against the PREVIOUS baseline
 // so a spike is measured against the established norm, not a diluted average.

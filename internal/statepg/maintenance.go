@@ -275,7 +275,11 @@ func (s *Store) RunMaintenance(ctx context.Context) (stats MaintenanceStats, ret
 	}
 	stats.RowsDeleted = stats.rowsDeleted()
 	stats.Duration = time.Since(started)
-	if budget.batches >= budget.maxBatches || budget.remainingRows <= 0 {
+	// A pass can exhaust its wall-clock budget before the row/batch budget. A
+	// zero deletion count is not evidence that the queue is empty in that case;
+	// publish a conservative non-zero backlog so readiness/telemetry cannot
+	// claim retention is caught up after a timed-out pass.
+	if budget.batches >= budget.maxBatches || budget.remainingRows <= 0 || ctx.Err() != nil {
 		stats.BacklogEstimate = 1
 	}
 	s.recordMaintenance(stats, retErr)

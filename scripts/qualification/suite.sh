@@ -9,6 +9,7 @@ repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 requested_result_dir="${GRIPLINE_QUALIFICATION_RESULT_DIR:-}"
 keep="${GRIPLINE_QUALIFICATION_KEEP:-0}"
 soak_duration="30s"
+capacity_duration="30s"
 workers="${GRIPLINE_CLUSTER_SOAK_WORKERS:-8}"
 only_soak=0
 
@@ -16,6 +17,10 @@ while [[ $# -gt 0 ]]; do
 	case "$1" in
 		--soak-duration)
 			soak_duration=${2:?--soak-duration requires a value}
+			shift 2
+			;;
+		--capacity-duration)
+			capacity_duration=${2:?--capacity-duration requires a value}
 			shift 2
 			;;
 		--workers)
@@ -83,6 +88,8 @@ run_gate() {
 	rc=0
 	if [[ "$name" == "soak" ]]; then
 		GRIPLINE_SOAK_EVIDENCE_FILE="$result_dir/soak-telemetry.json" bash "$repo_dir/scripts/qualification/${script}" "$@" >"$log" 2>&1 || rc=$?
+	elif [[ "$name" == "capacity-load" ]]; then
+		GRIPLINE_CLUSTER_HARNESS_CAPACITY_EVIDENCE_FILE="$result_dir/capacity-load-telemetry.json" bash "$repo_dir/scripts/qualification/${script}" "$@" >"$log" 2>&1 || rc=$?
 	else
 		bash "$repo_dir/scripts/qualification/${script}" "$@" >"$log" 2>&1 || rc=$?
 	fi
@@ -134,7 +141,9 @@ if [[ "$only_soak" == 0 ]]; then
 	run_gate exact-cost exact-cost.sh
 fi
 run_gate soak soak.sh --duration "$soak_duration" --workers "$workers"
-run_gate capacity-load capacity.sh --duration "$soak_duration" --workers "$workers"
+if [[ "$only_soak" == 0 ]]; then
+	run_gate capacity-load capacity.sh --duration "$capacity_duration" --workers "$workers"
+fi
 
 gate_status() {
 	local key=$1
@@ -149,6 +158,7 @@ cat >"$result_dir/manifest.json" <<EOF
   "result": "$([[ "$overall" == 0 ]] && echo pass || echo fail)",
   "generated_at": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')",
   "soak_duration": "${soak_duration}",
+  "capacity_duration": "${capacity_duration}",
   "workers": ${workers},
   "gates": {
     "postgres-ha": "$(gate_status postgres-ha)",

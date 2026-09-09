@@ -80,10 +80,11 @@ type Store struct {
 // cluster-crypto generations and per-node capability acknowledgements. Version
 // 10 adds per-node policy observations used as an activation barrier. Version
 // 11 adds explicit creation timestamps to retention-managed receipts and
-// policy audit. Keep the marker versioned even though the DDL below is
+// policy audit. Version 13 adds a singleton guard for concurrent source-scope
+// cardinality decisions. Keep the marker versioned even though the DDL below is
 // idempotent: CREATE TABLE IF NOT EXISTS cannot add columns to an already
 // initialized database.
-const currentSchemaVersion = 12
+const currentSchemaVersion = 13
 
 const maxTransactionAttempts = 3
 
@@ -556,6 +557,10 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			scope_id TEXT PRIMARY KEY,
 			last_used_at TIMESTAMPTZ NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS gripline_resource_source_scope_guard (
+			singleton BOOLEAN PRIMARY KEY CHECK (singleton=TRUE)
+		)`,
+		`INSERT INTO gripline_resource_source_scope_guard (singleton) VALUES (TRUE) ON CONFLICT (singleton) DO NOTHING`,
 		`CREATE TABLE IF NOT EXISTS gripline_resource_leases (
 			lease_id TEXT PRIMARY KEY,
 			request_id TEXT NOT NULL UNIQUE,
@@ -814,6 +819,11 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 		}
 		version = 12
 	}
+	if version == 12 {
+		// Version 13 adds the source-scope cardinality guard. The idempotent DDL
+		// above creates and seeds it for both fresh and upgraded databases.
+		version = 13
+	}
 	if version != currentSchemaVersion {
 		return fmt.Errorf("%w: unsupported migration state %d", ErrMigrationRequired, version)
 	}
@@ -831,6 +841,13 @@ func begin(ctx context.Context, pool *pgxpool.Pool) (pgx.Tx, error) {
 		ctx = context.Background()
 	}
 	return pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+}
+
+func beginResource(ctx context.Context, pool *pgxpool.Pool) (pgx.Tx, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 }
 
 // withTransactionRetry is the shared bounded retry primitive for serializable

@@ -41,7 +41,8 @@ for _ in $(seq 1 90); do
 	if "${compose[@]}" exec -T primary pg_isready -U gripline -d gripline >/dev/null 2>&1 && "${compose[@]}" exec -T replica pg_isready -U gripline -d gripline >/dev/null 2>&1; then break; fi
 	sleep 1
 done
-writer_port=$((25434 + ($$ % 100)))
+writer_port="${GRIPLINE_HA_WRITER_PORT:-$(pick_free_port 26434 27434)}"
+export GRIPLINE_HA_WRITER_PORT="$writer_port"
 dsn="postgres://gripline:gripline@127.0.0.1:${writer_port}/gripline?sslmode=disable"
 "$work_dir/pg-writer" -listen "127.0.0.1:${writer_port}" \
 	-backend-dsn "postgres://gripline:gripline@127.0.0.1:${GRIPLINE_HA_PRIMARY_PORT:-25432}/gripline?sslmode=disable" \
@@ -60,6 +61,9 @@ esac
 GRIPLINE_CLUSTER_HARNESS_LOAD_MODE=capacity \
 GRIPLINE_CLUSTER_HARNESS_LOAD_SECONDS="$load_seconds" \
 GRIPLINE_CLUSTER_HARNESS_LOAD_WORKERS="$workers" \
+GRIPLINE_CLUSTER_HARNESS_MAX_CONNS="${GRIPLINE_CAPACITY_MAX_CONNS:-64}" \
+GRIPLINE_CLUSTER_HARNESS_OPERATION_TIMEOUT="${GRIPLINE_CAPACITY_OPERATION_TIMEOUT:-30s}" \
+GRIPLINE_CLUSTER_HARNESS_LOAD_TIMEOUT="${GRIPLINE_CAPACITY_LOAD_TIMEOUT:-30s}" \
 GRIPLINE_CLUSTER_HARNESS_SKIP_OUTAGE=1 \
 GRIPLINE_CLUSTER_HARNESS_SKIP_KILLED_NODE=1 \
 GRIPLINE_CLUSTER_HARNESS_REQUIRE_DB_OUTAGE=0 \

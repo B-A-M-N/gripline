@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -716,6 +717,88 @@ func policyRefForTest(t *testing.T, compiled *policy.CompiledPolicy) policy.Poli
 		t.Fatalf("digest policy %s/%d: %v", compiled.ID, compiled.Revision, err)
 	}
 	return policy.PolicyRef{ID: compiled.ID, Revision: compiled.Revision, Digest: digest}
+}
+
+func TestPostgresResourceAdmissionConcurrentFirstWriters(t *testing.T) {
+	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("GRIPLINE_TEST_POSTGRES_DSN is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	resetIntegrationAuthority(t, ctx, dsn)
+	stores := []*Store{
+		openIntegrationStore(t, ctx, dsn, "resource-contention-a"),
+		openIntegrationStore(t, ctx, dsn, "resource-contention-b"),
+		openIntegrationStore(t, ctx, dsn, "resource-contention-c"),
+	}
+	for _, store := range stores {
+		defer store.Close()
+		if _, err := store.SynchronizeCrypto(ctx, CryptoIdentity{
+			SignerActiveKID: 1, SignerFingerprint: "resource-contention-signer",
+			PepperActiveVersion: 1, PepperFingerprint: "resource-contention-pepper",
+			PseudonymVersion: 0, PseudonymFingerprint: "disabled",
+		}); err != nil {
+			t.Fatalf("synchronize contention node: %v", err)
+		}
+	}
+
+	scopes := []resource.ScopeSpec{
+		{Scope: resource.ScopeSource, ID: "resource-contention-source", Buckets: resource.BucketSpec{ConcurrencyCap: 128}},
+		{Scope: resource.ScopeAccount, ID: "resource-contention-account", Buckets: resource.BucketSpec{ConcurrencyCap: 128}},
+		{Scope: resource.ScopeCredential, ID: "resource-contention-credential", Buckets: resource.BucketSpec{ConcurrencyCap: 128}},
+		{Scope: resource.ScopeLane, ID: "resource-contention-lane", Buckets: resource.BucketSpec{ConcurrencyCap: 128}},
+	}
+	const attempts = 32
+	start := make(chan struct{})
+	var wait sync.WaitGroup
+	var mu sync.Mutex
+	reservations := make([]resource.UsageReservation, 0, attempts)
+	errs := make([]error, 0)
+	for i := 0; i < attempts; i++ {
+		wait.Add(1)
+		go func(i int) {
+			defer wait.Done()
+			<-start
+			reservation, err := stores[i%len(stores)].Reserve(ctx, resource.ReserveRequest{
+				RequestID: fmt.Sprintf("resource-contention-request-%02d", i),
+				Scopes:    scopes,
+				Estimate:  resource.UsageEstimate{Requests: 1},
+			})
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				errs = append(errs, err)
+				return
+			}
+			reservations = append(reservations, reservation)
+		}(i)
+	}
+	close(start)
+	wait.Wait()
+	if len(errs) != 0 {
+		t.Fatalf("concurrent first-writer reservations had %d errors (first=%v), want zero", len(errs), errs[0])
+	}
+	if len(reservations) != attempts {
+		t.Fatalf("concurrent reservations=%d, want %d", len(reservations), attempts)
+	}
+	for _, reservation := range reservations {
+		reservation.Release()
+	}
+	stats, err := stores[0].StatsContext(ctx)
+	if err != nil {
+		t.Fatalf("resource contention stats: %v", err)
+	}
+	if stats.ActiveLeases != 0 || stats.ActiveHolds != 0 || stats.ActiveConcurrency != 0 {
+		t.Fatalf("resource contention left active state: %+v", stats)
+	}
+	var sourceScopes int
+	if err := stores[0].pool.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_resource_source_scopes WHERE scope_id=$1`, scopes[0].ID).Scan(&sourceScopes); err != nil {
+		t.Fatalf("count contention source scope: %v", err)
+	}
+	if sourceScopes != 1 {
+		t.Fatalf("contention source scopes=%d, want one durable scope", sourceScopes)
+	}
 }
 
 func TestPostgresResourceAdmissionRejectsStalePolicyObservation(t *testing.T) {
