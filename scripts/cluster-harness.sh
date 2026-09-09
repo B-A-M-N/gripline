@@ -44,6 +44,8 @@ secret_one="cluster-secret-one-0123456789"
 secret_two="cluster-secret-two-0123456789"
 secret_three="cluster-secret-three-0123456789"
 secret_four="cluster-secret-four-0123456789"
+lease_ttl="${GRIPLINE_CLUSTER_HARNESS_LEASE_TTL:-30s}"
+renew_every="${GRIPLINE_CLUSTER_HARNESS_RENEW_EVERY:-5s}"
 pepper_one_b64="$(openssl rand -base64 32 | tr -d '\n')"
 pepper_two_b64="$(openssl rand -base64 32 | tr -d '\n')"
 pseudonym_one_b64="$(openssl rand -base64 32 | tr -d '\n')"
@@ -156,7 +158,7 @@ for node in a b c; do
   "policy": {"file": "${harness_dir}/policy.json", "verifier_key_file": "${harness_dir}/policy-verifier.key"},
   "authority": {
     "backend": "postgres", "dsn_env": "GRIPLINE_CLUSTER_DSN", "node_id": "cluster-${node}",
-    "lease_ttl": "10s", "renew_every": "2s", "connect_timeout": "10s", "operation_timeout": "2s",
+    "lease_ttl": "${lease_ttl}", "renew_every": "${renew_every}", "connect_timeout": "10s", "operation_timeout": "2s",
     "max_conns": 8, "min_conns": 1
   },
   "deployment": {"allow_ephemeral_state": false}
