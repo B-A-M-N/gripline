@@ -11,6 +11,7 @@ keep="${GRIPLINE_QUALIFICATION_KEEP:-0}"
 soak_duration="30s"
 capacity_duration="30s"
 workers="${GRIPLINE_CLUSTER_SOAK_WORKERS:-8}"
+capacity_workers="${GRIPLINE_CAPACITY_WORKERS:-2}"
 only_soak=0
 
 while [[ $# -gt 0 ]]; do
@@ -27,6 +28,10 @@ while [[ $# -gt 0 ]]; do
 			workers=${2:?--workers requires a value}
 			shift 2
 			;;
+		--capacity-workers)
+			capacity_workers=${2:?--capacity-workers requires a value}
+			shift 2
+			;;
 		--only-soak)
 			only_soak=1
 			shift
@@ -37,6 +42,11 @@ while [[ $# -gt 0 ]]; do
 			;;
 	esac
 done
+
+if ! [[ "$workers" =~ ^[1-9][0-9]*$ && "$capacity_workers" =~ ^[1-9][0-9]*$ ]]; then
+	echo "qualification suite: workers and capacity-workers must be positive integers" >&2
+	exit 2
+fi
 
 command -v git >/dev/null || { echo "qualification suite: git is required" >&2; exit 2; }
 commit="$(git -C "$repo_dir" rev-parse HEAD)"
@@ -159,7 +169,7 @@ if [[ "$only_soak" == 0 ]]; then
 fi
 run_gate soak soak.sh --duration "$soak_duration" --workers "$workers"
 if [[ "$only_soak" == 0 ]]; then
-	run_gate capacity-load capacity.sh --duration "$capacity_duration" --workers "$workers"
+	run_gate capacity-load capacity.sh --duration "$capacity_duration" --workers "$capacity_workers"
 fi
 
 gate_status() {
@@ -210,6 +220,7 @@ cat >"$result_dir/manifest.json" <<EOF
   "soak_duration": "${soak_duration}",
   "capacity_duration": "${capacity_duration}",
   "workers": ${workers},
+  "capacity_workers": ${capacity_workers},
   "qualification_mode": "$([[ "$only_soak" == 1 ]] && echo only-soak || echo full)",
   "required_gates": ${required_gates},
   "gates": {

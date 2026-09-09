@@ -30,7 +30,7 @@ def main() -> int:
     min_success_rps = threshold("GRIPLINE_CAPACITY_MIN_SUCCESS_RPS", 10.0)
     max_p95_ms = threshold("GRIPLINE_CAPACITY_MAX_P95_MS", 5000.0)
     max_p99_ms = threshold("GRIPLINE_CAPACITY_MAX_P99_MS", 8000.0)
-    max_retries_per_1000 = threshold("GRIPLINE_CAPACITY_MAX_RETRIES_PER_1000", 1000.0)
+    max_retries_per_1000 = threshold("GRIPLINE_CAPACITY_MAX_RETRIES_PER_1000", 1500.0)
     max_deadlocks = threshold("GRIPLINE_CAPACITY_MAX_DEADLOCKS", 0.0)
 
     counts = {

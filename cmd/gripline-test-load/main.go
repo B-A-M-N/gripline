@@ -29,6 +29,15 @@ type percentileSet struct {
 	P99Milliseconds float64 `json:"p99_ms"`
 }
 
+// failureSample is deliberately limited to status/protocol metadata. It is
+// diagnostic qualification evidence, not a request/response capture, so no
+// body or credential material enters the result.
+type failureSample struct {
+	Status    int    `json:"status"`
+	Reason    string `json:"gripline_reason,omitempty"`
+	RequestID string `json:"request_id,omitempty"`
+}
+
 type result struct {
 	DurationSeconds float64          `json:"duration_seconds"`
 	Workers         int              `json:"workers"`
@@ -45,9 +54,10 @@ type result struct {
 	// Keep the original top-level fields for consumers of the first fixture
 	// format. They describe all completed attempts; the structured latency
 	// object above is authoritative for new qualification gates.
-	P50Milliseconds float64 `json:"p50_ms"`
-	P95Milliseconds float64 `json:"p95_ms"`
-	P99Milliseconds float64 `json:"p99_ms"`
+	P50Milliseconds float64         `json:"p50_ms"`
+	P95Milliseconds float64         `json:"p95_ms"`
+	P99Milliseconds float64         `json:"p99_ms"`
+	FailureSamples  []failureSample `json:"failure_samples,omitempty"`
 }
 
 type samples struct {
@@ -138,6 +148,8 @@ func main() {
 
 	// #nosec G404 -- deterministic reservoir sampling only; this is never used for security or credential material.
 	stats := &samples{counts: make(map[string]int64), rng: rand.New(rand.NewSource(1))}
+	var failureMu sync.Mutex
+	failureSamples := make([]failureSample, 0, 8)
 	deadline := time.Now().Add(*duration)
 	var wg sync.WaitGroup
 	for worker := 0; worker < *workers; worker++ {
@@ -165,6 +177,17 @@ func main() {
 				successful := false
 				if err == nil {
 					status = fmt.Sprintf("%d", response.StatusCode)
+					if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+						failureMu.Lock()
+						if len(failureSamples) < cap(failureSamples) {
+							failureSamples = append(failureSamples, failureSample{
+								Status:    response.StatusCode,
+								Reason:    response.Header.Get("X-Gripline-Reason"),
+								RequestID: response.Header.Get("X-Gripline-Request-ID"),
+							})
+						}
+						failureMu.Unlock()
+					}
 					read, readErr := io.Copy(io.Discard, io.LimitReader(response.Body, maxLoadResponseDrain+1))
 					closeErr := response.Body.Close()
 					if readErr != nil || closeErr != nil || read > maxLoadResponseDrain {
@@ -190,6 +213,9 @@ func main() {
 	seen := stats.seen
 	successfulSeen := stats.successfulSeen
 	stats.mu.Unlock()
+	failureMu.Lock()
+	resultFailures := append([]failureSample(nil), failureSamples...)
+	failureMu.Unlock()
 	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
 	sort.Slice(successfulLatencies, func(i, j int) bool { return successfulLatencies[i] < successfulLatencies[j] })
 	successful := int64(0)
@@ -212,6 +238,7 @@ func main() {
 		P50Milliseconds: percentile(latencies, 50),
 		P95Milliseconds: percentile(latencies, 95),
 		P99Milliseconds: percentile(latencies, 99),
+		FailureSamples:  resultFailures,
 	}
 	output.Latency.All = percentileSet{
 		P50Milliseconds: percentile(latencies, 50),

@@ -87,7 +87,11 @@ type Store struct {
 // initialized database.
 const currentSchemaVersion = 14
 
-const maxTransactionAttempts = 3
+// Three attempts were too shallow for the repository's active/active
+// qualification workload: a transient serializable conflict could exhaust the
+// budget and turn an otherwise healthy request into a fail-closed denial.
+// Keep the retry budget bounded while allowing the hot-row lock to clear.
+const maxTransactionAttempts = 5
 
 const transactionRetryBaseDelay = 5 * time.Millisecond
 

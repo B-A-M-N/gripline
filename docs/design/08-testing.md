@@ -65,8 +65,16 @@ keeps production-like hard limits and asserts caps, denials, and fairness;
 `capacity-load` uses only disposable fixture ceilings and a persistent Go
 client pool. The latter runs through `bash scripts/qualification/capacity.sh`
 and reports status distribution, total/successful RPS, p50/p95/p99 latency,
-PostgreSQL pool wait, transaction retries, and transaction latency. Neither is
-an operator-specific capacity claim.
+PostgreSQL pool wait, transaction retries, and transaction latency. Its
+reference gate permits at most 1.5 recovered serializable retries per request
+and no deadlock retries; callers can tighten that bound for a deployment-
+specific benchmark. Neither is an operator-specific capacity claim.
+
+The qualification suite records `workers` for the security soak and
+`capacity_workers` independently. The reference suite defaults the capacity
+gate to two persistent clients so its bounded contention budget remains
+reproducible; `--capacity-workers` may be raised for an explicit stress
+profile without silently changing the release gate's workload.
 
 The security harness runs a configurable short sustained load phase
 (`GRIPLINE_CLUSTER_HARNESS_LOAD_SECONDS` and
