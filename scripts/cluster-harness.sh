@@ -161,6 +161,7 @@ for node in a b c; do
 	"tls": {"terminate_tls_upstream": true},
 	"backend": {
 	    "url": "https://127.0.0.1:${backend_port}",
+	    "trust_mode": "mtls",
 	    "tls": {"ca_file": "${ca_cert}", "client_cert_file": "${inference_client_cert}", "client_key_file": "${inference_client_key}", "server_name": "backend.internal", "min_version": "1.2"},
 	    "verifier_control": {"url": "https://127.0.0.1:${control_backend_port}/v1/verifier/rotate", "ca_file": "${ca_cert}", "client_cert_file": "${control_client_cert}", "client_key_file": "${control_client_key}", "server_name": "control.internal", "min_version": "1.2"},
     "timeout": "5s",
