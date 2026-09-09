@@ -6,6 +6,7 @@ set -euo pipefail
 # checks, and a promotion after the load phase.
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 fixture_dir="$repo_dir/scripts/qualification/fixtures/postgres-ha"
+source "$fixture_dir/ports.sh"
 project="gripline-soak-${$}"
 work_dir="$(mktemp -d)"
 monitor_pid=""
@@ -58,13 +59,13 @@ command -v docker >/dev/null || { echo "soak qualification: docker is required" 
 docker compose version >/dev/null || { echo "soak qualification: docker compose is required" >&2; exit 2; }
 command -v go >/dev/null || { echo "soak qualification: go is required" >&2; exit 2; }
 command -v curl >/dev/null || { echo "soak qualification: curl is required" >&2; exit 2; }
+command -v python3 >/dev/null || { echo "soak qualification: python3 is required" >&2; exit 2; }
+configure_ha_ports
 GOCACHE="${GOCACHE:-/tmp/gripline-go-cache}" go build -trimpath -o "$maintenance_bin" ./cmd/gripline-test-pg-maintenance
 writer_bin="$work_dir/pg-writer"
 GOCACHE="${GOCACHE:-/tmp/gripline-go-cache}" go build -trimpath -o "$writer_bin" ./cmd/gripline-test-pg-writer
 compose=(docker compose -p "$project" -f "$fixture_dir/compose.yaml")
 "${compose[@]}" up -d >/dev/null
-export GRIPLINE_HA_PRIMARY_PORT="${GRIPLINE_HA_PRIMARY_PORT:-$(${compose[*]} port primary 5432 | head -1 | awk -F: '{print $NF}')}"
-export GRIPLINE_HA_REPLICA_PORT="${GRIPLINE_HA_REPLICA_PORT:-$(${compose[*]} port replica 5432 | head -1 | awk -F: '{print $NF}')}"
 [[ "$GRIPLINE_HA_PRIMARY_PORT" =~ ^[0-9]+$ && "$GRIPLINE_HA_REPLICA_PORT" =~ ^[0-9]+$ ]] || {
 	echo "soak qualification: compose did not publish numeric PostgreSQL ports" >&2
 	exit 1

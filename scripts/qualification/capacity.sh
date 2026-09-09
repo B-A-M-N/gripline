@@ -6,6 +6,7 @@ set -euo pipefail
 # handoff so rate-limit/security recovery state cannot distort throughput.
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 fixture_dir="$repo_dir/scripts/qualification/fixtures/postgres-ha"
+source "$fixture_dir/ports.sh"
 project="gripline-capacity-${$}"
 work_dir="$(mktemp -d)"
 writer_pid=""
@@ -27,11 +28,11 @@ trap cleanup EXIT
 command -v docker >/dev/null || { echo "capacity qualification: docker is required" >&2; exit 2; }
 docker compose version >/dev/null || { echo "capacity qualification: docker compose is required" >&2; exit 2; }
 command -v go >/dev/null || { echo "capacity qualification: go is required" >&2; exit 2; }
+command -v python3 >/dev/null || { echo "capacity qualification: python3 is required" >&2; exit 2; }
+configure_ha_ports
 GOCACHE="${GOCACHE:-/tmp/gripline-go-cache}" go build -trimpath -o "$work_dir/pg-writer" ./cmd/gripline-test-pg-writer
 compose=(docker compose -p "$project" -f "$fixture_dir/compose.yaml")
 "${compose[@]}" up -d >/dev/null
-export GRIPLINE_HA_PRIMARY_PORT="${GRIPLINE_HA_PRIMARY_PORT:-$(${compose[*]} port primary 5432 | head -1 | awk -F: '{print $NF}')}"
-export GRIPLINE_HA_REPLICA_PORT="${GRIPLINE_HA_REPLICA_PORT:-$(${compose[*]} port replica 5432 | head -1 | awk -F: '{print $NF}')}"
 [[ "$GRIPLINE_HA_PRIMARY_PORT" =~ ^[0-9]+$ && "$GRIPLINE_HA_REPLICA_PORT" =~ ^[0-9]+$ ]] || {
 	echo "capacity qualification: compose did not publish numeric PostgreSQL ports" >&2
 	exit 1

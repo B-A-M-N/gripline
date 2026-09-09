@@ -411,7 +411,16 @@ wait_assertion_policy() {
 			rg -q '"policy_epoch":'"${epoch}" "$response"; then
 			return 0
 		fi
-		if [[ "$status" != 429 && "$status" != 503 && "$status" != 000 && "$status" != 200 ]]; then
+		# A node can briefly forward the request while its policy/verifier
+		# watcher is converging. The reference backend's exact response is a
+		# bounded transient; invalid credentials and every other 401 remain
+		# terminal failures.
+		if [[ "$status" == 401 ]] && ! rg -qx 'assertion required' "$response"; then
+			echo "cluster harness: policy ${revision}/${epoch} returned an unexpected 401 on port ${port}" >&2
+			cat "$response" >&2 || true
+			return 1
+		fi
+		if [[ "$status" != 401 && "$status" != 429 && "$status" != 503 && "$status" != 000 && "$status" != 200 ]]; then
 			echo "cluster harness: policy ${revision}/${epoch} convergence returned unexpected status ${status} on port ${port}" >&2
 			cat "$response" >&2 || true
 			return 1

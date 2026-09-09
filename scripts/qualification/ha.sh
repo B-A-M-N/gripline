@@ -8,6 +8,7 @@ set -euo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 fixture_dir="$repo_dir/scripts/qualification/fixtures/postgres-ha"
+source "$fixture_dir/ports.sh"
 project="gripline-ha-${$}"
 work_dir="$(mktemp -d)"
 live_pids=()
@@ -47,12 +48,12 @@ command -v docker >/dev/null || { echo "ha qualification: docker is required" >&
 docker compose version >/dev/null || { echo "ha qualification: docker compose is required" >&2; exit 2; }
 command -v go >/dev/null || { echo "ha qualification: go is required" >&2; exit 2; }
 command -v openssl >/dev/null || { echo "ha qualification: openssl is required" >&2; exit 2; }
+command -v python3 >/dev/null || { echo "ha qualification: python3 is required" >&2; exit 2; }
+configure_ha_ports
 
 compose=(docker compose -p "$project" -f "$fixture_dir/compose.yaml")
 
 "${compose[@]}" up -d
-export GRIPLINE_HA_PRIMARY_PORT="${GRIPLINE_HA_PRIMARY_PORT:-$(${compose[*]} port primary 5432 | head -1 | awk -F: '{print $NF}')}"
-export GRIPLINE_HA_REPLICA_PORT="${GRIPLINE_HA_REPLICA_PORT:-$(${compose[*]} port replica 5432 | head -1 | awk -F: '{print $NF}')}"
 [[ "$GRIPLINE_HA_PRIMARY_PORT" =~ ^[0-9]+$ && "$GRIPLINE_HA_REPLICA_PORT" =~ ^[0-9]+$ ]] || {
 	echo "ha qualification: compose did not publish numeric PostgreSQL ports" >&2
 	exit 1
