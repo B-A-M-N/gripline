@@ -47,16 +47,19 @@ soak evidence:
 |---|---|---|
 | PostgreSQL primary/replica promotion and rejoin | `bash scripts/qualification/ha.sh` | Replica promotion, preserved policy/crypto state, failed-node rejoin |
 | Base-backup/WAL PITR | `bash scripts/qualification/pitr.sh` | Target-time restore returns the pre-mutation security state |
-| Network isolation and mTLS | `bash scripts/qualification/perimeter.sh` | Public attacker cannot reach private backend/control/PostgreSQL; gateway identity succeeds |
+| Network isolation and mTLS | `bash scripts/qualification/perimeter.sh` and `bash scripts/qualification/clustered-perimeter.sh` | Public attacker cannot reach private backend/control/PostgreSQL; standalone and clustered gateway identities succeed |
 | Official SDK behavior | `bash scripts/qualification/sdk.sh` | OpenAI and Anthropic Python/TypeScript streaming and non-streaming usage, tools, large input, retry/429, 5xx, cancellation, reuse, and parallel calls |
 | Direct TLS/HTTP2 | `bash scripts/qualification/http2.sh` | ALPN, stream/header bounds, CONTINUATION, cancellation/recovery, error metrics, and `h2load` evidence |
 | Shared replay | `bash scripts/qualification/replay.sh` | Two independent processes produce exactly one winner for one claim |
 | Long-running active/active behavior | `bash scripts/qualification/soak.sh --duration 24h` | Replica/policy continuity, bounded active leases/holds/source scopes, retention checks, RSS/goroutine/heap snapshots, outage recovery, post-soak promotion |
+| Reference capacity behavior | `bash scripts/qualification/capacity.sh --duration 30s` | Persistent-client load, status distribution, p50/p95/p99, PostgreSQL pool wait, transaction retries, and transaction latency |
 
 The lab uses disposable containers, generated keys, and local
 provider-shaped fixtures; it requires no provider account. Each suite run emits
 sanitized per-gate JSON plus `manifest.json` and `manifest.sha256` under the
-qualification result directory. The manifest records the exact commit,
+qualification result directory. By default each run is written under a
+commit/run-specific directory; CI may provide an explicit artifact directory.
+The manifest records the exact commit,
 fixture image digests, tool versions, and gate outcomes; release publication
 verifies that manifest before building artifacts and attests it.
 The qualification workflow's manual `soak_duration` input accepts `24h` or

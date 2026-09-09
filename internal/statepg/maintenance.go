@@ -15,6 +15,9 @@ import (
 type MaintenanceOptions struct {
 	Interval                    time.Duration
 	BatchSize                   int
+	MaxBatchesPerPass           int
+	MaxRowsPerPass              int
+	MaxRuntimePerPass           time.Duration
 	EvidenceGrace               time.Duration
 	ReleasedLeaseRetention      time.Duration
 	CredentialReceiptRetention  time.Duration
@@ -34,6 +37,9 @@ type MaintenanceOptions struct {
 const (
 	defaultMaintenanceInterval         = time.Minute
 	defaultMaintenanceBatchSize        = 256
+	defaultMaintenanceMaxBatches       = 64
+	defaultMaintenanceMaxRows          = 4096
+	defaultMaintenanceMaxRuntime       = 5 * time.Second
 	defaultReleasedLeaseRetention      = 24 * time.Hour
 	defaultCredentialReceiptRetention  = 24 * time.Hour
 	defaultControlOperationRetention   = 24 * time.Hour
@@ -58,6 +64,21 @@ func (o MaintenanceOptions) withDefaults() MaintenanceOptions {
 	}
 	if o.BatchSize > 4096 {
 		o.BatchSize = 4096
+	}
+	if o.MaxBatchesPerPass <= 0 {
+		o.MaxBatchesPerPass = defaultMaintenanceMaxBatches
+	}
+	if o.MaxBatchesPerPass > 4096 {
+		o.MaxBatchesPerPass = 4096
+	}
+	if o.MaxRowsPerPass <= 0 {
+		o.MaxRowsPerPass = defaultMaintenanceMaxRows
+	}
+	if o.MaxRowsPerPass > 1<<20 {
+		o.MaxRowsPerPass = 1 << 20
+	}
+	if o.MaxRuntimePerPass <= 0 {
+		o.MaxRuntimePerPass = defaultMaintenanceMaxRuntime
 	}
 	if o.EvidenceGrace < 0 {
 		o.EvidenceGrace = 0
@@ -121,6 +142,89 @@ type MaintenanceStats struct {
 	LaneOperatorAuditDeleted   int
 	PolicyNodeStateDeleted     int
 	ClusterCryptoAcksDeleted   int
+	RowsDeleted                int
+	Batches                    int
+	BacklogEstimate            int
+	Duration                   time.Duration
+}
+
+func (s MaintenanceStats) rowsDeleted() int {
+	return s.EvidenceDeleted + s.EvidenceGuardsDeleted + s.ReleasedLeasesDeleted +
+		s.CredentialReceiptsDeleted + s.ControlOperationsDeleted + s.AdmissionAuditDeleted +
+		s.SecurityTransitionsDeleted + s.OperatorAuditDeleted + s.PolicyAuditDeleted +
+		s.MembershipDeleted + s.AdaptiveRowsDeleted + s.LaneOperatorAuditDeleted +
+		s.PolicyNodeStateDeleted + s.ClusterCryptoAcksDeleted
+}
+
+func (s *MaintenanceStats) add(other MaintenanceStats) {
+	s.EvidenceDeleted += other.EvidenceDeleted
+	s.EvidenceGuardsDeleted += other.EvidenceGuardsDeleted
+	s.ReleasedLeasesDeleted += other.ReleasedLeasesDeleted
+	s.CredentialReceiptsDeleted += other.CredentialReceiptsDeleted
+	s.ControlOperationsDeleted += other.ControlOperationsDeleted
+	s.AdmissionAuditDeleted += other.AdmissionAuditDeleted
+	s.SecurityTransitionsDeleted += other.SecurityTransitionsDeleted
+	s.OperatorAuditDeleted += other.OperatorAuditDeleted
+	s.PolicyAuditDeleted += other.PolicyAuditDeleted
+	s.MembershipDeleted += other.MembershipDeleted
+	s.AdaptiveRowsDeleted += other.AdaptiveRowsDeleted
+	s.LaneOperatorAuditDeleted += other.LaneOperatorAuditDeleted
+	s.PolicyNodeStateDeleted += other.PolicyNodeStateDeleted
+	s.ClusterCryptoAcksDeleted += other.ClusterCryptoAcksDeleted
+	s.RowsDeleted += other.RowsDeleted
+	s.Batches += other.Batches
+	if other.BacklogEstimate > s.BacklogEstimate {
+		s.BacklogEstimate = other.BacklogEstimate
+	}
+}
+
+type maintenanceBudget struct {
+	remainingRows int
+	maxBatches    int
+	batches       int
+}
+
+func (b *maintenanceBudget) batchSize(defaultSize int) int {
+	if b == nil || b.batches >= b.maxBatches || b.remainingRows <= 0 {
+		return 0
+	}
+	if defaultSize > b.remainingRows {
+		return b.remainingRows
+	}
+	return defaultSize
+}
+
+func (b *maintenanceBudget) record(rows int) {
+	if b == nil {
+		return
+	}
+	b.batches++
+	if rows > 0 {
+		b.remainingRows -= rows
+	}
+}
+
+func (b *maintenanceBudget) exhausted() bool {
+	return b == nil || b.batches >= b.maxBatches || b.remainingRows <= 0
+}
+
+type maintenanceBudgetContextKey struct{}
+
+func withMaintenanceBudget(ctx context.Context, budget *maintenanceBudget) context.Context {
+	return context.WithValue(ctx, maintenanceBudgetContextKey{}, budget)
+}
+
+func maintenanceBatchSize(ctx context.Context, configured int) int {
+	if budget, ok := ctx.Value(maintenanceBudgetContextKey{}).(*maintenanceBudget); ok {
+		return budget.batchSize(configured)
+	}
+	return configured
+}
+
+func recordMaintenanceBatch(ctx context.Context, rows int) {
+	if budget, ok := ctx.Value(maintenanceBudgetContextKey{}).(*maintenanceBudget); ok {
+		budget.record(rows)
+	}
 }
 
 // maintenanceLoop runs on serving nodes only. Each pass uses short
@@ -146,14 +250,49 @@ func (s *Store) maintenanceLoop() {
 // operators and tests can trigger a pass without waiting for the periodic
 // interval. A failure is returned instead of being treated as an empty table;
 // retention is operational hygiene, not a security fallback.
-func (s *Store) RunMaintenance(ctx context.Context) (MaintenanceStats, error) {
+func (s *Store) RunMaintenance(ctx context.Context) (stats MaintenanceStats, retErr error) {
 	if s == nil || s.pool == nil {
 		return MaintenanceStats{}, errors.New("statepg: authority is unavailable")
 	}
-	ctx, cancel := s.operationContext(ctx)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	started := time.Now()
+	ctx, cancel := context.WithTimeout(ctx, s.maintenance.MaxRuntimePerPass)
 	defer cancel()
-	var stats MaintenanceStats
+	budget := &maintenanceBudget{remainingRows: s.maintenance.MaxRowsPerPass, maxBatches: s.maintenance.MaxBatchesPerPass}
+	ctx = withMaintenanceBudget(ctx, budget)
+	for {
+		batch, err := s.runMaintenanceBatch(ctx)
+		stats.add(batch)
+		if err != nil {
+			retErr = err
+			break
+		}
+		if batch.rowsDeleted() == 0 || budget.exhausted() || ctx.Err() != nil {
+			break
+		}
+	}
+	stats.RowsDeleted = stats.rowsDeleted()
+	stats.Duration = time.Since(started)
+	if budget.batches >= budget.maxBatches || budget.remainingRows <= 0 {
+		stats.BacklogEstimate = 1
+	}
+	s.recordMaintenance(stats, retErr)
+	return stats, retErr
+}
+
+func (s *Store) runMaintenanceBatch(ctx context.Context) (stats MaintenanceStats, retErr error) {
 	var err error
+	var batchesBefore int
+	if budget, ok := ctx.Value(maintenanceBudgetContextKey{}).(*maintenanceBudget); ok {
+		batchesBefore = budget.batches
+	}
+	defer func() {
+		if budget, ok := ctx.Value(maintenanceBudgetContextKey{}).(*maintenanceBudget); ok {
+			stats.Batches = budget.batches - batchesBefore
+		}
+	}()
 	if stats.EvidenceDeleted, stats.EvidenceGuardsDeleted, err = s.maintainExpiredEvidence(ctx); err != nil {
 		return stats, err
 	}
@@ -247,6 +386,10 @@ func (s *Store) RunMaintenance(ctx context.Context) (MaintenanceStats, error) {
 }
 
 func (s *Store) maintainCutoff(ctx context.Context, retention time.Duration, query string) (int, error) {
+	batchSize := maintenanceBatchSize(ctx, s.maintenance.BatchSize)
+	if batchSize <= 0 {
+		return 0, nil
+	}
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return 0, mapDBError(err)
@@ -256,17 +399,22 @@ func (s *Store) maintainCutoff(ctx context.Context, retention time.Duration, que
 	if err != nil {
 		return 0, err
 	}
-	tag, err := tx.Exec(ctx, query, now.Add(-retention), s.maintenance.BatchSize)
+	tag, err := tx.Exec(ctx, query, now.Add(-retention), batchSize)
 	if err != nil {
 		return 0, mapDBError(err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, mapDBError(err)
 	}
+	recordMaintenanceBatch(ctx, int(tag.RowsAffected()))
 	return int(tag.RowsAffected()), nil
 }
 
 func (s *Store) maintainReleasedLeases(ctx context.Context) (int, error) {
+	batchSize := maintenanceBatchSize(ctx, s.maintenance.BatchSize)
+	if batchSize <= 0 {
+		return 0, nil
+	}
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return 0, mapDBError(err)
@@ -284,17 +432,22 @@ func (s *Store) maintainReleasedLeases(ctx context.Context) (int, error) {
 			ORDER BY COALESCE(l.released_at, l.created_at), l.lease_id
 			LIMIT $3 FOR UPDATE SKIP LOCKED
 		)
-		DELETE FROM gripline_resource_leases l USING doomed d WHERE l.lease_id=d.lease_id`, leaseReleased, now.Add(-s.maintenance.ReleasedLeaseRetention), s.maintenance.BatchSize)
+		DELETE FROM gripline_resource_leases l USING doomed d WHERE l.lease_id=d.lease_id`, leaseReleased, now.Add(-s.maintenance.ReleasedLeaseRetention), batchSize)
 	if err != nil {
 		return 0, mapDBError(err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, mapDBError(err)
 	}
+	recordMaintenanceBatch(ctx, int(tag.RowsAffected()))
 	return int(tag.RowsAffected()), nil
 }
 
 func (s *Store) maintainExpiredEvidence(ctx context.Context) (int, int, error) {
+	batchSize := maintenanceBatchSize(ctx, s.maintenance.BatchSize)
+	if batchSize <= 0 {
+		return 0, 0, nil
+	}
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return 0, 0, mapDBError(err)
@@ -313,9 +466,17 @@ func (s *Store) maintainExpiredEvidence(ctx context.Context) (int, int, error) {
 			LIMIT $2 FOR UPDATE SKIP LOCKED
 		)
 		DELETE FROM gripline_evidence e USING doomed d
-		WHERE e.scope=d.scope AND e.subject_id=d.subject_id AND e.evidence_id=d.evidence_id`, now.Add(-s.maintenance.EvidenceGrace), s.maintenance.BatchSize)
+		WHERE e.scope=d.scope AND e.subject_id=d.subject_id AND e.evidence_id=d.evidence_id`, now.Add(-s.maintenance.EvidenceGrace), batchSize)
 	if err != nil {
 		return 0, 0, mapDBError(err)
+	}
+	recordMaintenanceBatch(ctx, int(result.RowsAffected()))
+	guardBatchSize := maintenanceBatchSize(ctx, s.maintenance.BatchSize)
+	if guardBatchSize <= 0 {
+		if err := tx.Commit(ctx); err != nil {
+			return 0, 0, mapDBError(err)
+		}
+		return int(result.RowsAffected()), 0, nil
 	}
 	// Empty guards would otherwise become an unbounded historical subject
 	// index. An append creates/locks the guard again when the subject reappears.
@@ -330,13 +491,14 @@ func (s *Store) maintainExpiredEvidence(ctx context.Context) (int, int, error) {
 			LIMIT $2 FOR UPDATE SKIP LOCKED
 		)
 		DELETE FROM gripline_evidence_guards g USING doomed d
-		WHERE g.scope=d.scope AND g.subject_id=d.subject_id`, now.Add(-s.maintenance.EvidenceGuardRetention), s.maintenance.BatchSize)
+		WHERE g.scope=d.scope AND g.subject_id=d.subject_id`, now.Add(-s.maintenance.EvidenceGuardRetention), guardBatchSize)
 	if err != nil {
 		return 0, 0, mapDBError(err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, 0, mapDBError(err)
 	}
+	recordMaintenanceBatch(ctx, int(guardResult.RowsAffected()))
 	return int(result.RowsAffected()), int(guardResult.RowsAffected()), nil
 }
 

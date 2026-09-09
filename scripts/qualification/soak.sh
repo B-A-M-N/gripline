@@ -15,16 +15,20 @@ harness_artifact="$work_dir/harness.env"
 snapshot_file="$work_dir/soak.tsv"
 relation_file="$work_dir/relations.tsv"
 maintenance_file="$work_dir/maintenance.tsv"
+maintenance_metrics_file="$work_dir/maintenance-metrics.tsv"
 row_file="$work_dir/rows.tsv"
 maintenance_bin="$work_dir/maintenance"
+external_maintenance_interval="${GRIPLINE_SOAK_EXTERNAL_MAINTENANCE_INTERVAL:-60}"
 duration_text="5m"
 workers="${GRIPLINE_CLUSTER_SOAK_WORKERS:-24}"
+load_mode="${GRIPLINE_CLUSTER_SOAK_LOAD_MODE:-security}"
 handoff_timeout="${GRIPLINE_SOAK_HANDOFF_TIMEOUT:-600}"
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 		--duration) duration_text=${2:?--duration requires a value}; shift 2 ;;
 		--workers) workers=${2:?--workers requires a value}; shift 2 ;;
-		-h|--help) echo 'usage: soak.sh [--duration 24h|72h|300s] [--workers N]'; exit 0 ;;
+		--load-mode) load_mode=${2:?--load-mode requires a value}; shift 2 ;;
+		-h|--help) echo 'usage: soak.sh [--duration 24h|72h|300s] [--workers N] [--load-mode security|capacity]'; exit 0 ;;
 		*) echo "soak qualification: unknown argument $1" >&2; exit 2 ;;
 	esac
 done
@@ -35,13 +39,19 @@ esac
 [[ "$amount" =~ ^[1-9][0-9]*$ ]] || { echo "soak qualification: duration must be positive" >&2; exit 2; }
 case "$unit" in s) duration=$amount ;; m) duration=$((amount * 60)) ;; h) duration=$((amount * 3600)) ;; esac
 [[ "$workers" =~ ^[1-9][0-9]*$ ]] || { echo "soak qualification: workers must be positive" >&2; exit 2; }
+[[ "$load_mode" == security || "$load_mode" == capacity ]] || { echo "soak qualification: load mode must be security or capacity" >&2; exit 2; }
+[[ "$external_maintenance_interval" =~ ^[1-9][0-9]*$ ]] || { echo "soak qualification: external maintenance interval must be positive" >&2; exit 2; }
 [[ "$handoff_timeout" =~ ^[1-9][0-9]*$ ]] || { echo "soak qualification: handoff timeout must be positive" >&2; exit 2; }
 cleanup() {
 	if [[ -n "$harness_pid" ]]; then kill -TERM "$harness_pid" >/dev/null 2>&1 || true; wait "$harness_pid" >/dev/null 2>&1 || true; fi
 	if [[ -n "$monitor_pid" ]]; then kill "$monitor_pid" >/dev/null 2>&1 || true; wait "$monitor_pid" >/dev/null 2>&1 || true; fi
 	if [[ -n "$writer_pid" ]]; then kill "$writer_pid" >/dev/null 2>&1 || true; wait "$writer_pid" >/dev/null 2>&1 || true; fi
 	docker compose -p "$project" -f "$fixture_dir/compose.yaml" down -v --remove-orphans >/dev/null 2>&1 || true
-	rm -rf "$work_dir"
+	if [[ "${GRIPLINE_QUALIFICATION_KEEP:-0}" == "1" ]]; then
+		echo "soak qualification diagnostics retained: $work_dir" >&2
+	else
+		rm -rf "$work_dir"
+	fi
 }
 trap cleanup EXIT
 command -v docker >/dev/null || { echo "soak qualification: docker is required" >&2; exit 2; }
@@ -119,12 +129,23 @@ monitor() {
 				heap="$(metric runtime_heap_alloc_bytes)"
 				scopes="$(metric resource_source_scopes)"
 				active="$(metric resource_active_leases)"
+				maintenance_runs="$(metric postgres_maintenance_runs_total)"
+				maintenance_deleted="$(metric postgres_maintenance_rows_deleted_total)"
+				maintenance_backlog="$(metric postgres_maintenance_backlog_estimate)"
+				maintenance_duration="$(metric postgres_maintenance_last_duration_seconds)"
+				maintenance_errors="$(metric postgres_maintenance_errors_total)"
 				rss="$(awk '/^VmRSS:/ {print $2}' "/proc/$pid/status")"
 				if [[ ! "$goroutines" =~ ^[0-9]+$ || ! "$heap" =~ ^[0-9]+$ || ! "$scopes" =~ ^[0-9]+$ || ! "$active" =~ ^[0-9]+$ || ! "$rss" =~ ^[0-9]+$ ]]; then
 					continue
 				fi
+				maintenance_runs="${maintenance_runs:-0}"
+				maintenance_deleted="${maintenance_deleted:-0}"
+				maintenance_backlog="${maintenance_backlog:-0}"
+				maintenance_duration="${maintenance_duration:-0}"
+				maintenance_errors="${maintenance_errors:-0}"
 				if (( scopes > 4096 || active > 5 )); then echo "resource-bounds-${node}" >"$monitor_failure"; return 1; fi
 				printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$node" "$rss" "$goroutines" "$heap" "$scopes" "$active" >>"$snapshot_file"
+				printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$node" "$maintenance_runs" "$maintenance_deleted" "$maintenance_backlog" "$maintenance_duration" "$maintenance_errors" >>"$maintenance_metrics_file"
 			done
 			retention="$("${compose[@]}" exec -T primary psql -U gripline -d gripline -X -Atqc "SELECT (SELECT count(*) FROM gripline_resource_leases WHERE state IN ('reserved','forwarded')) || '|' || (SELECT count(*) FROM gripline_resource_holds h JOIN gripline_resource_leases l ON l.lease_id=h.lease_id WHERE l.state IN ('reserved','forwarded')) || '|' || (SELECT count(*) FROM gripline_evidence)" 2>/dev/null || true)"
 			if [[ "$retention" =~ ^([0-9]+)\|([0-9]+)\|([0-9]+)$ ]]; then
@@ -133,10 +154,10 @@ monitor() {
 			now="$(date +%s)"
 			rows="$(table_counts 2>/dev/null || true)"
 			[[ -n "$rows" ]] && printf '%s\t%s\n' "$now" "$rows" >>"$row_file"
-			if (( now >= last_maintenance + 60 )) && [[ ! -f "$promotion_file" ]]; then
+			if (( now >= last_maintenance + external_maintenance_interval )) && [[ ! -f "$promotion_file" ]]; then
 				before="$rows"
 				maintenance_start="$now"
-				maintenance_json="$($maintenance_bin -dsn "$dsn" -batch-size 256 2>/dev/null)" || { echo maintenance-failed >"$monitor_failure"; return 1; }
+				maintenance_json="$($maintenance_bin -dsn "$dsn" -batch-size 256 -history-retention "${GRIPLINE_SOAK_RETENTION_WINDOW:-1m}" 2>/dev/null)" || { echo maintenance-failed >"$monitor_failure"; return 1; }
 				"${compose[@]}" exec -T primary psql -U gripline -d gripline -X -v ON_ERROR_STOP=1 -c 'VACUUM (ANALYZE)' >/dev/null 2>&1 || { echo vacuum-failed >"$monitor_failure"; return 1; }
 				after="$(table_counts 2>/dev/null || true)"
 				printf '%s\t%s\t%s\t%s\t%s\n' "$now" "$(( $(date +%s) - maintenance_start ))" "$before" "$after" "$maintenance_json" >>"$maintenance_file"
@@ -166,7 +187,7 @@ wait_replica_caught_up() {
 }
 monitor &
 monitor_pid=$!
-GRIPLINE_LOG_READINESS_FAILURES=1 GRIPLINE_CLUSTER_HARNESS_ARTIFACT_FILE="$harness_artifact" GRIPLINE_CLUSTER_HARNESS_PAUSE_FILE="$pause_file" GRIPLINE_CLUSTER_HARNESS_RELEASE_FILE="$release_file" GRIPLINE_CLUSTER_WRITER_LOG="$work_dir/pg-writer.log" GRIPLINE_CLUSTER_HARNESS_KEEP="${GRIPLINE_QUALIFICATION_KEEP:-0}" GRIPLINE_TEST_POSTGRES_DSN="$dsn" GRIPLINE_TEST_POSTGRES_CONTAINER="${project}-primary-1" GRIPLINE_CLUSTER_HARNESS_REQUIRE_DB_OUTAGE=1 GRIPLINE_CLUSTER_HARNESS_LOAD_SECONDS="$duration" GRIPLINE_CLUSTER_HARNESS_LOAD_WORKERS="$workers" bash "$repo_dir/scripts/cluster-harness.sh" >"$work_dir/harness.log" 2>&1 &
+GRIPLINE_LOG_READINESS_FAILURES=1 GRIPLINE_CLUSTER_HARNESS_COMPRESSED_RETENTION=1 GRIPLINE_CLUSTER_HARNESS_RETENTION_WINDOW="${GRIPLINE_SOAK_RETENTION_WINDOW:-1m}" GRIPLINE_CLUSTER_HARNESS_ARTIFACT_FILE="$harness_artifact" GRIPLINE_CLUSTER_HARNESS_PAUSE_FILE="$pause_file" GRIPLINE_CLUSTER_HARNESS_RELEASE_FILE="$release_file" GRIPLINE_CLUSTER_WRITER_LOG="$work_dir/pg-writer.log" GRIPLINE_CLUSTER_HARNESS_KEEP="${GRIPLINE_QUALIFICATION_KEEP:-0}" GRIPLINE_TEST_POSTGRES_DSN="$dsn" GRIPLINE_TEST_POSTGRES_CONTAINER="${project}-primary-1" GRIPLINE_CLUSTER_HARNESS_REQUIRE_DB_OUTAGE=1 GRIPLINE_CLUSTER_HARNESS_LOAD_MODE="$load_mode" GRIPLINE_CLUSTER_HARNESS_LOAD_SECONDS="$duration" GRIPLINE_CLUSTER_HARNESS_LOAD_WORKERS="$workers" bash "$repo_dir/scripts/cluster-harness.sh" >"$work_dir/harness.log" 2>&1 &
 harness_pid=$!
 for _ in $(seq 1 120); do
 	if [[ -s "$harness_artifact" ]]; then break; fi
@@ -194,6 +215,26 @@ if (( duration >= 120 )) && [[ ! -s "$maintenance_file" ]]; then
 	echo "soak qualification: long soak did not execute scheduled maintenance" >&2
 	exit 1
 fi
+maintenance_metric_samples="$(wc -l <"$maintenance_metrics_file" 2>/dev/null || echo 0)"
+maintenance_max_deleted="$(awk -F '\t' 'BEGIN {m=0} {if ($4+0 > m) m=$4+0} END {print m+0}' "$maintenance_metrics_file" 2>/dev/null || echo 0)"
+external_maintenance_samples="$(wc -l <"$maintenance_file" 2>/dev/null || echo 0)"
+external_maintenance_max_deleted="$(rg -o '"RowsDeleted":[0-9]+' "$maintenance_file" 2>/dev/null | awk -F: 'BEGIN {m=0} {if ($2+0 > m) m=$2+0} END {print m+0}' || echo 0)"
+if (( external_maintenance_max_deleted > maintenance_max_deleted )); then maintenance_max_deleted=$external_maintenance_max_deleted; fi
+maintenance_max_errors="$(awk -F '\t' 'BEGIN {m=0} {if ($7+0 > m) m=$7+0} END {print m+0}' "$maintenance_metrics_file" 2>/dev/null || echo 0)"
+if (( duration >= 120 )); then
+	if (( maintenance_metric_samples + external_maintenance_samples < 1 )); then
+		echo "soak qualification: compressed-retention maintenance emitted no metrics" >&2
+		exit 1
+	fi
+	if (( maintenance_max_deleted < 1 )); then
+		echo "soak qualification: compressed-retention fixture deleted no expired rows" >&2
+		exit 1
+	fi
+	if (( maintenance_max_errors > 0 )); then
+		echo "soak qualification: maintenance reported ${maintenance_max_errors} errors" >&2
+		exit 1
+	fi
+fi
 for node in a b c; do
 	read -r rss_start rss_end <<<"$(awk -F '\t' -v want="$node" '$2 == want {if (!first) first=$3; last=$3} END {print first+0, last+0}' "$snapshot_file")"
 	if (( rss_end > rss_start + ${GRIPLINE_SOAK_MAX_RSS_GROWTH_KB:-131072} )); then
@@ -204,6 +245,7 @@ done
 base="$(awk -F= '$1 == "base" {print $2}' "$harness_artifact")"
 request_secret="$(awk -F= '$1 == "request_secret" {print $2}' "$harness_artifact")"
 wait_replica_caught_up
+promotion_started_ms="$(date +%s%3N)"
 touch "$promotion_file"
 "${compose[@]}" stop primary >/dev/null
 "${compose[@]}" exec -T replica gosu postgres pg_ctl promote -D /var/lib/postgresql/data >/dev/null
@@ -241,6 +283,7 @@ for port in $((base + 10)) $((base + 11)); do
 		exit 1
 	fi
 done
+promotion_recovery_ms="$(( $(date +%s%3N) - promotion_started_ms ))"
 touch "$release_file"
 if ! wait "$harness_pid"; then cat "$work_dir/harness.log" >&2; exit 1; fi
 harness_pid=""
@@ -249,21 +292,35 @@ wait "$monitor_pid" >/dev/null 2>&1 || true
 monitor_pid=""
 if [[ -n "${GRIPLINE_SOAK_EVIDENCE_FILE:-}" ]]; then
 	relation_max="$(awk '{if ($2 > m) m=$2} END {print m+0}' "$relation_file" 2>/dev/null || true)"
+	retention_first="$(awk -F '\t' 'NR == 1 {print $2; exit}' "$row_file" 2>/dev/null || true)"
+	retention_final="$(awk -F '\t' 'END {print $2}' "$row_file" 2>/dev/null || true)"
+	maintenance_max_duration="$(awk -F '\t' 'BEGIN {m=0} {if ($6+0 > m) m=$6+0} END {printf "%.6f", m+0}' "$maintenance_metrics_file" 2>/dev/null || echo 0)"
+	maintenance_p95_duration="$(awk -F '\t' '{print $6+0}' "$maintenance_metrics_file" 2>/dev/null | sort -n | awk -v n="$(wc -l <"$maintenance_metrics_file" 2>/dev/null || echo 0)" 'NR == int((n * 95 + 99) / 100) {printf "%.6f", $1; exit}')"
+	retention_first="${retention_first//\"/}"
+	retention_final="${retention_final//\"/}"
 	cat >"$GRIPLINE_SOAK_EVIDENCE_FILE" <<EOF
 {
   "qualification": "reference-production-soak",
   "status": "passed",
   "commit": "$(git rev-parse HEAD)",
   "duration_seconds": ${duration},
-  "workers": ${workers},
+	"workers": ${workers},
+	"load_mode": "${load_mode}",
   "snapshots": $(wc -l <"$snapshot_file"),
   "max_rss_kb": ${max_rss},
-  "max_goroutines": ${max_goroutines},
-  "max_heap_bytes": ${max_heap},
-	"maintenance_samples": $(wc -l <"$maintenance_file" 2>/dev/null || echo 0),
+	"max_goroutines": ${max_goroutines},
+	"max_heap_bytes": ${max_heap},
+	"maintenance_samples": $((maintenance_metric_samples + external_maintenance_samples)),
+	"maintenance_rows_deleted_max": ${maintenance_max_deleted},
+	"maintenance_max_duration_seconds": ${maintenance_max_duration:-0},
+	"maintenance_p95_duration_seconds": ${maintenance_p95_duration:-0},
+	"maintenance_errors_max": ${maintenance_max_errors},
 	"retention_row_samples": $(wc -l <"$row_file" 2>/dev/null || echo 0),
-	"maintenance_failures": 0,
-  "max_terminal_relation_bytes": ${relation_max:-0},
+	"retention_rows_first": "${retention_first}",
+	"retention_rows_final": "${retention_final}",
+		"maintenance_failures": 0,
+	  "max_terminal_relation_bytes": ${relation_max:-0},
+	  "post_promotion_recovery_ms": ${promotion_recovery_ms},
   "generated_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 EOF

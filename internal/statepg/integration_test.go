@@ -504,6 +504,10 @@ func TestPostgresMaintenanceCleansBoundedHistoricalRows(t *testing.T) {
 	if stats.ReleasedLeasesDeleted != 1 || stats.CredentialReceiptsDeleted != 1 || stats.ControlOperationsDeleted != 1 || stats.EvidenceDeleted != 1 {
 		t.Fatalf("maintenance stats=%+v, want released lease, receipt, operation, and expired evidence cleanup", stats)
 	}
+	health := store.Metrics()
+	if health.MaintenanceRuns != 1 || health.MaintenanceErrors != 0 || health.MaintenanceConsecutiveErrors != 0 || health.MaintenanceRowsDeleted != int64(stats.RowsDeleted) || health.MaintenanceLastSuccess.IsZero() {
+		t.Fatalf("maintenance health=%+v, want one successful recorded pass", health)
+	}
 	for table := range map[string]struct{}{
 		"gripline_resource_leases":          {},
 		"gripline_credential_receipts":      {},

@@ -141,6 +141,9 @@ type AuthoritySection struct {
 type MaintenanceSection struct {
 	Interval                    Duration `json:"interval,omitempty"`
 	BatchSize                   int      `json:"batch_size,omitempty"`
+	MaxBatchesPerPass           int      `json:"max_batches_per_pass,omitempty"`
+	MaxRowsPerPass              int      `json:"max_rows_per_pass,omitempty"`
+	MaxRuntimePerPass           Duration `json:"max_runtime_per_pass,omitempty"`
 	EvidenceGrace               Duration `json:"evidence_grace,omitempty"`
 	ReleasedLeaseRetention      Duration `json:"released_lease_retention,omitempty"`
 	CredentialReceiptRetention  Duration `json:"credential_receipt_retention,omitempty"`
@@ -158,7 +161,7 @@ type MaintenanceSection struct {
 }
 
 func (m MaintenanceSection) configured() bool {
-	return m.Interval.D() != 0 || m.BatchSize != 0 || m.EvidenceGrace.D() != 0 ||
+	return m.Interval.D() != 0 || m.BatchSize != 0 || m.MaxBatchesPerPass != 0 || m.MaxRowsPerPass != 0 || m.MaxRuntimePerPass.D() != 0 || m.EvidenceGrace.D() != 0 ||
 		m.ReleasedLeaseRetention.D() != 0 || m.CredentialReceiptRetention.D() != 0 ||
 		m.ControlOperationRetention.D() != 0 || m.AdmissionAuditRetention.D() != 0 ||
 		m.SecurityTransitionRetention.D() != 0 || m.OperatorAuditRetention.D() != 0 ||
@@ -831,14 +834,14 @@ func (c *Config) Validate() error {
 		if c.Authority.MaxConns < 0 || c.Authority.MinConns < 0 || (c.Authority.MaxConns > 0 && c.Authority.MinConns > c.Authority.MaxConns) {
 			return fmt.Errorf("authority min/max connection bounds are invalid")
 		}
-		if c.Authority.Maintenance.BatchSize < 0 {
-			return fmt.Errorf("authority.maintenance.batch_size must be non-negative")
+		if c.Authority.Maintenance.BatchSize < 0 || c.Authority.Maintenance.MaxBatchesPerPass < 0 || c.Authority.Maintenance.MaxRowsPerPass < 0 {
+			return fmt.Errorf("authority.maintenance batch limits must be non-negative")
 		}
 		retentions := []struct {
 			name  string
 			value time.Duration
 		}{
-			{"interval", c.Authority.Maintenance.Interval.D()}, {"evidence_grace", c.Authority.Maintenance.EvidenceGrace.D()},
+			{"interval", c.Authority.Maintenance.Interval.D()}, {"max_runtime_per_pass", c.Authority.Maintenance.MaxRuntimePerPass.D()}, {"evidence_grace", c.Authority.Maintenance.EvidenceGrace.D()},
 			{"released_lease_retention", c.Authority.Maintenance.ReleasedLeaseRetention.D()}, {"credential_receipt_retention", c.Authority.Maintenance.CredentialReceiptRetention.D()},
 			{"control_operation_retention", c.Authority.Maintenance.ControlOperationRetention.D()}, {"admission_audit_retention", c.Authority.Maintenance.AdmissionAuditRetention.D()},
 			{"security_transition_retention", c.Authority.Maintenance.SecurityTransitionRetention.D()}, {"operator_audit_retention", c.Authority.Maintenance.OperatorAuditRetention.D()},

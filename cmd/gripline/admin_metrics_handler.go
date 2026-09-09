@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/B-A-M-N/gripline/internal/anomaly"
 	"github.com/B-A-M-N/gripline/internal/control"
@@ -31,6 +32,12 @@ func adminMetrics(svc *control.Service, dp *proxy.DataPlane, governor resource.A
 		}
 		var b strings.Builder
 		writeMetric := func(name string, value any) { fmt.Fprintf(&b, "gripline_%s %v\n", name, value) }
+		metricTimestamp := func(value time.Time) int64 {
+			if value.IsZero() {
+				return 0
+			}
+			return value.Unix()
+		}
 		var mem runtime.MemStats
 		runtime.ReadMemStats(&mem)
 		writeMetric("runtime_goroutines", runtime.NumGoroutine())
@@ -143,6 +150,15 @@ func adminMetrics(svc *control.Service, dp *proxy.DataPlane, governor resource.A
 			writeMetric("postgres_expired_leases_total", a.ExpiredLeases)
 			writeMetric("postgres_forwarded_unsettled_consumed_total", a.ForwardedUnsettledConsumed)
 			writeMetric("postgres_release_failures_total", a.ReleaseFailures)
+			writeMetric("postgres_maintenance_runs_total", a.MaintenanceRuns)
+			writeMetric("postgres_maintenance_errors_total", a.MaintenanceErrors)
+			writeMetric("postgres_maintenance_consecutive_errors", a.MaintenanceConsecutiveErrors)
+			writeMetric("postgres_maintenance_rows_deleted_total", a.MaintenanceRowsDeleted)
+			writeMetric("postgres_maintenance_batches_total", a.MaintenanceBatches)
+			writeMetric("postgres_maintenance_backlog_estimate", a.MaintenanceBacklogEstimate)
+			writeMetric("postgres_maintenance_last_success_timestamp", metricTimestamp(a.MaintenanceLastSuccess))
+			writeMetric("postgres_maintenance_last_failure_timestamp", metricTimestamp(a.MaintenanceLastFailure))
+			writeMetric("postgres_maintenance_last_duration_seconds", a.MaintenanceLastDuration.Seconds())
 		}
 		if spray != nil {
 			writeMetric("detector_drops_total", spray.Stats().Dropped)

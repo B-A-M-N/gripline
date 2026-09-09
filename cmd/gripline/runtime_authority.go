@@ -56,7 +56,9 @@ func openRuntimeAuthorities(cfg *config.Config, connectTimeout, operationTimeout
 			NodeID: cfg.Authority.NodeID, LeaseTTL: cfg.Authority.LeaseTTL.D(), RenewEvery: cfg.Authority.RenewEvery.D(), MaxSourceScopes: cfg.Server.MaxSourceScopes, SourceScopeIdle: cfg.Server.SourceScopeIdle.D(),
 			ConnectTimeout: connectTimeout, OperationTimeout: operationTimeout, Maintenance: statepg.MaintenanceOptions{
 				Interval: cfg.Authority.Maintenance.Interval.D(), BatchSize: cfg.Authority.Maintenance.BatchSize,
-				EvidenceGrace: cfg.Authority.Maintenance.EvidenceGrace.D(), ReleasedLeaseRetention: cfg.Authority.Maintenance.ReleasedLeaseRetention.D(),
+				MaxBatchesPerPass: cfg.Authority.Maintenance.MaxBatchesPerPass, MaxRowsPerPass: cfg.Authority.Maintenance.MaxRowsPerPass,
+				MaxRuntimePerPass: cfg.Authority.Maintenance.MaxRuntimePerPass.D(),
+				EvidenceGrace:     cfg.Authority.Maintenance.EvidenceGrace.D(), ReleasedLeaseRetention: cfg.Authority.Maintenance.ReleasedLeaseRetention.D(),
 				CredentialReceiptRetention: cfg.Authority.Maintenance.CredentialReceiptRetention.D(), ControlOperationRetention: cfg.Authority.Maintenance.ControlOperationRetention.D(),
 				AdmissionAuditRetention: cfg.Authority.Maintenance.AdmissionAuditRetention.D(), SecurityTransitionRetention: cfg.Authority.Maintenance.SecurityTransitionRetention.D(),
 				OperatorAuditRetention: cfg.Authority.Maintenance.OperatorAuditRetention.D(), PolicyAuditRetention: cfg.Authority.Maintenance.PolicyAuditRetention.D(),

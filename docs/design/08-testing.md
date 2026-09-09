@@ -60,7 +60,15 @@ posture, policy, crypto rotation, source continuity, fencing, killed-node
 recovery, backend cancellation, and PostgreSQL outage/recovery. CI and release
 jobs require the PostgreSQL outage segment; local runs may skip it only when no
 PostgreSQL service container is available.
-The same harness runs a configurable short sustained load phase
+The same harness has two deliberately separate load modes. `security-load`
+keeps production-like hard limits and asserts caps, denials, and fairness;
+`capacity-load` uses only disposable fixture ceilings and a persistent Go
+client pool. The latter runs through `bash scripts/qualification/capacity.sh`
+and reports status distribution, total/successful RPS, p50/p95/p99 latency,
+PostgreSQL pool wait, transaction retries, and transaction latency. Neither is
+an operator-specific capacity claim.
+
+The security harness runs a configurable short sustained load phase
 (`GRIPLINE_CLUSTER_HARNESS_LOAD_SECONDS` and
 `GRIPLINE_CLUSTER_HARNESS_LOAD_WORKERS`, with the optional
 `GRIPLINE_CLUSTER_HARNESS_LOAD_P95_LIMIT_MS`) through the load balancer and
@@ -70,7 +78,10 @@ This is a pool/serialization regression gate. The repository-owned
 three-node workload, continuously checks replica/security invariants, bounded
 active leases/holds/source scopes and retention, and records each node's RSS,
 goroutine, and heap samples; it can run the 24-72 hour reference soak.
-Operator-specific capacity remains a separate deployment layer.
+The soak uses compressed historical retention only for its disposable fixture;
+live coordination state keeps a longer window, and the explicit maintenance
+tool exercises retention under traffic. Operator-specific capacity remains a
+separate deployment layer.
 The release harness also invokes `scripts/security-http-harness.sh`, which
 writes raw HTTP/1.1 framing and header cases to a TCP socket and checks that
 parser ambiguity never creates more than one backend request or leaks a

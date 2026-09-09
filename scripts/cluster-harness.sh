@@ -46,12 +46,22 @@ secret_three="cluster-secret-three-0123456789"
 secret_four="cluster-secret-four-0123456789"
 lease_ttl="${GRIPLINE_CLUSTER_HARNESS_LEASE_TTL:-30s}"
 renew_every="${GRIPLINE_CLUSTER_HARNESS_RENEW_EVERY:-5s}"
+load_mode="${GRIPLINE_CLUSTER_HARNESS_LOAD_MODE:-security}"
+if [[ "$load_mode" != security && "$load_mode" != capacity ]]; then
+	echo "cluster harness: load mode must be security or capacity" >&2
+	exit 2
+fi
 pepper_one_b64="$(openssl rand -base64 32 | tr -d '\n')"
 pepper_two_b64="$(openssl rand -base64 32 | tr -d '\n')"
 pseudonym_one_b64="$(openssl rand -base64 32 | tr -d '\n')"
 pseudonym_two_b64="$(openssl rand -base64 32 | tr -d '\n')"
 policy_epoch_file="$harness_dir/policy-epoch"
 printf '1\n' >"$policy_epoch_file"
+maintenance_config=""
+if [[ "${GRIPLINE_CLUSTER_HARNESS_COMPRESSED_RETENTION:-0}" == "1" ]]; then
+	retention_window="${GRIPLINE_CLUSTER_HARNESS_RETENTION_WINDOW:-1m}"
+	maintenance_config=", \"maintenance\": {\"interval\":\"1h\",\"batch_size\":256,\"max_batches_per_pass\":64,\"max_rows_per_pass\":4096,\"max_runtime_per_pass\":\"5s\",\"evidence_grace\":\"0s\",\"released_lease_retention\":\"${retention_window}\",\"credential_receipt_retention\":\"${retention_window}\",\"control_operation_retention\":\"${retention_window}\",\"admission_audit_retention\":\"${retention_window}\",\"security_transition_retention\":\"${retention_window}\",\"operator_audit_retention\":\"${retention_window}\",\"policy_audit_retention\":\"${retention_window}\",\"membership_retention\":\"1h\",\"adaptive_retention\":\"1h\",\"evidence_guard_retention\":\"${retention_window}\",\"lane_operator_audit_retention\":\"${retention_window}\",\"policy_node_state_retention\":\"1h\",\"cluster_crypto_ack_retention\":\"1h\"}"
+fi
 
 write_artifact() {
 	if [[ -n "${GRIPLINE_CLUSTER_HARNESS_ARTIFACT_FILE:-}" ]]; then
@@ -114,15 +124,21 @@ go build -trimpath -o "$harness_dir/gripline" ./cmd/gripline
 go build -trimpath -o "$harness_dir/backend" ./cmd/gripline-test-backend
 go build -trimpath -o "$harness_dir/lb" ./cmd/gripline-test-lb
 go build -trimpath -o "$harness_dir/setup" ./cmd/gripline-test-cluster-setup
+go build -trimpath -o "$harness_dir/load" ./cmd/gripline-test-load
 
-"$harness_dir/setup" \
-	-reset-dsn "$dsn" \
-	-keyring "$harness_dir/keyring.json" \
-	-policy "$harness_dir/policy.json" \
-	-candidate "$harness_dir/candidate.json" \
-	-verifier "$harness_dir/policy-verifier.key" \
-	-pepper-one "$pepper_one_b64" -pepper-two "$pepper_two_b64" \
+setup_args=(
+	-reset-dsn "$dsn"
+	-keyring "$harness_dir/keyring.json"
+	-policy "$harness_dir/policy.json"
+	-candidate "$harness_dir/candidate.json"
+	-verifier "$harness_dir/policy-verifier.key"
+	-pepper-one "$pepper_one_b64" -pepper-two "$pepper_two_b64"
 	-pseudonym-one "$pseudonym_one_b64" -pseudonym-two "$pseudonym_two_b64"
+)
+if [[ "$load_mode" == capacity ]]; then
+	setup_args+=(-capacity-mode)
+fi
+"$harness_dir/setup" "${setup_args[@]}"
 
 export GRIPLINE_CLUSTER_DSN="$dsn"
 for node in a b c; do
@@ -159,7 +175,7 @@ for node in a b c; do
   "authority": {
     "backend": "postgres", "dsn_env": "GRIPLINE_CLUSTER_DSN", "node_id": "cluster-${node}",
     "lease_ttl": "${lease_ttl}", "renew_every": "${renew_every}", "connect_timeout": "10s", "operation_timeout": "2s",
-    "max_conns": 8, "min_conns": 1
+    "max_conns": 8, "min_conns": 1${maintenance_config}
   },
   "deployment": {"allow_ephemeral_state": false}
 }
@@ -189,7 +205,7 @@ write_artifact
 	-require-client-dns "gripline-inference.internal" \
 	-keys "$harness_dir/keys.json" \
 	-audience "$audience" \
-	-work-delay 2s \
+	-work-delay "$([[ "$load_mode" == capacity ]] && echo 10ms || echo 2s)" \
 	-active "$harness_dir/backend-active" \
 	-peak "$harness_dir/backend-peak" \
 	-policy-epoch-file "$policy_epoch_file" \
@@ -598,57 +614,83 @@ printf '3\n' >"$policy_epoch_file"
 		wait_assertion_policy "$port" "$secret_four" 1 3
 	done
 
-# Run the destructive security load only after deterministic lifecycle checks
-# have converged. This keeps rate-limit/resource pressure from making policy,
-# crypto, revoke, and posture assertions nondeterministic.
+# Run load only after deterministic lifecycle checks have converged. Security
+# mode intentionally exercises hard limits. Capacity mode raises only the
+# disposable fixture's ceilings and uses persistent clients so its measurements
+# describe actual gateway/PostgreSQL behavior rather than curl process churn.
 if [[ "$load_seconds" -gt 0 ]]; then
 	load_dir="$harness_dir/cluster-load"
 	mkdir -p "$load_dir"
-	load_end_epoch=$(( $(date +%s) + load_seconds ))
-	load_secrets=("$secret_two" "$secret_three" "$secret_four")
-	load_worker() {
-		local worker=$1 result_file="$load_dir/worker-${1}.tsv"
-		local secret_index=$(( (worker - 1) % ${#load_secrets[@]} ))
-		local load_secret="${load_secrets[$secret_index]}"
-		local started ended code
-		: >"$result_file"
-		while [[ "$(date +%s)" -lt "$load_end_epoch" ]]; do
-			started="$(date +%s%N)"
-			code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${lb_port}/v1/messages" \
-				-H "Authorization: Bearer ${load_secret}" -d '{}' 2>/dev/null || true)"
-			ended="$(date +%s%N)"
-			printf '%s\t%s\n' "${code:-000}" "$((ended - started))" >>"$result_file"
+	if [[ "$load_mode" == security ]]; then
+		load_end_epoch=$(( $(date +%s) + load_seconds ))
+		load_secrets=("$secret_two" "$secret_three" "$secret_four")
+		load_worker() {
+			local worker=$1 result_file="$load_dir/worker-${1}.tsv"
+			local secret_index=$(( (worker - 1) % ${#load_secrets[@]} ))
+			local load_secret="${load_secrets[$secret_index]}"
+			local started ended code
+			: >"$result_file"
+			while [[ "$(date +%s)" -lt "$load_end_epoch" ]]; do
+				started="$(date +%s%N)"
+				code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${lb_port}/v1/messages" \
+					-H "Authorization: Bearer ${load_secret}" -d '{}' 2>/dev/null || true)"
+				ended="$(date +%s%N)"
+				printf '%s\t%s\n' "${code:-000}" "$((ended - started))" >>"$result_file"
+			done
+		}
+		load_pids=()
+		for worker in $(seq 1 "$load_workers"); do
+			load_worker "$worker" &
+			load_pids+=("$!")
 		done
-	}
-	load_pids=()
-	for worker in $(seq 1 "$load_workers"); do
-		load_worker "$worker" &
-		load_pids+=("$!")
-	done
-	for pid in "${load_pids[@]}"; do
-		wait "$pid" || true
-	done
-	cat "$load_dir"/*.tsv >"$load_dir/results.tsv"
-	load_samples="$(wc -l <"$load_dir/results.tsv")"
-	if [[ "$load_samples" -lt 1 ]]; then
-		echo "cluster harness: sustained load produced no samples" >&2
-		exit 1
-	fi
-	load_successes="$(awk -F '\t' '$1 == 200 {n++} END {print n+0}' "$load_dir/results.tsv")"
-	awk -F '\t' '$1 == 200 {print $2}' "$load_dir/results.tsv" | sort -n >"$load_dir/success-latencies.ns"
-	success_count="$(wc -l <"$load_dir/success-latencies.ns")"
-	if [[ "$load_successes" -lt 1 ]]; then
-		echo "cluster harness: sustained load had no successful requests" >&2
-		exit 1
-	fi
-	load_p50_ns="$(awk -v n="$success_count" 'NR == int((n * 50 + 99) / 100) {print; exit}' "$load_dir/success-latencies.ns")"
-	load_p95_ns="$(awk -v n="$success_count" 'NR == int((n * 95 + 99) / 100) {print; exit}' "$load_dir/success-latencies.ns")"
-	load_success_rate="$(awk -v successes="$load_successes" -v seconds="$load_seconds" 'BEGIN {printf "%.2f", successes / seconds}')"
-	printf 'cluster harness: security load samples=%s successes=%s success_per_sec=%s p50_ns=%s p95_ns=%s workers=%s seconds=%s\n' \
-		"$load_samples" "$load_successes" "$load_success_rate" "$load_p50_ns" "$load_p95_ns" "$load_workers" "$load_seconds"
-	if [[ "$load_p95_ns" -gt "$load_p95_limit_ns" ]]; then
-		echo "cluster harness: security-load p95 ${load_p95_ns}ns exceeded ${load_p95_limit_ms}ms limit" >&2
-		exit 1
+		for pid in "${load_pids[@]}"; do
+			wait "$pid" || true
+		done
+		cat "$load_dir"/*.tsv >"$load_dir/results.tsv"
+		load_samples="$(wc -l <"$load_dir/results.tsv")"
+		if [[ "$load_samples" -lt 1 ]]; then
+			echo "cluster harness: security load produced no samples" >&2
+			exit 1
+		fi
+		load_successes="$(awk -F '\t' '$1 == 200 {n++} END {print n+0}' "$load_dir/results.tsv")"
+		awk -F '\t' '$1 == 200 {print $2}' "$load_dir/results.tsv" | sort -n >"$load_dir/success-latencies.ns"
+		success_count="$(wc -l <"$load_dir/success-latencies.ns")"
+		if [[ "$load_successes" -lt 1 ]]; then
+			echo "cluster harness: security load had no successful requests" >&2
+			exit 1
+		fi
+		load_p50_ns="$(awk -v n="$success_count" 'NR == int((n * 50 + 99) / 100) {print; exit}' "$load_dir/success-latencies.ns")"
+		load_p95_ns="$(awk -v n="$success_count" 'NR == int((n * 95 + 99) / 100) {print; exit}' "$load_dir/success-latencies.ns")"
+		load_success_rate="$(awk -v successes="$load_successes" -v seconds="$load_seconds" 'BEGIN {printf "%.2f", successes / seconds}')"
+		printf 'cluster harness: security load samples=%s successes=%s success_per_sec=%s p50_ns=%s p95_ns=%s workers=%s seconds=%s\n' \
+			"$load_samples" "$load_successes" "$load_success_rate" "$load_p50_ns" "$load_p95_ns" "$load_workers" "$load_seconds"
+		if [[ "$load_p95_ns" -gt "$load_p95_limit_ns" ]]; then
+			echo "cluster harness: security-load p95 ${load_p95_ns}ns exceeded ${load_p95_limit_ms}ms limit" >&2
+			exit 1
+		fi
+	else
+		metrics_before="$load_dir/metrics-before.prom"
+		metrics_after="$load_dir/metrics-after.prom"
+		curl -fsS "http://127.0.0.1:$((base + 20))/admin/metrics" -H "Authorization: Bearer ${operator_token}" >"$metrics_before"
+		"$harness_dir/load" -url "http://127.0.0.1:${lb_port}/v1/messages" -secrets "$secret_two,$secret_three,$secret_four" -duration "${load_seconds}s" -workers "$load_workers" >"$load_dir/capacity.json"
+		if ! rg -q '"successful"[[:space:]]*:[[:space:]]*[1-9]' "$load_dir/capacity.json"; then
+			echo "cluster harness: capacity load had no successful requests" >&2
+			cat "$load_dir/capacity.json" >&2
+			exit 1
+		fi
+		curl -fsS "http://127.0.0.1:$((base + 20))/admin/metrics" -H "Authorization: Bearer ${operator_token}" >"$metrics_after"
+		metric_value() { awk -v key="gripline_$1" '$1 == key {print $2; exit}' "$2"; }
+		metric_delta() {
+			awk -v before="$(metric_value "$1" "$metrics_before")" -v after="$(metric_value "$1" "$metrics_after")" 'BEGIN {printf "%.6f", (after+0)-(before+0)}'
+		}
+		serialization_retries="$(metric_delta postgres_serialization_retries_total)"
+		deadlock_retries="$(metric_delta postgres_deadlock_retries_total)"
+		transaction_retries="$(awk -v serialization="$serialization_retries" -v deadlock="$deadlock_retries" 'BEGIN {printf "%.0f", serialization + deadlock}')"
+		printf 'cluster harness: capacity load metrics=%s pg_pool_wait_seconds=%s transaction_retries=%s transaction_latency_seconds=%s\n' \
+			"$(cat "$load_dir/capacity.json")" \
+			"$(metric_delta postgres_pool_empty_acquire_wait_seconds)" \
+			"$transaction_retries" \
+			"$(metric_delta postgres_transaction_latency_seconds_total)"
 	fi
 fi
 
@@ -657,7 +699,7 @@ fi
 # CI/release jobs set REQUIRE_DB_OUTAGE so this cannot silently become optional
 # in the release gate.
 postgres_container="${GRIPLINE_TEST_POSTGRES_CONTAINER:-}"
-if [[ -z "$postgres_container" ]] && command -v docker >/dev/null 2>&1; then
+if [[ "${GRIPLINE_CLUSTER_HARNESS_SKIP_OUTAGE:-0}" != "1" && -z "$postgres_container" ]] && command -v docker >/dev/null 2>&1; then
 	postgres_container="$(docker ps --filter 'ancestor=postgres:16' --format '{{.ID}}' | head -n 1 || true)"
 fi
 if [[ -z "$postgres_container" ]]; then
@@ -707,6 +749,7 @@ fi
 # fixture's active-work counter measures backend work, not merely proxy
 # sockets; this proves the concurrency cap is released only after cancellation
 # reaches the actual backend operation.
+if [[ "${GRIPLINE_CLUSTER_HARNESS_SKIP_KILLED_NODE:-0}" != "1" ]]; then
 printf '0\n' >"$harness_dir/backend-active"
 curl -sS -o /dev/null "http://127.0.0.1:$((base + 12))/v1/work" \
 	-H "Authorization: Bearer ${secret_two}" >"$harness_dir/killed-request.log" 2>&1 &
@@ -740,6 +783,7 @@ fi
 if curl -sS "http://127.0.0.1:$((base + 12))/readyz" >/dev/null 2>&1; then
 	echo "cluster harness: killed node remained reachable" >&2
 	exit 1
+fi
 fi
 
 # A long-soak coordinator can hold the complete live cluster here, promote its

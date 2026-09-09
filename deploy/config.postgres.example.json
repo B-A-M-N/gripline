@@ -107,6 +107,9 @@
     "maintenance": {
       "interval": "1m",
       "batch_size": 1024,
+      "max_batches_per_pass": 64,
+      "max_rows_per_pass": 4096,
+      "max_runtime_per_pass": "5s",
       "evidence_grace": "0s",
       "released_lease_retention": "24h",
       "credential_receipt_retention": "24h",

@@ -27,15 +27,31 @@ func main() {
 	dsn := flag.String("dsn", "", "PostgreSQL authority DSN")
 	timeout := flag.Duration("timeout", 10*time.Second, "maintenance operation timeout")
 	batchSize := flag.Int("batch-size", 256, "maximum rows deleted per maintenance category")
+	maxBatches := flag.Int("max-batches", 64, "maximum cleanup batches per pass")
+	maxRows := flag.Int("max-rows", 4096, "maximum rows deleted per pass")
+	maxRuntime := flag.Duration("max-runtime", 5*time.Second, "maximum maintenance runtime per pass")
+	historyRetention := flag.Duration("history-retention", 0, "optional compressed retention for historical audit/receipt rows")
 	flag.Parse()
-	if *dsn == "" || *timeout <= 0 || *batchSize <= 0 {
-		log.Fatal("-dsn, positive -timeout, and positive -batch-size are required")
+	if *dsn == "" || *timeout <= 0 || *batchSize <= 0 || *maxBatches <= 0 || *maxRows <= 0 || *maxRuntime <= 0 || *historyRetention < 0 {
+		log.Fatal("-dsn, positive -timeout, -batch-size, -max-batches, -max-rows, and -max-runtime are required; -history-retention must be non-negative")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
+	maintenance := statepg.MaintenanceOptions{BatchSize: *batchSize, MaxBatchesPerPass: *maxBatches, MaxRowsPerPass: *maxRows, MaxRuntimePerPass: *maxRuntime}
+	if *historyRetention > 0 {
+		maintenance.ReleasedLeaseRetention = *historyRetention
+		maintenance.CredentialReceiptRetention = *historyRetention
+		maintenance.ControlOperationRetention = *historyRetention
+		maintenance.AdmissionAuditRetention = *historyRetention
+		maintenance.SecurityTransitionRetention = *historyRetention
+		maintenance.OperatorAuditRetention = *historyRetention
+		maintenance.PolicyAuditRetention = *historyRetention
+		maintenance.EvidenceGuardRetention = *historyRetention
+		maintenance.LaneOperatorAuditRetention = *historyRetention
+	}
 	store, err := statepg.Open(ctx, statepg.Options{
 		DSN: *dsn, OperationTimeout: *timeout,
-		Maintenance: statepg.MaintenanceOptions{BatchSize: *batchSize},
+		Maintenance: maintenance,
 	})
 	if err != nil {
 		log.Fatalf("open authority: %v", err)

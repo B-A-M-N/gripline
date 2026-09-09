@@ -26,51 +26,96 @@ type PoolStats struct {
 // identifiers and are safe to expose through the authenticated metrics
 // surface. Latency is accumulated wall-clock time at the authority boundary.
 type AuthorityMetrics struct {
-	TransactionAttempts        int64
-	TransactionErrors          int64
-	TransactionLatency         time.Duration
-	SerializationRetries       int64
-	DeadlockRetries            int64
-	ReservationAttempts        int64
-	ReservationsGranted        int64
-	ReservationFailures        int64
-	ReservationLatency         time.Duration
-	ForwardAttempts            int64
-	Forwarded                  int64
-	ForwardFailures            int64
-	LeaseRenewalAttempts       int64
-	LeasesRenewed              int64
-	LeaseRenewalFailures       int64
-	SettlementAttempts         int64
-	Settlements                int64
-	SettlementFailures         int64
-	ExpiredLeases              int64
-	ForwardedUnsettledConsumed int64
-	ReleaseFailures            int64
+	TransactionAttempts          int64
+	TransactionErrors            int64
+	TransactionLatency           time.Duration
+	SerializationRetries         int64
+	DeadlockRetries              int64
+	ReservationAttempts          int64
+	ReservationsGranted          int64
+	ReservationFailures          int64
+	ReservationLatency           time.Duration
+	ForwardAttempts              int64
+	Forwarded                    int64
+	ForwardFailures              int64
+	LeaseRenewalAttempts         int64
+	LeasesRenewed                int64
+	LeaseRenewalFailures         int64
+	SettlementAttempts           int64
+	Settlements                  int64
+	SettlementFailures           int64
+	ExpiredLeases                int64
+	ForwardedUnsettledConsumed   int64
+	ReleaseFailures              int64
+	MaintenanceRuns              int64
+	MaintenanceErrors            int64
+	MaintenanceConsecutiveErrors int64
+	MaintenanceRowsDeleted       int64
+	MaintenanceBatches           int64
+	MaintenanceBacklogEstimate   int64
+	MaintenanceLastSuccess       time.Time
+	MaintenanceLastFailure       time.Time
+	MaintenanceLastDuration      time.Duration
 }
 
 type authorityMetrics struct {
-	transactionAttempts        atomic.Int64
-	transactionErrors          atomic.Int64
-	transactionLatencyNanos    atomic.Int64
-	serializationRetries       atomic.Int64
-	deadlockRetries            atomic.Int64
-	reservationAttempts        atomic.Int64
-	reservationsGranted        atomic.Int64
-	reservationFailures        atomic.Int64
-	reservationLatencyNanos    atomic.Int64
-	forwardAttempts            atomic.Int64
-	forwarded                  atomic.Int64
-	forwardFailures            atomic.Int64
-	leaseRenewalAttempts       atomic.Int64
-	leasesRenewed              atomic.Int64
-	leaseRenewalFailures       atomic.Int64
-	settlementAttempts         atomic.Int64
-	settlements                atomic.Int64
-	settlementFailures         atomic.Int64
-	expiredLeases              atomic.Int64
-	forwardedUnsettledConsumed atomic.Int64
-	releaseFailures            atomic.Int64
+	transactionAttempts          atomic.Int64
+	transactionErrors            atomic.Int64
+	transactionLatencyNanos      atomic.Int64
+	serializationRetries         atomic.Int64
+	deadlockRetries              atomic.Int64
+	reservationAttempts          atomic.Int64
+	reservationsGranted          atomic.Int64
+	reservationFailures          atomic.Int64
+	reservationLatencyNanos      atomic.Int64
+	forwardAttempts              atomic.Int64
+	forwarded                    atomic.Int64
+	forwardFailures              atomic.Int64
+	leaseRenewalAttempts         atomic.Int64
+	leasesRenewed                atomic.Int64
+	leaseRenewalFailures         atomic.Int64
+	settlementAttempts           atomic.Int64
+	settlements                  atomic.Int64
+	settlementFailures           atomic.Int64
+	expiredLeases                atomic.Int64
+	forwardedUnsettledConsumed   atomic.Int64
+	releaseFailures              atomic.Int64
+	maintenanceRuns              atomic.Int64
+	maintenanceErrors            atomic.Int64
+	maintenanceConsecutiveErrors atomic.Int64
+	maintenanceRowsDeleted       atomic.Int64
+	maintenanceBatches           atomic.Int64
+	maintenanceBacklogEstimate   atomic.Int64
+	maintenanceLastSuccess       atomic.Int64
+	maintenanceLastFailure       atomic.Int64
+	maintenanceLastDurationNanos atomic.Int64
+}
+
+func (s *Store) recordMaintenance(stats MaintenanceStats, err error) {
+	if s == nil {
+		return
+	}
+	now := time.Now().UTC().UnixNano()
+	s.metrics.maintenanceRuns.Add(1)
+	s.metrics.maintenanceRowsDeleted.Add(int64(stats.RowsDeleted))
+	s.metrics.maintenanceBatches.Add(int64(stats.Batches))
+	s.metrics.maintenanceBacklogEstimate.Store(int64(stats.BacklogEstimate))
+	s.metrics.maintenanceLastDurationNanos.Store(stats.Duration.Nanoseconds())
+	if err != nil {
+		s.metrics.maintenanceErrors.Add(1)
+		s.metrics.maintenanceConsecutiveErrors.Add(1)
+		s.metrics.maintenanceLastFailure.Store(now)
+		return
+	}
+	s.metrics.maintenanceConsecutiveErrors.Store(0)
+	s.metrics.maintenanceLastSuccess.Store(now)
+}
+
+func metricTime(nanos int64) time.Time {
+	if nanos == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, nanos).UTC()
 }
 
 // Metrics returns a point-in-time copy of authority activity counters.
@@ -79,27 +124,36 @@ func (s *Store) Metrics() AuthorityMetrics {
 		return AuthorityMetrics{}
 	}
 	return AuthorityMetrics{
-		TransactionAttempts:        s.metrics.transactionAttempts.Load(),
-		TransactionErrors:          s.metrics.transactionErrors.Load(),
-		TransactionLatency:         time.Duration(s.metrics.transactionLatencyNanos.Load()),
-		SerializationRetries:       s.metrics.serializationRetries.Load(),
-		DeadlockRetries:            s.metrics.deadlockRetries.Load(),
-		ReservationAttempts:        s.metrics.reservationAttempts.Load(),
-		ReservationsGranted:        s.metrics.reservationsGranted.Load(),
-		ReservationFailures:        s.metrics.reservationFailures.Load(),
-		ReservationLatency:         time.Duration(s.metrics.reservationLatencyNanos.Load()),
-		ForwardAttempts:            s.metrics.forwardAttempts.Load(),
-		Forwarded:                  s.metrics.forwarded.Load(),
-		ForwardFailures:            s.metrics.forwardFailures.Load(),
-		LeaseRenewalAttempts:       s.metrics.leaseRenewalAttempts.Load(),
-		LeasesRenewed:              s.metrics.leasesRenewed.Load(),
-		LeaseRenewalFailures:       s.metrics.leaseRenewalFailures.Load(),
-		SettlementAttempts:         s.metrics.settlementAttempts.Load(),
-		Settlements:                s.metrics.settlements.Load(),
-		SettlementFailures:         s.metrics.settlementFailures.Load(),
-		ExpiredLeases:              s.metrics.expiredLeases.Load(),
-		ForwardedUnsettledConsumed: s.metrics.forwardedUnsettledConsumed.Load(),
-		ReleaseFailures:            s.metrics.releaseFailures.Load(),
+		TransactionAttempts:          s.metrics.transactionAttempts.Load(),
+		TransactionErrors:            s.metrics.transactionErrors.Load(),
+		TransactionLatency:           time.Duration(s.metrics.transactionLatencyNanos.Load()),
+		SerializationRetries:         s.metrics.serializationRetries.Load(),
+		DeadlockRetries:              s.metrics.deadlockRetries.Load(),
+		ReservationAttempts:          s.metrics.reservationAttempts.Load(),
+		ReservationsGranted:          s.metrics.reservationsGranted.Load(),
+		ReservationFailures:          s.metrics.reservationFailures.Load(),
+		ReservationLatency:           time.Duration(s.metrics.reservationLatencyNanos.Load()),
+		ForwardAttempts:              s.metrics.forwardAttempts.Load(),
+		Forwarded:                    s.metrics.forwarded.Load(),
+		ForwardFailures:              s.metrics.forwardFailures.Load(),
+		LeaseRenewalAttempts:         s.metrics.leaseRenewalAttempts.Load(),
+		LeasesRenewed:                s.metrics.leasesRenewed.Load(),
+		LeaseRenewalFailures:         s.metrics.leaseRenewalFailures.Load(),
+		SettlementAttempts:           s.metrics.settlementAttempts.Load(),
+		Settlements:                  s.metrics.settlements.Load(),
+		SettlementFailures:           s.metrics.settlementFailures.Load(),
+		ExpiredLeases:                s.metrics.expiredLeases.Load(),
+		ForwardedUnsettledConsumed:   s.metrics.forwardedUnsettledConsumed.Load(),
+		ReleaseFailures:              s.metrics.releaseFailures.Load(),
+		MaintenanceRuns:              s.metrics.maintenanceRuns.Load(),
+		MaintenanceErrors:            s.metrics.maintenanceErrors.Load(),
+		MaintenanceConsecutiveErrors: s.metrics.maintenanceConsecutiveErrors.Load(),
+		MaintenanceRowsDeleted:       s.metrics.maintenanceRowsDeleted.Load(),
+		MaintenanceBatches:           s.metrics.maintenanceBatches.Load(),
+		MaintenanceBacklogEstimate:   s.metrics.maintenanceBacklogEstimate.Load(),
+		MaintenanceLastSuccess:       metricTime(s.metrics.maintenanceLastSuccess.Load()),
+		MaintenanceLastFailure:       metricTime(s.metrics.maintenanceLastFailure.Load()),
+		MaintenanceLastDuration:      time.Duration(s.metrics.maintenanceLastDurationNanos.Load()),
 	}
 }
 

@@ -127,8 +127,9 @@ EOF
 			profile_env=(GRIPLINE_SDK_PROFILE="$profile" GRIPLINE_SDK_STREAM="$stream" GRIPLINE_SDK_EXPECT_USAGE_JSON="$profile_usage")
 			[[ "$profile" == models ]] && profile_env+=(GRIPLINE_SDK_EXPECT_USAGE=0) || profile_env+=(GRIPLINE_SDK_EXPECT_USAGE=1)
 			expect_input=3; expect_output=2; expect_combined=5; expect_cost=33
+		[[ "$provider" == openai ]] && expect_cost=21
 			[[ "$profile" == models ]] && expect_input=0 && expect_output=0 && expect_combined=0 && expect_cost=0
-			[[ "$profile" == embeddings ]] && expect_output=0 && expect_combined=3 && expect_cost=27
+			[[ "$profile" == embeddings ]] && expect_output=0 && expect_combined=3 && expect_cost=15
 			run_sdk_case "profile-${profile}-py-${stream}" 1 "$expect_input" "$expect_output" "$expect_combined" "$expect_cost" env "${sdk_env[@]}" "${profile_env[@]}" "$venv/bin/python" "$repo_dir/qualification/sdk/python/runner.py" "$provider"
 			run_sdk_case "profile-${profile}-ts-${stream}" 1 "$expect_input" "$expect_output" "$expect_combined" "$expect_cost" env "${sdk_env[@]}" "${profile_env[@]}" node "$ts_dir/runner.mjs" "$provider"
 		done
@@ -141,9 +142,10 @@ EOF
 	for scenario in "${scenarios[@]}"; do
 		extra=(GRIPLINE_SDK_SCENARIO="$scenario" GRIPLINE_SDK_STREAM=0)
 		expect_sessions=1; expect_input=3; expect_output=2; expect_combined=5; expect_cost=33
+		[[ "$provider" == openai ]] && expect_cost=21
 		case "$scenario" in
-			connection) extra+=(GRIPLINE_SDK_REQUESTS=4); expect_sessions=4; expect_input=12; expect_output=8; expect_combined=20; expect_cost=132 ;;
-			parallel) extra+=(GRIPLINE_SDK_PARALLEL=4); expect_sessions=4; expect_input=12; expect_output=8; expect_combined=20; expect_cost=132 ;;
+			connection) extra+=(GRIPLINE_SDK_REQUESTS=4); expect_sessions=4; expect_input=12; expect_output=8; expect_combined=20; expect_cost=$((expect_cost * 4)) ;;
+			parallel) extra+=(GRIPLINE_SDK_PARALLEL=4); expect_sessions=4; expect_input=12; expect_output=8; expect_combined=20; expect_cost=$((expect_cost * 4)) ;;
 			cache) expect_input=10; expect_combined=12; expect_cost=96 ;;
 		esac
 		if [[ "$scenario" == retry ]]; then
@@ -181,11 +183,13 @@ EOF
 	metrics="$(curl -fsS "http://127.0.0.1:${admin_port}/admin/metrics" -H "Authorization: Bearer ${operator_token}")"
 	metric() { printf '%s\n' "$metrics" | awk -v name="gripline_$1" '$1 == name {print $2}'; }
 	echo "SDK qualification metrics ($provider): sessions=$(metric usage_sessions_total) input=$(metric usage_input_tokens_total) output=$(metric usage_output_tokens_total) combined=$(metric usage_combined_tokens_total) cost=$(metric usage_cost_microunits_total) backend4xx=$(metric backend_4xx_total) backend5xx=$(metric backend_5xx_total)"
+	cost_min=312
+	[[ "$provider" == openai ]] && cost_min=200
 	test "$(metric usage_sessions_total)" -ge 20
 	test "$(metric usage_input_tokens_total)" -ge 78
 	test "$(metric usage_output_tokens_total)" -ge 52
 	test "$(metric usage_combined_tokens_total)" -ge 130
-	test "$(metric usage_cost_microunits_total)" -ge 312
+	test "$(metric usage_cost_microunits_total)" -ge "$cost_min"
 	test "$(metric backend_5xx_total)" -ge 2
 	kill -TERM "$gateway_pid" >/dev/null 2>&1 || true
 	wait "$gateway_pid" >/dev/null 2>&1 || true

@@ -61,3 +61,8 @@ matrix invokes OpenAI Chat Completions, Responses, Embeddings, and Models, plus
 Anthropic Messages, in both streaming and non-streaming forms where supported;
 the Anthropic `cache` scenario exercises read and 5-minute/1-hour creation
 dimensions through the local provider-shaped backend.
+
+The SDK matrix intentionally runs conservative pricing so incomplete provider
+responses remain safely over-reserved. Exact settlement is qualified separately
+by `scripts/qualification/exact-cost.sh`, which asserts OpenAI, Anthropic, and
+cache-dimension metric deltas plus zero conservative fallbacks.

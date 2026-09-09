@@ -156,7 +156,13 @@ prices unknown provider cache splits at the highest configured input/cache rate;
 `usage.cost_mode=exact` is fail-closed and requires the provider's cache pricing
 dimensions (including Anthropic's 5-minute and 1-hour cache-write rates).
 Provider usage envelopes that exceed the bounded parser are settled
-conservatively rather than claimed as exact monetary accounting.
+conservatively rather than claimed as exact monetary accounting. The stock
+JSON/SSE adapter retains at most 64 KiB of an incomplete usage record; if a
+terminal usage envelope cannot be parsed within that bound, exact mode settles
+conservatively and increments `gripline_usage_conservative_settlements_total`.
+The repository-owned `scripts/qualification/exact-cost.sh` gate proves exact
+OpenAI/Anthropic/cache pricing and zero conservative fallbacks on bounded
+provider-shaped responses.
 
 Operator lifecycle:
 
@@ -422,10 +428,12 @@ passing repository tests:
   for each process. `PlanID` is required credential metadata, but a multi-plan
   provider policy resolver is not shipped.
 - **Reference qualification lab:** `scripts/qualification/ha.sh`, `pitr.sh`,
-  `perimeter.sh`, `sdk.sh`, `http2.sh`, `replay.sh`, and `soak.sh` own the
-  reproducible PostgreSQL HA/PITR, mTLS/network, official SDK, HTTP/2, shared
-  replay, and active/active soak proofs. These are software-production gates,
-  not permanent external blockers.
+  `perimeter.sh`, `clustered-perimeter.sh`, `sdk.sh`, `exact-cost.sh`,
+  `http2.sh`, `replay.sh`, `capacity.sh`, and `soak.sh` own the reproducible
+  PostgreSQL HA/PITR, standalone and clustered mTLS/network, official SDK,
+  exact-cost, HTTP/2, shared replay, persistent-client capacity, and
+  active/active soak proofs. These are software-production gates, not permanent
+  external blockers.
 - **Operator deployment:** the actual AWS/Kubernetes/VPC policy, managed
   PostgreSQL product, issued PKI, secret delivery, edge DDoS controls,
   observability, and provider account/model quotas remain deployment

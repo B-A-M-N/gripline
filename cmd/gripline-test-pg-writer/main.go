@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -22,6 +23,29 @@ import (
 )
 
 type dsnList []string
+
+type backendState struct {
+	address   string
+	reachable bool
+	writable  bool
+}
+
+func selectWritableBackend(states []backendState) (string, error) {
+	selected := ""
+	for _, state := range states {
+		if !state.reachable || !state.writable {
+			continue
+		}
+		if selected != "" {
+			return "", errors.New("split-brain: multiple writable PostgreSQL candidates")
+		}
+		selected = state.address
+	}
+	if selected == "" {
+		return "", errors.New("no writable PostgreSQL candidate")
+	}
+	return selected, nil
+}
 
 func (d *dsnList) String() string { return strings.Join(*d, ",") }
 func (d *dsnList) Set(value string) error {
@@ -61,24 +85,27 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				selected := ""
+				states := make([]backendState, 0, len(backends))
 				for index, dsn := range backends {
+					state := backendState{address: addresses[index]}
 					probeCtx, probeCancel := context.WithTimeout(ctx, 750*time.Millisecond)
 					conn, err := pgx.Connect(probeCtx, dsn)
 					if err == nil {
+						state.reachable = true
 						var recovery bool
 						err = conn.QueryRow(probeCtx, "SELECT pg_is_in_recovery()").Scan(&recovery)
 						_ = conn.Close(probeCtx)
-						if err == nil && !recovery {
-							selected = addresses[index]
-							probeCancel()
-							break
-						}
+						state.writable = err == nil && !recovery
 					} else {
-						probeCancel()
-						continue
+						state.reachable = false
 					}
 					probeCancel()
+					states = append(states, state)
+				}
+				selected, err := selectWritableBackend(states)
+				if err != nil {
+					log.Printf("writer has no unambiguous writable backend: %v", err)
+					selected = ""
 				}
 				previous, _ := active.Load().(string)
 				if selected != previous {

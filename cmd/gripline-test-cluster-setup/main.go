@@ -39,6 +39,7 @@ func main() {
 	pseudonymOne := flag.String("pseudonym-one", "", "optional base64 pseudonym generation 1 for seeded crypto state")
 	pseudonymTwo := flag.String("pseudonym-two", "", "optional base64 pseudonym generation 2 for seeded crypto state")
 	seedReferenceState := flag.Bool("seed-reference-state", false, "seed valid policy and representative non-secret authority state")
+	capacityMode := flag.Bool("capacity-mode", false, "use high test-only resource ceilings for persistent capacity load")
 	flag.Parse()
 	if *keyringPath == "" || *policyPath == "" || *verifierPath == "" {
 		fatal("-keyring, -policy, and -verifier are required")
@@ -80,9 +81,18 @@ func main() {
 	}
 
 	configured := policy.Default()
-	configured.Limits.Normal.ConcurrencyCap = 5
-	configured.Limits.Constrained.ConcurrencyCap = 5
-	configured.Global.ConcurrencyCap = 5
+	if *capacityMode {
+		configured.Learning.AllowNewLanes = true
+		configured.Limits.Normal.ConcurrencyCap = 1024
+		configured.Limits.Normal.Requests = policy.BucketConfig{Capacity: 1 << 30, RefillPer: 1 << 30, RefillIn: time.Minute}
+		configured.Limits.Constrained.ConcurrencyCap = 1024
+		configured.Limits.Constrained.Requests = policy.BucketConfig{Capacity: 1 << 30, RefillPer: 1 << 30, RefillIn: time.Minute}
+		configured.Global.ConcurrencyCap = 4096
+	} else {
+		configured.Limits.Normal.ConcurrencyCap = 5
+		configured.Limits.Constrained.ConcurrencyCap = 5
+		configured.Global.ConcurrencyCap = 5
+	}
 	writePolicy(*policyPath, configured, private)
 	if *candidatePath != "" {
 		candidate := *configured
