@@ -51,6 +51,12 @@ command -v openssl >/dev/null || { echo "ha qualification: openssl is required" 
 compose=(docker compose -p "$project" -f "$fixture_dir/compose.yaml")
 
 "${compose[@]}" up -d
+export GRIPLINE_HA_PRIMARY_PORT="${GRIPLINE_HA_PRIMARY_PORT:-$(${compose[*]} port primary 5432 | head -1 | awk -F: '{print $NF}')}"
+export GRIPLINE_HA_REPLICA_PORT="${GRIPLINE_HA_REPLICA_PORT:-$(${compose[*]} port replica 5432 | head -1 | awk -F: '{print $NF}')}"
+[[ "$GRIPLINE_HA_PRIMARY_PORT" =~ ^[0-9]+$ && "$GRIPLINE_HA_REPLICA_PORT" =~ ^[0-9]+$ ]] || {
+	echo "ha qualification: compose did not publish numeric PostgreSQL ports" >&2
+	exit 1
+}
 phase="replica-catchup"
 for _ in $(seq 1 90); do
 	if "${compose[@]}" exec -T primary pg_isready -U gripline -d gripline >/dev/null 2>&1 && \

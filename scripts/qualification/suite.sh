@@ -166,7 +166,8 @@ cat >"$result_dir/manifest.json" <<EOF
     "postgres": "postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94",
     "nginx": "nginx:alpine@sha256:72ba65eb42c10344912a84ff42408db7d34f2feb642204570ab8fc5ffd29f1d3",
     "curl": "curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b",
-    "debian": "debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171"
+    "debian": "debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171",
+    "h2load": "scripts/qualification/fixtures/http2/Dockerfile (nghttp2-client)"
   },
   "evidence": {
     "postgres-ha": {"path": "postgres-ha.json", "sha256": "${evidence_sha256[postgres-ha]:-}"},

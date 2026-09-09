@@ -87,7 +87,9 @@ writes raw HTTP/1.1 framing and header cases to a TCP socket and checks that
 parser ambiguity never creates more than one backend request or leaks a
 client-controlled carrier. `scripts/qualification/http2.sh` starts the real
 TLS listener with local PKI and executes the HTTP/2 cases with `nghttp`, the
-repository cancellation/recovery client, and `h2load`; it also checks bounded
+repository cancellation/recovery client, and `h2load`. When the host does not
+provide `h2load`, the gate builds its pinned Debian fixture and runs the actual
+`nghttp2-client` binary in a host-networked container; it also checks bounded
 oversized-header rejection and authenticated HTTP/2 error metrics.
 `scripts/security-http2-harness.sh` remains the URL-driven operator
 deployment check. `scripts/fuzz-smoke.sh` runs short parser fuzzing in

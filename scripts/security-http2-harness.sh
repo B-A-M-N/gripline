@@ -150,10 +150,25 @@ fi
 if command -v h2load >/dev/null; then
 	load_status=passed
 	load_output="$scratch_dir/h2load.log"
-	h2load -n 32 -c 16 -m 8 -t 5 \
-		-H "authorization: Bearer ${secret}" \
-		-H 'content-type: application/json' \
-		-d "$payload" "$h2load_url" >"$load_output" 2>&1
+	set +e
+	if [[ -n "$ca_file" ]]; then
+		SSL_CERT_FILE="$ca_file" h2load -n 32 -c 16 -m 8 -t 5 \
+			-H "authorization: Bearer ${secret}" \
+			-H 'content-type: application/json' \
+			-d "$payload" "$h2load_url" >"$load_output" 2>&1
+	else
+		h2load -n 32 -c 16 -m 8 -t 5 \
+			-H "authorization: Bearer ${secret}" \
+			-H 'content-type: application/json' \
+			-d "$payload" "$h2load_url" >"$load_output" 2>&1
+	fi
+	h2load_rc=$?
+	set -e
+	if [[ "$h2load_rc" != 0 ]]; then
+		echo "security HTTP/2 harness: h2load exited ${h2load_rc}" >&2
+		cat "$load_output" >&2
+		exit 1
+	fi
 	done_count="$(rg -o '[0-9]+ done' "$load_output" | awk '{print $1}' | tail -1 || true)"
 	succeeded_count="$(rg -o '[0-9]+ succeeded' "$load_output" | awk '{print $1}' | tail -1 || true)"
 	two_xx_count="$(rg -o '[0-9]+ 2xx' "$load_output" | awk '{print $1}' | tail -1 || true)"

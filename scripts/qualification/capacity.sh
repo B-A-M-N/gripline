@@ -30,6 +30,12 @@ command -v go >/dev/null || { echo "capacity qualification: go is required" >&2;
 GOCACHE="${GOCACHE:-/tmp/gripline-go-cache}" go build -trimpath -o "$work_dir/pg-writer" ./cmd/gripline-test-pg-writer
 compose=(docker compose -p "$project" -f "$fixture_dir/compose.yaml")
 "${compose[@]}" up -d >/dev/null
+export GRIPLINE_HA_PRIMARY_PORT="${GRIPLINE_HA_PRIMARY_PORT:-$(${compose[*]} port primary 5432 | head -1 | awk -F: '{print $NF}')}"
+export GRIPLINE_HA_REPLICA_PORT="${GRIPLINE_HA_REPLICA_PORT:-$(${compose[*]} port replica 5432 | head -1 | awk -F: '{print $NF}')}"
+[[ "$GRIPLINE_HA_PRIMARY_PORT" =~ ^[0-9]+$ && "$GRIPLINE_HA_REPLICA_PORT" =~ ^[0-9]+$ ]] || {
+	echo "capacity qualification: compose did not publish numeric PostgreSQL ports" >&2
+	exit 1
+}
 for _ in $(seq 1 90); do
 	if "${compose[@]}" exec -T primary pg_isready -U gripline -d gripline >/dev/null 2>&1 && "${compose[@]}" exec -T replica pg_isready -U gripline -d gripline >/dev/null 2>&1; then break; fi
 	sleep 1

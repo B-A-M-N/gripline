@@ -8,7 +8,7 @@ services:
       POSTGRES_HOST_AUTH_METHOD: trust
     command: ["postgres", "-c", "wal_level=replica", "-c", "max_wal_senders=10", "-c", "max_replication_slots=10", "-c", "hot_standby=on"]
     ports:
-      - "${GRIPLINE_HA_PRIMARY_PORT:-25432}:5432"
+      - "${GRIPLINE_HA_PRIMARY_PORT:-0}:5432"
     volumes:
       - primary-data:/var/lib/postgresql/data
       - ./primary-init.sql:/docker-entrypoint-initdb.d/010-replication.sql:ro
@@ -25,7 +25,7 @@ services:
       PGPASSWORD: gripline
     command: ["/usr/local/bin/gripline-replica-entrypoint.sh"]
     ports:
-      - "${GRIPLINE_HA_REPLICA_PORT:-25433}:5432"
+      - "${GRIPLINE_HA_REPLICA_PORT:-0}:5432"
     volumes:
       - replica-data:/var/lib/postgresql/data
       - ./replica-entrypoint.sh:/usr/local/bin/gripline-replica-entrypoint.sh:ro
