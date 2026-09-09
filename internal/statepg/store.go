@@ -82,10 +82,11 @@ type Store struct {
 // policy audit. Version 13 adds a singleton guard for concurrent source-scope
 // cardinality decisions. Version 14 adds durable source-pseudonym aliases so
 // every derived generation, including invalid-only traffic, resolves to one
-// stable source identity. Keep the marker versioned even though the DDL below
+// stable source identity. Version 15 adds authority-owned crypto activation,
+// supersession, and retirement-horizon timestamps. Keep the marker versioned even though the DDL below
 // is idempotent: CREATE TABLE IF NOT EXISTS cannot add columns to an already
 // initialized database.
-const currentSchemaVersion = 14
+const currentSchemaVersion = 15
 
 // Three attempts were too shallow for the repository's active/active
 // qualification workload: a transient serializable conflict could exhaust the
@@ -612,9 +613,15 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			generation INTEGER NOT NULL,
 			fingerprint TEXT NOT NULL,
 			state TEXT NOT NULL,
+			activated_at TIMESTAMPTZ,
+			superseded_at TIMESTAMPTZ,
+			retire_after TIMESTAMPTZ,
 			updated_at TIMESTAMPTZ NOT NULL,
 			PRIMARY KEY (kind, generation)
 		)`,
+		`ALTER TABLE gripline_cluster_crypto_generations ADD COLUMN IF NOT EXISTS activated_at TIMESTAMPTZ`,
+		`ALTER TABLE gripline_cluster_crypto_generations ADD COLUMN IF NOT EXISTS superseded_at TIMESTAMPTZ`,
+		`ALTER TABLE gripline_cluster_crypto_generations ADD COLUMN IF NOT EXISTS retire_after TIMESTAMPTZ`,
 		`CREATE TABLE IF NOT EXISTS gripline_cluster_crypto_acks (
 			node_id TEXT NOT NULL,
 			node_epoch BIGINT NOT NULL,
@@ -828,6 +835,12 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			return fmt.Errorf("statepg: migrate source aliases: %w", mapDBError(err))
 		}
 		version = 14
+	}
+	if version == 14 {
+		// Version 15 records the authority-owned activation/supersession
+		// timestamps used to enforce safe retirement without trusting a client
+		// clock or a caller-supplied overlap horizon.
+		version = 15
 	}
 	if version != currentSchemaVersion {
 		return fmt.Errorf("%w: unsupported migration state %d", ErrMigrationRequired, version)

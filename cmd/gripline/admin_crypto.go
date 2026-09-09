@@ -129,13 +129,11 @@ func adminCryptoActivate(svc *control.Service, authority cryptoLifecycleAuthorit
 	}
 }
 
-// adminCryptoRetire removes a generation only after the explicit overlap
-// horizon. The shared authority commits first, preventing a concurrent
-// activation from selecting the generation while its verifier is being
-// retired. Because NotBefore has already elapsed, a backend-control outage
-// can only leave an expired generation accepted briefly; the reconciler keeps
-// the node unready and retries backend/local retirement. Local key material is
-// removed only after the authority records retirement.
+// adminCryptoRetire removes a generation only after the authority-owned
+// overlap horizon. The shared authority commits first, preventing a
+// concurrent activation from selecting the generation while its verifier is
+// being retired. Local key material is removed only after the authority
+// records retirement.
 func adminCryptoRetire(svc *control.Service, authority cryptoLifecycleAuthority, signer *terminator.Keyring, peppers *credential.PepperRing, pseudonyms ingress.PseudonymRing, signerPath string, acceptor preparedSignerAcceptor) http.HandlerFunc {
 	type request struct {
 		Kind        string    `json:"kind"`
@@ -166,8 +164,8 @@ func adminCryptoRetire(svc *control.Service, authority cryptoLifecycleAuthority,
 			writeAdminError(w, control.ErrOperationIDRequired)
 			return
 		}
-		if req.Generation < 1 || req.Fingerprint == "" || req.NotBefore.IsZero() || req.Reason == "" {
-			http.Error(w, "crypto retirement requires kind, positive generation, fingerprint, not_before, and reason", http.StatusBadRequest)
+		if req.Generation < 1 || req.Fingerprint == "" || req.Reason == "" {
+			http.Error(w, "crypto retirement requires kind, positive generation, fingerprint, and reason", http.StatusBadRequest)
 			return
 		}
 		if req.Kind != statepg.CryptoKindSigner && req.Kind != statepg.CryptoKindPepper && req.Kind != statepg.CryptoKindPseudonym {

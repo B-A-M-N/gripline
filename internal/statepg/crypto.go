@@ -17,6 +17,10 @@ const (
 	CryptoKindSigner    = "signer"
 	CryptoKindPepper    = "pepper"
 	CryptoKindPseudonym = "pseudonym"
+	// Signer assertions can remain valid for the configured policy TTL plus a
+	// bounded clock-skew allowance. The authority persists this horizon when a
+	// signer is superseded so retirement does not depend on a client clock.
+	cryptoSignerRetirementHorizon = 35 * time.Second
 )
 
 // CryptoGeneration is one loaded cluster capability. Its fingerprint binds
@@ -42,9 +46,11 @@ type CryptoActivationRequest struct {
 }
 
 // CryptoRetirementRequest removes one generation from the cluster's accepted
-// capability set after the overlap horizon. Retirement is separate from
-// activation because it must never remove the currently active generation and
-// because secret-ring/source-scope safety checks differ from activation.
+// capability set after the authority-owned overlap horizon. NotBefore is an
+// optional operator-supplied lower bound; the persisted supersession horizon
+// always wins. Retirement is separate from activation because it must never
+// remove the currently active generation and because secret-ring/source-scope
+// safety checks differ from activation.
 type CryptoRetirementRequest struct {
 	Kind        string
 	Generation  int
@@ -486,9 +492,6 @@ func validateCryptoRetirementRequest(req CryptoRetirementRequest) error {
 	if req.Generation < 1 || strings.TrimSpace(req.Fingerprint) == "" {
 		return errors.New("statepg: crypto retirement requires a positive generation and fingerprint")
 	}
-	if req.NotBefore.IsZero() {
-		return errors.New("statepg: crypto retirement requires an explicit not-before horizon")
-	}
 	if strings.TrimSpace(req.OperationID) == "" {
 		return control.ErrOperationIDRequired
 	}
@@ -590,10 +593,24 @@ func (s *Store) activateCryptoGenerationOnce(ctx context.Context, req CryptoActi
 		postgresEpoch(newEpoch), now); err != nil {
 		return CryptoIdentity{}, mapDBError(err)
 	}
+	previousGeneration := cryptoActiveGeneration(shared, req.Kind)
+	if previousGeneration > 0 && previousGeneration != req.Generation {
+		retireAfter := now
+		if req.Kind == CryptoKindSigner {
+			retireAfter = now.Add(cryptoSignerRetirementHorizon)
+		}
+		if _, err := tx.Exec(ctx, `UPDATE gripline_cluster_crypto_generations
+			SET state='loaded', superseded_at=$1, retire_after=$2, updated_at=$1
+			WHERE kind=$3 AND generation=$4 AND state='active'`, now, retireAfter, req.Kind, previousGeneration); err != nil {
+			return CryptoIdentity{}, mapDBError(err)
+		}
+	}
 	if _, err := tx.Exec(ctx, `UPDATE gripline_cluster_crypto_generations
-		SET state=CASE WHEN kind=$1 AND generation=$2 THEN 'active'
-			WHEN kind=$1 AND state='active' THEN 'loaded' ELSE state END,
-		updated_at=$3 WHERE kind=$1`, req.Kind, req.Generation, now); err != nil {
+		SET state=CASE WHEN generation=$1 THEN 'active' ELSE state END,
+			activated_at=CASE WHEN generation=$1 THEN COALESCE(activated_at, $2) ELSE activated_at END,
+			superseded_at=CASE WHEN generation=$1 THEN NULL ELSE superseded_at END,
+			retire_after=CASE WHEN generation=$1 THEN NULL ELSE retire_after END,
+			updated_at=$2 WHERE kind=$3`, req.Generation, now, req.Kind); err != nil {
 		return CryptoIdentity{}, mapDBError(err)
 	}
 	posture, err := loadPostureForAudit(ctx, tx)
@@ -659,13 +676,11 @@ func (s *Store) retireCryptoGenerationOnce(ctx context.Context, req CryptoRetire
 	if !s.cryptoReady.Load() {
 		return CryptoIdentity{}, ErrCryptoIdentityStale
 	}
-	if now.Before(req.NotBefore) {
-		return CryptoIdentity{}, fmt.Errorf("statepg: crypto generation %s/%d cannot retire before %s", req.Kind, req.Generation, req.NotBefore.UTC().Format(time.RFC3339))
-	}
 
 	var storedFingerprint, state string
-	err = tx.QueryRow(ctx, `SELECT fingerprint, state FROM gripline_cluster_crypto_generations
-		WHERE kind=$1 AND generation=$2 FOR UPDATE`, req.Kind, req.Generation).Scan(&storedFingerprint, &state)
+	var authorityRetireAfter *time.Time
+	err = tx.QueryRow(ctx, `SELECT fingerprint, state, retire_after FROM gripline_cluster_crypto_generations
+		WHERE kind=$1 AND generation=$2 FOR UPDATE`, req.Kind, req.Generation).Scan(&storedFingerprint, &state, &authorityRetireAfter)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return CryptoIdentity{}, fmt.Errorf("statepg: crypto generation %s/%d is not loaded", req.Kind, req.Generation)
 	}
@@ -677,6 +692,13 @@ func (s *Store) retireCryptoGenerationOnce(ctx context.Context, req CryptoRetire
 	}
 	if state == "retired" {
 		return CryptoIdentity{}, fmt.Errorf("statepg: crypto generation %s/%d is already retired", req.Kind, req.Generation)
+	}
+	safeAfter := req.NotBefore
+	if authorityRetireAfter != nil && authorityRetireAfter.After(safeAfter) {
+		safeAfter = *authorityRetireAfter
+	}
+	if now.Before(safeAfter) {
+		return CryptoIdentity{}, fmt.Errorf("statepg: crypto generation %s/%d cannot retire before %s", req.Kind, req.Generation, safeAfter.UTC().Format(time.RFC3339))
 	}
 	if cryptoGenerationIsActive(shared, req.Kind, req.Generation) {
 		return CryptoIdentity{}, fmt.Errorf("statepg: cannot retire active crypto generation %s/%d", req.Kind, req.Generation)
@@ -726,6 +748,19 @@ func cryptoGenerationIsActive(identity CryptoIdentity, kind string, generation i
 		return identity.PseudonymVersion == generation
 	default:
 		return false
+	}
+}
+
+func cryptoActiveGeneration(identity CryptoIdentity, kind string) int {
+	switch kind {
+	case CryptoKindSigner:
+		return identity.SignerActiveKID
+	case CryptoKindPepper:
+		return identity.PepperActiveVersion
+	case CryptoKindPseudonym:
+		return identity.PseudonymVersion
+	default:
+		return 0
 	}
 }
 
@@ -952,7 +987,7 @@ func recordCryptoCapabilities(ctx context.Context, tx pgx.Tx, s *Store, local, s
 				state = "active"
 			}
 			if _, err := tx.Exec(ctx, `INSERT INTO gripline_cluster_crypto_generations
-				(kind, generation, fingerprint, state, updated_at) VALUES ($1,$2,$3,$4,CURRENT_TIMESTAMP)`, generation.Kind, generation.Generation, generation.Fingerprint, state); err != nil {
+				(kind, generation, fingerprint, state, activated_at, updated_at) VALUES ($1,$2,$3,$4,CASE WHEN $4='active' THEN CURRENT_TIMESTAMP ELSE NULL END,CURRENT_TIMESTAMP)`, generation.Kind, generation.Generation, generation.Fingerprint, state); err != nil {
 				return mapDBError(err)
 			}
 		} else if err != nil {
@@ -962,7 +997,7 @@ func recordCryptoCapabilities(ctx context.Context, tx pgx.Tx, s *Store, local, s
 		} else if state == "retired" {
 			return fmt.Errorf("statepg: crypto generation %s/%d is retired", generation.Kind, generation.Generation)
 		} else if active && state != "active" {
-			if _, err := tx.Exec(ctx, `UPDATE gripline_cluster_crypto_generations SET state='active', updated_at=CURRENT_TIMESTAMP WHERE kind=$1 AND generation=$2`, generation.Kind, generation.Generation); err != nil {
+			if _, err := tx.Exec(ctx, `UPDATE gripline_cluster_crypto_generations SET state='active', activated_at=COALESCE(activated_at, CURRENT_TIMESTAMP), superseded_at=NULL, retire_after=NULL, updated_at=CURRENT_TIMESTAMP WHERE kind=$1 AND generation=$2`, generation.Kind, generation.Generation); err != nil {
 				return mapDBError(err)
 			}
 		}

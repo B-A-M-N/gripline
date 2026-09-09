@@ -27,12 +27,15 @@ type ClusterNodeStatus struct {
 // ClusterCryptoGenerationStatus describes shared generation metadata and the
 // number of live acknowledgements. It intentionally omits secret material.
 type ClusterCryptoGenerationStatus struct {
-	Kind              string    `json:"kind"`
-	Generation        int       `json:"generation"`
-	Fingerprint       string    `json:"fingerprint"`
-	State             string    `json:"state"`
-	AcknowledgedNodes int       `json:"acknowledged_nodes"`
-	UpdatedAt         time.Time `json:"updated_at"`
+	Kind              string     `json:"kind"`
+	Generation        int        `json:"generation"`
+	Fingerprint       string     `json:"fingerprint"`
+	State             string     `json:"state"`
+	ActivatedAt       *time.Time `json:"activated_at,omitempty"`
+	SupersededAt      *time.Time `json:"superseded_at,omitempty"`
+	RetireAfter       *time.Time `json:"retire_after,omitempty"`
+	AcknowledgedNodes int        `json:"acknowledged_nodes"`
+	UpdatedAt         time.Time  `json:"updated_at"`
 }
 
 // ClusterCryptoStatus is the shared crypto activation view exposed to
@@ -126,7 +129,7 @@ func (s *Store) ClusterStatus(ctx context.Context) (ClusterStatus, error) {
 	crypto.Initialized = true
 
 	genRows, err := tx.Query(ctx, `SELECT g.kind, g.generation, g.fingerprint,
-		g.state, g.updated_at,
+		g.state, g.activated_at, g.superseded_at, g.retire_after, g.updated_at,
 		(SELECT COUNT(*) FROM gripline_cluster_crypto_acks a
 			JOIN gripline_membership m ON m.node_id=a.node_id AND m.node_epoch=a.node_epoch
 			WHERE a.kind=g.kind AND a.generation=g.generation AND a.fingerprint=g.fingerprint
@@ -142,7 +145,9 @@ func (s *Store) ClusterStatus(ctx context.Context) (ClusterStatus, error) {
 	for genRows.Next() {
 		var generation ClusterCryptoGenerationStatus
 		if err := genRows.Scan(&generation.Kind, &generation.Generation,
-			&generation.Fingerprint, &generation.State, &generation.UpdatedAt,
+			&generation.Fingerprint, &generation.State,
+			&generation.ActivatedAt, &generation.SupersededAt, &generation.RetireAfter,
+			&generation.UpdatedAt,
 			&generation.AcknowledgedNodes); err != nil {
 			return out, mapDBError(err)
 		}
