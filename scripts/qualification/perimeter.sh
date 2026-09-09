@@ -191,7 +191,9 @@ if [[ "$mode" == clustered ]]; then
 		printf '%s\n' "$credential_secret" | docker exec -i "${lab}-gateway" env GRIPLINE_DB_DSN="$db_dsn" GRIPLINE_OPERATOR_TOKEN="$operator_token" /fixture/gripline credential add --config /fixture/gateway.json --id perimeter-credential --account perimeter --policy gripline-default-v1 --plan perimeter --reason "perimeter qualification" --operation-id "perimeter-credential-add-${$}" --secret-stdin >/dev/null
 else
 	docker exec "${lab}-gateway" /fixture/gripline keys export --config /fixture/gateway.json >"$work_dir/keys.json"
-		printf '%s\n' "$credential_secret" | docker exec -i "${lab}-gateway" env GRIPLINE_OPERATOR_TOKEN="$operator_token" /fixture/gripline credential add --config /fixture/gateway.json --id perimeter-credential --account perimeter --policy gripline-default-v1 --plan perimeter --reason "perimeter qualification" --operation-id "perimeter-credential-add-${$}" --secret-stdin >/dev/null
+		# Standalone Bolt authority does not expose the clustered operation-claim
+		# interface; its live mutation remains transactional without a replay key.
+		printf '%s\n' "$credential_secret" | docker exec -i "${lab}-gateway" env GRIPLINE_OPERATOR_TOKEN="$operator_token" /fixture/gripline credential add --config /fixture/gateway.json --id perimeter-credential --account perimeter --policy gripline-default-v1 --plan perimeter --reason "perimeter qualification" --secret-stdin >/dev/null
 fi
 docker run -d --name "${lab}-backend" --network "${lab}-private" --network-alias backend.internal \
 	-v "$work_dir:/fixture" debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 \
