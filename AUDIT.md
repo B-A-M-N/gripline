@@ -365,15 +365,16 @@ SDK, direct HTTP/2, shared replay, and active/active soak evidence. Managed
 PostgreSQL behavior, cloud network policy/PKI, edge DDoS, observability, and
 provider-account settlement remain operator deployment evidence.
 
-## Current release-readiness reconciliation (2026-09-09)
+## Current release-readiness reconciliation (2026-09-10)
 
 This table is the authoritative status for the latest clustered-authority
 review. “Local PostgreSQL verified” means the repository proof was exercised
 against the disposable authority in this environment; hosted exact-commit
-release evidence is still a separate step. The verified basis is local exact
-commit `10fd45658a5937ca7ceb9d4f0363d1f29f7cad6c`
-(`test: enforce source churn evidence bounds`); the hosted exact-SHA release
-record remains pending and must not be conflated with local evidence.
+release evidence is still a separate step. The latest full local qualification
+was generated on exact commit `0094597cbb77142be6cebdb91173c5388f3c4872`
+(`test: pin http2 fixture archive`); all 11 required gates passed, including
+the source-churn and HTTP/2 gates. The hosted exact-SHA release record remains
+pending and must not be conflated with local evidence.
 
 | Requirement | Current status | Implementation / proof | Limitation or evidence still required |
 |---|---|---|---|
@@ -381,7 +382,7 @@ record remains pending and must not be conflated with local evidence.
 | Source-alias lifecycle | IMPLEMENTED — local PostgreSQL verified | `SourceAliasRetention` defaults to 168h; maintenance deletes only stale aliases without live source-state references, and dormant old-generation aliases do not block pseudonym retirement while live referenced old state remains protected. PostgreSQL integration tests cover reference-aware alias/scope cleanup and retirement safety. | Hosted exact-commit evidence remains a release step. |
 | Source-churn qualification | IMPLEMENTED — local harness gate added | `scripts/qualification/source-churn.sh` drives 10,000 invalid-source requests, authenticated first-seen sources, bounded source-scope overflow, pseudonym rotation overlap, and stale-alias maintenance, emitting typed telemetry and manifest assertions. | Hosted exact-commit evidence remains a release step. |
 | Source-alias conflicts | IMPLEMENTED — local PostgreSQL verified | `ErrSourceAliasConflict` is typed; all distinct owners are queried and conflicts fail closed without mutation. The integration test seeds two owners and verifies row counts are unchanged. | Hosted exact-commit evidence remains a release step. |
-| Capacity reference gate | IMPLEMENTED — local harness verified | `capacity.sh` defaults to 16 workers, a 2s authority timeout, and 16 PostgreSQL connections per node; the harness emits typed total/success/ratio/RPS/p50/p95/p99/source-failure/timeout/retry/deadlock measurements, and `verify-manifest.py` requires them. Two retained real local PostgreSQL three-node 16-worker runs passed 1461/1461 and 1259/1259 with zero source failures, authority timeouts, and deadlocks. Membership ownership uses `FOR KEY SHARE`, allowing heartbeat timestamp updates without weakening replacement fencing; `TestPostgresNodeOwnershipSharedLocksAndReplacementFencing` covers that regression. | The Docker HA writer and exact-commit release manifest remain to be produced in hosted qualification. |
+| Capacity reference gate | IMPLEMENTED — local harness verified | `capacity.sh` defaults to 16 workers, a 2s authority timeout, and 16 PostgreSQL connections per node; the harness emits typed total/success/ratio/RPS/p50/p95/p99/source-failure/timeout/retry/deadlock measurements, and `verify-manifest.py` requires them. Two retained real local PostgreSQL three-node 16-worker runs passed 1461/1461 and 1259/1259 with zero source failures, authority timeouts, and deadlocks. Membership ownership uses `FOR KEY SHARE`, allowing heartbeat timestamp updates without weakening replacement fencing; `TestPostgresNodeOwnershipSharedLocksAndReplacementFencing` covers that regression. The full local exact-commit manifest also passed with capacity-load green. | The Docker HA writer and exact-commit release manifest still require hosted qualification. |
 | Doctor readiness semantics | IMPLEMENTED — local command tests verified | Cluster/policy 403 responses are blocking unknown state; policy reads use `policy.read`, mutations retain `policy.install`. Full command cases cover 403, unavailable authority, incomplete crypto, and non-blocking maintenance warnings. | Hosted exact-commit evidence remains a release step. |
 | Crypto active-set integrity | IMPLEMENTED — local unit/PostgreSQL verified | `cryptoGenerationsReady` requires exactly one singleton-matching active signer and pepper, an enabled pseudonym generation when configured, exact fingerprints, and live-node acknowledgements; unit corruption cases cover missing, mismatched, extra, and incomplete rows. The real PostgreSQL suite passed the activation/readiness cases. | Hosted exact-commit evidence remains a release step. |
 | PostgreSQL namespace | IMPLEMENTED — local PostgreSQL verified | `Open` and `InspectSchema` force every pool connection to `search_path=public`, matching unqualified DDL/runtime queries and the conflicting-search-path integration test passed against real PostgreSQL. | Hosted exact-commit evidence remains a release step. |
@@ -411,6 +412,6 @@ The source lifecycle follow-up adds an authenticated-only durable source-alias
 binding boundary, reference-aware alias and source-scope maintenance, bounded
 alias-touch batching, and a dedicated source-churn qualification gate. Release
 tag syntax and tagged-commit/main ancestry now run in an Ubuntu preflight before
-the self-hosted qualification job. The final hosted evidence record remains
-pending; this worktree must be committed before its exact release SHA can be
-recorded here.
+the self-hosted qualification job. The committed code-bearing qualification
+SHA `0094597cbb77142be6cebdb91173c5388f3c4872` passed the full short suite and
+manifest verification; the final hosted evidence record remains pending.
