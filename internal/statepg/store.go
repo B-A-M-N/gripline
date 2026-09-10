@@ -41,7 +41,10 @@ type Options struct {
 	// default around remote operations. The request context remains the
 	// authoritative upper bound when one is supplied.
 	OperationTimeout time.Duration
-	Maintenance      MaintenanceOptions
+	// ClusterBehavior is the canonical shared semantic configuration. When nil,
+	// Store derives it from the other authority options and their defaults.
+	ClusterBehavior *ClusterBehaviorConfig
+	Maintenance     MaintenanceOptions
 	// Migrate grants this process permission to create or alter the authority
 	// schema. Serving nodes must leave it false and only verify compatibility;
 	// the dedicated migration command sets it true.
@@ -63,6 +66,14 @@ type Store struct {
 	sourceScopeIdle          time.Duration
 	maxSourceAliasIdentities int
 	operationTimeout         time.Duration
+	clusterBehavior          ClusterBehaviorConfig
+	behaviorDigest           string
+	behaviorMismatch         atomic.Bool
+	lastSeenMu               sync.Mutex
+	lastSeenPending          map[string]time.Time
+	lastSeenQueue            chan string
+	lastSeenStop             chan struct{}
+	lastSeenDone             chan struct{}
 	sourceAliasTouchMu       sync.Mutex
 	sourceAliasLastTouch     map[string]time.Time
 	sourceAliasTouchPending  map[string]struct{}
@@ -96,10 +107,11 @@ type Store struct {
 // every authenticated source generation resolves to one stable source identity;
 // pre-auth misses remain provisional and read-only. Version 15 adds authority-owned crypto activation,
 // supersession, and retirement-horizon timestamps. Version 16 adds the source
-// alias identity cardinality guard and generation uniqueness invariant. Keep
+// alias identity cardinality guard and generation uniqueness invariant. Version
+// 17 adds the singleton canonical cluster-behavior digest. Keep
 // the marker versioned even though the DDL below is idempotent: CREATE TABLE
 // IF NOT EXISTS cannot add columns to an already initialized database.
-const currentSchemaVersion = 16
+const currentSchemaVersion = 17
 
 const defaultMaxSourceAliasIdentities = 4096
 
@@ -183,7 +195,43 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 		opts.OperationTimeout = 2 * time.Second
 	}
 	maintenance := opts.Maintenance.withDefaults()
-	s := &Store{pool: pool, now: opts.Now, nodeID: opts.NodeID, leaseTTL: opts.LeaseTTL, maxSourceScopes: opts.MaxSourceScopes, sourceScopeIdle: opts.SourceScopeIdle, maxSourceAliasIdentities: opts.MaxSourceAliasIdentities, operationTimeout: opts.OperationTimeout, sourceAliasLastTouch: make(map[string]time.Time), sourceAliasTouchPending: make(map[string]struct{}), sourceAliasTouchQueue: make(chan string, sourceAliasTouchQueueSize), sourceAliasTouchStop: make(chan struct{}), sourceAliasTouchDone: make(chan struct{}), maintenance: maintenance,
+	behavior := ClusterBehaviorConfig{LeaseTTL: opts.LeaseTTL, RenewEvery: opts.RenewEvery, MaxSourceScopes: opts.MaxSourceScopes, SourceScopeIdle: opts.SourceScopeIdle, MaxSourceAliasIdentities: opts.MaxSourceAliasIdentities,
+		EvidenceGrace: maintenance.EvidenceGrace, ReleasedLeaseRetention: maintenance.ReleasedLeaseRetention, CredentialReceiptRetention: maintenance.CredentialReceiptRetention,
+		ControlOperationRetention: maintenance.ControlOperationRetention, AdmissionAuditRetention: maintenance.AdmissionAuditRetention, SecurityTransitionRetention: maintenance.SecurityTransitionRetention,
+		OperatorAuditRetention: maintenance.OperatorAuditRetention, PolicyAuditRetention: maintenance.PolicyAuditRetention, MembershipRetention: maintenance.MembershipRetention,
+		AdaptiveRetention: maintenance.AdaptiveRetention, EvidenceGuardRetention: maintenance.EvidenceGuardRetention, LaneOperatorAuditRetention: maintenance.LaneOperatorAuditRetention,
+		PolicyNodeStateRetention: maintenance.PolicyNodeStateRetention, ClusterCryptoAckRetention: maintenance.ClusterCryptoAckRetention, SourceAliasRetention: maintenance.SourceAliasRetention}
+	if opts.ClusterBehavior != nil {
+		behavior = *opts.ClusterBehavior
+	}
+	behavior = behavior.normalize()
+	// The digest must describe the values this Store actually enforces. Keep
+	// the operational fields and retention semantics sourced from the same
+	// normalized object when callers provide an explicit behavior contract.
+	opts.LeaseTTL, opts.RenewEvery = behavior.LeaseTTL, behavior.RenewEvery
+	opts.MaxSourceScopes, opts.SourceScopeIdle = behavior.MaxSourceScopes, behavior.SourceScopeIdle
+	opts.MaxSourceAliasIdentities = behavior.MaxSourceAliasIdentities
+	maintenance.EvidenceGrace = behavior.EvidenceGrace
+	maintenance.ReleasedLeaseRetention = behavior.ReleasedLeaseRetention
+	maintenance.CredentialReceiptRetention = behavior.CredentialReceiptRetention
+	maintenance.ControlOperationRetention = behavior.ControlOperationRetention
+	maintenance.AdmissionAuditRetention = behavior.AdmissionAuditRetention
+	maintenance.SecurityTransitionRetention = behavior.SecurityTransitionRetention
+	maintenance.OperatorAuditRetention = behavior.OperatorAuditRetention
+	maintenance.PolicyAuditRetention = behavior.PolicyAuditRetention
+	maintenance.MembershipRetention = behavior.MembershipRetention
+	maintenance.AdaptiveRetention = behavior.AdaptiveRetention
+	maintenance.EvidenceGuardRetention = behavior.EvidenceGuardRetention
+	maintenance.LaneOperatorAuditRetention = behavior.LaneOperatorAuditRetention
+	maintenance.PolicyNodeStateRetention = behavior.PolicyNodeStateRetention
+	maintenance.ClusterCryptoAckRetention = behavior.ClusterCryptoAckRetention
+	maintenance.SourceAliasRetention = behavior.SourceAliasRetention
+	digest, err := behavior.Digest()
+	if err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("statepg: canonical cluster behavior: %w", err)
+	}
+	s := &Store{pool: pool, now: opts.Now, nodeID: opts.NodeID, leaseTTL: opts.LeaseTTL, maxSourceScopes: opts.MaxSourceScopes, sourceScopeIdle: opts.SourceScopeIdle, maxSourceAliasIdentities: opts.MaxSourceAliasIdentities, operationTimeout: opts.OperationTimeout, clusterBehavior: behavior, behaviorDigest: digest, lastSeenPending: make(map[string]time.Time), lastSeenQueue: make(chan string, lastSeenQueueSize), lastSeenStop: make(chan struct{}), lastSeenDone: make(chan struct{}), sourceAliasLastTouch: make(map[string]time.Time), sourceAliasTouchPending: make(map[string]struct{}), sourceAliasTouchQueue: make(chan string, sourceAliasTouchQueueSize), sourceAliasTouchStop: make(chan struct{}), sourceAliasTouchDone: make(chan struct{}), maintenance: maintenance,
 		leaseStop: make(chan struct{}), leaseDone: make(chan struct{})}
 	if err := s.Ping(connectCtx); err != nil {
 		pool.Close()
@@ -200,6 +248,10 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 	}
 	s.refreshSourceAliasCardinality(connectCtx)
 	if s.nodeID != "" {
+		if err := s.ensureClusterBehavior(connectCtx); err != nil {
+			pool.Close()
+			return nil, err
+		}
 		if err := s.registerNode(connectCtx); err != nil {
 			pool.Close()
 			return nil, err
@@ -211,6 +263,7 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 		go s.membershipHeartbeat()
 		go s.maintenanceLoop()
 	}
+	go s.lastSeenLoop()
 	go s.sourceAliasTouchLoop()
 	go s.leaseReaper()
 	return s, nil
@@ -338,6 +391,16 @@ func CheckSchemaCompatibility(ctx context.Context, pool *pgxpool.Pool) error {
 // Close releases the shared connection pool.
 func (s *Store) Close() {
 	if s != nil && s.pool != nil {
+		if s.lastSeenStop != nil {
+			select {
+			case <-s.lastSeenStop:
+			default:
+				close(s.lastSeenStop)
+			}
+			if s.lastSeenDone != nil {
+				<-s.lastSeenDone
+			}
+		}
 		if s.sourceAliasTouchStop != nil {
 			select {
 			case <-s.sourceAliasTouchStop:
@@ -838,6 +901,12 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			`CREATE INDEX IF NOT EXISTS gripline_control_operations_retention_idx ON gripline_control_operations (created_at, operation_id)`,
 			`CREATE INDEX IF NOT EXISTS gripline_admission_audit_retention_idx ON gripline_admission_audit (at, sequence)`,
 			`CREATE INDEX IF NOT EXISTS gripline_membership_retention_idx ON gripline_membership (state, last_seen_at, node_id)`,
+			`CREATE TABLE IF NOT EXISTS gripline_cluster_behavior (
+				singleton BOOLEAN PRIMARY KEY CHECK (singleton=TRUE),
+				digest TEXT NOT NULL,
+				canonical JSONB NOT NULL,
+				updated_at TIMESTAMPTZ NOT NULL
+			)`,
 			`CREATE INDEX IF NOT EXISTS gripline_lane_operator_audit_retention_idx ON gripline_lane_operator_audit (at, id)`,
 			`CREATE INDEX IF NOT EXISTS gripline_cluster_crypto_acks_retention_idx ON gripline_cluster_crypto_acks (acknowledged_at, node_id, node_epoch)`,
 			`CREATE INDEX IF NOT EXISTS gripline_policy_node_state_retention_idx ON gripline_policy_node_state (updated_at, node_id, node_epoch)`,
@@ -918,6 +987,11 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			return fmt.Errorf("statepg: enforce source alias generation uniqueness: %w", mapDBError(err))
 		}
 		version = 16
+	}
+	if version == 16 {
+		// Version 17's canonical cluster-behavior table is created by the
+		// idempotent DDL above; the first serving node seeds its digest.
+		version = 17
 	}
 	if version != currentSchemaVersion {
 		return fmt.Errorf("%w: unsupported migration state %d", ErrMigrationRequired, version)

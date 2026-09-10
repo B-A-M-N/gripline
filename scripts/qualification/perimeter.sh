@@ -3,6 +3,12 @@ set -euo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$repo_dir/scripts/qualification/assertions.sh"
+for command in docker go curl grep; do
+	command -v "$command" >/dev/null 2>&1 || {
+		echo "perimeter qualification: required command not found: $command" >&2
+		exit 2
+	}
+done
 
 # Repository-owned network-perimeter lab. Containers are placed on distinct
 # public/private/control/database networks; the private service requires a
@@ -209,8 +215,8 @@ inference_gateway_curl=(docker exec "${lab}-inference-client" curl --fail --sile
 inference_curl=(docker exec "${lab}-inference-client" curl --fail --silent --show-error --connect-timeout 3 --cacert /tls/ca.pem --cert /tls/gateway.pem --key /tls/gateway.key)
 control_curl=(docker exec "${lab}-control-client" curl --fail --silent --show-error --connect-timeout 3 --cacert /tls/ca.pem --cert /tls/control.pem --key /tls/control.key)
 attacker_curl=(docker exec "${lab}-attacker" curl --fail --silent --show-error --connect-timeout 2 --cacert /tls/ca.pem --cert /tls/attacker.pem --key /tls/attacker.key)
-"${gateway_curl[@]}" | rg -q '"authorized"[[:space:]]*:[[:space:]]*true'
-"${inference_gateway_curl[@]}" | rg -q '"authorized"[[:space:]]*:[[:space:]]*true'
+"${gateway_curl[@]}" | grep -q '"authorized"[[:space:]]*:[[:space:]]*true'
+"${inference_gateway_curl[@]}" | grep -q '"authorized"[[:space:]]*:[[:space:]]*true'
 if "${inference_curl[@]}" -H 'Authorization: Bearer raw-external-credential' https://backend.internal:8443/ >/dev/null 2>&1; then
 	echo "perimeter qualification: raw external credential reached the private backend" >&2
 	exit 1
@@ -223,7 +229,7 @@ if "${inference_curl[@]}" -H 'X-Gripline-Assertion: forged-assertion' https://ba
 	echo "perimeter qualification: forged backend assertion reached the private backend" >&2
 	exit 1
 fi
-"${control_curl[@]}" https://control.internal:8443/ | rg -qx verifier-control
+"${control_curl[@]}" https://control.internal:8443/ | grep -qx verifier-control
 if "${inference_curl[@]}" https://control.internal:8443/ >/dev/null 2>&1; then
 	echo "perimeter qualification: inference identity reached verifier control" >&2
 	exit 1
@@ -236,18 +242,18 @@ if "${attacker_curl[@]}" https://backend.internal:8443/ >/dev/null 2>&1; then
 	echo "perimeter qualification: public attacker reached private backend" >&2
 	exit 1
 fi
-if docker network inspect "${lab}-control" --format '{{json .Containers}}' | rg -q "${lab}-gateway"; then
+if docker network inspect "${lab}-control" --format '{{json .Containers}}' | grep -q "${lab}-gateway"; then
 	echo "perimeter qualification: data gateway is attached to control/admin network" >&2
 	exit 1
 fi
 if [[ "$mode" == clustered ]]; then
-	docker network inspect "${lab}-db" --format '{{json .Containers}}' | rg -q "${lab}-gateway" || {
+	docker network inspect "${lab}-db" --format '{{json .Containers}}' | grep -q "${lab}-gateway" || {
 		echo "perimeter qualification: clustered gateway is not attached to the state network" >&2
 		exit 1
 	}
 	docker exec "${lab}-gateway" env GRIPLINE_DB_DSN="$db_dsn" /fixture/gripline migrate plan --config /fixture/gateway.json >/dev/null
 else
-	if docker network inspect "${lab}-db" --format '{{json .Containers}}' | rg -q "${lab}-gateway"; then
+	if docker network inspect "${lab}-db" --format '{{json .Containers}}' | grep -q "${lab}-gateway"; then
 		echo "perimeter qualification: standalone gateway is attached to PostgreSQL network" >&2
 		exit 1
 	fi

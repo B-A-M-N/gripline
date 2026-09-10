@@ -109,6 +109,19 @@ func runStatusCLIWithOutput(cfgPath string, format outputFormat) error {
 	if maxSourceScopes == 0 {
 		maxSourceScopes = resource.DefaultMaxSourceScopes
 	}
+	maxSourceAliasIdentities := cfg.Authority.MaxSourceAliasIdentities
+	if maxSourceAliasIdentities == 0 {
+		maxSourceAliasIdentities = 4096
+	}
+	clusterBehaviorState, clusterBehaviorNote := "not-applicable", "standalone deployment"
+	if clustered {
+		clusterBehaviorState = "configured"
+		behaviorDigest, digestErr := clusterBehaviorFromConfig(cfg).Digest()
+		if digestErr != nil {
+			return fmt.Errorf("cluster behavior digest: %w", digestErr)
+		}
+		clusterBehaviorNote = fmt.Sprintf("local digest=%s; authority mismatch is reported by cluster status", behaviorDigest)
+	}
 	spoolBytes, spoolFiles := cfg.Server.SpoolMaxBytes, cfg.Server.SpoolMaxFiles
 	if !cfg.Deployment.AllowEphemeralState {
 		if spoolBytes == 0 {
@@ -120,6 +133,7 @@ func runStatusCLIWithOutput(cfgPath string, format outputFormat) error {
 	}
 	rows := []row{
 		{"authority backend", authorityBackendState(cfg), authorityNote(cfg)},
+		{"cluster behavior", clusterBehaviorState, clusterBehaviorNote},
 		{"credential authority", durab(stateBacked), authorityNote(cfg)},
 		{"lane authority", durab(stateBacked), authorityNote(cfg)},
 		{"evidence authority", durab(stateBacked), authorityNote(cfg)},
@@ -138,6 +152,7 @@ func runStatusCLIWithOutput(cfgPath string, format outputFormat) error {
 		{"active policy", policyState, fmt.Sprintf("%s revision=%d digest=%s", pol.ID, pol.Revision, policyDigest)},
 		{"resource persistence", resourcePersistenceState(clustered), resourcePersistenceNote(clustered)},
 		{"resource source-scope bound", fmt.Sprintf("%d", maxSourceScopes), "backend-neutral resource scope cardinality; overflow identities are hashed into bounded shared scopes"},
+		{"source alias identity bound", fmt.Sprintf("%d", maxSourceAliasIdentities), "shared alias capacity; live identity and row counts are shown by cluster status/metrics"},
 		{"source alias registration", "authenticated-only", "durable source aliases are bound only after credential match"},
 		{"spool bounds", fmt.Sprintf("%d bytes/%d files", spoolBytes, spoolFiles), "aggregate unknown-length request budget"},
 		{"active signer KID", activeKID, "public key generations are exported separately"},

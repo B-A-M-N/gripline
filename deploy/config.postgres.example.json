@@ -52,6 +52,7 @@
     "preauth_max_sources": 10000,
     "max_source_scopes": 10000,
     "source_scope_idle": "30m",
+    "preauth_source_idle": "10m",
     "spool_dir": "/tmp/gripline-spool",
     "spool_max_bytes": 67108864,
     "spool_max_files": 64
@@ -105,7 +106,7 @@
     "operation_timeout": "2s",
     "max_conns": 16,
     "min_conns": 2,
-    "max_source_alias_identities": 4096,
+    "max_source_alias_identities": 10000,
     "maintenance": {
       "interval": "1m",
       "batch_size": 1024,

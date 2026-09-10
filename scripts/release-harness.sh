@@ -23,6 +23,12 @@ cleanup() {
 trap cleanup EXIT
 
 cd "$repo_dir"
+for command in curl go openssl grep head gzip tr; do
+	command -v "$command" >/dev/null 2>&1 || {
+		echo "release harness: required command not found: $command" >&2
+		exit 2
+	}
+done
 gateway_port=$((18080 + ($$ % 500)))
 backend_port=$((gateway_port + 1))
 admin_port=$((gateway_port + 2))
@@ -131,7 +137,7 @@ if ! "$harness_dir/gripline" keys export --config "$harness_dir/config.json" >"$
 	cat "$harness_dir/gateway.log" >&2
 	exit 1
 fi
-if rg -n 'private|seed|secret' "$harness_dir/keys.json"; then
+if grep -En 'private|seed|secret' "$harness_dir/keys.json"; then
 	echo "release harness: key export contains private material" >&2
 	exit 1
 fi
@@ -185,8 +191,8 @@ test "$direct_code" = "403"
 response="$(curl -fsS -X POST "http://127.0.0.1:${gateway_port}/v1/messages" \
 	-H "Authorization: Bearer ${secret}" -H 'Content-Type: application/json' \
 	--data '{"prompt":"hello"}')"
-echo "$response" | rg -q '"authorized":true'
-echo "$response" | rg -q '"credential_id":"harness-credential"'
+echo "$response" | grep -q '"authorized":true'
+echo "$response" | grep -q '"credential_id":"harness-credential"'
 
 # The compiled gateway is now exercised with raw HTTP/1.1 bytes, including
 # ambiguous framing, malformed chunks, duplicate credentials, absolute-form
@@ -223,19 +229,19 @@ wait_backend
 # statuses, Retry-After propagation, and oversized-body rejection.
 echo "$(curl -fsS -X POST "http://127.0.0.1:${gateway_port}/v1/echo?model=canary&x=1" \
 	-H "Authorization: Bearer ${secret}" -H 'Content-Type: application/json' --data '{"prompt":"echo"}')" \
-	| rg -q '"query":"model=canary&x=1"'
+	| grep -q '"query":"model=canary&x=1"'
 chunked_response="$(printf '%s' '{"prompt":"chunked"}' | curl -fsS --http1.1 -X POST "http://127.0.0.1:${gateway_port}/v1/echo" \
 	-H "Authorization: Bearer ${secret}" -H 'Content-Type: application/json' \
 	-H 'Transfer-Encoding: chunked' --data-binary @-)"
-echo "$chunked_response" | rg -F -q '"body":"{\"prompt\":\"chunked\"}"'
+echo "$chunked_response" | grep -F -q '"body":"{\"prompt\":\"chunked\"}"'
 gzip_file="$harness_dir/gzip.bin"
 curl -fsS --raw -o "$gzip_file" "http://127.0.0.1:${gateway_port}/v1/gzip" -H "Authorization: Bearer ${secret}" -H 'Accept-Encoding: gzip'
-gzip -dc "$gzip_file" | rg -q '^compressed-body-fidelity$'
-curl -fsS --no-buffer "http://127.0.0.1:${gateway_port}/v1/stream" -H "Authorization: Bearer ${secret}" | rg -q 'data: \[DONE\]'
+gzip -dc "$gzip_file" | grep -q '^compressed-body-fidelity$'
+curl -fsS --no-buffer "http://127.0.0.1:${gateway_port}/v1/stream" -H "Authorization: Bearer ${secret}" | grep -q 'data: \[DONE\]'
 status429="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${gateway_port}/v1/status/429" -H "Authorization: Bearer ${secret}")"
 test "$status429" = "429"
 status429_headers="$(curl -sS -D - -o /dev/null "http://127.0.0.1:$gateway_port/v1/status/429" -H "Authorization: Bearer $secret")"
-echo "$status429_headers" | rg -i -q '^retry-after: 3'
+echo "$status429_headers" | grep -i -q '^retry-after: 3'
 status500="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${gateway_port}/v1/status/500" -H "Authorization: Bearer ${secret}")"
 test "$status500" = "502"
 # A silent upstream is cut by the configured idle bound; a client-side cancel
@@ -261,7 +267,7 @@ down_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${gateway
 test "$down_code" = "502"
 start_backend backend.log -capture "$harness_dir/backend-capture.log"
 wait_backend
-curl -fsS "http://127.0.0.1:${gateway_port}/v1/messages" -H "Authorization: Bearer ${secret}" | rg -q '"authorized":true'
+curl -fsS "http://127.0.0.1:${gateway_port}/v1/messages" -H "Authorization: Bearer ${secret}" | grep -q '"authorized":true'
 
 # Kill the compiled gateway without its graceful drain, then restart with the
 # same signer/config and persistent state. This verifies that credential,
@@ -276,7 +282,7 @@ for _ in $(seq 1 50); do
 	if curl -fsS "http://127.0.0.1:${gateway_port}/readyz" >/dev/null 2>&1; then break; fi
 	sleep 0.1
 done
-curl -fsS "http://127.0.0.1:${gateway_port}/v1/messages" -H "Authorization: Bearer ${secret}" | rg -q '"authorized":true'
+curl -fsS "http://127.0.0.1:${gateway_port}/v1/messages" -H "Authorization: Bearer ${secret}" | grep -q '"authorized":true'
 # Filesystem fault probes: a persistent authority must fail closed when its
 # state or signer becomes unreadable, while a read-only spool must reject the
 # affected unknown-length request without reaching the backend.
@@ -326,10 +332,10 @@ spool_fault_response="$(
 	timeout 5 cat <&3
 	exec 3>&-
 )"
-echo "$spool_fault_response" | head -n 1 | rg -q ' 400 '
+echo "$spool_fault_response" | head -n 1 | grep -q ' 400 '
 chmod 0750 "$harness_dir/spool"
 
-if rg -F -n "$secret" "$harness_dir"; then
+if grep -F -n "$secret" "$harness_dir"; then
 	echo "release harness: canary credential appeared in a generated artifact" >&2
 	exit 1
 fi

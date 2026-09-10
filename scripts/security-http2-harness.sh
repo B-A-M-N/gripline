@@ -13,6 +13,13 @@ gateway_url=$1
 secret=$2
 ca_file=${3:-}
 
+for command in nghttp grep awk wc tr tail; do
+	command -v "$command" >/dev/null 2>&1 || {
+		echo "security HTTP/2 harness: required command not found: $command" >&2
+		exit 2
+	}
+done
+
 if [[ "$gateway_url" != https://* ]]; then
 	echo "security HTTP/2 harness: gateway URL must use https://" >&2
 	exit 2
@@ -22,10 +29,6 @@ if [[ "$gateway_url" == */v1/messages ]]; then
 else
 	h2load_url="${gateway_url%/}/v1/messages"
 fi
-command -v nghttp >/dev/null || {
-	echo "security HTTP/2 harness: nghttp is required" >&2
-	exit 2
-}
 if [[ "${GRIPLINE_H2_INSECURE:-0}" == "1" && "${GRIPLINE_H2_QUALIFICATION:-0}" == "1" ]]; then
 	echo "security HTTP/2 harness: insecure certificate bypass is forbidden for qualification" >&2
 	exit 2
@@ -67,33 +70,33 @@ run_h2() {
 		-d "$payload" \
 			"$@" "$gateway_url" >"$output" 2>&1
 	fi
-	if ! rg -q 'The negotiated protocol: h2' "$output"; then
+	if ! grep -Eq 'The negotiated protocol: h2' "$output"; then
 		echo "security HTTP/2 harness: ${name} did not negotiate h2" >&2
 		cat "$output" >&2
 		exit 1
 	fi
-	status_successes="$(rg -o ':status: 2[0-9][0-9]' "$output" | wc -l | tr -d ' ' || true)"
+	status_successes="$(grep -Eo ':status: 2[0-9][0-9]' "$output" | wc -l | tr -d ' ' || true)"
 	if [[ ! "$status_successes" =~ ^[0-9]+$ || "$status_successes" -lt "$expected_successes" ]]; then
 		echo "security HTTP/2 harness: ${name} successful responses=${status_successes:-0}, want at least ${expected_successes}" >&2
 		cat "$output" >&2
 		exit 1
 	fi
-	if ! rg -q 'SETTINGS_MAX_CONCURRENT_STREAMS' "$output"; then
+	if ! grep -Eq 'SETTINGS_MAX_CONCURRENT_STREAMS' "$output"; then
 		echo "security HTTP/2 harness: ${name} did not expose server stream settings" >&2
 		cat "$output" >&2
 		exit 1
 	fi
-	if ! rg -q 'SETTINGS_HEADER_TABLE_SIZE' "$output"; then
+	if ! grep -Eq 'SETTINGS_HEADER_TABLE_SIZE' "$output"; then
 		echo "security HTTP/2 harness: ${name} did not expose header-table settings" >&2
 		cat "$output" >&2
 		exit 1
 	fi
-	if [[ -n "${GRIPLINE_H2_EXPECT_HEADER_TABLE:-}" ]] && ! rg -q "SETTINGS_HEADER_TABLE_SIZE.*${GRIPLINE_H2_EXPECT_HEADER_TABLE}" "$output"; then
+	if [[ -n "${GRIPLINE_H2_EXPECT_HEADER_TABLE:-}" ]] && ! grep -Eq "SETTINGS_HEADER_TABLE_SIZE.*${GRIPLINE_H2_EXPECT_HEADER_TABLE}" "$output"; then
 		echo "security HTTP/2 harness: ${name} advertised an unexpected header-table bound" >&2
 		cat "$output" >&2
 		exit 1
 	fi
-	if [[ -n "${GRIPLINE_H2_EXPECT_MAX_STREAMS:-}" ]] && ! rg -q "SETTINGS_MAX_CONCURRENT_STREAMS.*${GRIPLINE_H2_EXPECT_MAX_STREAMS}" "$output"; then
+	if [[ -n "${GRIPLINE_H2_EXPECT_MAX_STREAMS:-}" ]] && ! grep -Eq "SETTINGS_MAX_CONCURRENT_STREAMS.*${GRIPLINE_H2_EXPECT_MAX_STREAMS}" "$output"; then
 		echo "security HTTP/2 harness: ${name} advertised an unexpected stream bound" >&2
 		cat "$output" >&2
 		exit 1
@@ -136,12 +139,12 @@ else
 fi
 oversized_status=$?
 set -e
-if ! rg -q 'The negotiated protocol: h2' "$oversized_output"; then
+if ! grep -Eq 'The negotiated protocol: h2' "$oversized_output"; then
 	echo "security HTTP/2 harness: oversized-header case did not negotiate h2" >&2
 	cat "$oversized_output" >&2
 	exit 1
 fi
-if ! rg -q ':status: 4[0-9][0-9]|PROTOCOL_ERROR|ENHANCE_YOUR_CALM|FRAME_SIZE_ERROR|length of the frame is invalid|Some requests were not processed' "$oversized_output"; then
+if ! grep -Eq ':status: 4[0-9][0-9]|PROTOCOL_ERROR|ENHANCE_YOUR_CALM|FRAME_SIZE_ERROR|length of the frame is invalid|Some requests were not processed' "$oversized_output"; then
 	echo "security HTTP/2 harness: oversized-header case was not rejected (exit=${oversized_status})" >&2
 	cat "$oversized_output" >&2
 	exit 1
@@ -169,12 +172,12 @@ if command -v h2load >/dev/null; then
 		cat "$load_output" >&2
 		exit 1
 	fi
-	done_count="$(rg -o '[0-9]+ done' "$load_output" | awk '{print $1}' | tail -1 || true)"
-	succeeded_count="$(rg -o '[0-9]+ succeeded' "$load_output" | awk '{print $1}' | tail -1 || true)"
-	two_xx_count="$(rg -o '[0-9]+ 2xx' "$load_output" | awk '{print $1}' | tail -1 || true)"
-	failed_count="$(rg -o '[0-9]+ failed' "$load_output" | awk '{print $1}' | tail -1 || true)"
-	error_count="$(rg -o '[0-9]+ errored' "$load_output" | awk '{print $1}' | tail -1 || true)"
-	timeout_count="$(rg -o '[0-9]+ timeout' "$load_output" | awk '{print $1}' | tail -1 || true)"
+	done_count="$(grep -Eo '[0-9]+ done' "$load_output" | awk '{print $1}' | tail -1 || true)"
+	succeeded_count="$(grep -Eo '[0-9]+ succeeded' "$load_output" | awk '{print $1}' | tail -1 || true)"
+	two_xx_count="$(grep -Eo '[0-9]+ 2xx' "$load_output" | awk '{print $1}' | tail -1 || true)"
+	failed_count="$(grep -Eo '[0-9]+ failed' "$load_output" | awk '{print $1}' | tail -1 || true)"
+	error_count="$(grep -Eo '[0-9]+ errored' "$load_output" | awk '{print $1}' | tail -1 || true)"
+	timeout_count="$(grep -Eo '[0-9]+ timeout' "$load_output" | awk '{print $1}' | tail -1 || true)"
 	if [[ ! "$done_count" =~ ^[0-9]+$ || ! "$succeeded_count" =~ ^[0-9]+$ || ! "$two_xx_count" =~ ^[0-9]+$ || "$done_count" == 0 || "$succeeded_count" != "$done_count" || "$two_xx_count" != "$done_count" || "${failed_count:-0}" != 0 || "${error_count:-0}" != 0 || "${timeout_count:-0}" != 0 ]]; then
 		echo "security HTTP/2 harness: h2load did not report successful responses" >&2
 		cat "$load_output" >&2

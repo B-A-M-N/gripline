@@ -28,6 +28,11 @@ var ErrRevoked = errors.New("credential: revoked")
 // ErrUnknown indicates the presented credential did not match any record.
 var ErrUnknown = errors.New("credential: unknown")
 
+// MaxLoadedPepperGenerations bounds the rotation window held in process
+// memory. Retaining unbounded historical peppers expands the blast radius of
+// a process compromise and usually indicates an incomplete retirement plan.
+const MaxLoadedPepperGenerations = 4
+
 // Status is the credential lifecycle state (§30 of the spec).
 type Status int
 
@@ -241,7 +246,7 @@ var (
 
 // NewPepperRing builds a ring from one or more versions. A later version is
 // "active" for new verifiers; all versions remain valid for comparison.
-// Versions with empty key material or negative version numbers are refused:
+// Versions with empty key material or non-positive version numbers are refused:
 // an HMAC under an empty key is publicly computable, which would make stored
 // verifiers enumerable — the failure INV-1 exists to prevent. Key material is
 // COPIED on ingestion, so later mutation of the caller's slice cannot alter
@@ -253,8 +258,8 @@ func NewPepperRing(versions ...*PepperKey) (*PepperRing, error) {
 		if v == nil {
 			continue
 		}
-		if v.Version < 0 {
-			return nil, fmt.Errorf("credential: negative pepper version %d", v.Version)
+		if v.Version < 1 {
+			return nil, fmt.Errorf("credential: pepper version must be positive, got %d", v.Version)
 		}
 		if len(v.Key) == 0 {
 			return nil, fmt.Errorf("credential: pepper version %d has empty key", v.Version)
@@ -266,6 +271,9 @@ func NewPepperRing(versions ...*PepperKey) (*PepperRing, error) {
 	}
 	if len(r.st.active) == 0 {
 		return nil, fmt.Errorf("credential: pepper ring requires at least one keyed version")
+	}
+	if len(r.st.active) > MaxLoadedPepperGenerations {
+		return nil, fmt.Errorf("credential: pepper ring may load at most %d generations", MaxLoadedPepperGenerations)
 	}
 	return r, nil
 }

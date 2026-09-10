@@ -54,7 +54,8 @@ func openRuntimeAuthorities(cfg *config.Config, connectTimeout, operationTimeout
 		s, err := statepg.Open(connectCtx, statepg.Options{
 			DSN: dsn, MaxConns: cfg.Authority.MaxConns, MinConns: cfg.Authority.MinConns,
 			NodeID: cfg.Authority.NodeID, LeaseTTL: cfg.Authority.LeaseTTL.D(), RenewEvery: cfg.Authority.RenewEvery.D(), MaxSourceScopes: cfg.Server.MaxSourceScopes, SourceScopeIdle: cfg.Server.SourceScopeIdle.D(), MaxSourceAliasIdentities: cfg.Authority.MaxSourceAliasIdentities,
-			ConnectTimeout: connectTimeout, OperationTimeout: operationTimeout, Maintenance: statepg.MaintenanceOptions{
+			ClusterBehavior: clusterBehaviorFromConfig(cfg),
+			ConnectTimeout:  connectTimeout, OperationTimeout: operationTimeout, Maintenance: statepg.MaintenanceOptions{
 				Interval: cfg.Authority.Maintenance.Interval.D(), BatchSize: cfg.Authority.Maintenance.BatchSize,
 				MaxBatchesPerPass: cfg.Authority.Maintenance.MaxBatchesPerPass, MaxRowsPerPass: cfg.Authority.Maintenance.MaxRowsPerPass,
 				MaxRuntimePerPass: cfg.Authority.Maintenance.MaxRuntimePerPass.D(),
@@ -106,4 +107,24 @@ func openRuntimeAuthorities(cfg *config.Config, connectTimeout, operationTimeout
 		return nil, nil, fmt.Errorf("gripline: unsupported authority backend %q", cfg.Authority.Backend)
 	}
 	return set, cleanup, nil
+}
+
+func clusterBehaviorFromConfig(cfg *config.Config) *statepg.ClusterBehaviorConfig {
+	if cfg == nil {
+		return nil
+	}
+	m := cfg.Authority.Maintenance
+	return &statepg.ClusterBehaviorConfig{
+		LeaseTTL: cfg.Authority.LeaseTTL.D(), RenewEvery: cfg.Authority.RenewEvery.D(),
+		MaxSourceScopes: cfg.Server.MaxSourceScopes, SourceScopeIdle: cfg.Server.SourceScopeIdle.D(),
+		MaxSourceAliasIdentities: cfg.Authority.MaxSourceAliasIdentities,
+		EvidenceGrace:            m.EvidenceGrace.D(), ReleasedLeaseRetention: m.ReleasedLeaseRetention.D(),
+		CredentialReceiptRetention: m.CredentialReceiptRetention.D(), ControlOperationRetention: m.ControlOperationRetention.D(),
+		AdmissionAuditRetention: m.AdmissionAuditRetention.D(), SecurityTransitionRetention: m.SecurityTransitionRetention.D(),
+		OperatorAuditRetention: m.OperatorAuditRetention.D(), PolicyAuditRetention: m.PolicyAuditRetention.D(),
+		MembershipRetention: m.MembershipRetention.D(), AdaptiveRetention: m.AdaptiveRetention.D(),
+		EvidenceGuardRetention: m.EvidenceGuardRetention.D(), LaneOperatorAuditRetention: m.LaneOperatorAuditRetention.D(),
+		PolicyNodeStateRetention: m.PolicyNodeStateRetention.D(), ClusterCryptoAckRetention: m.ClusterCryptoAckRetention.D(),
+		SourceAliasRetention: m.SourceAliasRetention.D(),
+	}
 }

@@ -2,6 +2,7 @@ package pseudonym
 
 import (
 	"encoding/base64"
+	"fmt"
 	"testing"
 )
 
@@ -161,6 +162,19 @@ func TestNegativeVersionAndCopySafety(t *testing.T) {
 	want := mustRing(t, &Key{Version: 1, Secret: []byte("mutable-secret")}).mustDerive(t, FamilySource, []byte("in"))
 	if got != want {
 		t.Fatal("ring must copy key material on ingestion")
+	}
+}
+
+func TestRingBoundsLoadedGenerations(t *testing.T) {
+	keys := make([]*Key, 0, MaxLoadedGenerations+1)
+	for version := 1; version <= MaxLoadedGenerations+1; version++ {
+		keys = append(keys, &Key{Version: version, Secret: []byte(fmt.Sprintf("pseudonym-%d", version))})
+	}
+	if _, err := NewRing(keys...); err == nil {
+		t.Fatalf("pseudonym ring accepted more than %d generations", MaxLoadedGenerations)
+	}
+	if _, err := NewRing(&Key{Version: 0, Secret: []byte("zero")}); err == nil {
+		t.Fatal("pseudonym ring accepted non-positive version")
 	}
 }
 

@@ -55,7 +55,7 @@ func TestLoadValid(t *testing.T) {
 	if c.Backend.Timeout.D() != 30*time.Second || c.Identity.Audience != "fi-inference" {
 		t.Fatalf("fields not parsed: %+v", c)
 	}
-	if c.Server.MaxConnections != 4096 || c.Server.HTTP2MaxConcurrentStreams != 100 || c.Server.HTTP2HeaderTableBytes != 4096 || c.Server.HTTP2MaxReadFrameBytes != 1<<20 {
+	if c.Server.MaxConnections != 4096 || c.Server.HTTP2MaxConcurrentStreams != 100 || c.Server.HTTP2HeaderTableBytes != 4096 || c.Server.HTTP2MaxReadFrameBytes != 1<<20 || c.Server.PreAuthSourceIdle.D() != 10*time.Minute {
 		t.Fatalf("HTTP listener defaults not applied: %+v", c.Server)
 	}
 	if v, enabled := c.TLSConfig(); !enabled || v != tlsVersion13 {
@@ -63,6 +63,21 @@ func TestLoadValid(t *testing.T) {
 	}
 	if err := c.ValidateCertificates(); err == nil {
 		t.Fatal("nonexistent cert files must fail certificate validation")
+	}
+}
+
+func TestPreAuthSourceIdleIsIndependent(t *testing.T) {
+	c := &Config{
+		Listen: "127.0.0.1:8080", TLS: TLSSection{TerminateTLSUpstream: true},
+		Backend:  BackendSection{URL: "https://provider.internal", TrustMode: BackendTrustPrivateNetwork, Timeout: Duration(time.Second)},
+		Server:   ServerSection{ReadTimeout: Duration(time.Second), WriteTimeout: Duration(time.Second), IdleTimeout: Duration(time.Second), ReadHeaderTimeout: Duration(time.Second), SourceScopeIdle: Duration(30 * time.Minute)},
+		Identity: IdentitySection{Audience: "a"}, Paths: PathsSection{AuditLog: "/tmp/audit.jsonl"},
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Server.PreAuthSourceIdle.D(); got != 10*time.Minute {
+		t.Fatalf("pre-auth idle default=%s, want 10m", got)
 	}
 }
 

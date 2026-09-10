@@ -48,6 +48,8 @@ trap cleanup EXIT
 command -v docker >/dev/null || { echo "ha qualification: docker is required" >&2; exit 2; }
 docker compose version >/dev/null || { echo "ha qualification: docker compose is required" >&2; exit 2; }
 command -v go >/dev/null || { echo "ha qualification: go is required" >&2; exit 2; }
+command -v curl >/dev/null || { echo "ha qualification: curl is required" >&2; exit 2; }
+command -v grep >/dev/null || { echo "ha qualification: grep is required" >&2; exit 2; }
 command -v openssl >/dev/null || { echo "ha qualification: openssl is required" >&2; exit 2; }
 command -v python3 >/dev/null || { echo "ha qualification: python3 is required" >&2; exit 2; }
 configure_ha_ports
@@ -193,7 +195,7 @@ GRIPLINE_HA_WRITER_DSN="$writer_dsn" "$work_dir/gripline" keys export --config "
 "$work_dir/backend" -listen "127.0.0.1:${live_backend_port}" -keys "$work_dir/live-keys.json" -audience ha-live-qualification >"$work_dir/live-backend.log" 2>&1 & live_pids+=("$!")
 GRIPLINE_HA_WRITER_DSN="$writer_dsn" "$work_dir/gripline" serve --config "$live_config" >"$work_dir/live-gripline.log" 2>&1 & live_pids+=("$!")
 for _ in $(seq 1 60); do
-	if curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${live_port}/readyz" 2>/dev/null | rg -qx 200; then break; fi
+	if curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${live_port}/readyz" 2>/dev/null | grep -qx 200; then break; fi
 	sleep 0.25
 done
 curl -fsS "http://127.0.0.1:${live_port}/readyz" >/dev/null

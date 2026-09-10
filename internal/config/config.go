@@ -34,6 +34,19 @@ import (
 // ("30s", "1m") in configuration files, which plain time.Duration does not.
 type Duration time.Duration
 
+const (
+	credentialMaxLoadedGenerations = 4
+	pseudonymMaxLoadedGenerations  = 4
+)
+
+func parseGenerationKey(raw string) (int, error) {
+	n, err := strconv.ParseInt(raw, 10, 32)
+	if err != nil || n < 1 {
+		return 0, fmt.Errorf("generation must be a positive signed-32-bit decimal")
+	}
+	return int(n), nil
+}
+
 // UnmarshalJSON parses either a Go-duration string or an integer nanosecond
 // count. An unparseable value is a load error, never a zero.
 func (d *Duration) UnmarshalJSON(b []byte) error {
@@ -392,6 +405,11 @@ type ServerSection struct {
 	// SourceScopeIdle is the minimum idle horizon before a fully replenished
 	// source scope may be evicted.
 	SourceScopeIdle Duration `json:"source_scope_idle,omitempty"`
+	// PreAuthSourceIdle is the independent idle horizon for the bounded
+	// pre-authentication source table. It must not inherit the post-auth source
+	// scope retention horizon because the two tables have different threat and
+	// lifecycle semantics.
+	PreAuthSourceIdle Duration `json:"preauth_source_idle,omitempty"`
 	// PreAuthMaxConcurrent bounds expensive credential/authority work before
 	// authentication succeeds.
 	PreAuthMaxConcurrent int `json:"preauth_max_concurrent,omitempty"`
@@ -768,12 +786,20 @@ func (c *Config) Validate() error {
 	if c.Server.MaxSourceScopes < 0 || c.Server.SourceScopeIdle.D() < 0 || c.Server.PreAuthMaxConcurrent < 0 || c.Server.PreAuthRequestsPerSecond < 0 || c.Server.PreAuthSourceRequestsPerSecond < 0 || c.Server.PreAuthMaxSources < 0 {
 		return fmt.Errorf("server source and pre-auth bounds must be non-negative")
 	}
+	if c.Server.PreAuthSourceIdle.D() < 0 {
+		return fmt.Errorf("server.preauth_source_idle must be non-negative")
+	}
+	if c.Server.PreAuthSourceIdle.D() == 0 {
+		c.Server.PreAuthSourceIdle = Duration(10 * time.Minute)
+	}
 	if c.Server.StreamWriteIdleTimeout.D() < 0 {
 		return fmt.Errorf("server.stream_write_idle_timeout must be non-negative")
 	}
+	if len(c.Secrets.PepperVersions) > credentialMaxLoadedGenerations {
+		return fmt.Errorf("secrets.pepper_versions may contain at most %d loaded generations", credentialMaxLoadedGenerations)
+	}
 	for version, value := range c.Secrets.PepperVersions {
-		n, err := strconv.Atoi(version)
-		if err != nil || n < 1 {
+		if _, err := parseGenerationKey(version); err != nil {
 			return fmt.Errorf("secrets.pepper_versions key %q must be a positive decimal version", version)
 		}
 		if strings.TrimSpace(value) == "" {
@@ -823,9 +849,17 @@ func (c *Config) Validate() error {
 		}
 	}
 	if c.Ingress != nil {
+		loadedPseudonymGenerations := len(c.Ingress.PseudonymKeys)
+		if c.Ingress.PseudonymKey != "" {
+			if _, explicitVersionOne := c.Ingress.PseudonymKeys["1"]; !explicitVersionOne {
+				loadedPseudonymGenerations++
+			}
+		}
+		if loadedPseudonymGenerations > pseudonymMaxLoadedGenerations {
+			return fmt.Errorf("ingress.pseudonym_keys may contain at most %d loaded generations", pseudonymMaxLoadedGenerations)
+		}
 		for version, value := range c.Ingress.PseudonymKeys {
-			n, err := strconv.Atoi(version)
-			if err != nil || n < 1 {
+			if _, err := parseGenerationKey(version); err != nil {
 				return fmt.Errorf("ingress.pseudonym_keys key %q must be a positive decimal version", version)
 			}
 			if strings.TrimSpace(value) == "" {
@@ -884,6 +918,17 @@ func (c *Config) Validate() error {
 		}
 		if c.Authority.MaxConns < 0 || c.Authority.MinConns < 0 || c.Authority.MaxSourceAliasIdentities < 0 || (c.Authority.MaxConns > 0 && c.Authority.MinConns > c.Authority.MaxConns) {
 			return fmt.Errorf("authority min/max connection bounds are invalid")
+		}
+		maxScopes := c.Server.MaxSourceScopes
+		if maxScopes == 0 {
+			maxScopes = 4096
+		}
+		maxAliases := c.Authority.MaxSourceAliasIdentities
+		if maxAliases == 0 {
+			maxAliases = 4096
+		}
+		if maxAliases < maxScopes {
+			return fmt.Errorf("authority.max_source_alias_identities (%d) must be >= server.max_source_scopes (%d)", maxAliases, maxScopes)
 		}
 		if c.Authority.Maintenance.BatchSize < 0 || c.Authority.Maintenance.MaxBatchesPerPass < 0 || c.Authority.Maintenance.MaxRowsPerPass < 0 {
 			return fmt.Errorf("authority.maintenance batch limits must be non-negative")

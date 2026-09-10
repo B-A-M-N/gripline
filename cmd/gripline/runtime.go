@@ -535,7 +535,7 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		PreAuthRequestsPerSecond:       cfg.Server.PreAuthRequestsPerSecond,
 		PreAuthSourceRequestsPerSecond: cfg.Server.PreAuthSourceRequestsPerSecond,
 		PreAuthMaxSources:              cfg.Server.PreAuthMaxSources,
-		PreAuthSourceIdle:              cfg.Server.SourceScopeIdle.D(),
+		PreAuthSourceIdle:              cfg.Server.PreAuthSourceIdle.D(),
 	}
 	if cfg.Backend.AllowedEndpoints != nil {
 		proxyCfg.EndpointRules = make([]proxy.EndpointRule, 0, len(cfg.Backend.AllowedEndpoints))
@@ -744,10 +744,11 @@ func loadPepperRing(cfg *config.Config) (*credential.PepperRing, error) {
 	versions := make([]int, 0, len(values))
 	encoded := make(map[int]string, len(values))
 	for rawVersion, value := range values {
-		version, err := strconv.Atoi(rawVersion)
-		if err != nil || version < 1 {
+		parsed, err := strconv.ParseInt(rawVersion, 10, 32)
+		if err != nil || parsed < 1 {
 			return nil, fmt.Errorf("gripline: verifier pepper version %q must be a positive decimal", rawVersion)
 		}
+		version := int(parsed)
 		if _, exists := encoded[version]; exists {
 			return nil, fmt.Errorf("gripline: duplicate verifier pepper version %d", version)
 		}
@@ -824,10 +825,11 @@ func pseudonymRingFromConfig(cfg *config.Config, peppers *credential.PepperRing)
 		values[1] = cfg.Ingress.PseudonymKey
 	}
 	for rawVersion, encoded := range cfg.Ingress.PseudonymKeys {
-		version, err := strconv.Atoi(rawVersion)
-		if err != nil || version < 1 {
+		parsed, err := strconv.ParseInt(rawVersion, 10, 32)
+		if err != nil || parsed < 1 {
 			return nil, fmt.Errorf("gripline: ingress pseudonym key version %q must be a positive decimal", rawVersion)
 		}
+		version := int(parsed)
 		if _, exists := values[version]; exists {
 			return nil, fmt.Errorf("gripline: duplicate ingress pseudonym key version %d", version)
 		}

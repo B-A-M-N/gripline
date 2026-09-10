@@ -52,6 +52,9 @@ type AuthorityMetrics struct {
 	SourceAliasSaturations             int64
 	SourceAliasSafeEvictions           int64
 	SourceAliasCapacityDenials         int64
+	CredentialLastSeenBatches          int64
+	CredentialLastSeenRows             int64
+	CredentialLastSeenDropped          int64
 	ReservationAttempts                int64
 	ReservationsGranted                int64
 	ReservationFailures                int64
@@ -108,6 +111,9 @@ type authorityMetrics struct {
 	sourceAliasSaturations             atomic.Int64
 	sourceAliasSafeEvictions           atomic.Int64
 	sourceAliasCapacityDenials         atomic.Int64
+	credentialLastSeenBatches          atomic.Int64
+	credentialLastSeenRows             atomic.Int64
+	credentialLastSeenDropped          atomic.Int64
 	reservationAttempts                atomic.Int64
 	reservationsGranted                atomic.Int64
 	reservationFailures                atomic.Int64
@@ -221,6 +227,9 @@ func (s *Store) Metrics() AuthorityMetrics {
 		SourceAliasSaturations:             s.metrics.sourceAliasSaturations.Load(),
 		SourceAliasSafeEvictions:           s.metrics.sourceAliasSafeEvictions.Load(),
 		SourceAliasCapacityDenials:         s.metrics.sourceAliasCapacityDenials.Load(),
+		CredentialLastSeenBatches:          s.metrics.credentialLastSeenBatches.Load(),
+		CredentialLastSeenRows:             s.metrics.credentialLastSeenRows.Load(),
+		CredentialLastSeenDropped:          s.metrics.credentialLastSeenDropped.Load(),
 		ReservationAttempts:                s.metrics.reservationAttempts.Load(),
 		ReservationsGranted:                s.metrics.reservationsGranted.Load(),
 		ReservationFailures:                s.metrics.reservationFailures.Load(),

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -456,5 +457,18 @@ func TestPepperRingNegativeVersionAndCopySafety(t *testing.T) {
 	m.Write([]byte("raw"))
 	if !bytes.Equal(r.DeriveVerifier(s, 1), m.Sum(nil)) {
 		t.Fatal("ring must copy key material on ingestion")
+	}
+}
+
+func TestPepperRingBoundsLoadedGenerations(t *testing.T) {
+	keys := make([]*PepperKey, 0, MaxLoadedPepperGenerations+1)
+	for version := 1; version <= MaxLoadedPepperGenerations+1; version++ {
+		keys = append(keys, &PepperKey{Version: version, Key: []byte(fmt.Sprintf("pepper-%d", version))})
+	}
+	if _, err := NewPepperRing(keys...); err == nil {
+		t.Fatalf("pepper ring accepted more than %d generations", MaxLoadedPepperGenerations)
+	}
+	if _, err := NewPepperRing(&PepperKey{Version: 0, Key: []byte("zero")}); err == nil {
+		t.Fatal("pepper ring accepted non-positive version")
 	}
 }

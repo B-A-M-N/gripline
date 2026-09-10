@@ -45,6 +45,10 @@ func markLastSeen(reg credential.Registry, credentialID string, now time.Time) {
 	if reg == nil {
 		return
 	}
+	if batcher, ok := reg.(credential.LastSeenBatchWriter); ok {
+		batcher.QueueLastSeen(credentialID, now)
+		return
+	}
 	if aware, ok := reg.(credential.ContextLastSeenWriter); ok {
 		// Last-seen is telemetry, not authorization. Keep it out of the request
 		// critical path and bound the detached remote write independently.

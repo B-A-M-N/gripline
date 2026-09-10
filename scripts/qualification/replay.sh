@@ -22,6 +22,7 @@ command -v docker >/dev/null || { echo "replay qualification: docker is required
 docker compose version >/dev/null || { echo "replay qualification: docker compose is required" >&2; exit 2; }
 command -v go >/dev/null || { echo "replay qualification: go is required" >&2; exit 2; }
 command -v curl >/dev/null || { echo "replay qualification: curl is required" >&2; exit 2; }
+command -v grep >/dev/null || { echo "replay qualification: grep is required" >&2; exit 2; }
 compose=(docker compose -p "$project" -f "$fixture_dir/compose.yaml")
 replay_port="${GRIPLINE_REPLAY_POSTGRES_PORT:-$(pick_free_port 27434 28434)}"
 export GRIPLINE_REPLAY_POSTGRES_PORT="$replay_port"
@@ -64,7 +65,7 @@ for port in 19601 19602; do
 	claim_pids+=("$!")
 done
 for pid in "${claim_pids[@]}"; do wait "$pid"; done
-accepted="$(rg -l '"accepted":true' "$work_dir"/*.json | wc -l)"
+accepted="$(grep -l '"accepted":true' "$work_dir"/*.json | wc -l)"
 [[ "$accepted" == 1 ]] || { echo "replay qualification: accepted=$accepted, want exactly one" >&2; exit 1; }
 GOCACHE="${GOCACHE:-/tmp/gripline-go-cache}" GRIPLINE_REPLAY_POSTGRES_DSN="$dsn" go test ./internal/replay -run TestPostgresReplayGuardParallelAcrossInstances -count=1
 emit_qualification_assertions \

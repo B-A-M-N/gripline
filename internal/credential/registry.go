@@ -109,6 +109,13 @@ type ContextLastSeenWriter interface {
 	TouchLastSeenContext(context.Context, string, time.Time) error
 }
 
+// LastSeenBatchWriter is the preferred analytics writeback boundary for
+// high-throughput authorities. Implementations must enqueue without blocking
+// or returning an admission error; the timestamp is not part of authz.
+type LastSeenBatchWriter interface {
+	QueueLastSeen(string, time.Time)
+}
+
 // IsUnknownCredential reports whether err is the typed "no such credential"
 // answer from a VerifierLookup (as opposed to an outage/timeouts/corruption).
 func IsUnknownCredential(err error) bool { return errors.Is(err, ErrNotFound) }

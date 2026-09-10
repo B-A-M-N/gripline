@@ -26,6 +26,10 @@ type Key struct {
 	Secret []byte
 }
 
+// MaxLoadedGenerations bounds the key-rotation window retained in process
+// memory. Old source identifiers should be migrated and retired deliberately.
+const MaxLoadedGenerations = 4
+
 // Format implements fmt.Formatter and always redacts (P0.38): formatting this
 // key-bearing config struct must never reach the secret bytes. The ring copies
 // the bytes at ingestion, so this construction-time handle is not retained.
@@ -93,8 +97,8 @@ func NewRing(keys ...*Key) (*Ring, error) {
 		if k == nil {
 			continue
 		}
-		if k.Version < 0 {
-			return nil, fmt.Errorf("pseudonym: negative key version %d", k.Version)
+		if k.Version < 1 {
+			return nil, fmt.Errorf("pseudonym: key version must be positive, got %d", k.Version)
 		}
 		if len(k.Secret) == 0 {
 			return nil, fmt.Errorf("pseudonym: key version %d has empty secret", k.Version)
@@ -106,6 +110,9 @@ func NewRing(keys ...*Key) (*Ring, error) {
 	}
 	if len(r.active) == 0 {
 		return nil, fmt.Errorf("pseudonym: ring requires at least one keyed version")
+	}
+	if len(r.active) > MaxLoadedGenerations {
+		return nil, fmt.Errorf("pseudonym: ring may load at most %d generations", MaxLoadedGenerations)
 	}
 	return r, nil
 }

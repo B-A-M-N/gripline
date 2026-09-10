@@ -49,6 +49,10 @@ func (s *Store) registerNodeOnce(ctx context.Context) (string, int64, error) {
 	if err != nil {
 		return "", 0, err
 	}
+	state := "ready"
+	if s.behaviorMismatch.Load() {
+		state = "not_ready"
+	}
 
 	var (
 		existingInstance string
@@ -101,13 +105,13 @@ func (s *Store) registerNodeOnce(ctx context.Context) (string, int64, error) {
 		}
 		epoch = existingEpoch + 1
 		if _, err := tx.Exec(ctx, `UPDATE gripline_membership SET instance_id=$1, node_epoch=$2,
-			protocol_version=$3, schema_version=$4, state='ready', last_seen_at=$5, drain_until=NULL
-			WHERE node_id=$6`, instanceID, epoch, currentProtocolVersion, currentSchemaVersion, now, s.nodeID); err != nil {
+			protocol_version=$3, schema_version=$4, state=$5, last_seen_at=$6, drain_until=NULL
+			WHERE node_id=$7`, instanceID, epoch, currentProtocolVersion, currentSchemaVersion, state, now, s.nodeID); err != nil {
 			return "", 0, mapDBError(err)
 		}
 	} else if _, err := tx.Exec(ctx, `INSERT INTO gripline_membership
 		(node_id, instance_id, node_epoch, protocol_version, schema_version, state, last_seen_at)
-		VALUES ($1,$2,$3,$4,$5,'ready',$6)`, s.nodeID, instanceID, epoch, currentProtocolVersion, currentSchemaVersion, now); err != nil {
+		VALUES ($1,$2,$3,$4,$5,$6,$7)`, s.nodeID, instanceID, epoch, currentProtocolVersion, currentSchemaVersion, state, now); err != nil {
 		return "", 0, mapDBError(err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -145,7 +149,7 @@ func (s *Store) heartbeatNode(ctx context.Context) error {
 		return ErrNodeFenced
 	}
 	tag, err := s.pool.Exec(ctx, `UPDATE gripline_membership SET last_seen_at=CURRENT_TIMESTAMP
-		WHERE node_id=$1 AND instance_id=$2 AND node_epoch=$3 AND state IN ('ready','draining')`, s.nodeID, s.instanceID, s.nodeEpoch)
+		WHERE node_id=$1 AND instance_id=$2 AND node_epoch=$3 AND state IN ('ready','draining','not_ready')`, s.nodeID, s.instanceID, s.nodeEpoch)
 	if err != nil {
 		return mapDBError(err)
 	}
@@ -256,6 +260,9 @@ func (s *Store) Ready(ctx context.Context) error {
 	}
 	if s.fenced.Load() {
 		return ErrNodeFenced
+	}
+	if s.behaviorMismatch.Load() {
+		return errors.New("statepg: cluster behavior digest mismatch")
 	}
 	var state string
 	var lastSeen, now time.Time

@@ -106,6 +106,13 @@ func runDoctorCLI(ctx *cliContext) error {
 					} else {
 						add("state authority", false, true, "local PostgreSQL membership is not ready")
 					}
+					if cluster.Behavior.AuthoritativeDigest != "" || cluster.Behavior.LocalDigest != "" {
+						if cluster.Behavior.Mismatch || !cluster.Behavior.Match {
+							add("cluster behavior", false, true, fmt.Sprintf("local digest %s does not match authoritative digest %s", cluster.Behavior.LocalDigest, cluster.Behavior.AuthoritativeDigest))
+						} else {
+							add("cluster behavior", true, true, fmt.Sprintf("digest %s", cluster.Behavior.AuthoritativeDigest))
+						}
+					}
 					cryptoOK, cryptoDetail := doctorCryptoHealth(cluster)
 					add("crypto synchronization", cryptoOK, true, cryptoDetail)
 					maintenanceOK, maintenanceDetail := doctorMaintenanceHealth(cluster.Maintenance)

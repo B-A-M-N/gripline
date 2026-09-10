@@ -79,9 +79,19 @@ type ClusterStatus struct {
 	LiveNodeCount        int                      `json:"live_node_count"`
 	LocalMembershipReady bool                     `json:"local_membership_ready"`
 	LocalCryptoReady     bool                     `json:"local_crypto_ready"`
+	Behavior             ClusterBehaviorStatus    `json:"behavior"`
+	SourceAliases        ClusterSourceAliasStatus `json:"source_aliases"`
 	Nodes                []ClusterNodeStatus      `json:"nodes"`
 	Crypto               ClusterCryptoStatus      `json:"crypto"`
 	Maintenance          ClusterMaintenanceStatus `json:"maintenance"`
+}
+
+// ClusterSourceAliasStatus exposes the bounded alias authority cardinality
+// alongside its configured capacity.
+type ClusterSourceAliasStatus struct {
+	Capacity            int `json:"capacity"`
+	CanonicalIdentities int `json:"canonical_identities"`
+	Rows                int `json:"rows"`
 }
 
 // ClusterStatus returns shared membership and crypto state in one bounded
@@ -106,6 +116,17 @@ func (s *Store) ClusterStatus(ctx context.Context) (ClusterStatus, error) {
 		return out, mapDBError(err)
 	}
 	defer tx.Rollback(ctx)
+	behavior, err := s.clusterBehaviorStatus(ctx, tx)
+	if err != nil {
+		return out, err
+	}
+	out.Behavior = behavior
+	var aliases ClusterSourceAliasStatus
+	if err := tx.QueryRow(ctx, `SELECT COUNT(*), COUNT(DISTINCT canonical_source_id) FROM gripline_source_aliases`).Scan(&aliases.Rows, &aliases.CanonicalIdentities); err != nil {
+		return out, mapDBError(err)
+	}
+	aliases.Capacity = s.maxSourceAliasIdentities
+	out.SourceAliases = aliases
 
 	rows, err := tx.Query(ctx, `SELECT node_id, instance_id, node_epoch,
 		protocol_version, schema_version, state, last_seen_at, drain_until,

@@ -42,6 +42,7 @@
     "preauth_requests_per_second": 2000,
     "preauth_source_requests_per_second": 100,
     "preauth_max_sources": 10000,
+    "preauth_source_idle": "10m",
     "spool_dir": "/tmp/gripline-spool",
     "spool_max_bytes": 67108864,
     "spool_max_files": 32

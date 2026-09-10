@@ -126,6 +126,16 @@ func printCryptoStatusTable(status map[string]any) error {
 }
 
 func printClusterStatusTable(status map[string]any) error {
+	behavior, _ := status["behavior"].(map[string]any)
+	authoritative, _ := behavior["authoritative_digest"].(string)
+	local, _ := behavior["local_digest"].(string)
+	match, _ := behavior["match"].(bool)
+	fmt.Printf("CLUSTER_BEHAVIOR\tMATCH=%t\tLOCAL=%s\tAUTHORITATIVE=%s\n", match, local, authoritative)
+	aliases, _ := status["source_aliases"].(map[string]any)
+	capacity, _ := aliases["capacity"].(float64)
+	identities, _ := aliases["canonical_identities"].(float64)
+	rowsCount, _ := aliases["rows"].(float64)
+	fmt.Printf("SOURCE_ALIASES\tCAPACITY=%d\tIDENTITIES=%d\tROWS=%d\n", int(capacity), int(identities), int(rowsCount))
 	nodes, _ := status["nodes"].([]any)
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(w, "NODE\tSTATE\tLIVE\tLOCAL\tLAST_SEEN")

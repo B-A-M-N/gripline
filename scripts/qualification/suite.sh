@@ -6,6 +6,7 @@ set -uo pipefail
 # artifacts and hashed into the manifest; result JSON never contains
 # credentials, assertions, private keys, or DSNs.
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+command -v grep >/dev/null || { echo "qualification suite: grep is required" >&2; exit 2; }
 requested_result_dir="${GRIPLINE_QUALIFICATION_RESULT_DIR:-}"
 keep="${GRIPLINE_QUALIFICATION_KEEP:-0}"
 soak_duration="30s"
@@ -134,7 +135,7 @@ run_gate() {
 	exit_code[$name]=$rc
 	duration_seconds[$name]=$((ended_epoch - started_epoch))
 	local summary summary_json telemetry_file telemetry_hash sanitized_log_file
-	summary="$( (rg -i 'qualification.*(passed|metrics|samples=)|cluster harness: capacity load metrics=' "$log" || true) | tail -5 | tr '\n' ' ' | tr -cd '[:print:]' | cut -c1-1200)"
+	summary="$( (grep -Ei 'qualification.*(passed|metrics|samples=)|cluster harness: capacity load metrics=' "$log" || true) | tail -5 | tr '\n' ' ' | tr -cd '[:print:]' | cut -c1-1200)"
 	summary_json="$(json_escape "$summary")"
 	sanitized_log_file="${name}-log.txt"
 	sanitize_log "$log" >"$result_dir/$sanitized_log_file"

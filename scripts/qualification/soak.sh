@@ -77,6 +77,7 @@ command -v docker >/dev/null || { echo "soak qualification: docker is required" 
 docker compose version >/dev/null || { echo "soak qualification: docker compose is required" >&2; exit 2; }
 command -v go >/dev/null || { echo "soak qualification: go is required" >&2; exit 2; }
 command -v curl >/dev/null || { echo "soak qualification: curl is required" >&2; exit 2; }
+command -v grep >/dev/null || { echo "soak qualification: grep is required" >&2; exit 2; }
 command -v python3 >/dev/null || { echo "soak qualification: python3 is required" >&2; exit 2; }
 configure_ha_ports
 GOCACHE="${GOCACHE:-/tmp/gripline-go-cache}" go build -trimpath -o "$maintenance_bin" ./cmd/gripline-test-pg-maintenance
@@ -134,10 +135,10 @@ table_counts() {
 monitor() {
 	last_maintenance=0
 	while [[ -z "$harness_pid" ]] || kill -0 "$harness_pid" >/dev/null 2>&1; do
-		if [[ ! -f "$promotion_file" ]] && ! "${compose[@]}" exec -T replica psql -U gripline -d gripline -X -Atqc 'SELECT pg_is_in_recovery()' 2>/dev/null | rg -qx t; then echo replica-not-in-recovery >"$monitor_failure"; return 1; fi
+		if [[ ! -f "$promotion_file" ]] && ! "${compose[@]}" exec -T replica psql -U gripline -d gripline -X -Atqc 'SELECT pg_is_in_recovery()' 2>/dev/null | grep -qx t; then echo replica-not-in-recovery >"$monitor_failure"; return 1; fi
 		schema="$("${compose[@]}" exec -T replica psql -U gripline -d gripline -X -Atqc "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='gripline_policy_manifest')" 2>/dev/null || true)"
 		if [[ "$schema" != t ]]; then sleep 5; continue; fi
-		if ! "${compose[@]}" exec -T replica psql -U gripline -d gripline -X -Atqc 'SELECT singleton FROM gripline_policy_manifest WHERE singleton=TRUE' 2>/dev/null | rg -qx t; then echo replica-policy-missing >"$monitor_failure"; return 1; fi
+		if ! "${compose[@]}" exec -T replica psql -U gripline -d gripline -X -Atqc 'SELECT singleton FROM gripline_policy_manifest WHERE singleton=TRUE' 2>/dev/null | grep -qx t; then echo replica-policy-missing >"$monitor_failure"; return 1; fi
 		if [[ -s "$harness_artifact" ]]; then
 			base="$(awk -F= '$1 == "base" {print $2}' "$harness_artifact")"
 			token="$(awk -F= '$1 == "operator_token" {print $2}' "$harness_artifact")"
@@ -204,7 +205,7 @@ wait_replica_caught_up() {
 	for _ in $(seq 1 "${GRIPLINE_SOAK_REPLICATION_WAIT_ATTEMPTS:-120}"); do
 		primary_lsn="$("${compose[@]}" exec -T primary psql -U gripline -d gripline -X -Atqc 'SELECT pg_current_wal_flush_lsn()' 2>/dev/null || true)"
 		if [[ "$primary_lsn" =~ ^[0-9A-Fa-f]+/[0-9A-Fa-f]+$ ]] &&
-			"${compose[@]}" exec -T replica psql -U gripline -d gripline -X -Atqc "SELECT pg_last_wal_replay_lsn() >= '${primary_lsn}'::pg_lsn" 2>/dev/null | rg -qx t; then
+			"${compose[@]}" exec -T replica psql -U gripline -d gripline -X -Atqc "SELECT pg_last_wal_replay_lsn() >= '${primary_lsn}'::pg_lsn" 2>/dev/null | grep -qx t; then
 			return 0
 		fi
 		sleep 0.5
@@ -290,7 +291,7 @@ awk -F '\t' -v cutoff="$maintenance_cutoff" '$1+0 <= cutoff+0' "$maintenance_met
 maintenance_metric_samples="$(wc -l <"$maintenance_qualification_file")"
 maintenance_max_deleted="$(awk -F '\t' 'BEGIN {m=0} {if ($4+0 > m) m=$4+0} END {print m+0}' "$maintenance_qualification_file")"
 external_maintenance_samples="$(wc -l <"$maintenance_file" 2>/dev/null || echo 0)"
-external_maintenance_max_deleted="$( { rg -o '"RowsDeleted":[0-9]+' "$maintenance_file" 2>/dev/null || true; } | awk -F: 'BEGIN {m=0} {if ($2+0 > m) m=$2+0} END {print m+0}')"
+external_maintenance_max_deleted="$( { grep -Eo '"RowsDeleted":[0-9]+' "$maintenance_file" 2>/dev/null || true; } | awk -F: 'BEGIN {m=0} {if ($2+0 > m) m=$2+0} END {print m+0}')"
 if (( external_maintenance_max_deleted > maintenance_max_deleted )); then maintenance_max_deleted=$external_maintenance_max_deleted; fi
 maintenance_max_errors="$(awk -F '\t' 'BEGIN {m=0} {if ($7+0 > m) m=$7+0} END {print m+0}' "$maintenance_qualification_file")"
 runtime_maintenance_runs_delta=0
@@ -337,11 +338,11 @@ touch "$promotion_file"
 "${compose[@]}" stop primary >/dev/null
 "${compose[@]}" exec -T replica gosu postgres pg_ctl promote -D /var/lib/postgresql/data >/dev/null
 for _ in $(seq 1 60); do
-	if "${compose[@]}" exec -T replica psql -U gripline -d gripline -X -Atqc 'SELECT pg_is_in_recovery()' 2>/dev/null | rg -qx f; then break; fi
+	if "${compose[@]}" exec -T replica psql -U gripline -d gripline -X -Atqc 'SELECT pg_is_in_recovery()' 2>/dev/null | grep -qx f; then break; fi
 	sleep 1
 done
-"${compose[@]}" exec -T replica psql -U gripline -d gripline -X -Atqc 'SELECT pg_is_in_recovery()' | rg -qx f
-"${compose[@]}" exec -T replica psql -U gripline -d gripline -X -Atqc 'SELECT singleton FROM gripline_policy_manifest WHERE singleton=TRUE' | rg -qx t
+"${compose[@]}" exec -T replica psql -U gripline -d gripline -X -Atqc 'SELECT pg_is_in_recovery()' | grep -qx f
+"${compose[@]}" exec -T replica psql -U gripline -d gripline -X -Atqc 'SELECT singleton FROM gripline_policy_manifest WHERE singleton=TRUE' | grep -qx t
 for port in $((base + 10)) $((base + 11)); do
 	ready_response="$work_dir/post-promotion-ready-${port}.json"
 	ready_status=000

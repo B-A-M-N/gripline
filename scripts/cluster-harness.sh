@@ -33,6 +33,12 @@ cleanup() {
 trap cleanup EXIT
 
 cd "$repo_dir"
+for command in curl docker go openssl psql python3 grep awk sed tr; do
+	command -v "$command" >/dev/null 2>&1 || {
+		echo "cluster harness: required command not found: $command" >&2
+		exit 2
+	}
+done
 dsn="${GRIPLINE_TEST_POSTGRES_DSN:-postgres://gripline:gripline@127.0.0.1:5432/gripline?sslmode=disable}"
 pick_cluster_base() {
 	python3 - <<'PY'
@@ -624,7 +630,7 @@ test "$control_to_data_code" = 403
 # below must make this assertion unverifiable at the backend after its TTL
 # overlap has explicitly elapsed.
 pre_rotation_assertion="$(curl -fsS -X POST "http://127.0.0.1:${lb_port}/v1/messages" -H "Authorization: Bearer ${secret_two}" -d '{}')"
-printf '%s\n' "$pre_rotation_assertion" | rg -q '"policy_revision":1'
+printf '%s\n' "$pre_rotation_assertion" | grep -q '"policy_revision":1'
 old_assertion="$(<"$harness_dir/latest-assertion")"
 test -n "$old_assertion"
 
@@ -660,7 +666,7 @@ for _ in $(seq 1 "${GRIPLINE_CLUSTER_HARNESS_RETIRE_ATTEMPTS:-120}"); do
 	if [[ "$retire_code" == "200" ]]; then
 		break
 	fi
-	if [[ "$retire_code" != "409" ]] || ! rg -q '"safe_after"' "$harness_dir/signer-retirement-body"; then
+	if [[ "$retire_code" != "409" ]] || ! grep -q '"safe_after"' "$harness_dir/signer-retirement-body"; then
 		cat "$harness_dir/signer-retirement-body" >&2
 		exit 1
 	fi
@@ -710,15 +716,15 @@ wait_assertion_policy() {
 		status="$(curl -sS -o "$response" -w '%{http_code}' -X POST "http://127.0.0.1:${port}/v1/messages" \
 			-H "Authorization: Bearer ${secret}" -d '{}' 2>/dev/null || true)"
 		if [[ "$status" == 200 ]] &&
-			rg -q '"policy_revision":'"${revision}" "$response" &&
-			rg -q '"policy_epoch":'"${epoch}" "$response"; then
+			grep -q '"policy_revision":'"${revision}" "$response" &&
+			grep -q '"policy_epoch":'"${epoch}" "$response"; then
 			return 0
 		fi
 		# A node can briefly forward the request while its policy/verifier
 		# watcher is converging. The reference backend's exact response is a
 		# bounded transient; invalid credentials and every other 401 remain
 		# terminal failures.
-		if [[ "$status" == 401 ]] && ! rg -qx 'assertion required' "$response"; then
+		if [[ "$status" == 401 ]] && ! grep -qx 'assertion required' "$response"; then
 			echo "cluster harness: policy ${revision}/${epoch} returned an unexpected 401 on port ${port}" >&2
 			cat "$response" >&2 || true
 			return 1
@@ -755,12 +761,12 @@ activate_crypto_generation() {
 	for port in $((base + 20)) $((base + 21)) $((base + 22)); do
 		for _ in $(seq 1 60); do
 			status="$(curl -sS "http://127.0.0.1:${port}/admin/crypto" -H "Authorization: Bearer ${operator_token}" 2>/dev/null || true)"
-			if printf '%s' "$status" | rg -q "\"${kind}_active_(version|kid)\":${generation}"; then
+			if printf '%s' "$status" | grep -Eq "\"${kind}_active_(version|kid)\":${generation}"; then
 				break
 			fi
 			sleep 0.1
 		done
-		printf '%s' "$status" | rg -q "\"${kind}_active_(version|kid)\":${generation}"
+		printf '%s' "$status" | grep -Eq "\"${kind}_active_(version|kid)\":${generation}"
 	done
 	# The shared generation becoming visible is not sufficient: every node
 	# withdraws readiness while it applies the local material and re-acknowledges
@@ -793,8 +799,8 @@ expected_pepper_one_count=2
 	if [[ "$source_churn_enabled" == "1" ]]; then
 		expected_pepper_one_count=$((expected_pepper_one_count + source_churn_authenticated_sources + 3))
 	fi
-printf '%s' "$pepper_counts" | rg -q "\"1\":${expected_pepper_one_count}"
-printf '%s' "$pepper_counts" | rg -q '"2":1'
+printf '%s' "$pepper_counts" | grep -q "\"1\":${expected_pepper_one_count}"
+printf '%s' "$pepper_counts" | grep -q '"2":1'
 test "$(curl_data_code "http://127.0.0.1:$((base + 12))/v1/messages" "$secret_three")" = 200
 
 # Pseudonym activation must preserve the source scope minted under v1. The
@@ -1006,8 +1012,8 @@ if [[ "$old_response_code" != 200 ]]; then
 	exit 1
 fi
 old_response="$(<"$old_response_file")"
-printf '%s\n' "$old_response" | rg -q '"policy_revision":1'
-printf '%s\n' "$old_response" | rg -q '"policy_epoch":1'
+printf '%s\n' "$old_response" | grep -q '"policy_revision":1'
+printf '%s\n' "$old_response" | grep -q '"policy_epoch":1'
 prepare_payload="$(printf '{"artifact":%s,"reason":"cluster policy canary"}' "$candidate")"
 missing_policy_operation_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((base + 20))/admin/policy/prepare" \
 	-H "Authorization: Bearer ${operator_token}" -H 'Content-Type: application/json' \
