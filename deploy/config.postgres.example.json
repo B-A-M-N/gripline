@@ -124,7 +124,8 @@
       "evidence_guard_retention": "24h",
       "lane_operator_audit_retention": "8760h",
       "policy_node_state_retention": "24h",
-      "cluster_crypto_ack_retention": "24h"
+      "cluster_crypto_ack_retention": "24h",
+      "source_alias_retention": "168h"
     }
   },
 

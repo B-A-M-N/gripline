@@ -39,6 +39,7 @@ manifest = {
     "schema": 2,
     "commit": "fixture",
     "result": "pass",
+    "qualification_mode": "only-soak",
     "required_gates": ["soak"],
     "gates": {"soak": "pass"},
     "evidence": {"soak": {
@@ -146,4 +147,16 @@ open(path, "w", encoding="utf-8").write(json.dumps(value) + "\n")
 PY
 refresh_hashes
 expect_reject missing-required-gate
+
+write_fixture
+python3 - "$fixture_dir/manifest.json" <<'PY'
+import json
+import sys
+path = sys.argv[1]
+value = json.loads(open(path, encoding="utf-8").read())
+value["required_gates"].append("soak")
+open(path, "w", encoding="utf-8").write(json.dumps(value) + "\n")
+PY
+refresh_hashes
+expect_reject duplicate-required-gate
 echo "qualification manifest: semantic and hash tamper rejection passed"

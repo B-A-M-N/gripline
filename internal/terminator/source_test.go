@@ -1,6 +1,8 @@
 package terminator
 
 import (
+	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,6 +14,49 @@ import (
 	"github.com/B-A-M-N/gripline/internal/resource"
 	"github.com/B-A-M-N/gripline/internal/secret"
 )
+
+type sourceAliasBindRecorder struct {
+	calls atomic.Int64
+}
+
+func (r *sourceAliasBindRecorder) BindAuthenticatedSource(context.Context, []SourceAliasCandidate, SourceAliasCandidate) (string, error) {
+	r.calls.Add(1)
+	return "canonical-authenticated-source", nil
+}
+
+// B1 regression: source alias persistence is an authenticated binding step,
+// not part of unauthenticated source resolution. A large invalid-credential
+// spray must therefore leave the binder untouched.
+func TestInvalidCredentialsNeverBindSourceAliases(t *testing.T) {
+	term, raw := buildTerminator(t, credential.StatusNormal, nil)
+	binder := new(sourceAliasBindRecorder)
+	src := TrustedSource{
+		Pseudonym:   "provisional-source",
+		Aliases:     []SourceAliasCandidate{{Alias: "v1.provisional-source", Generation: 1}},
+		ActiveAlias: SourceAliasCandidate{Alias: "v1.provisional-source", Generation: 1},
+		AliasBinder: binder,
+	}
+	for i := 0; i < 10000; i++ {
+		out := term.AdmitUsageContext(context.Background(), "invalid-source-alias-"+string(rune(i)), bearerHeaders("sk-invalid"), lane.Features{}, src, resource.UsageEstimate{Requests: 1})
+		if out.Authorized || out.CredentialAuthenticated {
+			t.Fatalf("invalid request %d outcome=%+v, want unauthenticated denial", i, out)
+		}
+	}
+	if got := binder.calls.Load(); got != 0 {
+		t.Fatalf("invalid credential spray invoked source alias binder %d times", got)
+	}
+
+	out := term.AdmitUsageContext(context.Background(), "valid-source-alias", bearerHeaders(raw), lane.Features{}, src, resource.UsageEstimate{Requests: 1})
+	if !out.Authorized || !out.CredentialAuthenticated {
+		t.Fatalf("valid request outcome=%+v, want authenticated authorization", out)
+	}
+	if got := binder.calls.Load(); got != 1 {
+		t.Fatalf("authenticated request invoked source alias binder %d times, want 1", got)
+	}
+	if out.Trace == nil || out.Trace.SourcePseudonym != "canonical-authenticated-source" {
+		t.Fatalf("authenticated source was not rebound canonically: trace=%+v", out.Trace)
+	}
+}
 
 // sourceTestTerm builds a terminator with a spray detector and a governor so
 // source-scoped behavior is fully wired.

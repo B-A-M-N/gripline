@@ -48,28 +48,32 @@ type Options struct {
 // Store is the shared transactional authority. Credential, lane, and evidence
 // methods are split across files but use this same pool and transaction model.
 type Store struct {
-	pool                 *pgxpool.Pool
-	metrics              authorityMetrics
-	now                  func() time.Time
-	nodeID               string
-	instanceID           string
-	nodeEpoch            int64
-	fenced               atomic.Bool
-	leaseTTL             time.Duration
-	maxSourceScopes      int
-	sourceScopeIdle      time.Duration
-	operationTimeout     time.Duration
-	sourceAliasTouchMu   sync.Mutex
-	sourceAliasLastTouch map[string]time.Time
-	maintenance          MaintenanceOptions
-	leaseStop            chan struct{}
-	leaseDone            chan struct{}
-	maintenanceStop      chan struct{}
-	maintenanceDone      chan struct{}
-	membershipStop       chan struct{}
-	membershipDone       chan struct{}
-	cryptoReady          atomic.Bool
-	cryptoObserved       atomic.Value // cryptoObservation
+	pool                    *pgxpool.Pool
+	metrics                 authorityMetrics
+	now                     func() time.Time
+	nodeID                  string
+	instanceID              string
+	nodeEpoch               int64
+	fenced                  atomic.Bool
+	leaseTTL                time.Duration
+	maxSourceScopes         int
+	sourceScopeIdle         time.Duration
+	operationTimeout        time.Duration
+	sourceAliasTouchMu      sync.Mutex
+	sourceAliasLastTouch    map[string]time.Time
+	sourceAliasTouchPending map[string]struct{}
+	sourceAliasTouchQueue   chan string
+	sourceAliasTouchStop    chan struct{}
+	sourceAliasTouchDone    chan struct{}
+	maintenance             MaintenanceOptions
+	leaseStop               chan struct{}
+	leaseDone               chan struct{}
+	maintenanceStop         chan struct{}
+	maintenanceDone         chan struct{}
+	membershipStop          chan struct{}
+	membershipDone          chan struct{}
+	cryptoReady             atomic.Bool
+	cryptoObserved          atomic.Value // cryptoObservation
 }
 
 // Schema version 1 is the original clustered-authority layout. Version 2
@@ -85,8 +89,8 @@ type Store struct {
 // 11 adds explicit creation timestamps to retention-managed receipts and
 // policy audit. Version 13 adds a singleton guard for concurrent source-scope
 // cardinality decisions. Version 14 adds durable source-pseudonym aliases so
-// every derived generation, including invalid-only traffic, resolves to one
-// stable source identity. Version 15 adds authority-owned crypto activation,
+// every authenticated source generation resolves to one stable source identity;
+// pre-auth misses remain provisional and read-only. Version 15 adds authority-owned crypto activation,
 // supersession, and retirement-horizon timestamps. Keep the marker versioned even though the DDL below
 // is idempotent: CREATE TABLE IF NOT EXISTS cannot add columns to an already
 // initialized database.
@@ -169,7 +173,7 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 		opts.OperationTimeout = 2 * time.Second
 	}
 	maintenance := opts.Maintenance.withDefaults()
-	s := &Store{pool: pool, now: opts.Now, nodeID: opts.NodeID, leaseTTL: opts.LeaseTTL, maxSourceScopes: opts.MaxSourceScopes, sourceScopeIdle: opts.SourceScopeIdle, operationTimeout: opts.OperationTimeout, sourceAliasLastTouch: make(map[string]time.Time), maintenance: maintenance,
+	s := &Store{pool: pool, now: opts.Now, nodeID: opts.NodeID, leaseTTL: opts.LeaseTTL, maxSourceScopes: opts.MaxSourceScopes, sourceScopeIdle: opts.SourceScopeIdle, operationTimeout: opts.OperationTimeout, sourceAliasLastTouch: make(map[string]time.Time), sourceAliasTouchPending: make(map[string]struct{}), sourceAliasTouchQueue: make(chan string, sourceAliasTouchQueueSize), sourceAliasTouchStop: make(chan struct{}), sourceAliasTouchDone: make(chan struct{}), maintenance: maintenance,
 		leaseStop: make(chan struct{}), leaseDone: make(chan struct{})}
 	if err := s.Ping(connectCtx); err != nil {
 		pool.Close()
@@ -196,6 +200,7 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 		go s.membershipHeartbeat()
 		go s.maintenanceLoop()
 	}
+	go s.sourceAliasTouchLoop()
 	go s.leaseReaper()
 	return s, nil
 }
@@ -322,6 +327,16 @@ func CheckSchemaCompatibility(ctx context.Context, pool *pgxpool.Pool) error {
 // Close releases the shared connection pool.
 func (s *Store) Close() {
 	if s != nil && s.pool != nil {
+		if s.sourceAliasTouchStop != nil {
+			select {
+			case <-s.sourceAliasTouchStop:
+			default:
+				close(s.sourceAliasTouchStop)
+			}
+			if s.sourceAliasTouchDone != nil {
+				<-s.sourceAliasTouchDone
+			}
+		}
 		if s.maintenanceStop != nil {
 			select {
 			case <-s.maintenanceStop:
@@ -898,6 +913,18 @@ func begin(ctx context.Context, pool *pgxpool.Pool) (pgx.Tx, error) {
 }
 
 func beginResource(ctx context.Context, pool *pgxpool.Pool) (pgx.Tx, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+}
+
+// beginSourceAlias starts the alias reducer at read-committed isolation. The
+// reducer takes deterministic transaction-scoped advisory locks for every
+// candidate alias before reading or inserting rows, which provides the
+// required per-alias atomicity without serializable predicate conflicts when
+// many unrelated first-seen sources register concurrently.
+func beginSourceAlias(ctx context.Context, pool *pgxpool.Pool) (pgx.Tx, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}

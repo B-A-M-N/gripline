@@ -71,6 +71,7 @@ func adminMetrics(svc *control.Service, dp *proxy.DataPlane, governor resource.A
 			writeMetric("preauth_source_table_saturated_total", m.PreAuthSourceTableSaturated)
 			writeMetric("preauth_overflow_assignments_total", m.PreAuthOverflowAssignments)
 			writeMetric("preauth_overflow_denials_total", m.PreAuthOverflowDenials)
+			writeMetric("preauth_source_table_entries", m.PreAuthSourceTableEntries)
 			for i, count := range m.ResourceDenialsByScope {
 				writeMetric("resource_denials_scope_"+strings.ToLower(resource.Scope(i).String())+"_total", count)
 			}
@@ -154,6 +155,8 @@ func adminMetrics(svc *control.Service, dp *proxy.DataPlane, governor resource.A
 			writeMetric("postgres_source_alias_resolution_failures_total", a.SourceAliasFailures)
 			writeMetric("postgres_source_alias_resolution_seconds", a.SourceAliasResolutionLatency.Seconds())
 			writeMetric("postgres_source_alias_resolution_seconds_total", a.SourceAliasResolutionLatency.Seconds())
+			writeMetric("postgres_source_alias_touch_batches_total", a.SourceAliasTouchBatches)
+			writeMetric("postgres_source_alias_touch_dropped_total", a.SourceAliasTouchDropped)
 			writeMetric("postgres_reservation_attempts_total", a.ReservationAttempts)
 			writeMetric("postgres_reservations_granted_total", a.ReservationsGranted)
 			writeMetric("postgres_reservation_failures_total", a.ReservationFailures)
@@ -174,6 +177,8 @@ func adminMetrics(svc *control.Service, dp *proxy.DataPlane, governor resource.A
 			writeMetric("postgres_maintenance_errors_total", a.MaintenanceErrors)
 			writeMetric("postgres_maintenance_consecutive_errors", a.MaintenanceConsecutiveErrors)
 			writeMetric("postgres_maintenance_rows_deleted_total", a.MaintenanceRowsDeleted)
+			writeMetric("postgres_maintenance_source_aliases_deleted_total", a.MaintenanceSourceAliasesDeleted)
+			writeMetric("postgres_maintenance_resource_source_scopes_deleted_total", a.MaintenanceSourceScopesDeleted)
 			writeMetric("postgres_maintenance_batches_total", a.MaintenanceBatches)
 			writeMetric("postgres_maintenance_backlog_estimate", a.MaintenanceBacklogEstimate)
 			writeMetric("postgres_maintenance_last_success_timestamp", metricTimestamp(a.MaintenanceLastSuccess))

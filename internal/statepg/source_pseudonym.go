@@ -10,8 +10,10 @@ import (
 )
 
 const (
-	sourceAliasTouchInterval = time.Minute
-	sourceAliasTouchTimeout  = 500 * time.Millisecond
+	sourceAliasTouchInterval  = time.Minute
+	sourceAliasTouchTimeout   = 500 * time.Millisecond
+	sourceAliasTouchQueueSize = 4096
+	sourceAliasTouchBatchSize = 128
 )
 
 // SourcePseudonymAlias is one locally-derived source alias. Generation is
@@ -36,19 +38,7 @@ func (s *Store) ResolveOrRegisterSource(ctx context.Context, candidates []Source
 	started := time.Now()
 	registered := false
 	defer func() {
-		if s != nil {
-			s.metrics.sourceAliasAttempts.Add(1)
-			s.metrics.sourceAliasResolutionLatencyNanos.Add(time.Since(started).Nanoseconds())
-			if registered {
-				s.metrics.sourceAliasRegistrations.Add(1)
-			}
-			if errors.Is(err, ErrSourceAliasConflict) {
-				s.metrics.sourceAliasConflicts.Add(1)
-			}
-			if err != nil {
-				s.metrics.sourceAliasFailures.Add(1)
-			}
-		}
+		s.recordSourceAliasResolution(started, registered, err)
 	}()
 	if s == nil || s.pool == nil {
 		return "", errors.New("statepg: authority is unavailable")
@@ -94,6 +84,117 @@ func (s *Store) ResolveOrRegisterSource(ctx context.Context, candidates []Source
 	return canonical, nil
 }
 
+// ResolveSourceAliases performs the source lookup used before authentication.
+// It is deliberately read-only: a miss returns the active keyed pseudonym as
+// a provisional request identity and never creates durable authority state.
+func (s *Store) ResolveSourceAliases(ctx context.Context, candidates []SourcePseudonymAlias, active SourcePseudonymAlias) (canonical string, err error) {
+	started := time.Now()
+	defer func() {
+		s.recordSourceAliasResolution(started, false, err)
+	}()
+	if s == nil || s.pool == nil {
+		return "", errors.New("statepg: authority is unavailable")
+	}
+	if err := validateSourceAliases(candidates, active); err != nil {
+		return "", err
+	}
+	aliases := normalizeSourceAliases(candidates, active)
+	if len(aliases) == 0 {
+		return active.Alias, nil
+	}
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
+	canonical, _, err = s.resolveSourceAliasesReadOnly(ctx, aliasValues(aliases))
+	if err != nil {
+		return "", err
+	}
+	if canonical == "" {
+		return active.Alias, nil
+	}
+	return canonical, nil
+}
+
+// BindAuthenticatedSource is the only source-alias mutation entry point used
+// by request admission. Callers must invoke it only after a presented secret
+// has matched a known credential; invalid credentials remain provisional.
+func (s *Store) BindAuthenticatedSource(ctx context.Context, candidates []SourcePseudonymAlias, active SourcePseudonymAlias) (canonical string, err error) {
+	started := time.Now()
+	registered := false
+	defer func() {
+		s.recordSourceAliasResolution(started, registered, err)
+	}()
+	if s == nil || s.pool == nil {
+		return "", errors.New("statepg: authority is unavailable")
+	}
+	if err := validateSourceAliases(candidates, active); err != nil {
+		return "", err
+	}
+	aliases := normalizeSourceAliases(candidates, active)
+	if len(aliases) == 0 {
+		return "", errors.New("statepg: source aliases are required")
+	}
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
+	canonical, registered, err = s.registerSourceAliases(ctx, aliases, active.Alias)
+	if err == nil {
+		s.maybeTouchSourceAliases(aliasValues(aliases))
+	}
+	return canonical, err
+}
+
+func (s *Store) recordSourceAliasResolution(started time.Time, registered bool, err error) {
+	if s == nil {
+		return
+	}
+	s.metrics.sourceAliasAttempts.Add(1)
+	s.metrics.sourceAliasResolutionLatencyNanos.Add(time.Since(started).Nanoseconds())
+	if registered {
+		s.metrics.sourceAliasRegistrations.Add(1)
+	}
+	if errors.Is(err, ErrSourceAliasConflict) {
+		s.metrics.sourceAliasConflicts.Add(1)
+	}
+	if err != nil {
+		s.metrics.sourceAliasFailures.Add(1)
+	}
+}
+
+func validateSourceAliases(candidates []SourcePseudonymAlias, active SourcePseudonymAlias) error {
+	if strings.TrimSpace(active.Alias) == "" || active.Generation < 1 {
+		return errors.New("statepg: active source alias is required")
+	}
+	for _, candidate := range candidates {
+		if strings.TrimSpace(candidate.Alias) == "" || candidate.Generation < 1 {
+			return fmt.Errorf("statepg: invalid source alias candidate")
+		}
+	}
+	return nil
+}
+
+func normalizeSourceAliases(candidates []SourcePseudonymAlias, active SourcePseudonymAlias) []SourcePseudonymAlias {
+	seen := make(map[string]struct{}, len(candidates)+1)
+	aliases := make([]SourcePseudonymAlias, 0, len(candidates)+1)
+	for _, candidate := range append(append([]SourcePseudonymAlias(nil), candidates...), active) {
+		if strings.TrimSpace(candidate.Alias) == "" || candidate.Generation < 1 {
+			continue
+		}
+		if _, ok := seen[candidate.Alias]; ok {
+			continue
+		}
+		seen[candidate.Alias] = struct{}{}
+		aliases = append(aliases, candidate)
+	}
+	return aliases
+}
+
+func aliasValues(aliases []SourcePseudonymAlias) []string {
+	values := make([]string, 0, len(aliases))
+	for _, alias := range aliases {
+		values = append(values, alias.Alias)
+	}
+	return values
+}
+
 func (s *Store) resolveSourceAliasesReadOnly(ctx context.Context, aliases []string) (string, bool, error) {
 	rows, err := s.pool.Query(ctx, `SELECT alias, canonical_source_id
 		FROM gripline_source_aliases WHERE alias = ANY($1::text[])`, aliases)
@@ -132,7 +233,7 @@ func (s *Store) registerSourceAliases(ctx context.Context, aliases []SourcePseud
 	lockValues := append([]string(nil), values...)
 	sort.Strings(lockValues)
 	err = s.withTransactionRetry(ctx, "source alias registration", func() error {
-		tx, err := begin(ctx, s.pool)
+		tx, err := beginSourceAlias(ctx, s.pool)
 		if err != nil {
 			return mapDBError(err)
 		}
@@ -205,21 +306,62 @@ func (s *Store) registerSourceAliases(ctx context.Context, aliases []SourcePseud
 // intentionally best effort because recency is analytics/retention metadata,
 // not an inference correctness condition.
 func (s *Store) maybeTouchSourceAliases(aliases []string) {
-	if s == nil || s.pool == nil || len(aliases) == 0 {
+	if s == nil || s.pool == nil || s.sourceAliasTouchQueue == nil || len(aliases) == 0 {
 		return
 	}
 	claimed := s.claimSourceAliasTouch(aliases, time.Now())
 	if len(claimed) == 0 {
 		return
 	}
-	go func() {
-		touchCtx, cancel := context.WithTimeout(context.Background(), sourceAliasTouchTimeout)
-		defer cancel()
-		_, _ = s.pool.Exec(touchCtx, `UPDATE gripline_source_aliases
-			SET last_seen_at=CURRENT_TIMESTAMP
-			WHERE alias = ANY($1::text[])
-			  AND last_seen_at < CURRENT_TIMESTAMP - INTERVAL '30 seconds'`, claimed)
-	}()
+	s.sourceAliasTouchMu.Lock()
+	defer s.sourceAliasTouchMu.Unlock()
+	for _, alias := range claimed {
+		if _, pending := s.sourceAliasTouchPending[alias]; pending {
+			continue
+		}
+		select {
+		case s.sourceAliasTouchQueue <- alias:
+			s.sourceAliasTouchPending[alias] = struct{}{}
+		default:
+			s.metrics.sourceAliasTouchDropped.Add(1)
+		}
+	}
+}
+
+func (s *Store) sourceAliasTouchLoop() {
+	if s == nil || s.sourceAliasTouchDone == nil {
+		return
+	}
+	defer close(s.sourceAliasTouchDone)
+	for {
+		select {
+		case first := <-s.sourceAliasTouchQueue:
+			batch := []string{first}
+			for len(batch) < sourceAliasTouchBatchSize {
+				select {
+				case alias := <-s.sourceAliasTouchQueue:
+					batch = append(batch, alias)
+				default:
+					goto flush
+				}
+			}
+		flush:
+			ctx, cancel := context.WithTimeout(context.Background(), sourceAliasTouchTimeout)
+			_, _ = s.pool.Exec(ctx, `UPDATE gripline_source_aliases
+				SET last_seen_at=CURRENT_TIMESTAMP
+				WHERE alias = ANY($1::text[])
+				  AND last_seen_at < CURRENT_TIMESTAMP - INTERVAL '30 seconds'`, batch)
+			cancel()
+			s.sourceAliasTouchMu.Lock()
+			for _, alias := range batch {
+				delete(s.sourceAliasTouchPending, alias)
+			}
+			s.sourceAliasTouchMu.Unlock()
+			s.metrics.sourceAliasTouchBatches.Add(1)
+		case <-s.sourceAliasTouchStop:
+			return
+		}
+	}
 }
 
 func (s *Store) claimSourceAliasTouch(aliases []string, now time.Time) []string {

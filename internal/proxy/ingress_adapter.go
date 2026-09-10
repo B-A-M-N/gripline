@@ -17,6 +17,20 @@ type IngressSourceResolver struct {
 	inner *ingress.Resolver
 }
 
+type ingressAliasBinder struct{ inner ingress.SourceAliasBinder }
+
+func (b ingressAliasBinder) BindAuthenticatedSource(ctx context.Context, candidates []terminator.SourceAliasCandidate, active terminator.SourceAliasCandidate) (string, error) {
+	if b.inner == nil {
+		return "", nil
+	}
+	aliases := make([]ingress.SourceAliasCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		aliases = append(aliases, ingress.SourceAliasCandidate{Alias: candidate.Alias, Generation: candidate.Generation})
+	}
+	canonical, err := b.inner.BindAuthenticatedSource(ctx, aliases, ingress.SourceAliasCandidate{Alias: active.Alias, Generation: active.Generation})
+	return canonical, err
+}
+
 // NewIngressSourceResolver wraps an ingress.Resolver as a proxy.SourceResolver.
 func NewIngressSourceResolver(r *ingress.Resolver) *IngressSourceResolver {
 	return &IngressSourceResolver{inner: r}
@@ -44,6 +58,20 @@ func (s *IngressSourceResolver) ResolveSourceContext(ctx context.Context, obs Ob
 		ASN:         src.ASN,
 		NetworkType: src.NetworkType,
 		Region:      src.Region,
+		Aliases: func() []terminator.SourceAliasCandidate {
+			out := make([]terminator.SourceAliasCandidate, 0, len(src.Aliases))
+			for _, candidate := range src.Aliases {
+				out = append(out, terminator.SourceAliasCandidate{Alias: candidate.Alias, Generation: candidate.Generation})
+			}
+			return out
+		}(),
+		ActiveAlias: terminator.SourceAliasCandidate{Alias: src.ActiveAlias.Alias, Generation: src.ActiveAlias.Generation},
+		AliasBinder: func() terminator.SourceAliasBinder {
+			if src.AliasBinder == nil {
+				return nil
+			}
+			return ingressAliasBinder{inner: src.AliasBinder}
+		}(),
 	}, nil
 }
 

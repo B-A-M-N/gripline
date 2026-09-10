@@ -442,6 +442,7 @@ type MetricsSnapshot struct {
 	PreAuthSourceTableSaturated  uint64
 	PreAuthOverflowAssignments   uint64
 	PreAuthOverflowDenials       uint64
+	PreAuthSourceTableEntries    int
 	ResourceDenialsByScope       [5]uint64
 	ResourceDenialsByDimension   [6]uint64
 	Spool                        SpoolStats
@@ -486,6 +487,7 @@ func (d *DataPlane) Metrics() MetricsSnapshot {
 	snapshot.PreAuthSourceTableSaturated = preAuth.SourceTableSaturated
 	snapshot.PreAuthOverflowAssignments = preAuth.OverflowAssignments
 	snapshot.PreAuthOverflowDenials = preAuth.OverflowDenials
+	snapshot.PreAuthSourceTableEntries = preAuth.SourceTableEntries
 	for i := range snapshot.ResourceDenialsByScope {
 		snapshot.ResourceDenialsByScope[i] = d.metrics.resourceByScope[i].Load()
 	}

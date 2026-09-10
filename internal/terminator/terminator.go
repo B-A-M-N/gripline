@@ -31,12 +31,18 @@ import (
 type Outcome struct {
 	RequestID  string
 	Authorized bool
-	Reason     string // safe, non-secret denial/status reason
-	DenialErr  error
-	Principal  principal.Principal
-	Context    principal.AuthorizedContext
-	Assertion  *Assertion
-	Lease      *resource.LeaseHandle // non-nil when authorized; proxy releases on completion
+	// CredentialAuthenticated reports that the presented secret matched a
+	// known credential, even when that credential was subsequently denied for
+	// revocation, quarantine, expiry, policy, or resource state. It is kept
+	// separate from Authorized so authenticated source identity can be bound
+	// without granting admission.
+	CredentialAuthenticated bool
+	Reason                  string // safe, non-secret denial/status reason
+	DenialErr               error
+	Principal               principal.Principal
+	Context                 principal.AuthorizedContext
+	Assertion               *Assertion
+	Lease                   *resource.LeaseHandle // non-nil when authorized; proxy releases on completion
 	// ResourceReservation is the backend-neutral resource hold (P0.23-P0.27).
 	// The proxy releases it when the upstream request completes; until then the
 	// capacity is held for this request only.
@@ -618,6 +624,26 @@ type TrustedSource struct {
 	ASN         string
 	NetworkType string
 	Region      string
+	// Aliases and ActiveAlias are derived source pseudonyms used by clustered
+	// authorities to preserve identity across key rotation. AliasBinder is
+	// called only after credential authentication succeeds; unknown credentials
+	// therefore cannot create durable source-alias rows.
+	Aliases     []SourceAliasCandidate
+	ActiveAlias SourceAliasCandidate
+	AliasBinder SourceAliasBinder
+}
+
+// SourceAliasCandidate is the terminator-side representation of one derived
+// source alias. It intentionally contains no raw network identity.
+type SourceAliasCandidate struct {
+	Alias      string
+	Generation int
+}
+
+// SourceAliasBinder binds derived aliases to a canonical source identity after
+// the credential has been identified by the authoritative registry.
+type SourceAliasBinder interface {
+	BindAuthenticatedSource(context.Context, []SourceAliasCandidate, SourceAliasCandidate) (string, error)
 }
 
 // sourceID returns the key this request attributes to for SOURCE-scope
@@ -739,6 +765,17 @@ func (t *Terminator) admitUsageWithRequestID(ctx context.Context, reqID string, 
 
 	// 2. Authenticate.
 	cred, err := t.authenticate(ctx, presented)
+	if cred != nil {
+		out.CredentialAuthenticated = true
+		if bindErr := bindAuthenticatedSource(ctx, &src); bindErr != nil {
+			out.Authorized = false
+			out.Reason = "source_resolution_failed"
+			out.DenialErr = bindErr
+			tr.SourcePseudonym = src.sourceID()
+			return out
+		}
+		tr.SourcePseudonym = src.sourceID()
+	}
 	if err != nil {
 		out.Authorized = false
 		out.Reason = safeReason(err)
@@ -1518,6 +1555,20 @@ func (t *Terminator) admitUsageWithRequestID(ctx context.Context, reqID string, 
 	out.Adaptive = adaptiveForObservation
 	out.Degraded = adaptiveForObservation == AdaptiveDegraded
 	return out
+}
+
+func bindAuthenticatedSource(ctx context.Context, src *TrustedSource) error {
+	if src == nil || src.AliasBinder == nil || len(src.Aliases) == 0 {
+		return nil
+	}
+	canonical, err := src.AliasBinder.BindAuthenticatedSource(ctx, src.Aliases, src.ActiveAlias)
+	if err != nil {
+		return err
+	}
+	if canonical != "" {
+		src.Pseudonym = canonical
+	}
+	return nil
 }
 
 func (t *Terminator) provisionMultiscope(requestCtx context.Context, cred *credential.Credential, laneID string, laneSec lane.SecurityStatus, limits policy.Limits, authCtx principal.AuthorizedContext, reqID string, out *Outcome, adaptiveForObservation AdaptiveStateStatus, laneRisk, credentialRisk, effectiveRisk int, evidenceCodes []string, src TrustedSource, est resource.UsageEstimate, tr *DecisionTrace) *Outcome {

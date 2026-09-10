@@ -18,6 +18,7 @@ REQUIRED_ASSERTIONS = {
     "http2": ("alpn_h2_negotiated", "stream_limit_enforced", "continuation_case_passed", "cancellation_recovered"),
     "sdk": ("python_provider_passed", "typescript_provider_passed", "retry_429_passed", "server_error_passed", "cancellation_passed", "connection_reuse_passed", "parallel_passed"),
     "exact-cost": ("openai_exact_deltas", "anthropic_exact_deltas", "cache_dimensions_exact", "zero_conservative_fallbacks"),
+    "source-churn": ("invalid_source_misses_read_only", "preauth_state_bounded", "backend_isolated", "authenticated_sources_registered", "source_scope_overflow_bounded", "rotation_overlap_continuous", "stale_alias_maintenance_succeeded"),
     "soak": ("cluster_ha_recovery", "runtime_bounds_held", "maintenance_succeeded", "promotion_traffic_succeeded", "database_outage_recovered"),
     "capacity-load": ("load_completed", "concurrency_bound_enforced", "resource_state_bounded"),
 }
@@ -31,6 +32,32 @@ REQUIRED_MEASUREMENTS = {
     "http2": {"advertised_max_streams": int, "http2_errors": int, "h2load_version": str},
     "sdk": {"providers_tested": int, "minimum_sessions_per_provider": int},
     "exact-cost": {"verified_cases": int, "conservative_settlements": int},
+    "source-churn": {
+        "invalid_sources": int,
+        "aliases_before": int,
+        "aliases_after_invalid": int,
+        "adaptive_rows_after_invalid": int,
+        "adaptive_subjects_after_invalid": int,
+        "adaptive_keys_after_invalid": int,
+        "adaptive_baselines_after_invalid": int,
+        "adaptive_subject_bound": int,
+        "adaptive_key_bound": int,
+        "preauth_source_table_entries_peak": int,
+        "preauth_source_table_bound": int,
+        "backend_hits_from_invalid": int,
+        "authenticated_aliases_created": int,
+        "authenticated_source_requests": int,
+        "authenticated_source_failures": int,
+        "source_scope_bound": int,
+        "source_scopes_peak": int,
+        "source_scope_overflows": int,
+        "rotation_source_scopes_before": int,
+        "rotation_source_scopes_after": int,
+        "stale_aliases_before_maintenance": int,
+        "stale_aliases_after_maintenance": int,
+        "source_resolution_failures": int,
+        "authority_timeouts": int,
+    },
     "soak": {"duration_seconds": int, "workers": int, "post_promotion_recovery_ms": int},
     "capacity-load": {
         "duration_seconds": int,
@@ -111,6 +138,24 @@ def main() -> None:
         fail("required_gates and gates are required")
     if not isinstance(evidence, dict):
         fail("evidence object is required")
+
+    mode = manifest.get("qualification_mode")
+    expected_required = {
+        "full": ("postgres-ha", "postgres-pitr", "perimeter", "clustered-perimeter", "replay", "http2", "sdk", "exact-cost", "source-churn", "soak", "capacity-load"),
+        "only-soak": ("soak",),
+    }.get(mode)
+    if expected_required is None:
+        fail(f"unknown qualification_mode: {mode}")
+    if any(not isinstance(gate_name, str) for gate_name in required):
+        fail("required gate names must be strings")
+    if len(required) != len(set(required)):
+        fail("required_gates contains duplicates")
+    if required != list(expected_required):
+        fail(f"required_gates does not match the {mode} gate contract")
+    if set(gates) != set(expected_required):
+        fail(f"gates does not match the {mode} gate contract")
+    if set(evidence) != set(expected_required):
+        fail(f"evidence does not match the {mode} gate contract")
 
     for gate_name in required:
         if not isinstance(gate_name, str):

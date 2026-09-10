@@ -142,16 +142,21 @@ type preAuthMetricsSnapshot struct {
 	SourceTableSaturated uint64
 	OverflowAssignments  uint64
 	OverflowDenials      uint64
+	SourceTableEntries   int
 }
 
 func (g *preAuthGuard) metricsSnapshot() preAuthMetricsSnapshot {
 	if g == nil {
 		return preAuthMetricsSnapshot{}
 	}
+	g.mu.Lock()
+	entries := len(g.sources)
+	g.mu.Unlock()
 	return preAuthMetricsSnapshot{
 		SourceTableSaturated: g.sourceTableFull.Load(),
 		OverflowAssignments:  g.overflowAssigned.Load(),
 		OverflowDenials:      g.overflowDenied.Load(),
+		SourceTableEntries:   entries,
 	}
 }
 

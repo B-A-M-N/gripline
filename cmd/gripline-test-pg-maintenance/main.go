@@ -31,9 +31,10 @@ func main() {
 	maxRows := flag.Int("max-rows", 4096, "maximum rows deleted per pass")
 	maxRuntime := flag.Duration("max-runtime", 5*time.Second, "maximum maintenance runtime per pass")
 	historyRetention := flag.Duration("history-retention", 0, "optional compressed retention for historical audit/receipt rows")
+	sourceAliasRetention := flag.Duration("source-alias-retention", 0, "optional source-alias retention window")
 	flag.Parse()
-	if *dsn == "" || *timeout <= 0 || *batchSize <= 0 || *maxBatches <= 0 || *maxRows <= 0 || *maxRuntime <= 0 || *historyRetention < 0 {
-		log.Fatal("-dsn, positive -timeout, -batch-size, -max-batches, -max-rows, and -max-runtime are required; -history-retention must be non-negative")
+	if *dsn == "" || *timeout <= 0 || *batchSize <= 0 || *maxBatches <= 0 || *maxRows <= 0 || *maxRuntime <= 0 || *historyRetention < 0 || *sourceAliasRetention < 0 {
+		log.Fatal("-dsn, positive -timeout, -batch-size, -max-batches, -max-rows, and -max-runtime are required; retention values must be non-negative")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
@@ -48,6 +49,9 @@ func main() {
 		maintenance.PolicyAuditRetention = *historyRetention
 		maintenance.EvidenceGuardRetention = *historyRetention
 		maintenance.LaneOperatorAuditRetention = *historyRetention
+	}
+	if *sourceAliasRetention > 0 {
+		maintenance.SourceAliasRetention = *sourceAliasRetention
 	}
 	store, err := statepg.Open(ctx, statepg.Options{
 		DSN: *dsn, OperationTimeout: *timeout,

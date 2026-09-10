@@ -181,6 +181,7 @@ if [[ "$only_soak" == 0 ]]; then
 	run_gate http2 http2.sh
 	run_gate sdk sdk.sh
 	run_gate exact-cost exact-cost.sh
+	run_gate source-churn source-churn.sh
 fi
 run_gate soak soak.sh --duration "$soak_duration" --workers "$workers"
 if [[ "$only_soak" == 0 ]]; then
@@ -190,6 +191,19 @@ fi
 gate_status() {
 	local key=$1
 	printf '%s' "${status[$key]:-skipped}"
+}
+
+manifest_gates_json() {
+	local key first=1
+	local gate_list="postgres-ha postgres-pitr perimeter clustered-perimeter replay http2 sdk exact-cost source-churn soak capacity-load"
+	if [[ "$only_soak" == 1 ]]; then
+		gate_list="soak"
+	fi
+	for key in $gate_list; do
+		if [[ "$first" == 0 ]]; then printf ',\n'; fi
+		printf '    "%s": "%s"' "$key" "$(gate_status "$key")"
+		first=0
+	done
 }
 
 manifest_evidence_entry() {
@@ -206,7 +220,7 @@ manifest_evidence_entry() {
 
 manifest_evidence_json() {
 	local key first=1
-	for key in postgres-ha postgres-pitr perimeter clustered-perimeter replay http2 sdk exact-cost soak capacity-load; do
+	for key in postgres-ha postgres-pitr perimeter clustered-perimeter replay http2 sdk exact-cost source-churn soak capacity-load; do
 		if [[ "${status[$key]:-skipped}" == skipped ]]; then
 			continue
 		fi
@@ -221,7 +235,7 @@ if ! python3 "$repo_dir/scripts/qualification/scan-evidence.py" "$result_dir" "$
 	overall=1
 fi
 
-required_gates='["postgres-ha", "postgres-pitr", "perimeter", "clustered-perimeter", "replay", "http2", "sdk", "exact-cost", "soak", "capacity-load"]'
+required_gates='["postgres-ha", "postgres-pitr", "perimeter", "clustered-perimeter", "replay", "http2", "sdk", "exact-cost", "source-churn", "soak", "capacity-load"]'
 if [[ "$only_soak" == 1 ]]; then
 	required_gates='["soak"]'
 fi
@@ -243,16 +257,7 @@ cat >"$result_dir/manifest.json" <<EOF
   "qualification_mode": "$([[ "$only_soak" == 1 ]] && echo only-soak || echo full)",
   "required_gates": ${required_gates},
   "gates": {
-    "postgres-ha": "$(gate_status postgres-ha)",
-    "postgres-pitr": "$(gate_status postgres-pitr)",
-    "perimeter": "$(gate_status perimeter)",
-    "clustered-perimeter": "$(gate_status clustered-perimeter)",
-    "replay": "$(gate_status replay)",
-    "http2": "$(gate_status http2)",
-    "sdk": "$(gate_status sdk)",
-    "exact-cost": "$(gate_status exact-cost)",
-    "soak": "$(gate_status soak)",
-    "capacity-load": "$(gate_status capacity-load)"
+$(manifest_gates_json)
   },
   "fixture_images": {
     "postgres": "postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94",

@@ -153,3 +153,66 @@ func TestClusterPseudonymRotationMintsOnlyActiveGenerationOnAliasMiss(t *testing
 		t.Fatalf("post-activation alias miss minted %q, want active v2 generation", second.Pseudonym)
 	}
 }
+
+func TestReconcileClusterCryptoRetiresLocalPseudonymGeneration(t *testing.T) {
+	ring, err := pseudonym.NewRing(
+		&pseudonym.Key{Version: 1, Secret: []byte("pseudonym-generation-one-0123456789")},
+		&pseudonym.Key{Version: 2, Secret: []byte("pseudonym-generation-two-0123456789")},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pseudonyms := &pseudonymRingAdapter{ring: ring}
+	signer, err := terminator.NewKeyring()
+	if err != nil {
+		t.Fatal(err)
+	}
+	peppers := credential.MustPepperRing(&credential.PepperKey{Version: 1, Key: []byte("pepper-generation-one-0123456789")})
+	authority := &recordingCryptoSynchronizer{}
+	pseudonymFingerprint, ok := pseudonyms.VersionFingerprint(2)
+	if !ok {
+		t.Fatal("missing pseudonym generation 2 fingerprint")
+	}
+	shared := statepg.CryptoIdentity{
+		SignerActiveKID: signer.ActiveKid(), SignerActiveFingerprint: runtimeTestSignerFingerprint(t, signer),
+		PepperActiveVersion: 1, PepperActiveFingerprint: runtimeTestPepperFingerprint(t, peppers, 1),
+		PseudonymVersion: 2, PseudonymActiveFingerprint: pseudonymFingerprint,
+		Retired: []statepg.CryptoGeneration{{Kind: statepg.CryptoKindPseudonym, Generation: 1, Fingerprint: runtimeTestPseudonymFingerprint(t, pseudonyms, 1)}},
+	}
+	if err := reconcileClusterCrypto(context.Background(), shared, authority, signer, peppers, pseudonyms); err != nil {
+		t.Fatal(err)
+	}
+	if _, loaded := pseudonyms.VersionFingerprint(1); loaded {
+		t.Fatal("reconciliation retained the shared retired pseudonym generation locally")
+	}
+	if pseudonyms.ActiveVersion() != 2 || !authority.called {
+		t.Fatalf("reconciled pseudonym state active=%d authority_called=%v, want active 2 and acknowledgement", pseudonyms.ActiveVersion(), authority.called)
+	}
+}
+
+func runtimeTestSignerFingerprint(t *testing.T, signer *terminator.Keyring) string {
+	t.Helper()
+	fingerprint, ok := signer.PublicKeyFingerprint(signer.ActiveKid())
+	if !ok {
+		t.Fatal("missing signer fingerprint")
+	}
+	return fingerprint
+}
+
+func runtimeTestPepperFingerprint(t *testing.T, peppers *credential.PepperRing, version int) string {
+	t.Helper()
+	fingerprint, ok := peppers.VersionFingerprint(version)
+	if !ok {
+		t.Fatalf("missing pepper fingerprint for version %d", version)
+	}
+	return fingerprint
+}
+
+func runtimeTestPseudonymFingerprint(t *testing.T, pseudonyms *pseudonymRingAdapter, version int) string {
+	t.Helper()
+	fingerprint, ok := pseudonyms.VersionFingerprint(version)
+	if !ok {
+		t.Fatalf("missing pseudonym fingerprint for version %d", version)
+	}
+	return fingerprint
+}

@@ -158,6 +158,7 @@ type MaintenanceSection struct {
 	LaneOperatorAuditRetention  Duration `json:"lane_operator_audit_retention,omitempty"`
 	PolicyNodeStateRetention    Duration `json:"policy_node_state_retention,omitempty"`
 	ClusterCryptoAckRetention   Duration `json:"cluster_crypto_ack_retention,omitempty"`
+	SourceAliasRetention        Duration `json:"source_alias_retention,omitempty"`
 }
 
 func (m MaintenanceSection) configured() bool {
@@ -168,7 +169,7 @@ func (m MaintenanceSection) configured() bool {
 		m.PolicyAuditRetention.D() != 0 || m.MembershipRetention.D() != 0 ||
 		m.AdaptiveRetention.D() != 0 || m.EvidenceGuardRetention.D() != 0 ||
 		m.LaneOperatorAuditRetention.D() != 0 || m.PolicyNodeStateRetention.D() != 0 ||
-		m.ClusterCryptoAckRetention.D() != 0
+		m.ClusterCryptoAckRetention.D() != 0 || m.SourceAliasRetention.D() != 0
 }
 
 // PolicySection selects the versioned policy artifact for the deployment.
@@ -381,8 +382,9 @@ type ServerSection struct {
 	// SpoolMaxFiles bounds concurrent unknown-length body reservations. Zero
 	// resolves to a conservative production default.
 	SpoolMaxFiles int `json:"spool_max_files,omitempty"`
-	// MaxSourceScopes bounds source pseudonym state in the process-local
-	// governor. Zero uses the conservative runtime default.
+	// MaxSourceScopes is the backend-neutral resource source-scope cardinality
+	// limit. Zero uses the conservative runtime default; source alias
+	// registration state has its own authenticated-only lifecycle.
 	MaxSourceScopes int `json:"max_source_scopes,omitempty"`
 	// SourceScopeIdle is the minimum idle horizon before a fully replenished
 	// source scope may be evicted.
@@ -894,7 +896,7 @@ func (c *Config) Validate() error {
 			{"policy_audit_retention", c.Authority.Maintenance.PolicyAuditRetention.D()}, {"membership_retention", c.Authority.Maintenance.MembershipRetention.D()},
 			{"adaptive_retention", c.Authority.Maintenance.AdaptiveRetention.D()}, {"evidence_guard_retention", c.Authority.Maintenance.EvidenceGuardRetention.D()},
 			{"lane_operator_audit_retention", c.Authority.Maintenance.LaneOperatorAuditRetention.D()}, {"policy_node_state_retention", c.Authority.Maintenance.PolicyNodeStateRetention.D()},
-			{"cluster_crypto_ack_retention", c.Authority.Maintenance.ClusterCryptoAckRetention.D()},
+			{"cluster_crypto_ack_retention", c.Authority.Maintenance.ClusterCryptoAckRetention.D()}, {"source_alias_retention", c.Authority.Maintenance.SourceAliasRetention.D()},
 		}
 		for _, retention := range retentions {
 			if retention.value < 0 {

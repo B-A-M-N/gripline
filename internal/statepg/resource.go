@@ -306,7 +306,6 @@ func (s *Store) resolveResourceScope(ctx context.Context, tx pgx.Tx, sp resource
 // source. SKIP LOCKED lets several nodes look for reclamation without
 // waiting on the same old candidate.
 func (s *Store) evictIdleSourceScopes(ctx context.Context, tx pgx.Tx, now time.Time) error {
-	cutoff := now.Add(-s.sourceScopeIdle)
 	for {
 		var count int
 		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_resource_source_scopes`).Scan(&count); err != nil {
@@ -315,32 +314,14 @@ func (s *Store) evictIdleSourceScopes(ctx context.Context, tx pgx.Tx, now time.T
 		if count < s.maxSourceScopes {
 			return nil
 		}
-		var scopeID string
-		err := tx.QueryRow(ctx, `SELECT ss.scope_id
-			FROM gripline_resource_source_scopes ss
-			WHERE ss.last_used_at <= $1
-			  AND ss.scope_id NOT LIKE '__source_overflow_%'
-			  AND NOT EXISTS (
-				SELECT 1 FROM gripline_resource_holds h
-				JOIN gripline_resource_leases l ON l.lease_id=h.lease_id
-				WHERE h.scope=$2 AND h.scope_id=ss.scope_id AND l.state <> $3
-			  )
-			  AND NOT EXISTS (
-				SELECT 1 FROM gripline_resource_buckets b
-				WHERE b.scope=$2 AND b.scope_id=ss.scope_id
-				  AND (b.concurrency_used <> 0 OR
-					b.available + CASE WHEN b.refill_per > 0 AND b.refill_in_ns > 0
-						THEN b.refill_per * EXTRACT(EPOCH FROM ($4 - b.updated_at)) * 1000000000.0 / b.refill_in_ns
-						ELSE 0 END < b.capacity - 1e-9)
-			  )
-			ORDER BY ss.last_used_at, ss.scope_id
-			FOR UPDATE SKIP LOCKED LIMIT 1`, cutoff, resource.ScopeSource, leaseReleased, now).Scan(&scopeID)
-		if errors.Is(err, pgx.ErrNoRows) {
+		scopeIDs, err := s.safeIdleSourceScopeIDs(ctx, tx, now, 1)
+		if err != nil {
+			return err
+		}
+		if len(scopeIDs) == 0 {
 			return nil
 		}
-		if err != nil {
-			return mapDBError(err)
-		}
+		scopeID := scopeIDs[0]
 		if _, err := tx.Exec(ctx, `DELETE FROM gripline_resource_buckets WHERE scope=$1 AND scope_id=$2`, resource.ScopeSource, scopeID); err != nil {
 			return mapDBError(err)
 		}
@@ -348,6 +329,51 @@ func (s *Store) evictIdleSourceScopes(ctx context.Context, tx pgx.Tx, now time.T
 			return mapDBError(err)
 		}
 	}
+}
+
+// safeIdleSourceScopeIDs selects source scopes whose state can be discarded
+// without releasing an active hold or restoring partially spent quota. The
+// same predicate is used by admission-time saturation eviction and periodic
+// maintenance so the latter cannot reclaim a scope the former would preserve.
+func (s *Store) safeIdleSourceScopeIDs(ctx context.Context, tx pgx.Tx, now time.Time, limit int) ([]string, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	rows, err := tx.Query(ctx, `SELECT ss.scope_id
+		FROM gripline_resource_source_scopes ss
+		WHERE ss.last_used_at <= $1
+		  AND ss.scope_id NOT LIKE '__source_overflow_%'
+		  AND NOT EXISTS (
+			SELECT 1 FROM gripline_resource_holds h
+			JOIN gripline_resource_leases l ON l.lease_id=h.lease_id
+			WHERE h.scope=$2 AND h.scope_id=ss.scope_id AND l.state <> $3
+		  )
+		  AND NOT EXISTS (
+			SELECT 1 FROM gripline_resource_buckets b
+			WHERE b.scope=$2 AND b.scope_id=ss.scope_id
+			  AND (b.concurrency_used <> 0 OR
+				b.available + CASE WHEN b.refill_per > 0 AND b.refill_in_ns > 0
+					THEN b.refill_per * EXTRACT(EPOCH FROM ($4 - b.updated_at)) * 1000000000.0 / b.refill_in_ns
+					ELSE 0 END < b.capacity - 1e-9)
+		  )
+		ORDER BY ss.last_used_at, ss.scope_id
+		LIMIT $5 FOR UPDATE SKIP LOCKED`, now.Add(-s.sourceScopeIdle), resource.ScopeSource, leaseReleased, now, limit)
+	if err != nil {
+		return nil, mapDBError(err)
+	}
+	defer rows.Close()
+	ids := make([]string, 0, limit)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, mapDBError(err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, mapDBError(err)
+	}
+	return ids, nil
 }
 
 type resourceBucketRow struct {
@@ -1009,8 +1035,8 @@ func (s *Store) StatsContext(ctx context.Context) (resource.ResourceStats, error
 		(SELECT COUNT(*) FROM gripline_resource_leases WHERE state = $5),
 		(SELECT COUNT(*) FROM gripline_resource_holds h JOIN gripline_resource_leases l ON l.lease_id=h.lease_id WHERE l.state <> $5),
 		(SELECT COUNT(*) FROM gripline_resource_source_scopes),
-		(SELECT COUNT(*) FROM gripline_resource_source_scopes WHERE scope_id LIKE '__source_overflow_%')`,
-		resource.DimConcurrency, leaseReleased, leaseForwarded, leaseSettled, leaseReleased).Scan(
+		(SELECT COUNT(DISTINCT scope_id) FROM gripline_resource_buckets WHERE scope=$6 AND scope_id LIKE '__source_overflow_%')`,
+		resource.DimConcurrency, leaseReleased, leaseForwarded, leaseSettled, leaseReleased, resource.ScopeSource).Scan(
 		&activeConcurrency, &activeLeases, &forwardedLeases, &settledLeases,
 		&releasedLeases, &activeHolds, &sourceScopes, &sourceOverflows)
 	if err != nil {

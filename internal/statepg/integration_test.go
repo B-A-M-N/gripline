@@ -1998,16 +1998,345 @@ func TestPostgresSourceAliasResolutionReadMostly(t *testing.T) {
 	if after != before {
 		t.Fatalf("conflict rows changed from %d to %d", before, after)
 	}
-	var attempts, registrations, conflicts, failures int64
+	var attempts, registrations, conflicts, failures, touchBatches int64
 	for _, store := range stores {
 		metrics := store.Metrics()
 		attempts += metrics.SourceAliasAttempts
 		registrations += metrics.SourceAliasRegistrations
 		conflicts += metrics.SourceAliasConflicts
 		failures += metrics.SourceAliasFailures
+		touchBatches += metrics.SourceAliasTouchBatches
 	}
-	if attempts < 70 || registrations == 0 || conflicts == 0 || failures == 0 {
-		t.Fatalf("source alias metrics are incomplete: attempts=%d registrations=%d conflicts=%d failures=%d", attempts, registrations, conflicts, failures)
+	if attempts < 70 || registrations == 0 || conflicts == 0 || failures == 0 || touchBatches == 0 {
+		t.Fatalf("source alias metrics are incomplete: attempts=%d registrations=%d conflicts=%d failures=%d touch_batches=%d", attempts, registrations, conflicts, failures, touchBatches)
+	}
+}
+
+func TestPostgresSourceAliasBindingConcurrentFirstWriters(t *testing.T) {
+	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("GRIPLINE_TEST_POSTGRES_DSN is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	resetIntegrationAuthority(t, ctx, dsn)
+	prefix := fmt.Sprintf("source-alias-first-writer-%d", time.Now().UnixNano())
+	stores := []*Store{
+		openSourceAliasIntegrationStore(t, ctx, dsn, prefix+"-a"),
+		openSourceAliasIntegrationStore(t, ctx, dsn, prefix+"-b"),
+		openSourceAliasIntegrationStore(t, ctx, dsn, prefix+"-c"),
+	}
+	for _, store := range stores {
+		defer store.Close()
+	}
+
+	const attempts = 32
+	start := make(chan struct{})
+	results := make(chan string, attempts)
+	errorsCh := make(chan error, attempts)
+	var group sync.WaitGroup
+	for i := 0; i < attempts; i++ {
+		store := stores[i%len(stores)]
+		v1 := SourcePseudonymAlias{Alias: fmt.Sprintf("%s-%02d-v1", prefix, i), Generation: 1}
+		v2 := SourcePseudonymAlias{Alias: fmt.Sprintf("%s-%02d-v2", prefix, i), Generation: 2}
+		group.Add(1)
+		go func(store *Store, v1, v2 SourcePseudonymAlias) {
+			defer group.Done()
+			<-start
+			canonical, err := store.BindAuthenticatedSource(ctx, []SourcePseudonymAlias{v1, v2}, v2)
+			if err != nil {
+				errorsCh <- err
+				return
+			}
+			results <- canonical
+		}(store, v1, v2)
+	}
+	close(start)
+	group.Wait()
+	close(results)
+	close(errorsCh)
+	for err := range errorsCh {
+		t.Fatalf("concurrent authenticated source binding: %v", err)
+	}
+	for canonical := range results {
+		if canonical == "" {
+			t.Fatal("concurrent authenticated source binding returned an empty canonical identity")
+		}
+	}
+
+	var aliases, canonicalIDs int
+	if err := stores[0].pool.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_source_aliases WHERE alias LIKE $1`, prefix+"-%").Scan(&aliases); err != nil {
+		t.Fatalf("count concurrently bound aliases: %v", err)
+	}
+	if err := stores[0].pool.QueryRow(ctx, `SELECT COUNT(DISTINCT canonical_source_id) FROM gripline_source_aliases WHERE alias LIKE $1`, prefix+"-%").Scan(&canonicalIDs); err != nil {
+		t.Fatalf("count concurrently bound canonical identities: %v", err)
+	}
+	if aliases != attempts*2 || canonicalIDs != attempts {
+		t.Fatalf("concurrent source binding aliases=%d canonical_ids=%d, want %d/%d", aliases, canonicalIDs, attempts*2, attempts)
+	}
+}
+
+func TestPostgresSourceAliasMissesAreReadOnly(t *testing.T) {
+	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("GRIPLINE_TEST_POSTGRES_DSN is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	resetIntegrationAuthority(t, ctx, dsn)
+	store := openSourceAliasIntegrationStore(t, ctx, dsn, "source-alias-read-only")
+	defer store.Close()
+
+	const requests = 10000
+	const workers = 32
+	results := make(chan error, workers)
+	var group sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		group.Add(1)
+		go func(worker int) {
+			defer group.Done()
+			for i := worker; i < requests; i += workers {
+				active := SourcePseudonymAlias{Alias: fmt.Sprintf("read-only-miss-%d", i), Generation: 2}
+				got, err := store.ResolveSourceAliases(ctx, nil, active)
+				if err != nil {
+					results <- err
+					return
+				}
+				if got != active.Alias {
+					results <- fmt.Errorf("miss resolved to %q, want provisional %q", got, active.Alias)
+					return
+				}
+			}
+			results <- nil
+		}(worker)
+	}
+	group.Wait()
+	close(results)
+	for err := range results {
+		if err != nil {
+			t.Fatalf("read-only source alias miss: %v", err)
+		}
+	}
+
+	var rows int
+	if err := store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_source_aliases WHERE alias LIKE 'read-only-miss-%'`).Scan(&rows); err != nil {
+		t.Fatalf("count read-only source alias misses: %v", err)
+	}
+	if rows != 0 {
+		t.Fatalf("read-only source alias misses created %d durable rows", rows)
+	}
+	old := time.Now().UTC().Add(-2 * time.Hour)
+	if _, err := store.pool.Exec(ctx, `INSERT INTO gripline_source_aliases
+		(canonical_source_id, alias, generation, created_at, last_seen_at)
+		VALUES ('read-only-established', 'read-only-established-v2', 2, $1, $1)`, old); err != nil {
+		t.Fatalf("seed established read-only source alias: %v", err)
+	}
+	got, err := store.ResolveSourceAliases(ctx, nil, SourcePseudonymAlias{Alias: "read-only-established-v2", Generation: 2})
+	if err != nil || got != "read-only-established" {
+		t.Fatalf("established read-only source alias resolved to %q with error %v", got, err)
+	}
+	var untouched bool
+	if err := store.pool.QueryRow(ctx, `SELECT last_seen_at < CURRENT_TIMESTAMP - INTERVAL '30 seconds' FROM gripline_source_aliases WHERE alias='read-only-established-v2'`).Scan(&untouched); err != nil {
+		t.Fatalf("check established read-only source alias recency: %v", err)
+	}
+	if !untouched {
+		t.Fatal("pre-auth source alias lookup updated durable recency metadata")
+	}
+}
+
+func TestPostgresSourceAliasMaintenanceRespectsReferences(t *testing.T) {
+	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("GRIPLINE_TEST_POSTGRES_DSN is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resetIntegrationAuthority(t, ctx, dsn)
+	retention := time.Hour
+	store, err := Open(ctx, Options{
+		DSN: dsn, NodeID: "source-alias-maintenance", LeaseTTL: 10 * time.Second,
+		RenewEvery: 2 * time.Second, OperationTimeout: 10 * time.Second,
+		SourceScopeIdle: retention,
+		Maintenance: MaintenanceOptions{
+			Interval: time.Hour, BatchSize: 16, SourceAliasRetention: retention,
+		},
+	})
+	if err != nil {
+		t.Fatalf("open source alias maintenance authority: %v", err)
+	}
+	defer store.Close()
+
+	old := time.Now().UTC().Add(-2 * time.Hour)
+	if _, err := store.pool.Exec(ctx, `INSERT INTO gripline_source_aliases
+		(canonical_source_id, alias, generation, created_at, last_seen_at)
+		VALUES ('source-unreferenced', 'source-unreferenced-v1', 1, $1, $1),
+		       ('source-referenced', 'source-referenced-v1', 1, $1, $1)`, old); err != nil {
+		t.Fatalf("seed source aliases: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO gripline_resource_source_scopes (scope_id, last_used_at)
+		VALUES ('source-scope-idle', $1)`, old); err != nil {
+		t.Fatalf("seed idle source scope: %v", err)
+	}
+	activeEvidence := evidence.Evidence{
+		EvidenceID: "source-reference-evidence", Code: "SOURCE_REFERENCE", Family: evidence.FamilySourceDiscontinuity,
+		Scope: evidence.ScopeSource, SubjectID: "source-referenced", Score: 1, Confidence: 50,
+		CreatedAt: old, ExpiresAt: time.Now().UTC().Add(time.Hour),
+	}
+	raw, err := json.Marshal(activeEvidence)
+	if err != nil {
+		t.Fatalf("marshal source reference evidence: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO gripline_evidence
+		(scope, subject_id, evidence_id, expires_at, item) VALUES ($1,$2,$3,$4,$5)`,
+		activeEvidence.Scope.String(), activeEvidence.SubjectID, activeEvidence.EvidenceID,
+		zeroTime(activeEvidence.ExpiresAt), raw); err != nil {
+		t.Fatalf("seed source reference evidence: %v", err)
+	}
+
+	stats, err := store.RunMaintenance(ctx)
+	if err != nil {
+		t.Fatalf("run source alias maintenance: %v", err)
+	}
+	if stats.SourceAliasesDeleted != 1 || stats.ResourceSourceScopesDeleted != 1 {
+		t.Fatalf("source maintenance stats=%+v, want one alias and one source scope deleted", stats)
+	}
+	var unreferenced, referenced, scopes int
+	if err := store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_source_aliases WHERE alias='source-unreferenced-v1'`).Scan(&unreferenced); err != nil {
+		t.Fatalf("count unreferenced source alias: %v", err)
+	}
+	if err := store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_source_aliases WHERE alias='source-referenced-v1'`).Scan(&referenced); err != nil {
+		t.Fatalf("count referenced source alias: %v", err)
+	}
+	if err := store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_resource_source_scopes WHERE scope_id='source-scope-idle'`).Scan(&scopes); err != nil {
+		t.Fatalf("count idle source scope: %v", err)
+	}
+	if unreferenced != 0 || referenced != 1 || scopes != 0 {
+		t.Fatalf("source cleanup counts unreferenced=%d referenced=%d scopes=%d, want 0/1/0", unreferenced, referenced, scopes)
+	}
+}
+
+func TestPostgresPseudonymRetirementIgnoresDormantAliasesButBlocksLiveState(t *testing.T) {
+	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("GRIPLINE_TEST_POSTGRES_DSN is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resetIntegrationAuthority(t, ctx, dsn)
+	store := openIntegrationStore(t, ctx, dsn, "pseudonym-retirement-aliases")
+	defer store.Close()
+	if _, err := store.pool.Exec(ctx, `INSERT INTO gripline_cluster_crypto
+		(singleton, signer_active_kid, signer_fingerprint, signer_active_fingerprint,
+		 pepper_active_version, pepper_fingerprint, pepper_active_fingerprint,
+		 pseudonym_version, pseudonym_fingerprint, pseudonym_active_fingerprint,
+		 generation_epoch, updated_at)
+		VALUES (TRUE, 1, 'signer-1', 'signer-1', 1, 'pepper-1', 'pepper-1',
+		 2, 'pseudonym-2', 'pseudonym-2', 1, CURRENT_TIMESTAMP)`); err != nil {
+		t.Fatalf("seed crypto identity: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO gripline_cluster_crypto_generations
+		(kind, generation, fingerprint, state, updated_at)
+		VALUES ('pseudonym', 1, 'pseudonym-1', 'loaded', CURRENT_TIMESTAMP),
+		       ('pseudonym', 2, 'pseudonym-2', 'active', CURRENT_TIMESTAMP)`); err != nil {
+		t.Fatalf("seed pseudonym generations: %v", err)
+	}
+	old := time.Now().UTC().Add(-2 * time.Hour)
+	if _, err := store.pool.Exec(ctx, `INSERT INTO gripline_source_aliases
+		(canonical_source_id, alias, generation, created_at, last_seen_at)
+		VALUES ('dormant-source', 'dormant-source-v1', 1, $1, $1),
+		       ('live-source', 'live-source-v1', 1, $1, $1)`, old); err != nil {
+		t.Fatalf("seed pseudonym aliases: %v", err)
+	}
+	activeEvidence := evidence.Evidence{
+		EvidenceID: "live-source-evidence", Code: "LIVE_SOURCE_REFERENCE", Family: evidence.FamilySourceDiscontinuity,
+		Scope: evidence.ScopeSource, SubjectID: "live-source", Score: 1, Confidence: 50,
+		CreatedAt: old, ExpiresAt: time.Now().UTC().Add(time.Hour),
+	}
+	raw, err := json.Marshal(activeEvidence)
+	if err != nil {
+		t.Fatalf("marshal live source evidence: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO gripline_evidence
+		(scope, subject_id, evidence_id, expires_at, item) VALUES ($1,$2,$3,$4,$5)`,
+		activeEvidence.Scope.String(), activeEvidence.SubjectID, activeEvidence.EvidenceID,
+		zeroTime(activeEvidence.ExpiresAt), raw); err != nil {
+		t.Fatalf("seed live source evidence: %v", err)
+	}
+	store.maintenance.SourceAliasRetention = time.Hour
+	cleanup, err := store.RunMaintenance(ctx)
+	if err != nil {
+		t.Fatalf("cleanup dormant old-generation alias: %v", err)
+	}
+	if cleanup.SourceAliasesDeleted != 1 {
+		t.Fatalf("dormant alias cleanup stats=%+v, want one alias deleted", cleanup)
+	}
+	var dormant, live int
+	if err := store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_source_aliases WHERE alias='dormant-source-v1'`).Scan(&dormant); err != nil {
+		t.Fatalf("count dormant old-generation alias: %v", err)
+	}
+	if err := store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_source_aliases WHERE alias='live-source-v1'`).Scan(&live); err != nil {
+		t.Fatalf("count live old-generation alias: %v", err)
+	}
+	if dormant != 0 || live != 1 {
+		t.Fatalf("alias cleanup counts dormant=%d live=%d, want 0/1", dormant, live)
+	}
+	store.cryptoReady.Store(true)
+	retireRequest := CryptoRetirementRequest{
+		Kind: CryptoKindPseudonym, Generation: 1, Fingerprint: "pseudonym-1",
+		NotBefore: time.Now().Add(-time.Second), OperationID: "retire-live-source-blocked",
+		Actor: "integration-test", Reason: "verify live source safety",
+	}
+	blocked, err := store.RetireCryptoGeneration(ctx, retireRequest)
+	if err == nil {
+		t.Fatalf("retirement with live old-generation source state succeeded: %+v", blocked)
+	}
+	var blockedErr CryptoRetirementBlockedError
+	if !errors.As(err, &blockedErr) || blockedErr.References != 1 {
+		t.Fatalf("retirement with live old-generation source state error=%v, want one blocked reference", err)
+	}
+
+	if _, err := store.pool.Exec(ctx, `INSERT INTO gripline_source_aliases
+		(canonical_source_id, alias, generation, created_at, last_seen_at)
+		VALUES ('live-source', 'live-source-v2', 2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`); err != nil {
+		t.Fatalf("seed retained pseudonym alias: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE gripline_source_aliases SET last_seen_at=CURRENT_TIMESTAMP WHERE alias='live-source-v1'`); err != nil {
+		t.Fatalf("refresh old-generation alias before retirement cleanup: %v", err)
+	}
+	store.cryptoReady.Store(true)
+	retireRequest.OperationID = "retire-dormant-source-ok"
+	retireRequest.Reason = "verify dormant source safety"
+	if _, err := store.RetireCryptoGeneration(ctx, retireRequest); err != nil {
+		t.Fatalf("retirement with retained generation and dormant alias: %v", err)
+	}
+	if _, err := store.RetireCryptoGeneration(ctx, retireRequest); err != nil {
+		t.Fatalf("exact repeated pseudonym retirement operation: %v", err)
+	}
+	conflict := retireRequest
+	conflict.Reason = "conflicting repeated retirement"
+	if _, err := store.RetireCryptoGeneration(ctx, conflict); !errors.Is(err, control.ErrOperationConflict) {
+		t.Fatalf("conflicting pseudonym retirement retry error=%v, want operation conflict", err)
+	}
+	postRetirementCleanup, err := store.RunMaintenance(ctx)
+	if err != nil {
+		t.Fatalf("cleanup retired old-generation alias: %v", err)
+	}
+	if postRetirementCleanup.SourceAliasesDeleted != 1 {
+		t.Fatalf("post-retirement alias cleanup stats=%+v, want one alias deleted", postRetirementCleanup)
+	}
+	if err := store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_source_aliases WHERE alias='live-source-v1'`).Scan(&live); err != nil {
+		t.Fatalf("count retired old-generation alias: %v", err)
+	}
+	if live != 0 {
+		t.Fatalf("retired old-generation alias remains after retained alias cleanup: %d", live)
+	}
+	var state string
+	if err := store.pool.QueryRow(ctx, `SELECT state FROM gripline_cluster_crypto_generations
+		WHERE kind='pseudonym' AND generation=1`).Scan(&state); err != nil {
+		t.Fatalf("read retired pseudonym generation: %v", err)
+	}
+	if state != "retired" {
+		t.Fatalf("pseudonym generation state=%q, want retired", state)
 	}
 }
 

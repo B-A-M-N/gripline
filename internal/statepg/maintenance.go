@@ -5,6 +5,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/B-A-M-N/gripline/internal/resource"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -32,6 +33,7 @@ type MaintenanceOptions struct {
 	LaneOperatorAuditRetention  time.Duration
 	PolicyNodeStateRetention    time.Duration
 	ClusterCryptoAckRetention   time.Duration
+	SourceAliasRetention        time.Duration
 }
 
 const (
@@ -53,6 +55,7 @@ const (
 	defaultLaneOperatorAuditRetention  = 365 * 24 * time.Hour
 	defaultPolicyNodeStateRetention    = 24 * time.Hour
 	defaultClusterCryptoAckRetention   = 24 * time.Hour
+	defaultSourceAliasRetention        = 7 * 24 * time.Hour
 )
 
 func (o MaintenanceOptions) withDefaults() MaintenanceOptions {
@@ -122,30 +125,35 @@ func (o MaintenanceOptions) withDefaults() MaintenanceOptions {
 	if o.ClusterCryptoAckRetention <= 0 {
 		o.ClusterCryptoAckRetention = defaultClusterCryptoAckRetention
 	}
+	if o.SourceAliasRetention <= 0 {
+		o.SourceAliasRetention = defaultSourceAliasRetention
+	}
 	return o
 }
 
 // MaintenanceStats reports only aggregate row counts. It is safe to expose as
 // low-cardinality health telemetry and contains no subject identifiers.
 type MaintenanceStats struct {
-	EvidenceDeleted            int
-	EvidenceGuardsDeleted      int
-	ReleasedLeasesDeleted      int
-	CredentialReceiptsDeleted  int
-	ControlOperationsDeleted   int
-	AdmissionAuditDeleted      int
-	SecurityTransitionsDeleted int
-	OperatorAuditDeleted       int
-	PolicyAuditDeleted         int
-	MembershipDeleted          int
-	AdaptiveRowsDeleted        int
-	LaneOperatorAuditDeleted   int
-	PolicyNodeStateDeleted     int
-	ClusterCryptoAcksDeleted   int
-	RowsDeleted                int
-	Batches                    int
-	BacklogEstimate            int
-	Duration                   time.Duration
+	EvidenceDeleted             int
+	EvidenceGuardsDeleted       int
+	ReleasedLeasesDeleted       int
+	CredentialReceiptsDeleted   int
+	ControlOperationsDeleted    int
+	AdmissionAuditDeleted       int
+	SecurityTransitionsDeleted  int
+	OperatorAuditDeleted        int
+	PolicyAuditDeleted          int
+	MembershipDeleted           int
+	AdaptiveRowsDeleted         int
+	LaneOperatorAuditDeleted    int
+	PolicyNodeStateDeleted      int
+	ClusterCryptoAcksDeleted    int
+	SourceAliasesDeleted        int
+	ResourceSourceScopesDeleted int
+	RowsDeleted                 int
+	Batches                     int
+	BacklogEstimate             int
+	Duration                    time.Duration
 }
 
 func (s MaintenanceStats) rowsDeleted() int {
@@ -153,7 +161,8 @@ func (s MaintenanceStats) rowsDeleted() int {
 		s.CredentialReceiptsDeleted + s.ControlOperationsDeleted + s.AdmissionAuditDeleted +
 		s.SecurityTransitionsDeleted + s.OperatorAuditDeleted + s.PolicyAuditDeleted +
 		s.MembershipDeleted + s.AdaptiveRowsDeleted + s.LaneOperatorAuditDeleted +
-		s.PolicyNodeStateDeleted + s.ClusterCryptoAcksDeleted
+		s.PolicyNodeStateDeleted + s.ClusterCryptoAcksDeleted + s.SourceAliasesDeleted +
+		s.ResourceSourceScopesDeleted
 }
 
 func (s *MaintenanceStats) add(other MaintenanceStats) {
@@ -171,6 +180,8 @@ func (s *MaintenanceStats) add(other MaintenanceStats) {
 	s.LaneOperatorAuditDeleted += other.LaneOperatorAuditDeleted
 	s.PolicyNodeStateDeleted += other.PolicyNodeStateDeleted
 	s.ClusterCryptoAcksDeleted += other.ClusterCryptoAcksDeleted
+	s.SourceAliasesDeleted += other.SourceAliasesDeleted
+	s.ResourceSourceScopesDeleted += other.ResourceSourceScopesDeleted
 	s.RowsDeleted += other.RowsDeleted
 	s.Batches += other.Batches
 	if other.BacklogEstimate > s.BacklogEstimate {
@@ -386,7 +397,96 @@ func (s *Store) runMaintenanceBatch(ctx context.Context) (stats MaintenanceStats
 	if stats.AdaptiveRowsDeleted, err = s.maintainAdaptive(ctx); err != nil {
 		return stats, err
 	}
+	if stats.ResourceSourceScopesDeleted, err = s.maintainSourceScopes(ctx); err != nil {
+		return stats, err
+	}
+	if stats.SourceAliasesDeleted, err = s.maintainSourceAliases(ctx); err != nil {
+		return stats, err
+	}
 	return stats, nil
+}
+
+func (s *Store) maintainSourceAliases(ctx context.Context) (int, error) {
+	batchSize := maintenanceBatchSize(ctx, s.maintenance.BatchSize)
+	if batchSize <= 0 {
+		return 0, nil
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return 0, mapDBError(err)
+	}
+	defer tx.Rollback(ctx)
+	now, err := dbNow(ctx, tx)
+	if err != nil {
+		return 0, err
+	}
+	query := `WITH doomed AS (
+		SELECT a.alias
+		FROM gripline_source_aliases a
+		WHERE (
+			(
+				a.last_seen_at < $1
+				AND NOT ` + sourceIdentityReferencePredicate("a.canonical_source_id") + `
+			)
+			OR (
+				EXISTS (SELECT 1 FROM gripline_cluster_crypto_generations g
+					WHERE g.kind='pseudonym' AND g.generation=a.generation AND g.state='retired')
+				AND EXISTS (SELECT 1 FROM gripline_source_aliases retained
+					WHERE retained.canonical_source_id=a.canonical_source_id
+					  AND retained.generation<>a.generation)
+			)
+		)
+		ORDER BY a.last_seen_at, a.alias
+		LIMIT $2 FOR UPDATE SKIP LOCKED
+	)
+	DELETE FROM gripline_source_aliases a USING doomed d WHERE a.alias=d.alias`
+	tag, err := tx.Exec(ctx, query, now.Add(-s.maintenance.SourceAliasRetention), batchSize)
+	if err != nil {
+		return 0, mapDBError(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, mapDBError(err)
+	}
+	recordMaintenanceBatch(ctx, int(tag.RowsAffected()))
+	return int(tag.RowsAffected()), nil
+}
+
+func (s *Store) maintainSourceScopes(ctx context.Context) (int, error) {
+	batchSize := maintenanceBatchSize(ctx, s.maintenance.BatchSize)
+	if batchSize <= 0 {
+		return 0, nil
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return 0, mapDBError(err)
+	}
+	defer tx.Rollback(ctx)
+	now, err := dbNow(ctx, tx)
+	if err != nil {
+		return 0, err
+	}
+	ids, err := s.safeIdleSourceScopeIDs(ctx, tx, now, batchSize)
+	if err != nil {
+		return 0, err
+	}
+	if len(ids) == 0 {
+		if err := tx.Commit(ctx); err != nil {
+			return 0, mapDBError(err)
+		}
+		return 0, nil
+	}
+	result, err := tx.Exec(ctx, `DELETE FROM gripline_resource_buckets WHERE scope=$1 AND scope_id=ANY($2::text[])`, resource.ScopeSource, ids)
+	if err != nil {
+		return 0, mapDBError(err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM gripline_resource_source_scopes WHERE scope_id=ANY($1::text[])`, ids); err != nil {
+		return 0, mapDBError(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, mapDBError(err)
+	}
+	recordMaintenanceBatch(ctx, len(ids)+int(result.RowsAffected()))
+	return len(ids), nil
 }
 
 func (s *Store) maintainCutoff(ctx context.Context, retention time.Duration, query string) (int, error) {

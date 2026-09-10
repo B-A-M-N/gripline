@@ -35,6 +35,10 @@ duration_text="5m"
 workers="${GRIPLINE_CLUSTER_SOAK_WORKERS:-24}"
 load_mode="${GRIPLINE_CLUSTER_SOAK_LOAD_MODE:-security}"
 handoff_timeout="${GRIPLINE_SOAK_HANDOFF_TIMEOUT:-600}"
+active_lease_bound="${GRIPLINE_SOAK_MAX_ACTIVE_LEASES:-5}"
+if [[ "${GRIPLINE_CLUSTER_HARNESS_SOURCE_CHURN:-0}" == "1" ]]; then
+	active_lease_bound=$((active_lease_bound + ${GRIPLINE_CLUSTER_HARNESS_AUTHENTICATED_SOURCES:-16}))
+fi
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 		--duration) duration_text=${2:?--duration requires a value}; shift 2 ;;
@@ -166,7 +170,7 @@ monitor() {
 				maintenance_backlog="${maintenance_backlog:-0}"
 				maintenance_duration="${maintenance_duration:-0}"
 				maintenance_errors="${maintenance_errors:-0}"
-				if (( scopes > 4096 || active > 5 )); then echo "resource-bounds-${node}" >"$monitor_failure"; return 1; fi
+				if (( scopes > 4096 || active > active_lease_bound )); then echo "resource-bounds-${node}" >"$monitor_failure"; return 1; fi
 				printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$node" "$rss" "$goroutines" "$heap" "$heap_objects" "$scopes" "$active" >>"$snapshot_file"
 				printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$node" "$maintenance_runs" "$maintenance_deleted" "$maintenance_backlog" "$maintenance_duration" "$maintenance_errors" >>"$maintenance_metrics_file"
 			done
@@ -180,7 +184,7 @@ monitor() {
 			if [[ "$external_maintenance_enabled" == 1 ]] && (( now >= last_maintenance + external_maintenance_interval )) && [[ ! -f "$promotion_file" ]]; then
 				before="$rows"
 				maintenance_start="$now"
-				maintenance_json="$($maintenance_bin -dsn "$dsn" -batch-size 256 -history-retention "${GRIPLINE_SOAK_RETENTION_WINDOW:-1m}" 2>/dev/null)" || { echo maintenance-failed >"$monitor_failure"; return 1; }
+				maintenance_json="$($maintenance_bin -dsn "$dsn" -batch-size 256 -history-retention "${GRIPLINE_SOAK_RETENTION_WINDOW:-1m}" -source-alias-retention "${GRIPLINE_SOAK_SOURCE_ALIAS_RETENTION:-${GRIPLINE_SOAK_RETENTION_WINDOW:-1m}}" 2>/dev/null)" || { echo maintenance-failed >"$monitor_failure"; return 1; }
 				"${compose[@]}" exec -T primary psql -U gripline -d gripline -X -v ON_ERROR_STOP=1 -c 'VACUUM (ANALYZE)' >/dev/null 2>&1 || { echo vacuum-failed >"$monitor_failure"; return 1; }
 				after="$(table_counts 2>/dev/null || true)"
 				printf '%s\t%s\t%s\t%s\t%s\n' "$now" "$(( $(date +%s) - maintenance_start ))" "$before" "$after" "$maintenance_json" >>"$maintenance_file"
@@ -210,7 +214,7 @@ wait_replica_caught_up() {
 }
 monitor &
 monitor_pid=$!
-GRIPLINE_LOG_READINESS_FAILURES=1 GRIPLINE_CLUSTER_HARNESS_COMPRESSED_RETENTION=1 GRIPLINE_CLUSTER_HARNESS_MAINTENANCE_INTERVAL="${GRIPLINE_SOAK_RUNTIME_MAINTENANCE_INTERVAL:-10s}" GRIPLINE_CLUSTER_HARNESS_RETENTION_WINDOW="${GRIPLINE_SOAK_RETENTION_WINDOW:-1m}" GRIPLINE_CLUSTER_HARNESS_ARTIFACT_FILE="$harness_artifact" GRIPLINE_CLUSTER_HARNESS_PAUSE_FILE="$pause_file" GRIPLINE_CLUSTER_HARNESS_RELEASE_FILE="$release_file" GRIPLINE_CLUSTER_HARNESS_OUTAGE_MARKER_FILE="$outage_marker" GRIPLINE_CLUSTER_WRITER_LOG="$work_dir/pg-writer.log" GRIPLINE_CLUSTER_HARNESS_KEEP="${GRIPLINE_QUALIFICATION_KEEP:-0}" GRIPLINE_TEST_POSTGRES_DSN="$dsn" GRIPLINE_TEST_POSTGRES_CONTAINER="${project}-primary-1" GRIPLINE_CLUSTER_HARNESS_REQUIRE_DB_OUTAGE=1 GRIPLINE_CLUSTER_HARNESS_LOAD_MODE="$load_mode" GRIPLINE_CLUSTER_HARNESS_LOAD_SECONDS="$duration" GRIPLINE_CLUSTER_HARNESS_LOAD_WORKERS="$workers" bash "$repo_dir/scripts/cluster-harness.sh" >"$work_dir/harness.log" 2>&1 &
+GRIPLINE_LOG_READINESS_FAILURES=1 GRIPLINE_CLUSTER_HARNESS_COMPRESSED_RETENTION=1 GRIPLINE_CLUSTER_HARNESS_MAINTENANCE_INTERVAL="${GRIPLINE_SOAK_RUNTIME_MAINTENANCE_INTERVAL:-10s}" GRIPLINE_CLUSTER_HARNESS_RETENTION_WINDOW="${GRIPLINE_SOAK_RETENTION_WINDOW:-1m}" GRIPLINE_CLUSTER_HARNESS_SOURCE_ALIAS_RETENTION="${GRIPLINE_SOAK_SOURCE_ALIAS_RETENTION:-${GRIPLINE_SOAK_RETENTION_WINDOW:-1m}}" GRIPLINE_CLUSTER_HARNESS_SOURCE_CHURN="${GRIPLINE_CLUSTER_HARNESS_SOURCE_CHURN:-0}" GRIPLINE_CLUSTER_HARNESS_INVALID_SOURCES="${GRIPLINE_CLUSTER_HARNESS_INVALID_SOURCES:-10000}" GRIPLINE_CLUSTER_HARNESS_AUTHENTICATED_SOURCES="${GRIPLINE_CLUSTER_HARNESS_AUTHENTICATED_SOURCES:-16}" GRIPLINE_CLUSTER_HARNESS_SOURCE_SCOPE_LIMIT="${GRIPLINE_CLUSTER_HARNESS_SOURCE_SCOPE_LIMIT:-4096}" GRIPLINE_CLUSTER_HARNESS_PREAUTH_MAX_SOURCES="${GRIPLINE_CLUSTER_HARNESS_PREAUTH_MAX_SOURCES:-10000}" GRIPLINE_CLUSTER_HARNESS_ADAPTIVE_MAX_SUBJECTS="${GRIPLINE_CLUSTER_HARNESS_ADAPTIVE_MAX_SUBJECTS:-65536}" GRIPLINE_CLUSTER_HARNESS_ADAPTIVE_MAX_KEYS="${GRIPLINE_CLUSTER_HARNESS_ADAPTIVE_MAX_KEYS:-256}" GRIPLINE_CLUSTER_HARNESS_MAX_CONNS="${GRIPLINE_SOAK_MAX_CONNS:-8}" GRIPLINE_CLUSTER_HARNESS_MAINTENANCE_BIN="$maintenance_bin" GRIPLINE_CLUSTER_HARNESS_SOURCE_CHURN_EVIDENCE_FILE="${GRIPLINE_CLUSTER_HARNESS_SOURCE_CHURN_EVIDENCE_FILE:-}" GRIPLINE_CLUSTER_HARNESS_ARTIFACT_FILE="$harness_artifact" GRIPLINE_CLUSTER_HARNESS_PAUSE_FILE="$pause_file" GRIPLINE_CLUSTER_HARNESS_RELEASE_FILE="$release_file" GRIPLINE_CLUSTER_HARNESS_OUTAGE_MARKER_FILE="$outage_marker" GRIPLINE_CLUSTER_WRITER_LOG="$work_dir/pg-writer.log" GRIPLINE_CLUSTER_HARNESS_KEEP="${GRIPLINE_QUALIFICATION_KEEP:-0}" GRIPLINE_TEST_POSTGRES_DSN="$dsn" GRIPLINE_TEST_POSTGRES_CONTAINER="${project}-primary-1" GRIPLINE_CLUSTER_HARNESS_REQUIRE_DB_OUTAGE=1 GRIPLINE_CLUSTER_HARNESS_LOAD_MODE="$load_mode" GRIPLINE_CLUSTER_HARNESS_LOAD_SECONDS="$duration" GRIPLINE_CLUSTER_HARNESS_LOAD_WORKERS="$workers" bash "$repo_dir/scripts/cluster-harness.sh" >"$work_dir/harness.log" 2>&1 &
 harness_pid=$!
 for _ in $(seq 1 120); do
 	if [[ -s "$harness_artifact" ]]; then break; fi

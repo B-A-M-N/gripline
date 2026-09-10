@@ -83,15 +83,23 @@ pseudonym_two_b64="$(openssl rand -base64 32 | tr -d '\n')"
 policy_epoch_file="$harness_dir/policy-epoch"
 printf '1\n' >"$policy_epoch_file"
 maintenance_config=""
+source_alias_retention="${GRIPLINE_CLUSTER_HARNESS_SOURCE_ALIAS_RETENTION:-${GRIPLINE_CLUSTER_HARNESS_RETENTION_WINDOW:-1m}}"
 if [[ "${GRIPLINE_CLUSTER_HARNESS_COMPRESSED_RETENTION:-0}" == "1" ]]; then
 	retention_window="${GRIPLINE_CLUSTER_HARNESS_RETENTION_WINDOW:-1m}"
 	maintenance_interval="${GRIPLINE_CLUSTER_HARNESS_MAINTENANCE_INTERVAL:-1h}"
-	maintenance_config=", \"maintenance\": {\"interval\":\"${maintenance_interval}\",\"batch_size\":256,\"max_batches_per_pass\":64,\"max_rows_per_pass\":4096,\"max_runtime_per_pass\":\"5s\",\"evidence_grace\":\"0s\",\"released_lease_retention\":\"${retention_window}\",\"credential_receipt_retention\":\"${retention_window}\",\"control_operation_retention\":\"${retention_window}\",\"admission_audit_retention\":\"${retention_window}\",\"security_transition_retention\":\"${retention_window}\",\"operator_audit_retention\":\"${retention_window}\",\"policy_audit_retention\":\"${retention_window}\",\"membership_retention\":\"1h\",\"adaptive_retention\":\"1h\",\"evidence_guard_retention\":\"${retention_window}\",\"lane_operator_audit_retention\":\"${retention_window}\",\"policy_node_state_retention\":\"1h\",\"cluster_crypto_ack_retention\":\"1h\"}"
+	maintenance_config=", \"maintenance\": {\"interval\":\"${maintenance_interval}\",\"batch_size\":256,\"max_batches_per_pass\":64,\"max_rows_per_pass\":4096,\"max_runtime_per_pass\":\"5s\",\"evidence_grace\":\"0s\",\"released_lease_retention\":\"${retention_window}\",\"credential_receipt_retention\":\"${retention_window}\",\"control_operation_retention\":\"${retention_window}\",\"admission_audit_retention\":\"${retention_window}\",\"security_transition_retention\":\"${retention_window}\",\"operator_audit_retention\":\"${retention_window}\",\"policy_audit_retention\":\"${retention_window}\",\"membership_retention\":\"1h\",\"adaptive_retention\":\"1h\",\"evidence_guard_retention\":\"${retention_window}\",\"lane_operator_audit_retention\":\"${retention_window}\",\"policy_node_state_retention\":\"1h\",\"cluster_crypto_ack_retention\":\"1h\",\"source_alias_retention\":\"${source_alias_retention}\"}"
 fi
 max_conns="${GRIPLINE_CLUSTER_HARNESS_MAX_CONNS:-8}"
 operation_timeout="${GRIPLINE_CLUSTER_HARNESS_OPERATION_TIMEOUT:-2s}"
 load_timeout="${GRIPLINE_CLUSTER_HARNESS_LOAD_TIMEOUT:-10s}"
 load_user_agent="${GRIPLINE_CLUSTER_HARNESS_LOAD_USER_AGENT:-gripline-qualification-load/1}"
+backend_work_delay="${GRIPLINE_CLUSTER_HARNESS_WORK_DELAY:-2s}"
+source_churn_enabled="${GRIPLINE_CLUSTER_HARNESS_SOURCE_CHURN:-0}"
+source_scope_limit="${GRIPLINE_CLUSTER_HARNESS_SOURCE_SCOPE_LIMIT:-4096}"
+preauth_max_sources="${GRIPLINE_CLUSTER_HARNESS_PREAUTH_MAX_SOURCES:-10000}"
+maintenance_bin="${GRIPLINE_CLUSTER_HARNESS_MAINTENANCE_BIN:-}"
+source_churn_authenticated_sources=0
+source_churn_secrets=()
 ingress_extra=""
 if [[ "$load_mode" == capacity ]]; then
 	# The disposable load balancer is the only trusted proxy in this fixture.
@@ -206,6 +214,7 @@ for node in a b c; do
   "server": {
     "read_timeout": "10s", "write_timeout": "10s", "idle_timeout": "10s",
     "read_header_timeout": "5s", "stream_write_idle_timeout": "1s", "max_body_bytes": 1048576,
+    "max_source_scopes": ${source_scope_limit}, "preauth_max_sources": ${preauth_max_sources},
     "spool_dir": "${harness_dir}/spool-${node}", "spool_max_bytes": 1048576, "spool_max_files": 8
   },
   "identity": {"audience": "${audience}"},
@@ -247,7 +256,7 @@ write_artifact
 	-require-client-dns "gripline-inference.internal" \
 	-keys "$harness_dir/keys.json" \
 	-audience "$audience" \
-	-work-delay "$([[ "$load_mode" == capacity ]] && echo 10ms || echo 2s)" \
+	-work-delay "$backend_work_delay" \
 	-active "$harness_dir/backend-active" \
 	-peak "$harness_dir/backend-peak" \
 	-policy-epoch-file "$policy_epoch_file" \
@@ -365,6 +374,123 @@ provision() {
 }
 provision cluster-credential-one "$secret_one"
 provision cluster-credential-two "$secret_two"
+
+if [[ "$source_churn_enabled" == "1" ]]; then
+	if [[ "$load_mode" != capacity ]]; then
+		echo "cluster harness: source churn requires capacity load mode" >&2
+		exit 2
+	fi
+	command -v psql >/dev/null || { echo "cluster harness: psql is required for source churn" >&2; exit 2; }
+	source_churn_invalid_sources="${GRIPLINE_CLUSTER_HARNESS_INVALID_SOURCES:-10000}"
+	source_churn_authenticated_sources="${GRIPLINE_CLUSTER_HARNESS_AUTHENTICATED_SOURCES:-16}"
+	source_churn_workers="${GRIPLINE_CLUSTER_HARNESS_SOURCE_CHURN_WORKERS:-32}"
+	source_churn_adaptive_subject_bound="${GRIPLINE_CLUSTER_HARNESS_ADAPTIVE_MAX_SUBJECTS:-65536}"
+	source_churn_adaptive_key_bound="${GRIPLINE_CLUSTER_HARNESS_ADAPTIVE_MAX_KEYS:-256}"
+	if ! [[ "$source_churn_invalid_sources" =~ ^[1-9][0-9]*$ && "$source_churn_authenticated_sources" =~ ^[1-9][0-9]*$ && "$source_churn_workers" =~ ^[1-9][0-9]*$ && "$source_scope_limit" =~ ^[1-9][0-9]*$ && "$preauth_max_sources" =~ ^[1-9][0-9]*$ && "$source_churn_adaptive_subject_bound" =~ ^[1-9][0-9]*$ && "$source_churn_adaptive_key_bound" =~ ^[1-9][0-9]*$ ]]; then
+		echo "cluster harness: source churn bounds must be positive integers" >&2
+		exit 2
+	fi
+	for index in $(seq 0 $((source_churn_authenticated_sources - 1))); do
+		source_churn_secret="source-churn-secret-${index}-0123456789"
+		provision "source-churn-credential-${index}" "$source_churn_secret"
+		source_churn_secrets+=("$source_churn_secret")
+	done
+	source_sql() { psql "$dsn" -X -Atqc "$1"; }
+	source_metric_sum() {
+		local metric=$1 total=0 port value
+		for port in $((base + 20)) $((base + 21)) $((base + 22)); do
+			value="$(curl -fsS "http://127.0.0.1:${port}/admin/metrics" -H "Authorization: Bearer ${operator_token}" | awk -v name="gripline_${metric}" '$1 == name {print $2; exit}')"
+			total=$((total + ${value:-0}))
+		done
+		printf '%s\n' "$total"
+	}
+	source_metric_max() {
+		local metric=$1 max=0 port value
+		for port in $((base + 20)) $((base + 21)) $((base + 22)); do
+			value="$(curl -fsS "http://127.0.0.1:${port}/admin/metrics" -H "Authorization: Bearer ${operator_token}" | awk -v name="gripline_${metric}" '$1 == name {print $2; exit}')"
+			if [[ "${value:-0}" =~ ^[0-9]+$ ]] && (( value > max )); then max=$value; fi
+		done
+		printf '%s\n' "$max"
+	}
+	source_churn_aliases_before="$(source_sql 'SELECT COUNT(*) FROM gripline_source_aliases')"
+	source_churn_backend_before=0
+	if [[ -f "$harness_dir/backend-capture.log" ]]; then source_churn_backend_before="$(wc -l <"$harness_dir/backend-capture.log")"; fi
+	source_churn_invalid_dir="$harness_dir/source-churn-invalid"
+	mkdir -p "$source_churn_invalid_dir"
+	source_churn_invalid_worker() {
+		local worker=$1 file="$source_churn_invalid_dir/worker-$1.tsv" i octet2 octet3 octet4 ip code
+		: >"$file"
+		for ((i = worker; i < source_churn_invalid_sources; i += source_churn_workers)); do
+			octet2=$(((i + 1) / 65536))
+			octet3=$((((i + 1) / 256) % 256))
+			octet4=$(((i + 1) % 256))
+			ip="10.${octet2}.${octet3}.${octet4}"
+			code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${lb_port}/v1/messages" \
+				-H "X-Forwarded-For: ${ip}" -H "Authorization: Bearer invalid-source-churn-secret" -d '{}' 2>/dev/null || true)"
+			printf '%s\n' "${code:-000}" >>"$file"
+		done
+	}
+	source_churn_invalid_pids=()
+	for worker in $(seq 0 $((source_churn_workers - 1))); do
+		source_churn_invalid_worker "$worker" &
+		source_churn_invalid_pids+=("$!")
+	done
+	for pid in "${source_churn_invalid_pids[@]}"; do wait "$pid" || true; done
+	source_churn_invalid_results="$harness_dir/source-churn-invalid.tsv"
+	cat "$source_churn_invalid_dir"/*.tsv >"$source_churn_invalid_results"
+	source_churn_invalid_200="$(awk '$1 == 200 {n++} END {print n+0}' "$source_churn_invalid_results")"
+	source_churn_invalid_5xx="$(awk '$1 ~ /^5/ {n++} END {print n+0}' "$source_churn_invalid_results")"
+	source_churn_aliases_after_invalid="$(source_sql 'SELECT COUNT(*) FROM gripline_source_aliases')"
+	source_churn_adaptive_subjects_after_invalid="$(source_sql 'SELECT COUNT(*) FROM gripline_adaptive_window_subjects')"
+	source_churn_adaptive_keys_after_invalid="$(source_sql 'SELECT COUNT(*) FROM gripline_adaptive_window_keys')"
+	source_churn_adaptive_baselines_after_invalid="$(source_sql 'SELECT COUNT(*) FROM gripline_adaptive_baselines')"
+	source_churn_adaptive_rows_after_invalid=$((source_churn_adaptive_subjects_after_invalid + source_churn_adaptive_keys_after_invalid + source_churn_adaptive_baselines_after_invalid))
+	source_churn_preauth_entries_peak="$(source_metric_max preauth_source_table_entries)"
+	source_churn_backend_after_invalid=0
+	if [[ -f "$harness_dir/backend-capture.log" ]]; then source_churn_backend_after_invalid="$(wc -l <"$harness_dir/backend-capture.log")"; fi
+	source_churn_backend_hits_from_invalid=$((source_churn_backend_after_invalid - source_churn_backend_before))
+	if [[ "$source_churn_invalid_200" != 0 || "$source_churn_invalid_5xx" != 0 || "$source_churn_aliases_after_invalid" != "$source_churn_aliases_before" || "$source_churn_adaptive_subjects_after_invalid" -gt "$source_churn_adaptive_subject_bound" || "$source_churn_adaptive_keys_after_invalid" -gt $((source_churn_adaptive_subject_bound * source_churn_adaptive_key_bound)) || "$source_churn_adaptive_baselines_after_invalid" -gt "$source_churn_adaptive_subject_bound" || "$source_churn_backend_hits_from_invalid" != 0 ]]; then
+		echo "cluster harness: invalid source churn violated read-only/isolated behavior" >&2
+		exit 1
+	fi
+
+	source_churn_valid_dir="$harness_dir/source-churn-valid"
+	mkdir -p "$source_churn_valid_dir"
+	source_churn_valid_worker() {
+		local index=$1 ip="11.0.0.$((index + 1))" code valid_secret="${source_churn_secrets[$index]}"
+		code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${lb_port}/v1/messages" \
+			-H "X-Forwarded-For: ${ip}" -H "Authorization: Bearer ${valid_secret}" -d '{}' 2>/dev/null || true)"
+		printf '%s\n' "${code:-000}" >"$source_churn_valid_dir/$index"
+	}
+	source_churn_valid_pids=()
+	for index in $(seq 0 $((source_churn_authenticated_sources - 1))); do
+		source_churn_valid_worker "$index" &
+		source_churn_valid_pids+=("$!")
+	done
+	for pid in "${source_churn_valid_pids[@]}"; do wait "$pid" || true; done
+	source_churn_valid_successes="$(awk '$1 == 200 {n++} END {print n+0}' "$source_churn_valid_dir"/*)"
+	source_churn_valid_failures="$(awk '$1 != 200 {n++} END {print n+0}' "$source_churn_valid_dir"/*)"
+	source_churn_aliases_before_valid="$(source_sql 'SELECT COUNT(DISTINCT canonical_source_id) FROM gripline_source_aliases')"
+	if [[ "$source_churn_valid_successes" != "$source_churn_authenticated_sources" || "$source_churn_valid_failures" != 0 || "$source_churn_aliases_before_valid" != "$source_churn_authenticated_sources" ]]; then
+		echo "cluster harness: authenticated first-seen source churn did not register cleanly" >&2
+		exit 1
+	fi
+	stale_alias_before=0
+	source_sql "INSERT INTO gripline_source_aliases (canonical_source_id, alias, generation, created_at, last_seen_at) VALUES ('source-churn-stale', 'source-churn-stale-v1', 1, CURRENT_TIMESTAMP - INTERVAL '8 days', CURRENT_TIMESTAMP - INTERVAL '8 days') ON CONFLICT (alias) DO NOTHING" >/dev/null
+	if [[ "$(source_sql "SELECT COUNT(*) FROM gripline_source_aliases WHERE alias='source-churn-stale-v1'")" == 1 ]]; then
+		stale_alias_before=1
+	fi
+	source_churn_overflow_code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${lb_port}/v1/messages" \
+		-H 'X-Forwarded-For: 12.0.0.1' -H "Authorization: Bearer ${secret_one}" -d '{}' 2>/dev/null || true)"
+	source_churn_source_scopes_after_valid="$(source_sql "SELECT COUNT(*) FROM gripline_resource_source_scopes WHERE scope_id NOT LIKE '__source_overflow_%'")"
+	source_churn_source_scopes_after_overflow="$(source_sql 'SELECT COUNT(*) FROM gripline_resource_source_scopes')"
+	source_churn_source_overflows="$(source_sql "SELECT COUNT(DISTINCT scope_id) FROM gripline_resource_buckets WHERE scope=0 AND scope_id LIKE '__source_overflow_%'")"
+	source_churn_source_aliases_created="$source_churn_aliases_before_valid"
+	if [[ "$source_churn_overflow_code" != 200 || "$source_churn_source_scopes_after_valid" -gt "$source_scope_limit" || "$source_churn_source_overflows" -lt 1 ]]; then
+		echo "cluster harness: source-scope overflow behavior failed" >&2
+		exit 1
+	fi
+fi
 
 # The public data plane must not expose the verifier-management path, and the
 # backend must reject a direct unauthenticated control mutation before parsing
@@ -551,7 +677,11 @@ pepper_replay_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:
 test "$pepper_replay_code" = 200
 provision cluster-credential-three "$secret_three"
 pepper_counts="$(curl -fsS "http://127.0.0.1:$((base + 22))/admin/credentials/pepper-status" -H "Authorization: Bearer ${operator_token}")"
-printf '%s' "$pepper_counts" | rg -q '"1":2'
+expected_pepper_one_count=2
+if [[ "$source_churn_enabled" == "1" ]]; then
+	expected_pepper_one_count=$((expected_pepper_one_count + source_churn_authenticated_sources))
+fi
+printf '%s' "$pepper_counts" | rg -q "\"1\":${expected_pepper_one_count}"
 printf '%s' "$pepper_counts" | rg -q '"2":1'
 test "$(curl_data_code "http://127.0.0.1:$((base + 12))/v1/messages" "$secret_three")" = 200
 
@@ -571,8 +701,85 @@ done
 source_scopes_after="$(curl -fsS "http://127.0.0.1:$((base + 21))/admin/metrics" -H "Authorization: Bearer ${operator_token}" | sed -n 's/^gripline_resource_source_scopes \([0-9][0-9]*\)$/\1/p')"
 test "$source_scopes_after" = "$source_scopes_before"
 
-# Global concurrency cap is five. Fifteen requests enter via the LB and the
-# backend's independently tracked active-work peak must never exceed five.
+if [[ "$source_churn_enabled" == "1" ]]; then
+	source_churn_rotation_dir="$harness_dir/source-churn-rotation"
+	mkdir -p "$source_churn_rotation_dir"
+	source_churn_rotation_worker() {
+		local index=$1 ip="11.0.0.$((index + 1))" code rotation_secret="${source_churn_secrets[$index]}"
+		code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${lb_port}/v1/messages" \
+			-H "X-Forwarded-For: ${ip}" -H "Authorization: Bearer ${rotation_secret}" -d '{}' 2>/dev/null || true)"
+		printf '%s\n' "${code:-000}" >"$source_churn_rotation_dir/$index"
+	}
+	source_churn_rotation_pids=()
+	for index in $(seq 0 $((source_churn_authenticated_sources - 1))); do
+		source_churn_rotation_worker "$index" &
+		source_churn_rotation_pids+=("$!")
+	done
+	for pid in "${source_churn_rotation_pids[@]}"; do wait "$pid" || true; done
+	source_churn_rotation_successes="$(awk '$1 == 200 {n++} END {print n+0}' "$source_churn_rotation_dir"/*)"
+	source_churn_rotation_failures="$(awk '$1 != 200 {n++} END {print n+0}' "$source_churn_rotation_dir"/*)"
+	source_churn_source_scopes_after_rotation="$(source_sql "SELECT COUNT(*) FROM gripline_resource_source_scopes WHERE scope_id NOT LIKE '__source_overflow_%'")"
+	if [[ "$source_churn_rotation_successes" != "$source_churn_authenticated_sources" || "$source_churn_rotation_failures" != 0 || "$source_churn_source_scopes_after_rotation" != "$source_churn_source_scopes_after_valid" ]]; then
+		echo "cluster harness: source alias rotation overlap lost canonical/resource continuity" >&2
+		exit 1
+	fi
+	source_churn_stale_aliases_after=1
+	for _ in $(seq 1 60); do
+		if [[ -n "$maintenance_bin" ]]; then
+			"$maintenance_bin" -dsn "$dsn" -batch-size 256 -history-retention "${GRIPLINE_CLUSTER_HARNESS_RETENTION_WINDOW:-1m}" -source-alias-retention "${GRIPLINE_CLUSTER_HARNESS_SOURCE_ALIAS_RETENTION:-${GRIPLINE_CLUSTER_HARNESS_RETENTION_WINDOW:-1m}}" >"$harness_dir/source-churn-maintenance.log" 2>&1 || {
+				cat "$harness_dir/source-churn-maintenance.log" >&2
+				exit 1
+			}
+		fi
+		source_churn_stale_aliases_after="$(source_sql "SELECT COUNT(*) FROM gripline_source_aliases WHERE alias='source-churn-stale-v1'")"
+		if [[ "$source_churn_stale_aliases_after" == 0 ]]; then break; fi
+		sleep 1
+	done
+	if [[ "$source_churn_stale_aliases_after" != 0 ]]; then
+		echo "cluster harness: source alias maintenance did not reclaim stale unreferenced identity" >&2
+		exit 1
+	fi
+	source_churn_source_scopes_peak="$source_churn_source_scopes_after_overflow"
+	if [[ "$source_churn_source_scopes_after_rotation" -gt "$source_churn_source_scopes_peak" ]]; then
+		source_churn_source_scopes_peak="$source_churn_source_scopes_after_rotation"
+	fi
+	source_churn_resolution_failures="$(source_metric_sum postgres_source_alias_resolution_failures_total)"
+	source_churn_authority_timeouts="$(source_metric_sum postgres_authority_timeouts_total)"
+	if [[ -n "${GRIPLINE_CLUSTER_HARNESS_SOURCE_CHURN_EVIDENCE_FILE:-}" ]]; then
+		cat >"$GRIPLINE_CLUSTER_HARNESS_SOURCE_CHURN_EVIDENCE_FILE" <<EOF
+{
+  "invalid_sources": ${source_churn_invalid_sources},
+  "aliases_before": ${source_churn_aliases_before},
+  "aliases_after_invalid": ${source_churn_aliases_after_invalid},
+  "adaptive_rows_after_invalid": ${source_churn_adaptive_rows_after_invalid},
+  "adaptive_subjects_after_invalid": ${source_churn_adaptive_subjects_after_invalid},
+  "adaptive_keys_after_invalid": ${source_churn_adaptive_keys_after_invalid},
+  "adaptive_baselines_after_invalid": ${source_churn_adaptive_baselines_after_invalid},
+  "adaptive_subject_bound": ${source_churn_adaptive_subject_bound},
+  "adaptive_key_bound": ${source_churn_adaptive_key_bound},
+  "preauth_source_table_entries_peak": ${source_churn_preauth_entries_peak},
+  "preauth_source_table_bound": ${preauth_max_sources},
+  "backend_hits_from_invalid": ${source_churn_backend_hits_from_invalid},
+  "authenticated_aliases_created": ${source_churn_source_aliases_created},
+  "authenticated_source_requests": ${source_churn_valid_successes},
+  "authenticated_source_failures": ${source_churn_valid_failures},
+  "source_scope_bound": ${source_scope_limit},
+  "source_scopes_peak": ${source_churn_source_scopes_peak},
+  "source_scope_overflows": ${source_churn_source_overflows},
+  "rotation_source_scopes_before": ${source_churn_source_scopes_after_valid},
+  "rotation_source_scopes_after": ${source_churn_source_scopes_after_rotation},
+  "stale_aliases_before_maintenance": ${stale_alias_before},
+  "stale_aliases_after_maintenance": ${source_churn_stale_aliases_after},
+  "source_resolution_failures": ${source_churn_resolution_failures},
+  "authority_timeouts": ${source_churn_authority_timeouts}
+}
+EOF
+	fi
+fi
+
+# Security mode's global concurrency cap is five. Fifteen requests enter via
+# the LB and the backend's independently tracked active-work peak must never
+# exceed five; capacity mode deliberately raises this fixture ceiling.
 mkdir -p "$harness_dir/codes"
 work_pids=()
 for i in $(seq 1 15); do
@@ -584,7 +791,7 @@ for pid in "${work_pids[@]}"; do
 	wait "$pid" || true
 done
 peak="$(cat "$harness_dir/backend-peak")"
-if [[ "$peak" -gt 5 ]]; then
+if [[ "$load_mode" == security && "$peak" -gt 5 ]]; then
 	echo "cluster harness: backend peak ${peak} exceeded global cap 5" >&2
 	exit 1
 fi
@@ -933,6 +1140,25 @@ else
 		fi
 	done
 	wait_status "http://127.0.0.1:${lb_port}/readyz"
+fi
+
+# Readiness is a serving invariant, but the first post-outage authority lookup
+# can still be completing while the node transitions back to READY. Converge a
+# protected request on the node used by the cancellation probe before asking it
+# to hold a long-running backend operation.
+if [[ "${GRIPLINE_CLUSTER_HARNESS_SKIP_KILLED_NODE:-0}" != "1" ]]; then
+	post_recovery_code=000
+	for _ in $(seq 1 60); do
+		post_recovery_code="$(curl_data_code "http://127.0.0.1:$((base + 12))/v1/messages" "$secret_two")"
+		if [[ "$post_recovery_code" == "200" ]]; then
+			break
+		fi
+		sleep 0.1
+	done
+	if [[ "$post_recovery_code" != "200" ]]; then
+		echo "cluster harness: post-recovery protected request did not converge on killed-node target" >&2
+		exit 1
+	fi
 fi
 
 # A killed replica with in-flight work must cancel the upstream request. The

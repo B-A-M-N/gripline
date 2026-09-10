@@ -45,6 +45,8 @@ type AuthorityMetrics struct {
 	SourceAliasConflicts               int64
 	SourceAliasFailures                int64
 	SourceAliasResolutionLatency       time.Duration
+	SourceAliasTouchBatches            int64
+	SourceAliasTouchDropped            int64
 	ReservationAttempts                int64
 	ReservationsGranted                int64
 	ReservationFailures                int64
@@ -65,6 +67,8 @@ type AuthorityMetrics struct {
 	MaintenanceErrors                  int64
 	MaintenanceConsecutiveErrors       int64
 	MaintenanceRowsDeleted             int64
+	MaintenanceSourceAliasesDeleted    int64
+	MaintenanceSourceScopesDeleted     int64
 	MaintenanceBatches                 int64
 	MaintenanceBacklogEstimate         int64
 	MaintenanceLastSuccess             time.Time
@@ -92,6 +96,8 @@ type authorityMetrics struct {
 	sourceAliasConflicts               atomic.Int64
 	sourceAliasFailures                atomic.Int64
 	sourceAliasResolutionLatencyNanos  atomic.Int64
+	sourceAliasTouchBatches            atomic.Int64
+	sourceAliasTouchDropped            atomic.Int64
 	reservationAttempts                atomic.Int64
 	reservationsGranted                atomic.Int64
 	reservationFailures                atomic.Int64
@@ -112,6 +118,8 @@ type authorityMetrics struct {
 	maintenanceErrors                  atomic.Int64
 	maintenanceConsecutiveErrors       atomic.Int64
 	maintenanceRowsDeleted             atomic.Int64
+	maintenanceSourceAliasesDeleted    atomic.Int64
+	maintenanceSourceScopesDeleted     atomic.Int64
 	maintenanceBatches                 atomic.Int64
 	maintenanceBacklogEstimate         atomic.Int64
 	maintenanceLastSuccess             atomic.Int64
@@ -126,6 +134,8 @@ func (s *Store) recordMaintenance(stats MaintenanceStats, err error) {
 	now := time.Now().UTC().UnixNano()
 	s.metrics.maintenanceRuns.Add(1)
 	s.metrics.maintenanceRowsDeleted.Add(int64(stats.RowsDeleted))
+	s.metrics.maintenanceSourceAliasesDeleted.Add(int64(stats.SourceAliasesDeleted))
+	s.metrics.maintenanceSourceScopesDeleted.Add(int64(stats.ResourceSourceScopesDeleted))
 	s.metrics.maintenanceBatches.Add(int64(stats.Batches))
 	s.metrics.maintenanceBacklogEstimate.Store(int64(stats.BacklogEstimate))
 	s.metrics.maintenanceLastDurationNanos.Store(stats.Duration.Nanoseconds())
@@ -194,6 +204,8 @@ func (s *Store) Metrics() AuthorityMetrics {
 		SourceAliasConflicts:               s.metrics.sourceAliasConflicts.Load(),
 		SourceAliasFailures:                s.metrics.sourceAliasFailures.Load(),
 		SourceAliasResolutionLatency:       time.Duration(s.metrics.sourceAliasResolutionLatencyNanos.Load()),
+		SourceAliasTouchBatches:            s.metrics.sourceAliasTouchBatches.Load(),
+		SourceAliasTouchDropped:            s.metrics.sourceAliasTouchDropped.Load(),
 		ReservationAttempts:                s.metrics.reservationAttempts.Load(),
 		ReservationsGranted:                s.metrics.reservationsGranted.Load(),
 		ReservationFailures:                s.metrics.reservationFailures.Load(),
@@ -214,6 +226,8 @@ func (s *Store) Metrics() AuthorityMetrics {
 		MaintenanceErrors:                  s.metrics.maintenanceErrors.Load(),
 		MaintenanceConsecutiveErrors:       s.metrics.maintenanceConsecutiveErrors.Load(),
 		MaintenanceRowsDeleted:             s.metrics.maintenanceRowsDeleted.Load(),
+		MaintenanceSourceAliasesDeleted:    s.metrics.maintenanceSourceAliasesDeleted.Load(),
+		MaintenanceSourceScopesDeleted:     s.metrics.maintenanceSourceScopesDeleted.Load(),
 		MaintenanceBatches:                 s.metrics.maintenanceBatches.Load(),
 		MaintenanceBacklogEstimate:         s.metrics.maintenanceBacklogEstimate.Load(),
 		MaintenanceLastSuccess:             metricTime(s.metrics.maintenanceLastSuccess.Load()),

@@ -467,11 +467,11 @@ passing repository tests:
   provider policy resolver is not shipped.
 - **Reference qualification lab:** `scripts/qualification/ha.sh`, `pitr.sh`,
   `perimeter.sh`, `clustered-perimeter.sh`, `sdk.sh`, `exact-cost.sh`,
-  `http2.sh`, `replay.sh`, `capacity.sh`, and `soak.sh` own the reproducible
+  `http2.sh`, `replay.sh`, `source-churn.sh`, `capacity.sh`, and `soak.sh` own the reproducible
   PostgreSQL HA/PITR, standalone and clustered mTLS/network, official SDK,
-  exact-cost, HTTP/2, shared replay, persistent-client capacity, and
-  active/active soak proofs. These are software-production gates, not permanent
-  external blockers.
+  exact-cost, HTTP/2, shared replay, source-churn, persistent-client capacity,
+  and active/active soak proofs. These are software-production gates, not
+  permanent external blockers.
 - **Operator deployment:** the actual AWS/Kubernetes/VPC policy, managed
   PostgreSQL product, issued PKI, secret delivery, edge DDoS controls,
   observability, and provider account/model quotas remain deployment

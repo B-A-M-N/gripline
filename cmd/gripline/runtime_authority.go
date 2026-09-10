@@ -64,7 +64,7 @@ func openRuntimeAuthorities(cfg *config.Config, connectTimeout, operationTimeout
 				OperatorAuditRetention: cfg.Authority.Maintenance.OperatorAuditRetention.D(), PolicyAuditRetention: cfg.Authority.Maintenance.PolicyAuditRetention.D(),
 				MembershipRetention: cfg.Authority.Maintenance.MembershipRetention.D(), AdaptiveRetention: cfg.Authority.Maintenance.AdaptiveRetention.D(),
 				EvidenceGuardRetention: cfg.Authority.Maintenance.EvidenceGuardRetention.D(), LaneOperatorAuditRetention: cfg.Authority.Maintenance.LaneOperatorAuditRetention.D(),
-				PolicyNodeStateRetention: cfg.Authority.Maintenance.PolicyNodeStateRetention.D(), ClusterCryptoAckRetention: cfg.Authority.Maintenance.ClusterCryptoAckRetention.D(),
+				PolicyNodeStateRetention: cfg.Authority.Maintenance.PolicyNodeStateRetention.D(), ClusterCryptoAckRetention: cfg.Authority.Maintenance.ClusterCryptoAckRetention.D(), SourceAliasRetention: cfg.Authority.Maintenance.SourceAliasRetention.D(),
 			}, Migrate: false,
 		})
 		connectCancel()

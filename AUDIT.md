@@ -377,7 +377,9 @@ hosted gates pass.
 
 | Requirement | Current status | Implementation / proof | Limitation or evidence still required |
 |---|---|---|---|
-| Source-alias contention | IMPLEMENTED — local PostgreSQL verified | `ResolveOrRegisterSource` uses a read-only established-alias path with a bounded asynchronous best-effort recency touch; only first registration or partial generation linkage takes ordered advisory locks and a serializable transaction. `TestPostgresSourceAliasResolutionReadMostly` covers first-use, 32-way established use, three nodes, generation overlap, 2s operation contexts, and bounded recency maintenance. The repeated three-node 16-worker capacity passes had zero source failures. | Hosted exact-commit evidence remains a release step. |
+| Source-alias contention | IMPLEMENTED — local PostgreSQL verified | Pre-auth `ResolveSourceAliases` is read-only and returns a provisional active pseudonym on a miss; `BindAuthenticatedSource` performs the only durable registration after credential match. Established aliases use a Store-owned bounded deduplicating touch queue/batch worker, and `TestPostgresSourceAliasResolutionReadMostly` plus the invalid-credential binder regression cover the read-heavy and no-bind paths. | Hosted exact-commit evidence remains a release step. |
+| Source-alias lifecycle | IMPLEMENTED — local PostgreSQL verified | `SourceAliasRetention` defaults to 168h; maintenance deletes only stale aliases without live source-state references, and dormant old-generation aliases do not block pseudonym retirement while live referenced old state remains protected. PostgreSQL integration tests cover reference-aware alias/scope cleanup and retirement safety. | Hosted exact-commit evidence remains a release step. |
+| Source-churn qualification | IMPLEMENTED — local harness gate added | `scripts/qualification/source-churn.sh` drives 10,000 invalid-source requests, authenticated first-seen sources, bounded source-scope overflow, pseudonym rotation overlap, and stale-alias maintenance, emitting typed telemetry and manifest assertions. | Hosted exact-commit evidence remains a release step. |
 | Source-alias conflicts | IMPLEMENTED — local PostgreSQL verified | `ErrSourceAliasConflict` is typed; all distinct owners are queried and conflicts fail closed without mutation. The integration test seeds two owners and verifies row counts are unchanged. | Hosted exact-commit evidence remains a release step. |
 | Capacity reference gate | IMPLEMENTED — local harness verified | `capacity.sh` defaults to 16 workers, a 2s authority timeout, and 16 PostgreSQL connections per node; the harness emits typed total/success/ratio/RPS/p50/p95/p99/source-failure/timeout/retry/deadlock measurements, and `verify-manifest.py` requires them. Two retained real local PostgreSQL three-node 16-worker runs passed 1461/1461 and 1259/1259 with zero source failures, authority timeouts, and deadlocks. Membership ownership uses `FOR KEY SHARE`, allowing heartbeat timestamp updates without weakening replacement fencing; `TestPostgresNodeOwnershipSharedLocksAndReplacementFencing` covers that regression. | The Docker HA writer and exact-commit release manifest remain to be produced in hosted qualification. |
 | Doctor readiness semantics | IMPLEMENTED — local command tests verified | Cluster/policy 403 responses are blocking unknown state; policy reads use `policy.read`, mutations retain `policy.install`. Full command cases cover 403, unavailable authority, incomplete crypto, and non-blocking maintenance warnings. | Hosted exact-commit evidence remains a release step. |
@@ -402,3 +404,13 @@ repository-owned qualification lab. The lab covers direct HTTP/2 churn, shared
 replay state, HA/PITR, provider SDK/metering fixtures, mTLS/network isolation,
 and configurable 24-72-hour active/active soak load; cloud/provider-specific
 capacity and deployment controls remain outside the generic software claim.
+
+## Security qualification follow-up (2026-09-10)
+
+The source lifecycle follow-up adds an authenticated-only durable source-alias
+binding boundary, reference-aware alias and source-scope maintenance, bounded
+alias-touch batching, and a dedicated source-churn qualification gate. Release
+tag syntax and tagged-commit/main ancestry now run in an Ubuntu preflight before
+the self-hosted qualification job. The final hosted evidence record remains
+pending; this worktree must be committed before its exact release SHA can be
+recorded here.

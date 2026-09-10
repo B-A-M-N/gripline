@@ -53,6 +53,7 @@ soak evidence:
 | Shared replay | `bash scripts/qualification/replay.sh` | Two independent processes produce exactly one winner for one claim |
 | Long-running active/active behavior | `bash scripts/qualification/soak.sh --duration 24h` | Replica/policy continuity, bounded active leases/holds/source scopes, retention checks, RSS/goroutine/heap snapshots, outage recovery, post-soak promotion |
 | Reference capacity behavior | `bash scripts/qualification/capacity.sh --duration 30s` | Persistent-client load, status distribution, p50/p95/p99, PostgreSQL pool wait, transaction retries, and transaction latency |
+| Source-churn qualification | `bash scripts/qualification/source-churn.sh` | Invalid-source spray remains read-only and backend-isolated; authenticated first-seen sources bind, source scopes overflow within bounds, pseudonym rotation preserves cardinality, and stale aliases are reclaimed |
 
 The lab uses disposable containers, generated keys, and local
 provider-shaped fixtures; it requires no provider account. Each suite run emits

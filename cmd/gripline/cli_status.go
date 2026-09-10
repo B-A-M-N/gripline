@@ -137,7 +137,8 @@ func runStatusCLIWithOutput(cfgPath string, format outputFormat) error {
 		{"cost accounting", onoff(usageConfigured && (cfg.Usage.InputMicrounitsPerToken > 0 || cfg.Usage.OutputMicrounitsPerToken > 0)), usageNote(cfg, "cost")},
 		{"active policy", policyState, fmt.Sprintf("%s revision=%d digest=%s", pol.ID, pol.Revision, policyDigest)},
 		{"resource persistence", resourcePersistenceState(clustered), resourcePersistenceNote(clustered)},
-		{"source-table bound", fmt.Sprintf("%d", maxSourceScopes), "zero resolves to the conservative runtime default; overflow identities are hashed into bounded shared scopes"},
+		{"resource source-scope bound", fmt.Sprintf("%d", maxSourceScopes), "backend-neutral resource scope cardinality; overflow identities are hashed into bounded shared scopes"},
+		{"source alias registration", "authenticated-only", "durable source aliases are bound only after credential match"},
 		{"spool bounds", fmt.Sprintf("%d bytes/%d files", spoolBytes, spoolFiles), "aggregate unknown-length request budget"},
 		{"active signer KID", activeKID, "public key generations are exported separately"},
 		{"pepper versions", pepperVersions, "version identifiers only; key material is never displayed"},
@@ -156,6 +157,11 @@ func runStatusCLIWithOutput(cfgPath string, format outputFormat) error {
 			row{"control operation retention", formatRetention(controlRetention), "operation IDs replay only within this authority retention window"},
 			row{"credential receipt retention", formatRetention(credentialRetention), "credential retry receipts are retained for this window"},
 		)
+		sourceAliasRetention := cfg.Authority.Maintenance.SourceAliasRetention.D()
+		if sourceAliasRetention <= 0 {
+			sourceAliasRetention = 7 * 24 * time.Hour
+		}
+		rows = append(rows, row{"source alias retention", formatRetention(sourceAliasRetention), "stale unreferenced aliases are reclaimed only after this window"})
 	}
 	if format == outputJSON || format == outputJSONL {
 		return encodeCLIOutputRows(format, rows)

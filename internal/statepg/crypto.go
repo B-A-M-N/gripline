@@ -804,31 +804,13 @@ func requireCryptoRetirementSafety(ctx context.Context, tx pgx.Tx, req CryptoRet
 		}
 	case CryptoKindPseudonym:
 		var count int
-		prefix := fmt.Sprintf("v%d.", req.Generation)
-		if err := tx.QueryRow(ctx, `WITH referenced_sources(source_id) AS (
-			SELECT alias FROM gripline_source_aliases WHERE generation=$1
-			UNION SELECT scope_id FROM gripline_resource_source_scopes WHERE scope_id LIKE $2
-			UNION SELECT subject_id FROM gripline_evidence WHERE scope='SOURCE' AND subject_id LIKE $2
-			UNION SELECT subject_id FROM gripline_evidence_guards WHERE scope='SOURCE' AND subject_id LIKE $2
-			UNION SELECT subject FROM gripline_adaptive_window_subjects WHERE subject LIKE $2
-			UNION SELECT subject FROM gripline_adaptive_baselines WHERE subject LIKE $2
-		), unresolved(source_id) AS (
-			SELECT DISTINCT r.source_id
-			FROM referenced_sources r
-			WHERE NOT EXISTS (
-				SELECT 1 FROM gripline_source_aliases old
-				WHERE old.alias=r.source_id AND old.generation=$1
-			)
-			OR NOT EXISTS (
-				SELECT 1
-				FROM gripline_source_aliases old
-				JOIN gripline_source_aliases retained
-				  ON retained.canonical_source_id=old.canonical_source_id
-				 AND retained.generation<>$1
-				WHERE old.alias=r.source_id AND old.generation=$1
-			)
-		)
-		SELECT COUNT(*) FROM unresolved`, req.Generation, prefix+"%").Scan(&count); err != nil {
+		query := `SELECT COUNT(DISTINCT old.canonical_source_id)
+			FROM gripline_source_aliases old
+			WHERE old.generation=$1
+			  AND ` + sourceIdentityReferencePredicate("old.canonical_source_id") + `
+			  AND NOT EXISTS (SELECT 1 FROM gripline_source_aliases retained
+				WHERE retained.canonical_source_id=old.canonical_source_id AND retained.generation<>$1)`
+		if err := tx.QueryRow(ctx, query, req.Generation).Scan(&count); err != nil {
 			return mapDBError(err)
 		}
 		if count != 0 {

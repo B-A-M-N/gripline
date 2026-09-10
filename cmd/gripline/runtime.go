@@ -912,8 +912,12 @@ type sourcePseudonymAliasLookup interface {
 	ResolveExistingSourcePseudonym(context.Context, []string) (string, error)
 }
 
-type sourcePseudonymAliasRegistrar interface {
-	ResolveOrRegisterSource(context.Context, []statepg.SourcePseudonymAlias, statepg.SourcePseudonymAlias) (string, error)
+type sourcePseudonymAliasReadOnly interface {
+	ResolveSourceAliases(context.Context, []statepg.SourcePseudonymAlias, statepg.SourcePseudonymAlias) (string, error)
+}
+
+type sourcePseudonymAliasBinder interface {
+	BindAuthenticatedSource(context.Context, []statepg.SourcePseudonymAlias, statepg.SourcePseudonymAlias) (string, error)
 }
 
 func (a *pseudonymRingAdapter) Derive(family []byte, raw []byte) (string, error) {
@@ -921,6 +925,14 @@ func (a *pseudonymRingAdapter) Derive(family []byte, raw []byte) (string, error)
 }
 
 func (a *pseudonymRingAdapter) DeriveContext(ctx context.Context, family []byte, raw []byte) (string, error) {
+	if string(family) == string(pseudonym.FamilySource) {
+		resolution, err := a.ResolveSourceContext(ctx, raw)
+		return resolution.Pseudonym, err
+	}
+	return a.deriveNonSource(ctx, family, raw)
+}
+
+func (a *pseudonymRingAdapter) ResolveSourceContext(ctx context.Context, raw []byte) (ingress.SourcePseudonymResolution, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -931,7 +943,7 @@ func (a *pseudonymRingAdapter) DeriveContext(ctx context.Context, family []byte,
 	var active statepg.SourcePseudonymAlias
 	var activeValue string
 	var err error
-	if string(family) == string(pseudonym.FamilySource) && ring != nil && aliases != nil {
+	if ring != nil && aliases != nil {
 		versioned, deriveErr := ring.DeriveAllVersioned(pseudonym.FamilySource, raw)
 		err = deriveErr
 		if err == nil {
@@ -947,37 +959,69 @@ func (a *pseudonymRingAdapter) DeriveContext(ctx context.Context, family []byte,
 	}
 	a.mu.RUnlock()
 	if err != nil {
-		return "", err
+		return ingress.SourcePseudonymResolution{}, err
 	}
 	if len(candidates) > 0 {
-		if registrar, ok := aliases.(sourcePseudonymAliasRegistrar); ok {
-			return registrar.ResolveOrRegisterSource(ctx, candidates, active)
+		stable := ""
+		if readOnly, ok := aliases.(sourcePseudonymAliasReadOnly); ok {
+			stable, err = readOnly.ResolveSourceAliases(ctx, candidates, active)
+		} else {
+			candidateValues := make([]string, 0, len(candidates))
+			for _, candidate := range candidates {
+				candidateValues = append(candidateValues, candidate.Alias)
+			}
+			stable, err = aliases.ResolveExistingSourcePseudonym(ctx, candidateValues)
+			if stable == "" && err == nil {
+				stable = active.Alias
+			}
 		}
-		candidateValues := make([]string, 0, len(candidates))
+		if err != nil {
+			return ingress.SourcePseudonymResolution{}, err
+		}
+		if stable == "" {
+			stable = active.Alias
+		}
+		resolution := ingress.SourcePseudonymResolution{Pseudonym: stable}
 		for _, candidate := range candidates {
-			candidateValues = append(candidateValues, candidate.Alias)
+			resolution.Aliases = append(resolution.Aliases, ingress.SourceAliasCandidate{Alias: candidate.Alias, Generation: candidate.Generation})
 		}
-		if stable, lookupErr := aliases.ResolveExistingSourcePseudonym(ctx, candidateValues); lookupErr != nil {
-			return "", lookupErr
-		} else if stable != "" {
-			return stable, nil
+		resolution.ActiveAlias = ingress.SourceAliasCandidate{Alias: active.Alias, Generation: active.Generation}
+		if _, ok := aliases.(sourcePseudonymAliasBinder); ok {
+			resolution.AliasBinder = a
 		}
-		// DeriveAll is only a historical-alias lookup. A cache miss must mint
-		// under the explicitly active generation, never under whichever loaded
-		// generation happens to sort last.
-		a.mu.RLock()
-		defer a.mu.RUnlock()
-		if a.ring == nil {
-			return "", errors.New("gripline: pseudonym ring unavailable")
-		}
-		return a.ring.Derive(pseudonym.FamilySource, raw)
+		return resolution, nil
 	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if ring == nil {
+		return ingress.SourcePseudonymResolution{}, errors.New("gripline: pseudonym ring unavailable")
+	}
+	value, err := ring.Derive(pseudonym.FamilySource, raw)
+	return ingress.SourcePseudonymResolution{Pseudonym: value}, err
+}
+
+func (a *pseudonymRingAdapter) deriveNonSource(_ context.Context, family []byte, raw []byte) (string, error) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	if a.ring == nil {
 		return "", errors.New("gripline: pseudonym ring unavailable")
 	}
 	return a.ring.Derive(pseudonym.Family(family), raw)
+}
+
+func (a *pseudonymRingAdapter) BindAuthenticatedSource(ctx context.Context, candidates []ingress.SourceAliasCandidate, active ingress.SourceAliasCandidate) (string, error) {
+	a.mu.RLock()
+	aliases := a.sourceAliases
+	a.mu.RUnlock()
+	binder, ok := aliases.(sourcePseudonymAliasBinder)
+	if !ok {
+		return active.Alias, nil
+	}
+	values := make([]statepg.SourcePseudonymAlias, 0, len(candidates))
+	for _, candidate := range candidates {
+		values = append(values, statepg.SourcePseudonymAlias{Alias: candidate.Alias, Generation: candidate.Generation})
+	}
+	return binder.BindAuthenticatedSource(ctx, values, statepg.SourcePseudonymAlias{Alias: active.Alias, Generation: active.Generation})
 }
 
 func (a *pseudonymRingAdapter) SetActiveVersion(version int) error {

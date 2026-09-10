@@ -39,6 +39,40 @@ type ContextPseudonymRing interface {
 	DeriveContext(context.Context, []byte, []byte) (string, error)
 }
 
+// SourceAliasCandidate is a derived source pseudonym together with the key
+// generation that produced it. It is carried through trusted ingress so an
+// authenticated request can bind a new generation without allowing an
+// unauthenticated request to mutate the authority.
+type SourceAliasCandidate struct {
+	Alias      string
+	Generation int
+}
+
+// SourceAliasBinder persists source aliases after credential authentication.
+// Implementations must reconcile all candidates atomically and fail closed on
+// conflicting ownership.
+type SourceAliasBinder interface {
+	BindAuthenticatedSource(context.Context, []SourceAliasCandidate, SourceAliasCandidate) (string, error)
+}
+
+// SourcePseudonymResolution is the optional richer result used by clustered
+// pseudonym rings. Pseudonym is always safe to use for the current request;
+// aliases and Binder are only used after the terminator has authenticated the
+// presented credential.
+type SourcePseudonymResolution struct {
+	Pseudonym   string
+	Aliases     []SourceAliasCandidate
+	ActiveAlias SourceAliasCandidate
+	AliasBinder SourceAliasBinder
+}
+
+// ContextSourcePseudonymResolver is the metadata-preserving source seam used
+// by clustered rings. Legacy rings may continue implementing only
+// ContextPseudonymRing or PseudonymRing.
+type ContextSourcePseudonymResolver interface {
+	ResolveSourceContext(context.Context, []byte) (SourcePseudonymResolution, error)
+}
+
 // NetworkMetadataResolver resolves ASN/network/region metadata for a source IP.
 type NetworkMetadataResolver interface {
 	Resolve(ip netip.Addr) (asn string, networkType string, region string, ok bool)
@@ -50,6 +84,9 @@ type TrustedSource struct {
 	ASN         string
 	NetworkType string
 	Region      string
+	Aliases     []SourceAliasCandidate
+	ActiveAlias SourceAliasCandidate
+	AliasBinder SourceAliasBinder
 }
 
 // Resolve derives the trusted source identity from the transport peer and
@@ -89,7 +126,11 @@ func (r *Resolver) ResolveContext(ctx context.Context, remoteAddr string, header
 
 	// HMAC-pseudonymize the canonical peer IP.
 	var pseudonym string
-	if contextRing, ok := r.Pseudonyms.(ContextPseudonymRing); ok {
+	var resolution SourcePseudonymResolution
+	if contextRing, ok := r.Pseudonyms.(ContextSourcePseudonymResolver); ok {
+		resolution, err = contextRing.ResolveSourceContext(ctx, []byte(canonical.String()))
+		pseudonym = resolution.Pseudonym
+	} else if contextRing, ok := r.Pseudonyms.(ContextPseudonymRing); ok {
 		pseudonym, err = contextRing.DeriveContext(ctx, []byte("source"), []byte(canonical.String()))
 	} else {
 		pseudonym, err = r.Pseudonyms.Derive([]byte("source"), []byte(canonical.String()))
@@ -99,7 +140,10 @@ func (r *Resolver) ResolveContext(ctx context.Context, remoteAddr string, header
 	}
 
 	src := TrustedSource{
-		Pseudonym: pseudonym,
+		Pseudonym:   pseudonym,
+		Aliases:     resolution.Aliases,
+		ActiveAlias: resolution.ActiveAlias,
+		AliasBinder: resolution.AliasBinder,
 	}
 
 	// Enrich with ASN/network/region metadata.
