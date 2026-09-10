@@ -241,7 +241,7 @@ if [[ "$only_soak" == 1 ]]; then
 fi
 # http2.sh wraps both protocol clients in the pinned repository-owned
 # container; no host package or ambient load generator is part of the gate.
-h2load_provenance="pinned Docker fixture: scripts/qualification/fixtures/http2/Dockerfile (nghttp2-client=1.52.0-1+deb12u2)"
+h2load_provenance="pinned Docker fixture: scripts/qualification/fixtures/http2/Dockerfile (Debian Snapshot 20240929T143658Z; nghttp2-client=1.52.0-1+deb12u2)"
 
 cat >"$result_dir/manifest.json" <<EOF
 {
@@ -264,7 +264,7 @@ $(manifest_gates_json)
     "nginx": "nginx:alpine@sha256:72ba65eb42c10344912a84ff42408db7d34f2feb642204570ab8fc5ffd29f1d3",
     "curl": "curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b",
     "debian": "debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171",
-    "h2load": "scripts/qualification/fixtures/http2/Dockerfile (nghttp2-client=1.52.0-1+deb12u2)"
+    "h2load": "scripts/qualification/fixtures/http2/Dockerfile (Debian Snapshot 20240929T143658Z; nghttp2-client=1.52.0-1+deb12u2)"
   },
   "evidence": {
 $(manifest_evidence_json)

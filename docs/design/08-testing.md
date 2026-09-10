@@ -99,7 +99,8 @@ parser ambiguity never creates more than one backend request or leaks a
 client-controlled carrier. `scripts/qualification/http2.sh` starts the real
 TLS listener with local PKI and executes the HTTP/2 cases with `nghttp`, the
 repository cancellation/recovery client, and `h2load`. Both protocol clients
-run from the pinned Debian fixture (`nghttp2-client=1.52.0-1+deb12u2`) in a
+run from the pinned Debian fixture (`nghttp2-client=1.52.0-1+deb12u2` from
+Debian Snapshot `20240929T143658Z`) in a
 host-networked container; no ambient host package is part of the certified
 gate. It also checks bounded oversized-header rejection and authenticated
 HTTP/2 error metrics.
