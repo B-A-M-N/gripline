@@ -197,6 +197,10 @@ func run(cfgPath string) (retErr error) {
 		return fmt.Errorf("gripline: listen %s: %w", cfg.Listen, err)
 	}
 	ln = newLimitedListener(ln, cfg.Server.MaxConnections)
+	shutdownTimeout := cfg.Server.ShutdownTimeout.D()
+	if shutdownTimeout <= 0 {
+		shutdownTimeout = 30 * time.Second
+	}
 	log.Printf("gripline: data plane listening on %s (tls=%v) → backend %s",
 		cfg.Listen, srv.TLSConfig != nil, cfg.Backend.URL)
 
@@ -222,7 +226,7 @@ func run(cfgPath string) (retErr error) {
 			_ = ln.Close()
 			return fmt.Errorf("gripline: admin listen %s: %w", cfg.Admin.Listen, err)
 		}
-		adminLn = newLimitedListener(adminLn, cfg.Server.MaxConnections)
+		adminLn = newLimitedListener(adminLn, cfg.Admin.MaxConnections)
 		go func() {
 			log.Printf("gripline: admin control plane listening on %s", cfg.Admin.Listen)
 			if serveErr := rt.Admin.Serve(adminLn); serveErr != nil && serveErr != http.ErrServerClosed {
@@ -244,8 +248,8 @@ func run(cfgPath string) (retErr error) {
 		ready.Store(false)
 	}
 	if rt.Authorities.Membership != nil {
-		drainCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if err := rt.MarkDraining(drainCtx, time.Now().Add(30*time.Second)); err != nil {
+		drainCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		if err := rt.MarkDraining(drainCtx, time.Now().Add(shutdownTimeout)); err != nil {
 			lifecycleErr = errors.Join(lifecycleErr, fmt.Errorf("gripline: mark draining: %w", err))
 		}
 		cancel()
@@ -257,14 +261,14 @@ func run(cfgPath string) (retErr error) {
 	shutdownErrCh := make(chan error, 2)
 	shutdownCount := 1
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
 		shutdownErrCh <- srv.Shutdown(ctx)
 	}()
 	if rt.Admin != nil {
 		shutdownCount++
 		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 			defer cancel()
 			shutdownErrCh <- rt.Admin.Shutdown(ctx)
 		}()

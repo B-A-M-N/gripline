@@ -55,7 +55,7 @@ func TestLoadValid(t *testing.T) {
 	if c.Backend.Timeout.D() != 30*time.Second || c.Identity.Audience != "fi-inference" {
 		t.Fatalf("fields not parsed: %+v", c)
 	}
-	if c.Server.MaxConnections != 4096 || c.Server.HTTP2MaxConcurrentStreams != 100 || c.Server.HTTP2HeaderTableBytes != 4096 || c.Server.HTTP2MaxReadFrameBytes != 1<<20 || c.Server.PreAuthSourceIdle.D() != 10*time.Minute {
+	if c.Server.MaxConnections != 4096 || c.Server.HTTP2MaxConcurrentStreams != 100 || c.Server.HTTP2HeaderTableBytes != 4096 || c.Server.HTTP2MaxReadFrameBytes != 1<<20 || c.Server.PreAuthSourceIdle.D() != 10*time.Minute || c.Server.SpoolMemoryThreshold != 256<<10 || c.Server.ShutdownTimeout.D() != 30*time.Second {
 		t.Fatalf("HTTP listener defaults not applied: %+v", c.Server)
 	}
 	if v, enabled := c.TLSConfig(); !enabled || v != tlsVersion13 {
@@ -370,6 +370,9 @@ func TestValidateClusterAdminUsesPostgresAuditAuthority(t *testing.T) {
 	}
 	if err := c.Validate(); err != nil {
 		t.Fatalf("postgres authority must satisfy admin audit durability: %v", err)
+	}
+	if c.Authority.ReconcileInterval.D() != time.Second || c.Admin.MaxConnections != 256 || c.Admin.ReadTimeout.D() != 30*time.Second {
+		t.Fatalf("cluster/admin defaults not applied: authority=%+v admin=%+v", c.Authority, c.Admin)
 	}
 
 	withLocalAudit := *c

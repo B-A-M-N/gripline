@@ -145,7 +145,7 @@ func runCredentialPepperStatusLiveWithOutput(cfgPath, token string, format outpu
 	}
 	versions := make([]int, 0, len(counts))
 	for raw := range counts {
-		version, err := strconv.Atoi(raw)
+		version, err := parseCLIGeneration(raw)
 		if err != nil {
 			return fmt.Errorf("credential pepper-status: invalid server version %q", raw)
 		}

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"sort"
-	"strconv"
 	"text/tabwriter"
 	"time"
 
@@ -186,7 +185,7 @@ func recoveryMetadata(cfg *config.Config, durableState *statebolt.Store) (stateb
 		sort.Strings(metadata.SignerPublicFingerprints)
 	}
 	for rawVersion := range cfg.Secrets.PepperVersions {
-		if version, err := strconv.Atoi(rawVersion); err == nil && version > 0 {
+		if version, err := parseCLIGeneration(rawVersion); err == nil {
 			metadata.RequiredPepperVersions = append(metadata.RequiredPepperVersions, version)
 		}
 	}
@@ -198,7 +197,7 @@ func recoveryMetadata(cfg *config.Config, durableState *statebolt.Store) (stateb
 			metadata.RequiredPseudonymVersions = append(metadata.RequiredPseudonymVersions, 1)
 		}
 		for rawVersion := range cfg.Ingress.PseudonymKeys {
-			if version, err := strconv.Atoi(rawVersion); err == nil && version > 0 {
+			if version, err := parseCLIGeneration(rawVersion); err == nil {
 				metadata.RequiredPseudonymVersions = append(metadata.RequiredPseudonymVersions, version)
 			}
 		}

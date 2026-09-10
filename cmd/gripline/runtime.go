@@ -156,6 +156,10 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 	if operationTimeout <= 0 {
 		operationTimeout = 2 * time.Second
 	}
+	reconcileInterval := cfg.Authority.ReconcileInterval.D()
+	if reconcileInterval <= 0 {
+		reconcileInterval = time.Second
+	}
 	backend, err := urlFrom(cfg.Backend.URL)
 	if err != nil {
 		return nil, err
@@ -489,7 +493,7 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 	}
 	pol = &compiledPolicy.Policy
 	if postgres != nil {
-		stopPolicyWatcher := policyManager.StartWatcher(context.Background(), time.Second, operationTimeout)
+		stopPolicyWatcher := policyManager.StartWatcher(context.Background(), reconcileInterval, operationTimeout)
 		closers = append(closers, func() error { stopPolicyWatcher(); return nil })
 	}
 
@@ -530,6 +534,7 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		SpoolDir:                       cfg.Server.SpoolDir,
 		SpoolMaxBytes:                  cfg.Server.SpoolMaxBytes,
 		SpoolMaxFiles:                  cfg.Server.SpoolMaxFiles,
+		SpoolMemoryThreshold:           cfg.Server.SpoolMemoryThreshold,
 		ReservationRenewEvery:          cfg.Authority.RenewEvery.D(),
 		PreAuthMaxConcurrent:           cfg.Server.PreAuthMaxConcurrent,
 		PreAuthRequestsPerSecond:       cfg.Server.PreAuthRequestsPerSecond,
@@ -588,7 +593,7 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		return nil, fmt.Errorf("gripline: proxy: %w", err)
 	}
 	if postgres != nil {
-		stopCryptoReconciler := postgres.StartCryptoReconciler(context.Background(), time.Second, operationTimeout, func(ctx context.Context, shared statepg.CryptoIdentity) error {
+		stopCryptoReconciler := postgres.StartCryptoReconciler(context.Background(), reconcileInterval, operationTimeout, func(ctx context.Context, shared statepg.CryptoIdentity) error {
 			return reconcileClusterCryptoWithSigner(ctx, shared, postgres, signer, peppers, pseudonyms, cfg.Paths.SignerKeyring, verifierAcceptor)
 		})
 		closers = append(closers, func() error { stopCryptoReconciler(); return nil })
@@ -687,10 +692,10 @@ func BuildRuntime(cfg *config.Config) (_ *Runtime, retErr error) {
 		adminSrv = &http.Server{
 			Addr:              cfg.Admin.Listen,
 			Handler:           mux,
-			ReadHeaderTimeout: 10 * time.Second,
-			ReadTimeout:       30 * time.Second,
-			WriteTimeout:      30 * time.Second,
-			IdleTimeout:       120 * time.Second,
+			ReadHeaderTimeout: cfg.Admin.ReadHeaderTimeout.D(),
+			ReadTimeout:       cfg.Admin.ReadTimeout.D(),
+			WriteTimeout:      cfg.Admin.WriteTimeout.D(),
+			IdleTimeout:       cfg.Admin.IdleTimeout.D(),
 		}
 	}
 

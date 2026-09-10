@@ -14,7 +14,7 @@ import (
 
 func TestCLIUXHierarchicalHelp(t *testing.T) {
 	root := captureStdout(t, func() { printCLIHelp(nil) })
-	for _, want := range []string{"credential", "crypto", "doctor", "-c, --config", "-o, --output"} {
+	for _, want := range []string{"credential", "crypto", "config", "doctor", "-c, --config", "-o, --output"} {
 		if !strings.Contains(root, want) {
 			t.Fatalf("root help missing %q:\n%s", want, root)
 		}
@@ -39,6 +39,29 @@ func TestCLIUXHierarchicalHelp(t *testing.T) {
 	for _, want := range []string{"list", "export"} {
 		if !strings.Contains(security, want) {
 			t.Fatalf("audit security help missing %q:\n%s", want, security)
+		}
+	}
+}
+
+func TestCLIConfigEffectiveRedactsSecretsAndShowsDefaults(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	body := `{"listen":"127.0.0.1:8080","tls":{"terminate_tls_upstream":true},"backend":{"url":"https://provider.internal","trust_mode":"private_network","timeout":"5s"},"server":{"read_timeout":"5s","write_timeout":"5s","idle_timeout":"5s","read_header_timeout":"5s"},"identity":{"audience":"test"},"admin":{"listen":"127.0.0.1:9090","operator_tokens":{"operator-secret-0123456789abcdef0123456789abcdef":"ops:posture.control"}},"secrets":{"pepper_versions":{"1":"pepper-secret"}},"ingress":{"pseudonym_key":"pseudonym-secret"},"paths":{"audit_log":"audit.jsonl"}}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout := captureStdout(t, func() {
+		if _, _, err := runCLIInvocation([]string{"config", "effective", "--config", path, "--redact"}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	for _, secret := range []string{"operator-secret-0123456789abcdef0123456789abcdef", "pepper-secret", "pseudonym-secret"} {
+		if strings.Contains(stdout, secret) {
+			t.Fatalf("effective config leaked %q: %s", secret, stdout)
+		}
+	}
+	for _, want := range []string{"<redacted>", `"spool_memory_threshold": 262144`, `"shutdown_timeout": "30s"`} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("effective config missing %q: %s", want, stdout)
 		}
 	}
 }

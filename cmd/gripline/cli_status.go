@@ -69,7 +69,7 @@ func runStatusCLIWithOutput(cfgPath string, format outputFormat) error {
 	if len(cfg.Secrets.PepperVersions) > 0 {
 		versions := make([]int, 0, len(cfg.Secrets.PepperVersions))
 		for raw := range cfg.Secrets.PepperVersions {
-			if n, parseErr := strconv.Atoi(raw); parseErr == nil {
+			if n, parseErr := parseCLIGeneration(raw); parseErr == nil {
 				versions = append(versions, n)
 			}
 		}
@@ -84,7 +84,7 @@ func runStatusCLIWithOutput(cfgPath string, format outputFormat) error {
 	if cfg.Ingress != nil {
 		versions := make([]int, 0, len(cfg.Ingress.PseudonymKeys))
 		for raw := range cfg.Ingress.PseudonymKeys {
-			if n, parseErr := strconv.Atoi(raw); parseErr == nil {
+			if n, parseErr := parseCLIGeneration(raw); parseErr == nil {
 				versions = append(versions, n)
 			}
 		}
@@ -112,6 +112,14 @@ func runStatusCLIWithOutput(cfgPath string, format outputFormat) error {
 	maxSourceAliasIdentities := cfg.Authority.MaxSourceAliasIdentities
 	if maxSourceAliasIdentities == 0 {
 		maxSourceAliasIdentities = 4096
+	}
+	sourceScopeIdle := cfg.Server.SourceScopeIdle.D()
+	if sourceScopeIdle <= 0 {
+		sourceScopeIdle = 10 * time.Minute
+	}
+	preAuthSourceIdle := cfg.Server.PreAuthSourceIdle.D()
+	if preAuthSourceIdle <= 0 {
+		preAuthSourceIdle = 10 * time.Minute
 	}
 	clusterBehaviorState, clusterBehaviorNote := "not-applicable", "standalone deployment"
 	if clustered {
@@ -154,7 +162,12 @@ func runStatusCLIWithOutput(cfgPath string, format outputFormat) error {
 		{"resource source-scope bound", fmt.Sprintf("%d", maxSourceScopes), "backend-neutral resource scope cardinality; overflow identities are hashed into bounded shared scopes"},
 		{"source alias identity bound", fmt.Sprintf("%d", maxSourceAliasIdentities), "shared alias capacity; live identity and row counts are shown by cluster status/metrics"},
 		{"source alias registration", "authenticated-only", "durable source aliases are bound only after credential match"},
+		{"source scope idle", formatRetention(sourceScopeIdle), "post-auth resource scope retention horizon"},
+		{"pre-auth source idle", formatRetention(preAuthSourceIdle), "independent bounded pre-auth source-table retention horizon"},
 		{"spool bounds", fmt.Sprintf("%d bytes/%d files", spoolBytes, spoolFiles), "aggregate unknown-length request budget"},
+		{"spool memory threshold", fmt.Sprintf("%d bytes", cfg.Server.SpoolMemoryThreshold), "unknown-length bodies above this size use the spool directory"},
+		{"shutdown timeout", formatRetention(cfg.Server.ShutdownTimeout.D()), "shared graceful-drain budget for HTTP shutdown and membership drain"},
+		{"authority reconcile interval", formatRetention(cfg.Authority.ReconcileInterval.D()), "cluster policy and crypto convergence polling cadence"},
 		{"active signer KID", activeKID, "public key generations are exported separately"},
 		{"pepper versions", pepperVersions, "version identifiers only; key material is never displayed"},
 		{"pseudonym versions", pseudonymVersions, "active and overlap versions; key material is never displayed"},

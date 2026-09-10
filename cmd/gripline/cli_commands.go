@@ -71,6 +71,10 @@ var cliRoot = &cliCommand{
 	Usage:   "gripline [global options] <command> [arguments]",
 	Children: []*cliCommand{
 		{Name: "serve", Summary: "run the gateway", Usage: "gripline serve", Run: runServeCLI},
+		{Name: "config", Summary: "validate or inspect deployment configuration", Usage: "gripline config <validate|effective>", Default: "validate", Run: runConfigCommandCLI, Children: []*cliCommand{
+			{Name: "validate", Summary: "validate deployment configuration", Options: []cliOption{{Name: "--config PATH", Summary: "deployment configuration to validate"}}},
+			{Name: "effective", Summary: "print normalized configuration with secrets redacted", Options: []cliOption{{Name: "--config PATH", Summary: "deployment configuration to inspect"}, {Name: "--redact", Summary: "replace every secret value with <redacted> (default and only supported mode)"}}},
+		}},
 		{Name: "status", Summary: "show configured capability and persistence posture", Usage: "gripline status", Options: []cliOption{{Name: "--output FORMAT", Summary: "table, json, or jsonl"}}, Run: runStatusCommandCLI},
 		{Name: "credential", Summary: "manage credentials", Usage: "gripline credential <list|add|revoke|pepper-status>", Default: "list", Run: runCredentialCommandCLI, Children: []*cliCommand{
 			{Name: "list", Summary: "list credentials", Options: []cliOption{{Name: "--output FORMAT", Summary: "table, json, or jsonl"}, {Name: "--offline", Summary: "read stopped standalone state without the admin listener"}, {Name: "--token-file PATH", Summary: "read the operator token from this file"}, {Name: "--token TOKEN", Summary: "legacy bearer token; visible in shell history", Advanced: true}}},

@@ -10,10 +10,12 @@ import (
 	"sync"
 )
 
-// spoolMemoryThreshold is the body size above which we spool to a temp file
-// instead of keeping everything in memory. 256 KiB keeps the per-connection
-// memory bounded while avoiding the temp-file overhead for typical prompts.
-const spoolMemoryThreshold = 256 << 10
+// DefaultSpoolMemoryThreshold is the body size above which we spool to a temp
+// file instead of keeping everything in memory. 256 KiB keeps per-connection
+// memory bounded while avoiding temp-file overhead for typical prompts.
+const DefaultSpoolMemoryThreshold = 256 << 10
+
+const spoolMemoryThreshold = DefaultSpoolMemoryThreshold
 
 // spoolTempDir is the directory temp spool files are created in. Empty uses
 // the OS default. A var (not const) so tests can scope leak assertions to a

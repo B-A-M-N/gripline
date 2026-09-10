@@ -53,13 +53,20 @@
     "max_source_scopes": 10000,
     "source_scope_idle": "30m",
     "preauth_source_idle": "10m",
+    "shutdown_timeout": "30s",
     "spool_dir": "/tmp/gripline-spool",
     "spool_max_bytes": 67108864,
-    "spool_max_files": 64
+    "spool_max_files": 64,
+    "spool_memory_threshold": 262144
   },
 
   "admin": {
     "listen": "127.0.0.1:9090",
+    "max_connections": 256,
+    "read_header_timeout": "10s",
+    "read_timeout": "30s",
+    "write_timeout": "30s",
+    "idle_timeout": "120s",
     "operator_tokens": {
       "${GRIPLINE_OPERATOR_TOKEN}": "ops:posture.control,credential.lifecycle,lane.lifecycle,evidence.operator,policy.read,policy.install,audit.read,cluster.read,crypto.lifecycle"
     }
@@ -104,6 +111,7 @@
     "renew_every": "2s",
     "connect_timeout": "10s",
     "operation_timeout": "2s",
+    "reconcile_interval": "1s",
     "max_conns": 16,
     "min_conns": 2,
     "max_source_alias_identities": 10000,

@@ -269,6 +269,9 @@ type Config struct {
 	// zero disables that particular aggregate bound.
 	SpoolMaxBytes int64
 	SpoolMaxFiles int
+	// SpoolMemoryThreshold controls the memory-to-file transition for unknown-
+	// length request bodies. Zero uses DefaultSpoolMemoryThreshold.
+	SpoolMemoryThreshold int64
 	// ReservationRenewEvery is the heartbeat for distributed usage leases.
 	// Zero leaves renewal to the authority's own lifecycle.
 	ReservationRenewEvery time.Duration
@@ -529,6 +532,9 @@ func (d *DataPlane) recordUsage(actual resource.UsageEstimate) {
 // missing backend URL, terminator, or audience is a construction error, not a
 // degraded runtime (matching the terminator's own P0.6 seam contract).
 func New(cfg Config) (*DataPlane, error) {
+	if cfg.SpoolMemoryThreshold <= 0 {
+		cfg.SpoolMemoryThreshold = DefaultSpoolMemoryThreshold
+	}
 	if cfg.Terminator == nil {
 		return nil, fmt.Errorf("proxy: terminator required")
 	}
@@ -839,7 +845,7 @@ func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if tempDir == "" {
 				tempDir = spoolTempDir
 			}
-			body, err := spoolBodyInDirWithReservation(r.Body, d.cfg.MaxBodyBytes, spoolMemoryThreshold, tempDir, spoolReservation)
+			body, err := spoolBodyInDirWithReservation(r.Body, d.cfg.MaxBodyBytes, d.cfg.SpoolMemoryThreshold, tempDir, spoolReservation)
 			if err != nil {
 				out := &terminator.Outcome{RequestID: requestID, Authorized: false, Reason: "bad_request", DenialErr: err}
 				observeAdmission(out)

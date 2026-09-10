@@ -37,6 +37,14 @@ type Duration time.Duration
 const (
 	credentialMaxLoadedGenerations = 4
 	pseudonymMaxLoadedGenerations  = 4
+	defaultAuthorityReconcile      = time.Second
+	defaultSpoolMemoryThreshold    = 256 << 10
+	defaultShutdownTimeout         = 30 * time.Second
+	defaultAdminMaxConnections     = 256
+	defaultAdminReadHeaderTimeout  = 10 * time.Second
+	defaultAdminReadTimeout        = 30 * time.Second
+	defaultAdminWriteTimeout       = 30 * time.Second
+	defaultAdminIdleTimeout        = 120 * time.Second
 )
 
 func parseGenerationKey(raw string) (int, error) {
@@ -69,6 +77,13 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 
 // D returns the value as a time.Duration.
 func (d Duration) D() time.Duration { return time.Duration(d) }
+
+// MarshalJSON emits the same human-readable duration form accepted by the
+// loader. This keeps `gripline config effective` useful to operators instead
+// of exposing implementation-level nanosecond counts.
+func (d Duration) MarshalJSON() ([]byte, error) {
+	return json.Marshal(d.D().String())
+}
 
 // Config is the complete deployment configuration. Every field with a
 // security consequence is REQUIRED (no implicit defaults for TLS posture,
@@ -144,8 +159,12 @@ type AuthoritySection struct {
 	// OperationTimeout is the default bound for runtime-owned remote
 	// reconciliation and other ordinary authority operations.
 	OperationTimeout Duration `json:"operation_timeout,omitempty"`
-	MaxConns         int32    `json:"max_conns,omitempty"`
-	MinConns         int32    `json:"min_conns,omitempty"`
+	// ReconcileInterval controls policy and crypto convergence polling in a
+	// clustered deployment. It is deliberately separate from operation
+	// timeout: a slow operation must not silently change convergence cadence.
+	ReconcileInterval Duration `json:"reconcile_interval,omitempty"`
+	MaxConns          int32    `json:"max_conns,omitempty"`
+	MinConns          int32    `json:"min_conns,omitempty"`
 	// MaxSourceAliasIdentities bounds distinct canonical source identities in
 	// the shared PostgreSQL alias authority. Zero uses its conservative default.
 	MaxSourceAliasIdentities int                `json:"max_source_alias_identities,omitempty"`
@@ -398,6 +417,12 @@ type ServerSection struct {
 	// SpoolMaxFiles bounds concurrent unknown-length body reservations. Zero
 	// resolves to a conservative production default.
 	SpoolMaxFiles int `json:"spool_max_files,omitempty"`
+	// SpoolMemoryThreshold controls when an unknown-length body moves from
+	// memory to the dedicated spool directory.
+	SpoolMemoryThreshold int64 `json:"spool_memory_threshold,omitempty"`
+	// ShutdownTimeout is the single graceful-drain budget for public/admin
+	// HTTP shutdown and cluster drain publication.
+	ShutdownTimeout Duration `json:"shutdown_timeout,omitempty"`
 	// MaxSourceScopes is the backend-neutral resource source-scope cardinality
 	// limit. Zero uses the conservative runtime default; source alias
 	// registration state has its own authenticated-only lifecycle.
@@ -431,6 +456,13 @@ type AdminSection struct {
 	// only here (env-injected); the control plane stores digests. At least
 	// one token with each needed capability must be configured.
 	OperatorTokens map[string]string `json:"operator_tokens"` // token -> "name:cap1,cap2"
+	// Admin listener resource limits are independent from the public data
+	// plane. Zero values receive bounded defaults during validation.
+	MaxConnections    int      `json:"max_connections,omitempty"`
+	ReadHeaderTimeout Duration `json:"read_header_timeout,omitempty"`
+	ReadTimeout       Duration `json:"read_timeout,omitempty"`
+	WriteTimeout      Duration `json:"write_timeout,omitempty"`
+	IdleTimeout       Duration `json:"idle_timeout,omitempty"`
 }
 
 // IdentitySection is the internal assertion boundary.
@@ -771,6 +803,18 @@ func (c *Config) Validate() error {
 	if c.Server.SpoolMaxBytes < 0 || c.Server.SpoolMaxFiles < 0 {
 		return fmt.Errorf("server.spool_max_bytes/spool_max_files must be non-negative")
 	}
+	if c.Server.SpoolMemoryThreshold == 0 {
+		c.Server.SpoolMemoryThreshold = defaultSpoolMemoryThreshold
+	}
+	if c.Server.SpoolMemoryThreshold < 1 || c.Server.SpoolMemoryThreshold > 64<<20 {
+		return fmt.Errorf("server.spool_memory_threshold must be between 1 and 67108864 bytes")
+	}
+	if c.Server.ShutdownTimeout.D() == 0 {
+		c.Server.ShutdownTimeout = Duration(defaultShutdownTimeout)
+	}
+	if c.Server.ShutdownTimeout.D() < time.Second || c.Server.ShutdownTimeout.D() > 10*time.Minute {
+		return fmt.Errorf("server.shutdown_timeout must be between 1s and 10m")
+	}
 	// Unknown-length request bodies consume process and filesystem resources
 	// before the backend can help. Persistent deployments must never silently
 	// opt into an unlimited aggregate spool budget. The values are intentionally
@@ -888,7 +932,7 @@ func (c *Config) Validate() error {
 	// authority, and lease timing is part of the cluster's safety contract.
 	switch strings.ToLower(strings.TrimSpace(c.Authority.Backend)) {
 	case "", "standalone":
-		if c.Authority.DSNEnv != "" || c.Authority.NodeID != "" || c.Authority.LeaseTTL.D() != 0 || c.Authority.RenewEvery.D() != 0 || c.Authority.ConnectTimeout.D() != 0 || c.Authority.OperationTimeout.D() != 0 || c.Authority.MaxSourceAliasIdentities != 0 || c.Authority.Maintenance.configured() {
+		if c.Authority.DSNEnv != "" || c.Authority.NodeID != "" || c.Authority.LeaseTTL.D() != 0 || c.Authority.RenewEvery.D() != 0 || c.Authority.ConnectTimeout.D() != 0 || c.Authority.OperationTimeout.D() != 0 || c.Authority.ReconcileInterval.D() != 0 || c.Authority.MaxSourceAliasIdentities != 0 || c.Authority.Maintenance.configured() {
 			return fmt.Errorf("authority.dsn_env, node_id, lease timings require authority.backend=postgres")
 		}
 	case "postgres":
@@ -915,6 +959,12 @@ func (c *Config) Validate() error {
 		}
 		if c.Authority.ConnectTimeout.D() < 0 || c.Authority.OperationTimeout.D() < 0 {
 			return fmt.Errorf("authority connect/operation timeouts cannot be negative")
+		}
+		if c.Authority.ReconcileInterval.D() < 0 {
+			return fmt.Errorf("authority.reconcile_interval must be positive")
+		}
+		if c.Authority.ReconcileInterval.D() == 0 {
+			c.Authority.ReconcileInterval = Duration(defaultAuthorityReconcile)
 		}
 		if c.Authority.MaxConns < 0 || c.Authority.MinConns < 0 || c.Authority.MaxSourceAliasIdentities < 0 || (c.Authority.MaxConns > 0 && c.Authority.MinConns > c.Authority.MaxConns) {
 			return fmt.Errorf("authority min/max connection bounds are invalid")
@@ -974,6 +1024,30 @@ func (c *Config) Validate() error {
 		}
 		if len(c.Admin.OperatorTokens) == 0 {
 			return fmt.Errorf("admin.operator_tokens required when the admin section is present")
+		}
+		if c.Admin.MaxConnections == 0 {
+			c.Admin.MaxConnections = defaultAdminMaxConnections
+		}
+		if c.Admin.ReadHeaderTimeout.D() == 0 {
+			c.Admin.ReadHeaderTimeout = Duration(defaultAdminReadHeaderTimeout)
+		}
+		if c.Admin.ReadTimeout.D() == 0 {
+			c.Admin.ReadTimeout = Duration(defaultAdminReadTimeout)
+		}
+		if c.Admin.WriteTimeout.D() == 0 {
+			c.Admin.WriteTimeout = Duration(defaultAdminWriteTimeout)
+		}
+		if c.Admin.IdleTimeout.D() == 0 {
+			c.Admin.IdleTimeout = Duration(defaultAdminIdleTimeout)
+		}
+		if c.Admin.MaxConnections < 1 || c.Admin.MaxConnections > 1_000_000 {
+			return fmt.Errorf("admin.max_connections must be between 1 and 1000000")
+		}
+		if c.Admin.ReadHeaderTimeout.D() <= 0 || c.Admin.ReadTimeout.D() <= 0 || c.Admin.WriteTimeout.D() <= 0 || c.Admin.IdleTimeout.D() <= 0 {
+			return fmt.Errorf("admin read/write/idle timeouts must be positive")
+		}
+		if c.Admin.ReadTimeout.D() < c.Admin.ReadHeaderTimeout.D() {
+			return fmt.Errorf("admin.read_timeout must be >= admin.read_header_timeout")
 		}
 		for tok, spec := range c.Admin.OperatorTokens {
 			if tok == "" {
