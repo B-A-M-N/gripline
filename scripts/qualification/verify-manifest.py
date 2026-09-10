@@ -100,6 +100,57 @@ def load_json(path: pathlib.Path) -> dict:
     return value
 
 
+def verify_source_churn_measurements(measurements: dict) -> None:
+    """Enforce the source-churn gate's security and boundedness contract."""
+    if measurements["invalid_sources"] <= 0:
+        fail("source-churn invalid source count must be positive")
+    if measurements["aliases_before"] != 0 or measurements["aliases_after_invalid"] != 0:
+        fail("source-churn invalid requests created durable aliases")
+    if measurements["backend_hits_from_invalid"] != 0:
+        fail("source-churn invalid requests reached the backend")
+
+    if measurements["adaptive_rows_after_invalid"] != (
+        measurements["adaptive_subjects_after_invalid"]
+        + measurements["adaptive_keys_after_invalid"]
+        + measurements["adaptive_baselines_after_invalid"]
+    ):
+        fail("source-churn adaptive row measurement is inconsistent")
+    if measurements["adaptive_subject_bound"] != 65536 or measurements["adaptive_key_bound"] != 256:
+        fail("source-churn adaptive bounds do not match the detector contract")
+    if measurements["adaptive_subjects_after_invalid"] > measurements["adaptive_subject_bound"]:
+        fail("source-churn adaptive subject bound was exceeded")
+    if measurements["adaptive_keys_after_invalid"] > measurements["adaptive_subject_bound"] * measurements["adaptive_key_bound"]:
+        fail("source-churn adaptive key bound was exceeded")
+    if measurements["adaptive_baselines_after_invalid"] > measurements["adaptive_subject_bound"]:
+        fail("source-churn adaptive baseline bound was exceeded")
+
+    if measurements["preauth_source_table_bound"] <= 0:
+        fail("source-churn pre-auth bound must be positive")
+    if measurements["preauth_source_table_entries_peak"] > measurements["preauth_source_table_bound"] + 64:
+        fail("source-churn pre-auth source bound was exceeded")
+
+    if measurements["authenticated_source_requests"] <= 0:
+        fail("source-churn authenticated source count must be positive")
+    if measurements["authenticated_source_failures"] != 0:
+        fail("source-churn authenticated source requests failed")
+    if measurements["authenticated_aliases_created"] < measurements["authenticated_source_requests"]:
+        fail("source-churn authenticated aliases are incomplete")
+
+    if measurements["source_scope_bound"] <= 0:
+        fail("source-churn source-scope bound must be positive")
+    if measurements["source_scopes_peak"] > measurements["source_scope_bound"]:
+        fail("source-churn source-scope bound was exceeded")
+    if measurements["source_scope_overflows"] < 1:
+        fail("source-churn did not exercise source-scope overflow")
+    if measurements["rotation_source_scopes_before"] != measurements["rotation_source_scopes_after"]:
+        fail("source-churn rotation changed source-scope cardinality")
+
+    if measurements["stale_aliases_before_maintenance"] != 1 or measurements["stale_aliases_after_maintenance"] != 0:
+        fail("source-churn stale alias maintenance did not reclaim the expected identity")
+    if measurements["source_resolution_failures"] != 0 or measurements["authority_timeouts"] != 0:
+        fail("source-churn observed authority failures or timeouts")
+
+
 def verify_hash(root: pathlib.Path, entry: dict, label: str) -> pathlib.Path:
     path_value = entry.get("path")
     expected = entry.get("sha256")
@@ -191,6 +242,8 @@ def main() -> None:
             value = measurements.get(measurement)
             if not isinstance(value, expected_type) or isinstance(value, bool):
                 fail(f"{gate_name} measurement is missing or has the wrong type: {measurement}")
+        if gate_name == "source-churn":
+            verify_source_churn_measurements(measurements)
         if gate_name == "capacity-load":
             if measurements.get("workers") != manifest.get("capacity_workers"):
                 fail("capacity-load worker measurement does not match manifest capacity_workers")
