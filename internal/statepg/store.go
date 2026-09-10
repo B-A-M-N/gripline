@@ -478,7 +478,11 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 		return fmt.Errorf("statepg: inspect membership table before migration: %w", mapDBError(err))
 	}
 	if membershipTable != nil {
-		if err := requireMigrationQuiescence(ctx, tx, s.leaseTTL); err != nil {
+		leaseTTL, err := migrationLeaseTTL(ctx, tx, s.leaseTTL)
+		if err != nil {
+			return err
+		}
+		if err := requireMigrationQuiescence(ctx, tx, leaseTTL); err != nil {
 			return err
 		}
 	}
@@ -1011,12 +1015,48 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 func requireMigrationQuiescence(ctx context.Context, tx pgx.Tx, leaseTTL time.Duration) error {
 	var liveNodes int
 	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_membership
-		WHERE state IN ('ready','draining')
+		WHERE state <> 'stopped'
 		  AND last_seen_at > CURRENT_TIMESTAMP - ($1::double precision * interval '1 second')`, leaseTTL.Seconds()).Scan(&liveNodes); err != nil {
 		return fmt.Errorf("statepg: inspect live nodes before migration: %w", mapDBError(err))
 	}
 	if liveNodes > 0 {
 		return fmt.Errorf("%w: %d live node(s) remain", ErrMigrationRequiresQuiescence, liveNodes)
+	}
+	return nil
+}
+
+// migrationLeaseTTL prefers the lease contract already authoritative in the
+// cluster. A migrator may be invoked with a new/default local configuration;
+// it must not use that shorter TTL to declare an older authority process dead.
+// Authorities predating the cluster-behavior table use the caller's configured
+// TTL as the compatibility fallback.
+func migrationLeaseTTL(ctx context.Context, tx pgx.Tx, fallback time.Duration) (time.Duration, error) {
+	var canonical []byte
+	err := tx.QueryRow(ctx, `SELECT canonical FROM gripline_cluster_behavior WHERE singleton=TRUE`).Scan(&canonical)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fallback, nil
+	}
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "42P01" {
+			return fallback, nil
+		}
+		return 0, fmt.Errorf("statepg: inspect authoritative cluster behavior before migration: %w", mapDBError(err))
+	}
+	return behaviorLeaseTTL(canonical, fallback)
+}
+
+// requireNoLiveAuthorityLeases prevents a behavior transition from changing
+// lease semantics while an active resource authority lease can still settle,
+// renew, or release against the old contract.
+func requireNoLiveAuthorityLeases(ctx context.Context, tx pgx.Tx) error {
+	var liveLeases int
+	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_resource_leases
+		WHERE state IN ('reserved','forwarded') AND expires_at > CURRENT_TIMESTAMP`).Scan(&liveLeases); err != nil {
+		return fmt.Errorf("statepg: inspect active authority leases before behavior update: %w", mapDBError(err))
+	}
+	if liveLeases > 0 {
+		return fmt.Errorf("%w: %d active authority lease(s) remain", ErrClusterBehaviorRequiresQuiescence, liveLeases)
 	}
 	return nil
 }

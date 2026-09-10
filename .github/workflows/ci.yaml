@@ -67,12 +67,12 @@ jobs:
       - name: PostgreSQL authority integration
         env:
           GRIPLINE_TEST_POSTGRES_DSN: postgres://gripline:gripline@localhost:5432/gripline?sslmode=disable
-        run: go test -v ./internal/statepg -run '^TestPostgres'
+        run: go test -count=1 -v ./internal/statepg -run '^TestPostgres'
 
       - name: PostgreSQL authority integration under race
         env:
           GRIPLINE_TEST_POSTGRES_DSN: postgres://gripline:gripline@localhost:5432/gripline?sslmode=disable
-        run: go test -race -v ./internal/statepg -run '^TestPostgres'
+        run: go test -count=1 -race -v ./internal/statepg -run '^TestPostgres'
 
       - name: three-node PostgreSQL cluster harness
         env:

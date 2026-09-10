@@ -53,6 +53,7 @@ func runMigrateCLI(args []string) error {
 	}
 	opts := statepg.Options{
 		DSN: dsn, MaxConns: cfg.Authority.MaxConns, MinConns: cfg.Authority.MinConns,
+		LeaseTTL: cfg.Authority.LeaseTTL.D(), RenewEvery: cfg.Authority.RenewEvery.D(),
 		ConnectTimeout: connectTimeout, OperationTimeout: operationTimeout,
 	}
 	switch args[0] {

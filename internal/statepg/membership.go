@@ -16,6 +16,7 @@ var (
 	ErrNodeAlreadyActive = errors.New("statepg: node id already has a live instance")
 	ErrNodeFenced        = errors.New("statepg: node instance has been fenced")
 	ErrNodeDraining      = errors.New("statepg: node is draining")
+	ErrNodeNotReady      = errors.New("statepg: node is not ready")
 )
 
 func (s *Store) registerNode(ctx context.Context) error {
@@ -77,7 +78,7 @@ func (s *Store) registerNodeOnce(ctx context.Context) (string, int64, error) {
 	// is being replaced is checked above; other live nodes must still agree on
 	// the exact authority layout this process will use.
 	rows, err := tx.Query(ctx, `SELECT protocol_version, schema_version FROM gripline_membership
-		WHERE node_id <> $1 AND state IN ('ready','draining') AND last_seen_at > $2::timestamptz - ($3::double precision * interval '1 second')`, s.nodeID, now, int64(s.leaseTTL/time.Second))
+		WHERE node_id <> $1 AND state <> 'stopped' AND last_seen_at > $2::timestamptz - ($3::double precision * interval '1 second')`, s.nodeID, now, s.leaseTTL.Seconds())
 	if err != nil {
 		return "", 0, mapDBError(err)
 	}
@@ -121,7 +122,7 @@ func (s *Store) registerNodeOnce(ctx context.Context) (string, int64, error) {
 }
 
 func isLiveMembershipState(state string) bool {
-	return state == "ready" || state == "draining"
+	return state != "" && state != "stopped"
 }
 
 func (s *Store) membershipHeartbeat() {
@@ -222,9 +223,11 @@ func (s *Store) MarkDraining(ctx context.Context, drainUntil time.Time) error {
 	if !drainUntil.IsZero() {
 		until = drainUntil
 	}
-	tag, err := s.pool.Exec(ctx, `UPDATE gripline_membership SET state='draining', drain_until=$1,
+	tag, err := s.pool.Exec(ctx, `UPDATE gripline_membership SET
+		state=CASE WHEN state='not_ready' THEN 'stopped' ELSE 'draining' END,
+		drain_until=CASE WHEN state='not_ready' THEN NULL::timestamptz ELSE $1::timestamptz END,
 		last_seen_at=CURRENT_TIMESTAMP WHERE node_id=$2 AND instance_id=$3 AND node_epoch=$4
-		AND state IN ('ready','draining')`, until, s.nodeID, s.instanceID, s.nodeEpoch)
+		AND state IN ('ready','draining','not_ready')`, until, s.nodeID, s.instanceID, s.nodeEpoch)
 	if err != nil {
 		return mapDBError(err)
 	}
@@ -237,7 +240,7 @@ func (s *Store) MarkDraining(ctx context.Context, drainUntil time.Time) error {
 
 func (s *Store) markNodeStopped(ctx context.Context) error {
 	tag, err := s.pool.Exec(ctx, `UPDATE gripline_membership SET state='stopped', last_seen_at=CURRENT_TIMESTAMP
-		WHERE node_id=$1 AND instance_id=$2 AND node_epoch=$3 AND state IN ('ready','draining')`, s.nodeID, s.instanceID, s.nodeEpoch)
+		WHERE node_id=$1 AND instance_id=$2 AND node_epoch=$3`, s.nodeID, s.instanceID, s.nodeEpoch)
 	if err != nil {
 		return mapDBError(err)
 	}

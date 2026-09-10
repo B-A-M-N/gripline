@@ -81,6 +81,20 @@ func TestPreAuthSourceIdleIsIndependent(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsDuplicateLegacyPseudonymGenerationOne(t *testing.T) {
+	c, err := Load(writeCfg(t, validConfigJSON()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Ingress = &IngressSection{
+		PseudonymKey:  "legacy-pseudonym-key",
+		PseudonymKeys: map[string]string{"1": "versioned-pseudonym-key"},
+	}
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), `pseudonym_key and ingress.pseudonym_keys["1"]`) {
+		t.Fatalf("duplicate pseudonym generation one validation error=%v", err)
+	}
+}
+
 func TestDeploymentExamplesValidate(t *testing.T) {
 	for _, name := range []string{"GRIPLINE_OPERATOR_TOKEN", "GRIPLINE_PEPPER_V1", "GRIPLINE_PEPPER_V2", "GRIPLINE_PSEUDONYM_KEY", "GRIPLINE_PSEUDONYM_V1", "GRIPLINE_PSEUDONYM_V2"} {
 		t.Setenv(name, "fixture-"+name+"-0123456789abcdef0123456789abcdef")

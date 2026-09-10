@@ -349,7 +349,8 @@ stub:
   required by CI/release. It proves shared concurrency, revocation, lockdown,
   policy activation/rollback, signer activation and retirement, stale-assertion
   rejection, killed-node cancellation, and PostgreSQL outage/recovery.
-- `gripline migrate plan|apply`, `cluster status`, and `crypto
+- `gripline migrate plan|apply`, `cluster status`, `cluster behavior
+  plan|apply`, and `crypto
   status|activate|retire|signer-prepare` are the operational surfaces for the
   shared authority. Serving nodes do not run migrations automatically.
 - `deploy/config.postgres.example.json` is the reference clustered topology;

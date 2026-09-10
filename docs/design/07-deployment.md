@@ -66,15 +66,29 @@ Before starting serving nodes on a new or upgraded database, run:
 ```bash
 gripline migrate plan --config /etc/gripline/config.json
 gripline migrate apply --config /etc/gripline/config.json
+# The behavior contract is changed only through an explicit offline CAS.
+gripline cluster behavior plan --config /etc/gripline/config.json
+gripline cluster behavior apply --config /etc/gripline/config.json \
+  --expected-current-digest <digest> -r "planned authority behavior change"
 ```
 
 Serving nodes use `Migrate=false` and only check schema compatibility. Do not
 give the Internet-facing runtime database role DDL privileges. v1 uses an
 enforced stop-the-world upgrade contract: `migrate apply` refuses while a
-recently-live `ready` or `draining` membership row exists. Stop or drain every
-old node, apply the migration, then start the new binary. A future
+recently-live non-`stopped` membership row exists. Stop or drain every old
+node, apply the migration, then start the new binary. A future
 expand/contract release may replace this with an explicit protocol/schema
 compatibility range.
+
+The cluster behavior digest covers settings that change shared authority
+meaning, including lease timing, source/alias bounds, and retention semantics.
+Changing those settings requires the offline `cluster behavior` lifecycle:
+`plan` reports current and desired digests and changed non-secret fields;
+`apply` requires the expected current digest and an operator reason, checks the
+old authoritative lease horizon, membership and active resource leases, then
+performs a compare-and-swap update and writes a durable operator-audit record.
+Nodes with a behavior mismatch remain `not_ready` until the operator applies
+the new contract and restarts them.
 
 Crypto rotation is also a cluster operation: stage identical signer/pepper/
 pseudonym material, make every live node acknowledge the exact fingerprint,

@@ -143,8 +143,12 @@ var cliRoot = &cliCommand{
 			{Name: "plan", Summary: "inspect schema compatibility", Options: []cliOption{{Name: "--timeout DURATION", Summary: "maximum schema inspection time"}, {Name: "--output FORMAT", Summary: "table, json, or jsonl"}}},
 			{Name: "apply", Summary: "migrate PostgreSQL while serving nodes are stopped", Options: []cliOption{{Name: "--timeout DURATION", Summary: "maximum migration time"}, {Name: "--output FORMAT", Summary: "table, json, or jsonl"}}},
 		}},
-		{Name: "cluster", Summary: "show shared membership status", Usage: "gripline cluster [status]", Default: "status", Run: runClusterCommandCLI, Children: []*cliCommand{
+		{Name: "cluster", Summary: "show status or manage shared behavior", Usage: "gripline cluster [status|behavior]", Default: "status", Run: runClusterCommandCLI, Children: []*cliCommand{
 			{Name: "status", Summary: "show nodes and shared authority state", Options: []cliOption{{Name: "--output FORMAT", Summary: "table, json, or jsonl"}, {Name: "--token-file PATH", Summary: "read the operator token from this file"}, {Name: "--token TOKEN", Summary: "legacy bearer token; visible in shell history", Advanced: true}}},
+			{Name: "behavior", Summary: "plan or apply an explicit shared behavior transition", Usage: "gripline cluster behavior <plan|apply>", Default: "plan", Children: []*cliCommand{
+				{Name: "plan", Summary: "compare configured behavior with the authority", Options: []cliOption{{Name: "--timeout DURATION", Summary: "maximum database operation time"}, {Name: "--output FORMAT", Summary: "table, json, or jsonl"}}},
+				{Name: "apply", Summary: "apply a quiescent compare-and-swap behavior update", Options: []cliOption{{Name: "--expected-current-digest DIGEST", Summary: "authority digest required for compare-and-swap (or none)"}, {Name: "-r, --reason TEXT", Summary: "audited operator reason (required)"}, {Name: "--actor ID", Summary: "operator identity for the audit record"}, {Name: "--timeout DURATION", Summary: "maximum database operation time"}, {Name: "--output FORMAT", Summary: "table, json, or jsonl"}}},
+			}},
 		}},
 		{Name: "keys", Summary: "export backend verification keys", Usage: "gripline keys [export]", Default: "export", Run: runKeysCommandCLI, Children: []*cliCommand{
 			{Name: "export", Summary: "export public verification material (JSON only)", Options: []cliOption{{Name: "output", Summary: "fixed JSON artifact; global output formats do not apply"}}},

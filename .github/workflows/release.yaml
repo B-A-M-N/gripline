@@ -34,6 +34,20 @@ jobs:
     name: exact-SHA fast release check
     needs: release-preflight
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
+        env:
+          POSTGRES_USER: gripline
+          POSTGRES_PASSWORD: gripline
+          POSTGRES_DB: gripline
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U gripline -d gripline"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     permissions:
       contents: read
     steps:
@@ -47,8 +61,11 @@ jobs:
       - name: Require the exact tagged tree
         run: test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
       - name: Run fast exact-SHA prerequisite
+        env:
+          GRIPLINE_TEST_POSTGRES_DSN: postgres://gripline:gripline@localhost:5432/gripline?sslmode=disable
         run: |
           go test ./...
+          go test -count=1 -run '^TestPostgres' ./internal/statepg
           go vet ./...
           go build ./...
           git diff --check
@@ -155,8 +172,8 @@ jobs:
           go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
           go build ./...
           go test ./...
-          GRIPLINE_TEST_POSTGRES_DSN=postgres://gripline:gripline@localhost:5432/gripline?sslmode=disable go test -v ./internal/statepg -run '^TestPostgres'
-          GRIPLINE_TEST_POSTGRES_DSN=postgres://gripline:gripline@localhost:5432/gripline?sslmode=disable go test -race -v ./internal/statepg -run '^TestPostgres'
+          GRIPLINE_TEST_POSTGRES_DSN=postgres://gripline:gripline@localhost:5432/gripline?sslmode=disable go test -count=1 -v ./internal/statepg -run '^TestPostgres'
+          GRIPLINE_TEST_POSTGRES_DSN=postgres://gripline:gripline@localhost:5432/gripline?sslmode=disable go test -count=1 -race -v ./internal/statepg -run '^TestPostgres'
           GRIPLINE_TEST_POSTGRES_DSN=postgres://gripline:gripline@localhost:5432/gripline?sslmode=disable GRIPLINE_CLUSTER_HARNESS_REQUIRE_DB_OUTAGE=1 bash scripts/cluster-harness.sh
           go test -race ./...
           go test -run TestGate -v ./internal/gates/

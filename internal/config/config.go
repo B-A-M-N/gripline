@@ -893,6 +893,11 @@ func (c *Config) Validate() error {
 		}
 	}
 	if c.Ingress != nil {
+		if c.Ingress.PseudonymKey != "" {
+			if _, explicitVersionOne := c.Ingress.PseudonymKeys["1"]; explicitVersionOne {
+				return fmt.Errorf("ingress.pseudonym_key and ingress.pseudonym_keys[\"1\"] cannot both be configured")
+			}
+		}
 		loadedPseudonymGenerations := len(c.Ingress.PseudonymKeys)
 		if c.Ingress.PseudonymKey != "" {
 			if _, explicitVersionOne := c.Ingress.PseudonymKeys["1"]; !explicitVersionOne {

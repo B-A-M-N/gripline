@@ -130,7 +130,7 @@ func (s *Store) ClusterStatus(ctx context.Context) (ClusterStatus, error) {
 
 	rows, err := tx.Query(ctx, `SELECT node_id, instance_id, node_epoch,
 		protocol_version, schema_version, state, last_seen_at, drain_until,
-		(state IN ('ready','draining') AND last_seen_at > CURRENT_TIMESTAMP -
+		(state <> 'stopped' AND last_seen_at > CURRENT_TIMESTAMP -
 			($1::double precision * interval '1 second')) AS live
 		FROM gripline_membership ORDER BY node_id, node_epoch`, s.leaseTTL.Seconds())
 	if err != nil {

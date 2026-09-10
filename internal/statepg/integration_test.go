@@ -387,6 +387,12 @@ func TestPostgresMigrationRefusesLiveNodes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open serving authority: %v", err)
 	}
+	servingClosed := false
+	t.Cleanup(func() {
+		if !servingClosed {
+			serving.Close()
+		}
+	})
 	// Force the migration path to have real catalog work available. The
 	// regression is specifically that this work must not begin while a live
 	// node exists.
@@ -412,31 +418,38 @@ func TestPostgresMigrationRefusesLiveNodes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin concurrent state write: %v", err)
 	}
+	holderRolledBack := false
+	t.Cleanup(func() {
+		if !holderRolledBack {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			_ = holder.Rollback(cleanupCtx)
+		}
+	})
 	if _, err := holder.Exec(ctx, `UPDATE gripline_membership SET last_seen_at=last_seen_at WHERE node_id=$1`, serving.nodeID); err != nil {
 		holder.Rollback(ctx)
+		holderRolledBack = true
 		t.Fatalf("hold concurrent membership write: %v", err)
 	}
 	migrationCtx, migrationCancel := context.WithTimeout(ctx, 2*time.Second)
 	defer migrationCancel()
-	migrationResult := make(chan error, 1)
-	go func() {
-		_, migrationErr := Open(migrationCtx, Options{
-			DSN: dsn, LeaseTTL: 10 * time.Second, OperationTimeout: 10 * time.Second,
-			Migrate: true,
-		})
-		migrationResult <- migrationErr
-	}()
-	select {
-	case migrationErr := <-migrationResult:
-		if !errors.Is(migrationErr, ErrMigrationRequiresQuiescence) {
-			t.Fatalf("migration beside a live node = %v, want ErrMigrationRequiresQuiescence", migrationErr)
-		}
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("migration did not reject live node before waiting on unrelated DDL locks")
+	var migrationErr error
+	if migrated, openErr := Open(migrationCtx, Options{
+		DSN: dsn, LeaseTTL: 10 * time.Second, OperationTimeout: 10 * time.Second,
+		Migrate: true,
+	}); migrated != nil {
+		migrated.Close()
+		migrationErr = openErr
+	} else {
+		migrationErr = openErr
+	}
+	if !errors.Is(migrationErr, ErrMigrationRequiresQuiescence) {
+		t.Fatalf("migration beside a live node = %v, want ErrMigrationRequiresQuiescence", migrationErr)
 	}
 	if err := holder.Rollback(ctx); err != nil {
 		t.Fatalf("release concurrent state write: %v", err)
 	}
+	holderRolledBack = true
 	var afterVersion int
 	var afterIndex bool
 	if err := serving.pool.QueryRow(ctx, `SELECT version FROM gripline_schema WHERE singleton=TRUE`).Scan(&afterVersion); err != nil {
@@ -449,6 +462,7 @@ func TestPostgresMigrationRefusesLiveNodes(t *testing.T) {
 		t.Fatalf("live-node migration changed catalog state: before version/index=%d/%v after=%d/%v", beforeVersion, beforeIndex, afterVersion, afterIndex)
 	}
 	serving.Close()
+	servingClosed = true
 
 	migrated, err := Open(ctx, Options{
 		DSN: dsn, LeaseTTL: 10 * time.Second, OperationTimeout: 10 * time.Second,
@@ -482,6 +496,137 @@ func TestPostgresMigrationRefusesLiveNodes(t *testing.T) {
 	}
 	if err := <-secondDone; err != nil {
 		t.Fatalf("second serialized migration: %v", err)
+	}
+}
+
+func TestPostgresMigrationRefusesLiveNotReadyNodesAndStopsCleanly(t *testing.T) {
+	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("GRIPLINE_TEST_POSTGRES_DSN is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resetIntegrationAuthority(t, ctx, dsn)
+
+	seed, err := Open(ctx, Options{
+		DSN: dsn, NodeID: "behavior-authority", LeaseTTL: 60 * time.Second,
+		RenewEvery: 10 * time.Second, MaxSourceScopes: 64, OperationTimeout: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("open behavior authority seed: %v", err)
+	}
+	seedClosed := false
+	t.Cleanup(func() {
+		if !seedClosed {
+			seed.Close()
+		}
+	})
+	seed.Close()
+	seedClosed = true
+	notReady, err := Open(ctx, Options{
+		DSN: dsn, NodeID: "behavior-mismatch-node", LeaseTTL: 60 * time.Second,
+		RenewEvery: 10 * time.Second, MaxSourceScopes: 65, OperationTimeout: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("open behavior-mismatched authority: %v", err)
+	}
+	closed := false
+	t.Cleanup(func() {
+		if !closed {
+			notReady.Close()
+		}
+	})
+	var state string
+	if err := notReady.pool.QueryRow(ctx, `SELECT state FROM gripline_membership WHERE node_id=$1`, notReady.nodeID).Scan(&state); err != nil {
+		t.Fatalf("read behavior-mismatched membership: %v", err)
+	}
+	if state != "not_ready" {
+		t.Fatalf("behavior-mismatched membership state=%q, want not_ready", state)
+	}
+	// Make the row older than the migrator's local 30-second fallback but
+	// younger than the authoritative 60-second lease. The migration must use
+	// the latter and reject the still-live node.
+	if _, err := notReady.pool.Exec(ctx, `UPDATE gripline_membership SET last_seen_at=CURRENT_TIMESTAMP - INTERVAL '40 seconds' WHERE node_id=$1`, notReady.nodeID); err != nil {
+		t.Fatalf("age behavior-mismatched membership: %v", err)
+	}
+	migrationCtx, migrationCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer migrationCancel()
+	migrator, err := Open(migrationCtx, Options{DSN: dsn, LeaseTTL: 30 * time.Second, Migrate: true})
+	if migrator != nil {
+		migrator.Close()
+	}
+	if !errors.Is(err, ErrMigrationRequiresQuiescence) {
+		t.Fatalf("migration beside live not_ready node = %v, want ErrMigrationRequiresQuiescence", err)
+	}
+
+	notReady.Close()
+	closed = true
+	// Use a short-lived inspection connection after closing the store for the
+	// durable stopped-state assertion.
+	inspection, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect stopped-state inspection: %v", err)
+	}
+	defer inspection.Close()
+	if err := inspection.QueryRow(ctx, `SELECT state FROM gripline_membership WHERE node_id=$1`, notReady.nodeID).Scan(&state); err != nil {
+		t.Fatalf("read stopped behavior-mismatched membership: %v", err)
+	}
+	if state != "stopped" {
+		t.Fatalf("closed behavior-mismatched membership state=%q, want stopped", state)
+	}
+}
+
+func TestPostgresClusterBehaviorPlanApplyUsesCASAndAudit(t *testing.T) {
+	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("GRIPLINE_TEST_POSTGRES_DSN is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resetIntegrationAuthority(t, ctx, dsn)
+
+	seed := openIntegrationStore(t, ctx, dsn, "behavior-plan-seed")
+	currentDigest := seed.behaviorDigest
+	desired := seed.clusterBehavior
+	desired.LeaseTTL = 20 * time.Second
+	desired.RenewEvery = 5 * time.Second
+	seed.Close()
+
+	operator, err := Open(ctx, Options{
+		DSN: dsn, LeaseTTL: desired.LeaseTTL, RenewEvery: desired.RenewEvery,
+		ClusterBehavior: &desired, OperationTimeout: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("open offline behavior operator: %v", err)
+	}
+	defer operator.Close()
+	plan, err := operator.PlanClusterBehavior(ctx, desired)
+	if err != nil {
+		t.Fatalf("plan cluster behavior transition: %v", err)
+	}
+	if !plan.Initialized || plan.CurrentDigest != currentDigest || plan.DesiredDigest == currentDigest || len(plan.Changes) == 0 {
+		t.Fatalf("unexpected behavior plan: %+v", plan)
+	}
+	if _, err := operator.ApplyClusterBehavior(ctx, desired, "wrong-digest", "operator-a", "test transition"); !errors.Is(err, ErrClusterBehaviorDigestMismatch) {
+		t.Fatalf("wrong behavior digest error=%v, want ErrClusterBehaviorDigestMismatch", err)
+	}
+	if _, err := operator.ApplyClusterBehavior(ctx, desired, currentDigest, "operator-a", "test transition"); err != nil {
+		t.Fatalf("apply cluster behavior transition: %v", err)
+	}
+	after, err := operator.PlanClusterBehavior(ctx, desired)
+	if err != nil {
+		t.Fatalf("plan cluster behavior after apply: %v", err)
+	}
+	if len(after.Changes) != 0 || after.CurrentDigest != after.DesiredDigest {
+		t.Fatalf("behavior remains changed after apply: %+v", after)
+	}
+	var actor, action, reason string
+	if err := operator.pool.QueryRow(ctx, `SELECT actor, action, reason FROM gripline_operator_audit
+		WHERE action='cluster.behavior.apply' ORDER BY sequence DESC LIMIT 1`).Scan(&actor, &action, &reason); err != nil {
+		t.Fatalf("read behavior transition audit: %v", err)
+	}
+	if actor != "operator-a" || action != "cluster.behavior.apply" || reason != "test transition" {
+		t.Fatalf("behavior transition audit=%q/%q/%q", actor, action, reason)
 	}
 }
 
@@ -2117,6 +2262,7 @@ func TestPostgresSourceAliasCardinalityBoundReclaimsOnlySafeIdentities(t *testin
 	if identities != 2 || rows > 2 {
 		t.Fatalf("bounded source aliases identities=%d rows=%d, want 2 identities and at most 2 rows", identities, rows)
 	}
+	waitForSourceAliasTouches(t, store)
 
 	if _, err := store.pool.Exec(ctx, `UPDATE gripline_source_aliases
 		SET last_seen_at=CURRENT_TIMESTAMP - INTERVAL '2 hours'
@@ -2684,11 +2830,30 @@ func resetIntegrationAuthority(t *testing.T, ctx context.Context, dsn string) {
 		gripline_cluster_crypto,
 		gripline_cluster_crypto_generations,
 		gripline_cluster_crypto_acks,
+		gripline_cluster_behavior,
 			gripline_policy_node_state,
 			gripline_source_aliases,
 			gripline_source_alias_identity_guard,
 			gripline_membership`
 	if _, err := pool.Exec(ctx, "TRUNCATE TABLE "+tables+" RESTART IDENTITY CASCADE"); err != nil {
 		t.Fatalf("reset integration authority: %v", err)
+	}
+}
+
+func waitForSourceAliasTouches(t *testing.T, store *Store) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		store.sourceAliasTouchMu.Lock()
+		pending := len(store.sourceAliasTouchPending)
+		queued := len(store.sourceAliasTouchQueue)
+		store.sourceAliasTouchMu.Unlock()
+		if pending == 0 && queued == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("source alias touch queue did not drain: pending=%d queued=%d", pending, queued)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

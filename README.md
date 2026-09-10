@@ -134,13 +134,23 @@ Apply schema changes with a migration identity before starting serving nodes:
 ```bash
 gripline migrate plan  --config deploy/config.postgres.example.json
 gripline migrate apply --config deploy/config.postgres.example.json
+
+# Review and explicitly change the shared behavior contract while all nodes
+# and active authority leases are stopped.
+gripline cluster behavior plan  --config deploy/config.postgres.example.json
+gripline cluster behavior apply --config deploy/config.postgres.example.json \
+  --expected-current-digest <digest> -r "planned authority lease change"
 ```
 
 Serving nodes only check schema compatibility and do not perform DDL. v1
 schema upgrades are stop-the-world: `migrate apply` refuses while any
-recently-live node is `ready` or `draining`; stop all serving nodes before
-applying a migration, then start the new binary. Route traffic only to nodes
-whose `/readyz` returns 200. A node that loses its
+recently-live membership is not `stopped`; stop all serving nodes before
+applying a migration, then start the new binary. The behavior plan shows the
+current and desired canonical digests plus changed non-secret fields. Behavior
+apply requires the expected current digest and an operator reason, verifies
+that membership and active authority leases are quiescent, updates the
+singleton with compare-and-swap, and records the transition in operator audit.
+Route traffic only to nodes whose `/readyz` returns 200. A node that loses its
 membership epoch, shared policy/crypto state, or PostgreSQL connectivity is
 removed from service and fails protected admissions closed. PostgreSQL backup,
 PITR, replication, and failover are exercised by the repository-owned reference
