@@ -4,11 +4,15 @@ Gripline has three qualification layers. The first two are repository-owned;
 the third is specific to the operator's deployment.
 
 ```yaml
-repository_status: layer_1_local_exact_sha_passed
+candidate_sha: b1f1d453a067cb45700be321db6c7dbff6e308d5
+local_layer_1: pending_candidate_rerun
+local_reference_qualification: pending_candidate_rerun
 hosted_layer_1_status: pending
+long_soak_exact_sha: pending
 reference_lab_status: pending_exact_sha_hosted_record
 operator_deployment_status: separate_per_deployment
 production_qualification_status: pending_exact_release_record
+release_published: false
 production_stable: false
 production_stable_rule: layers_1_and_2_pass_on_exact_release_sha
 ```

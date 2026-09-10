@@ -370,11 +370,19 @@ provider-account settlement remain operator deployment evidence.
 This table is the authoritative status for the latest clustered-authority
 review. “Local PostgreSQL verified” means the repository proof was exercised
 against the disposable authority in this environment; hosted exact-commit
-release evidence is still a separate step. The latest full local qualification
-was generated on exact commit `0094597cbb77142be6cebdb91173c5388f3c4872`
-(`test: pin http2 fixture archive`); all 11 required gates passed, including
-the source-churn and HTTP/2 gates. The hosted exact-SHA release record remains
-pending and must not be conflated with local evidence.
+release evidence is still a separate step. The current local candidate is
+`b1f1d453a067cb45700be321db6c7dbff6e308d5`; its local qualification record
+must remain distinct from hosted exact-SHA evidence. The hosted exact-SHA
+release record remains pending and must not be conflated with local evidence.
+
+| Release state | Status |
+|---|---|
+| Local audited candidate | `b1f1d453a067cb45700be321db6c7dbff6e308d5` |
+| Local repository qualification | pending for this candidate commit |
+| Remote publication | pending |
+| Hosted exact-SHA Layer 1 | pending |
+| Hosted exact-SHA Layer 2 / 24h | pending |
+| Production-beta release | not yet published or qualified |
 
 | Requirement | Current status | Implementation / proof | Limitation or evidence still required |
 |---|---|---|---|
@@ -412,6 +420,7 @@ The source lifecycle follow-up adds an authenticated-only durable source-alias
 binding boundary, reference-aware alias and source-scope maintenance, bounded
 alias-touch batching, and a dedicated source-churn qualification gate. Release
 tag syntax and tagged-commit/main ancestry now run in an Ubuntu preflight before
-the self-hosted qualification job. The committed code-bearing qualification
-SHA `0094597cbb77142be6cebdb91173c5388f3c4872` passed the full short suite and
-manifest verification; the final hosted evidence record remains pending.
+the self-hosted qualification job. The committed candidate is the exact SHA
+named in the release-readiness table; local qualification, remote publication,
+and hosted exact-SHA evidence remain separate records. The final hosted
+evidence record remains pending.
