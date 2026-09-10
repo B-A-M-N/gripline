@@ -154,6 +154,30 @@ import json
 import sys
 path = sys.argv[1]
 value = json.loads(open(path, encoding="utf-8").read())
+value["gates"]["unexpected"] = "pass"
+open(path, "w", encoding="utf-8").write(json.dumps(value) + "\n")
+PY
+refresh_hashes
+expect_reject extra-gate-material
+
+write_fixture
+python3 - "$fixture_dir/manifest.json" <<'PY'
+import json
+import sys
+path = sys.argv[1]
+value = json.loads(open(path, encoding="utf-8").read())
+value["evidence"]["unexpected"] = {}
+open(path, "w", encoding="utf-8").write(json.dumps(value) + "\n")
+PY
+refresh_hashes
+expect_reject extra-evidence-material
+
+write_fixture
+python3 - "$fixture_dir/manifest.json" <<'PY'
+import json
+import sys
+path = sys.argv[1]
+value = json.loads(open(path, encoding="utf-8").read())
 value["required_gates"].append("soak")
 open(path, "w", encoding="utf-8").write(json.dumps(value) + "\n")
 PY

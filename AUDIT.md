@@ -370,10 +370,10 @@ provider-account settlement remain operator deployment evidence.
 This table is the authoritative status for the latest clustered-authority
 review. “Local PostgreSQL verified” means the repository proof was exercised
 against the disposable authority in this environment; hosted exact-commit
-release evidence is still a separate step. The verified basis is parent SHA
-`6efabb3ff697c2e7d711e202a2be3b28e9893f17` plus the uncommitted worktree
-changes; a release SHA must be recorded after the tree is committed and the
-hosted gates pass.
+release evidence is still a separate step. The verified basis is local exact
+commit `702804402f75302c83c4ffe90b4b07e2b00db309`
+(`feat: harden source alias lifecycle`); the hosted exact-SHA release record
+remains pending and must not be conflated with local evidence.
 
 | Requirement | Current status | Implementation / proof | Limitation or evidence still required |
 |---|---|---|---|
