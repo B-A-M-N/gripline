@@ -371,9 +371,9 @@ This table is the authoritative status for the latest clustered-authority
 review. “Local PostgreSQL verified” means the repository proof was exercised
 against the disposable authority in this environment; hosted exact-commit
 release evidence is still a separate step. The verified basis is local exact
-commit `702804402f75302c83c4ffe90b4b07e2b00db309`
-(`feat: harden source alias lifecycle`); the hosted exact-SHA release record
-remains pending and must not be conflated with local evidence.
+commit `10fd45658a5937ca7ceb9d4f0363d1f29f7cad6c`
+(`test: enforce source churn evidence bounds`); the hosted exact-SHA release
+record remains pending and must not be conflated with local evidence.
 
 | Requirement | Current status | Implementation / proof | Limitation or evidence still required |
 |---|---|---|---|
