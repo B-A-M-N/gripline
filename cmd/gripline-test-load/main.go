@@ -121,6 +121,7 @@ func main() {
 	timeout := flag.Duration("timeout", 10*time.Second, "per-request timeout")
 	userAgent := flag.String("user-agent", "", "optional deterministic User-Agent header")
 	localAddressPrefix := flag.String("local-address-prefix", "", "optional IPv4 prefix for per-worker source addresses, for example 127.0.0.")
+	forwardedForPrefix := flag.String("forwarded-for-prefix", "", "optional trusted X-Forwarded-For IPv4 prefix per worker, for example 11.0.0.")
 	flag.Parse()
 	credentials := []string{*secret}
 	if *secrets != "" {
@@ -180,6 +181,9 @@ func main() {
 				request.Header.Set("Content-Type", "application/json")
 				if *userAgent != "" {
 					request.Header.Set("User-Agent", *userAgent)
+				}
+				if *forwardedForPrefix != "" {
+					request.Header.Set("X-Forwarded-For", fmt.Sprintf("%s%d", *forwardedForPrefix, worker+1))
 				}
 				started := time.Now()
 				response, err := client.Do(request)

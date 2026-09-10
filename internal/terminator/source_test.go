@@ -38,7 +38,7 @@ func TestInvalidCredentialsNeverBindSourceAliases(t *testing.T) {
 	}
 	for i := 0; i < 10000; i++ {
 		out := term.AdmitUsageContext(context.Background(), "invalid-source-alias-"+string(rune(i)), bearerHeaders("sk-invalid"), lane.Features{}, src, resource.UsageEstimate{Requests: 1})
-		if out.Authorized || out.CredentialAuthenticated {
+		if out.Authorized || out.CredentialMatched || out.CredentialAuthenticated {
 			t.Fatalf("invalid request %d outcome=%+v, want unauthenticated denial", i, out)
 		}
 	}
@@ -55,6 +55,28 @@ func TestInvalidCredentialsNeverBindSourceAliases(t *testing.T) {
 	}
 	if out.Trace == nil || out.Trace.SourcePseudonym != "canonical-authenticated-source" {
 		t.Fatalf("authenticated source was not rebound canonically: trace=%+v", out.Trace)
+	}
+}
+
+func TestDeniedKnownCredentialsNeverBindSourceAliases(t *testing.T) {
+	for _, status := range []credential.Status{credential.StatusRevoked, credential.StatusQuarantined} {
+		t.Run(status.String(), func(t *testing.T) {
+			term, raw := buildTerminator(t, status, nil)
+			binder := new(sourceAliasBindRecorder)
+			src := TrustedSource{
+				Pseudonym:   "provisional-source",
+				Aliases:     []SourceAliasCandidate{{Alias: "v1.provisional-source", Generation: 1}},
+				ActiveAlias: SourceAliasCandidate{Alias: "v1.provisional-source", Generation: 1},
+				AliasBinder: binder,
+			}
+			out := term.AdmitUsageContext(context.Background(), "denied-known-source", bearerHeaders(raw), lane.Features{}, src, resource.UsageEstimate{Requests: 1})
+			if out.Authorized || !out.CredentialMatched || out.CredentialAuthenticated {
+				t.Fatalf("denied known credential outcome=%+v, want matched-only denial", out)
+			}
+			if got := binder.calls.Load(); got != 0 {
+				t.Fatalf("denied known credential invoked source alias binder %d times", got)
+			}
+		})
 	}
 }
 

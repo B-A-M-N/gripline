@@ -47,6 +47,11 @@ type AuthorityMetrics struct {
 	SourceAliasResolutionLatency       time.Duration
 	SourceAliasTouchBatches            int64
 	SourceAliasTouchDropped            int64
+	SourceAliasCanonicalIdentities     int64
+	SourceAliasRows                    int64
+	SourceAliasSaturations             int64
+	SourceAliasSafeEvictions           int64
+	SourceAliasCapacityDenials         int64
 	ReservationAttempts                int64
 	ReservationsGranted                int64
 	ReservationFailures                int64
@@ -98,6 +103,11 @@ type authorityMetrics struct {
 	sourceAliasResolutionLatencyNanos  atomic.Int64
 	sourceAliasTouchBatches            atomic.Int64
 	sourceAliasTouchDropped            atomic.Int64
+	sourceAliasCanonicalIdentities     atomic.Int64
+	sourceAliasRows                    atomic.Int64
+	sourceAliasSaturations             atomic.Int64
+	sourceAliasSafeEvictions           atomic.Int64
+	sourceAliasCapacityDenials         atomic.Int64
 	reservationAttempts                atomic.Int64
 	reservationsGranted                atomic.Int64
 	reservationFailures                atomic.Int64
@@ -206,6 +216,11 @@ func (s *Store) Metrics() AuthorityMetrics {
 		SourceAliasResolutionLatency:       time.Duration(s.metrics.sourceAliasResolutionLatencyNanos.Load()),
 		SourceAliasTouchBatches:            s.metrics.sourceAliasTouchBatches.Load(),
 		SourceAliasTouchDropped:            s.metrics.sourceAliasTouchDropped.Load(),
+		SourceAliasCanonicalIdentities:     s.metrics.sourceAliasCanonicalIdentities.Load(),
+		SourceAliasRows:                    s.metrics.sourceAliasRows.Load(),
+		SourceAliasSaturations:             s.metrics.sourceAliasSaturations.Load(),
+		SourceAliasSafeEvictions:           s.metrics.sourceAliasSafeEvictions.Load(),
+		SourceAliasCapacityDenials:         s.metrics.sourceAliasCapacityDenials.Load(),
 		ReservationAttempts:                s.metrics.reservationAttempts.Load(),
 		ReservationsGranted:                s.metrics.reservationsGranted.Load(),
 		ReservationFailures:                s.metrics.reservationFailures.Load(),

@@ -33,7 +33,10 @@ type Options struct {
 	RenewEvery      time.Duration
 	MaxSourceScopes int
 	SourceScopeIdle time.Duration
-	ConnectTimeout  time.Duration
+	// MaxSourceAliasIdentities bounds distinct canonical source identities in
+	// the durable alias authority. Zero uses the conservative default.
+	MaxSourceAliasIdentities int
+	ConnectTimeout           time.Duration
 	// OperationTimeout is reserved for callers that need a store-owned
 	// default around remote operations. The request context remains the
 	// authoritative upper bound when one is supplied.
@@ -48,32 +51,33 @@ type Options struct {
 // Store is the shared transactional authority. Credential, lane, and evidence
 // methods are split across files but use this same pool and transaction model.
 type Store struct {
-	pool                    *pgxpool.Pool
-	metrics                 authorityMetrics
-	now                     func() time.Time
-	nodeID                  string
-	instanceID              string
-	nodeEpoch               int64
-	fenced                  atomic.Bool
-	leaseTTL                time.Duration
-	maxSourceScopes         int
-	sourceScopeIdle         time.Duration
-	operationTimeout        time.Duration
-	sourceAliasTouchMu      sync.Mutex
-	sourceAliasLastTouch    map[string]time.Time
-	sourceAliasTouchPending map[string]struct{}
-	sourceAliasTouchQueue   chan string
-	sourceAliasTouchStop    chan struct{}
-	sourceAliasTouchDone    chan struct{}
-	maintenance             MaintenanceOptions
-	leaseStop               chan struct{}
-	leaseDone               chan struct{}
-	maintenanceStop         chan struct{}
-	maintenanceDone         chan struct{}
-	membershipStop          chan struct{}
-	membershipDone          chan struct{}
-	cryptoReady             atomic.Bool
-	cryptoObserved          atomic.Value // cryptoObservation
+	pool                     *pgxpool.Pool
+	metrics                  authorityMetrics
+	now                      func() time.Time
+	nodeID                   string
+	instanceID               string
+	nodeEpoch                int64
+	fenced                   atomic.Bool
+	leaseTTL                 time.Duration
+	maxSourceScopes          int
+	sourceScopeIdle          time.Duration
+	maxSourceAliasIdentities int
+	operationTimeout         time.Duration
+	sourceAliasTouchMu       sync.Mutex
+	sourceAliasLastTouch     map[string]time.Time
+	sourceAliasTouchPending  map[string]struct{}
+	sourceAliasTouchQueue    chan string
+	sourceAliasTouchStop     chan struct{}
+	sourceAliasTouchDone     chan struct{}
+	maintenance              MaintenanceOptions
+	leaseStop                chan struct{}
+	leaseDone                chan struct{}
+	maintenanceStop          chan struct{}
+	maintenanceDone          chan struct{}
+	membershipStop           chan struct{}
+	membershipDone           chan struct{}
+	cryptoReady              atomic.Bool
+	cryptoObserved           atomic.Value // cryptoObservation
 }
 
 // Schema version 1 is the original clustered-authority layout. Version 2
@@ -91,10 +95,13 @@ type Store struct {
 // cardinality decisions. Version 14 adds durable source-pseudonym aliases so
 // every authenticated source generation resolves to one stable source identity;
 // pre-auth misses remain provisional and read-only. Version 15 adds authority-owned crypto activation,
-// supersession, and retirement-horizon timestamps. Keep the marker versioned even though the DDL below
-// is idempotent: CREATE TABLE IF NOT EXISTS cannot add columns to an already
-// initialized database.
-const currentSchemaVersion = 15
+// supersession, and retirement-horizon timestamps. Version 16 adds the source
+// alias identity cardinality guard and generation uniqueness invariant. Keep
+// the marker versioned even though the DDL below is idempotent: CREATE TABLE
+// IF NOT EXISTS cannot add columns to an already initialized database.
+const currentSchemaVersion = 16
+
+const defaultMaxSourceAliasIdentities = 4096
 
 // Three attempts were too shallow for the repository's active/active
 // qualification workload: a transient serializable conflict could exhaust the
@@ -166,6 +173,9 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 	if opts.SourceScopeIdle <= 0 {
 		opts.SourceScopeIdle = 10 * time.Minute
 	}
+	if opts.MaxSourceAliasIdentities <= 0 {
+		opts.MaxSourceAliasIdentities = defaultMaxSourceAliasIdentities
+	}
 	if opts.RenewEvery <= 0 || opts.RenewEvery >= opts.LeaseTTL/2 {
 		opts.RenewEvery = opts.LeaseTTL / 3
 	}
@@ -173,7 +183,7 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 		opts.OperationTimeout = 2 * time.Second
 	}
 	maintenance := opts.Maintenance.withDefaults()
-	s := &Store{pool: pool, now: opts.Now, nodeID: opts.NodeID, leaseTTL: opts.LeaseTTL, maxSourceScopes: opts.MaxSourceScopes, sourceScopeIdle: opts.SourceScopeIdle, operationTimeout: opts.OperationTimeout, sourceAliasLastTouch: make(map[string]time.Time), sourceAliasTouchPending: make(map[string]struct{}), sourceAliasTouchQueue: make(chan string, sourceAliasTouchQueueSize), sourceAliasTouchStop: make(chan struct{}), sourceAliasTouchDone: make(chan struct{}), maintenance: maintenance,
+	s := &Store{pool: pool, now: opts.Now, nodeID: opts.NodeID, leaseTTL: opts.LeaseTTL, maxSourceScopes: opts.MaxSourceScopes, sourceScopeIdle: opts.SourceScopeIdle, maxSourceAliasIdentities: opts.MaxSourceAliasIdentities, operationTimeout: opts.OperationTimeout, sourceAliasLastTouch: make(map[string]time.Time), sourceAliasTouchPending: make(map[string]struct{}), sourceAliasTouchQueue: make(chan string, sourceAliasTouchQueueSize), sourceAliasTouchStop: make(chan struct{}), sourceAliasTouchDone: make(chan struct{}), maintenance: maintenance,
 		leaseStop: make(chan struct{}), leaseDone: make(chan struct{})}
 	if err := s.Ping(connectCtx); err != nil {
 		pool.Close()
@@ -188,6 +198,7 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 		pool.Close()
 		return nil, err
 	}
+	s.refreshSourceAliasCardinality(connectCtx)
 	if s.nodeID != "" {
 		if err := s.registerNode(connectCtx); err != nil {
 			pool.Close()
@@ -582,6 +593,10 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS gripline_source_aliases_canonical_idx ON gripline_source_aliases (canonical_source_id, generation)`,
 		`CREATE INDEX IF NOT EXISTS gripline_source_aliases_seen_idx ON gripline_source_aliases (last_seen_at, alias)`,
+		`CREATE TABLE IF NOT EXISTS gripline_source_alias_identity_guard (
+			singleton BOOLEAN PRIMARY KEY CHECK (singleton=TRUE)
+		)`,
+		`INSERT INTO gripline_source_alias_identity_guard (singleton) VALUES (TRUE) ON CONFLICT (singleton) DO NOTHING`,
 		`CREATE TABLE IF NOT EXISTS gripline_resource_leases (
 			lease_id TEXT PRIMARY KEY,
 			request_id TEXT NOT NULL UNIQUE,
@@ -848,6 +863,8 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			UNION SELECT subject_id FROM gripline_evidence_guards WHERE scope='SOURCE' AND subject_id ~ '^v[0-9]+\.'
 			UNION SELECT subject FROM gripline_adaptive_window_subjects WHERE subject ~ '^v[0-9]+\.'
 			UNION SELECT subject FROM gripline_adaptive_baselines WHERE subject ~ '^v[0-9]+\.'
+			UNION SELECT observation_key FROM gripline_adaptive_window_keys
+				WHERE detector='source_novelty_source' AND observation_key ~ '^v[0-9]+\.'
 		)
 		INSERT INTO gripline_source_aliases
 			(canonical_source_id, alias, generation, created_at, last_seen_at)
@@ -876,6 +893,31 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			}
 		}
 		version = 15
+	}
+	if version == 15 {
+		// Version 16 adds the source-alias cardinality guard and the invariant
+		// that one canonical identity has at most one alias per generation. Clean
+		// up any duplicate legacy rows deterministically before creating the
+		// unique index; the alias primary key already makes this safe to audit.
+		if _, err := tx.Exec(ctx, `WITH ranked AS (
+			SELECT alias, ROW_NUMBER() OVER (
+				PARTITION BY canonical_source_id, generation
+				ORDER BY last_seen_at DESC, alias
+			) AS row_number
+			FROM gripline_source_aliases
+		), deleted AS (
+			DELETE FROM gripline_source_aliases a
+			USING ranked r
+			WHERE a.alias=r.alias AND r.row_number > 1
+			RETURNING a.alias
+		)
+		SELECT COUNT(*) FROM deleted`); err != nil {
+			return fmt.Errorf("statepg: deduplicate source aliases: %w", mapDBError(err))
+		}
+		if _, err := tx.Exec(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS gripline_source_aliases_canonical_generation_idx ON gripline_source_aliases (canonical_source_id, generation)`); err != nil {
+			return fmt.Errorf("statepg: enforce source alias generation uniqueness: %w", mapDBError(err))
+		}
+		version = 16
 	}
 	if version != currentSchemaVersion {
 		return fmt.Errorf("%w: unsupported migration state %d", ErrMigrationRequired, version)

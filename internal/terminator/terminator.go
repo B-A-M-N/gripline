@@ -31,11 +31,14 @@ import (
 type Outcome struct {
 	RequestID  string
 	Authorized bool
-	// CredentialAuthenticated reports that the presented secret matched a
-	// known credential, even when that credential was subsequently denied for
-	// revocation, quarantine, expiry, policy, or resource state. It is kept
-	// separate from Authorized so authenticated source identity can be bound
-	// without granting admission.
+	// CredentialMatched reports that the presented secret identified a known
+	// credential. A matched credential may still be revoked, quarantined, or
+	// expired and therefore must not bind durable source state.
+	CredentialMatched bool
+	// CredentialAuthenticated reports that the identified credential passed
+	// its credential-level authentication checks. It is separate from
+	// Authorized because later policy or resource denial does not undo
+	// authentication.
 	CredentialAuthenticated bool
 	Reason                  string // safe, non-secret denial/status reason
 	DenialErr               error
@@ -766,14 +769,7 @@ func (t *Terminator) admitUsageWithRequestID(ctx context.Context, reqID string, 
 	// 2. Authenticate.
 	cred, err := t.authenticate(ctx, presented)
 	if cred != nil {
-		out.CredentialAuthenticated = true
-		if bindErr := bindAuthenticatedSource(ctx, &src); bindErr != nil {
-			out.Authorized = false
-			out.Reason = "source_resolution_failed"
-			out.DenialErr = bindErr
-			tr.SourcePseudonym = src.sourceID()
-			return out
-		}
+		out.CredentialMatched = true
 		tr.SourcePseudonym = src.sourceID()
 	}
 	if err != nil {
@@ -837,6 +833,15 @@ func (t *Terminator) admitUsageWithRequestID(ctx context.Context, reqID string, 
 		}
 		return out
 	}
+	out.CredentialAuthenticated = true
+	if bindErr := bindAuthenticatedSource(ctx, &src); bindErr != nil {
+		out.Authorized = false
+		out.Reason = "source_resolution_failed"
+		out.DenialErr = bindErr
+		tr.SourcePseudonym = src.sourceID()
+		return out
+	}
+	tr.SourcePseudonym = src.sourceID()
 	tr.CredentialID = cred.CredentialID
 	tr.AccountID = cred.AccountID
 	tr.CredentialStatusBefore = cred.Status.String()

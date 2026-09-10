@@ -4,9 +4,10 @@ Gripline has three qualification layers. The first two are repository-owned;
 the third is specific to the operator's deployment.
 
 ```yaml
-candidate_sha: 1693af3dfbed44c5f745f5f1257a6dfae72ac21e
-local_layer_1: passed
-local_reference_qualification: passed
+last_locally_qualified_sha: 1693af3dfbed44c5f745f5f1257a6dfae72ac21e
+current_worktree_sha: informational_unqualified_changes_may_be_present
+local_layer_1: passed_for_last_locally_qualified_sha
+local_reference_qualification: passed_for_last_locally_qualified_sha
 hosted_layer_1_status: pending
 long_soak_exact_sha: pending
 reference_lab_status: pending_exact_sha_hosted_record
@@ -19,9 +20,10 @@ production_stable_rule: layers_1_and_2_pass_on_exact_release_sha
 
 ## Layer 1 — code correctness
 
-These gates must pass on the exact release commit. The current worktree has
-passed the Go test/race/vet and unexcluded gosec gates; hosted release
-execution remains the authoritative exact-SHA record:
+These gates must pass on the exact release commit. The retained local result
+applies to `last_locally_qualified_sha`; any later worktree changes are
+pending a fresh frozen-candidate run. Hosted release execution remains the
+authoritative exact-SHA record:
 
 - `go test ./...`
 - `go test -race ./...`
@@ -58,7 +60,7 @@ soak evidence:
 | Shared replay | `bash scripts/qualification/replay.sh` | Two independent processes produce exactly one winner for one claim |
 | Long-running active/active behavior | `bash scripts/qualification/soak.sh --duration 24h` | Replica/policy continuity, bounded active leases/holds/source scopes, retention checks, RSS/goroutine/heap snapshots, outage recovery, post-soak promotion |
 | Reference capacity behavior | `bash scripts/qualification/capacity.sh --duration 30s` | Persistent-client load, status distribution, p50/p95/p99, PostgreSQL pool wait, transaction retries, and transaction latency |
-| Source-churn qualification | `bash scripts/qualification/source-churn.sh` | Invalid-source spray remains read-only and backend-isolated; authenticated first-seen sources bind, source scopes overflow within bounds, pseudonym rotation preserves cardinality, and stale aliases are reclaimed |
+| Source-churn qualification | `bash scripts/qualification/source-churn.sh` | Invalid-source receipt accounts for every attempt with zero transport/unexpected statuses; revoked credentials remain unbound, valid resource denial is recorded, authenticated churn hits the hard alias bound without exceeding it, source scopes overflow within bounds, pseudonym rotation preserves cardinality, and stale aliases are reclaimed |
 
 The lab uses disposable containers, generated keys, and local
 provider-shaped fixtures; it requires no provider account. Each suite run emits

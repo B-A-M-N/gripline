@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 const (
@@ -29,6 +31,16 @@ type SourcePseudonymAlias struct {
 // set would silently merge unrelated source scopes, so callers must fail
 // closed and leave the rows untouched.
 var ErrSourceAliasConflict = errors.New("statepg: source alias conflict")
+
+// ErrSourceAliasCapacity means that a new canonical source identity would
+// exceed the configured durable alias cardinality and no stale, unreferenced
+// identity was safe to reclaim.
+var ErrSourceAliasCapacity = errors.New("statepg: source alias identity capacity exhausted")
+
+// ErrSourceAliasGenerationUnavailable means a caller attempted to register an
+// alias for a pseudonym generation that is not in the authority's loaded
+// active/overlap set.
+var ErrSourceAliasGenerationUnavailable = errors.New("statepg: source alias generation is not loaded")
 
 // ResolveOrRegisterSource atomically resolves every loaded alias for one raw
 // source to a stable canonical identity. A miss registers the explicitly active
@@ -238,6 +250,12 @@ func (s *Store) registerSourceAliases(ctx context.Context, aliases []SourcePseud
 			return mapDBError(err)
 		}
 		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx, `SELECT singleton FROM gripline_source_alias_identity_guard WHERE singleton=TRUE FOR UPDATE`); err != nil {
+			return mapDBError(err)
+		}
+		if err := validateLoadedSourceAliasGenerations(ctx, tx, aliases); err != nil {
+			return err
+		}
 		for _, alias := range lockValues {
 			if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, alias); err != nil {
 				return mapDBError(err)
@@ -275,11 +293,36 @@ func (s *Store) registerSourceAliases(ctx context.Context, aliases []SourcePseud
 				canonical = owner
 			}
 		}
-		inserted := false
 		now, err := dbNow(ctx, tx)
 		if err != nil {
 			return err
 		}
+		saturated := false
+		safeEvictions := 0
+		if len(found) == 0 {
+			var identities int
+			if err := tx.QueryRow(ctx, `SELECT COUNT(DISTINCT canonical_source_id) FROM gripline_source_aliases`).Scan(&identities); err != nil {
+				return mapDBError(err)
+			}
+			maxIdentities := s.maxSourceAliasIdentities
+			if maxIdentities <= 0 {
+				maxIdentities = defaultMaxSourceAliasIdentities
+			}
+			if identities >= maxIdentities {
+				saturated = true
+				required := identities - maxIdentities + 1
+				safeEvictions, err = reclaimStaleSourceAliasIdentities(ctx, tx, now, required, s.maintenance.SourceAliasRetention)
+				if err != nil {
+					return err
+				}
+				if identities-safeEvictions >= maxIdentities {
+					s.metrics.sourceAliasSaturations.Add(1)
+					s.metrics.sourceAliasCapacityDenials.Add(1)
+					return ErrSourceAliasCapacity
+				}
+			}
+		}
+		inserted := false
 		for _, candidate := range aliases {
 			if _, ok := existingAliases[candidate.Alias]; !ok {
 				inserted = true
@@ -291,13 +334,117 @@ func (s *Store) registerSourceAliases(ctx context.Context, aliases []SourcePseud
 				return mapDBError(err)
 			}
 		}
+		var identitiesAfter, rowsAfter int64
+		if err := tx.QueryRow(ctx, `SELECT COUNT(DISTINCT canonical_source_id), COUNT(*) FROM gripline_source_aliases`).Scan(&identitiesAfter, &rowsAfter); err != nil {
+			return mapDBError(err)
+		}
 		if err := mapDBError(tx.Commit(ctx)); err != nil {
 			return err
 		}
 		registered = registered || inserted
+		if saturated {
+			s.metrics.sourceAliasSaturations.Add(1)
+		}
+		if safeEvictions > 0 {
+			s.metrics.sourceAliasSafeEvictions.Add(int64(safeEvictions))
+		}
+		s.metrics.sourceAliasCanonicalIdentities.Store(identitiesAfter)
+		s.metrics.sourceAliasRows.Store(rowsAfter)
 		return nil
 	})
 	return canonical, registered, err
+}
+
+func validateLoadedSourceAliasGenerations(ctx context.Context, tx pgx.Tx, aliases []SourcePseudonymAlias) error {
+	seen := make(map[int]struct{}, len(aliases))
+	generations := make([]int, 0, len(aliases))
+	for _, candidate := range aliases {
+		if _, ok := seen[candidate.Generation]; ok {
+			return fmt.Errorf("statepg: multiple source aliases for pseudonym generation %d", candidate.Generation)
+		}
+		seen[candidate.Generation] = struct{}{}
+		generations = append(generations, candidate.Generation)
+	}
+	rows, err := tx.Query(ctx, `SELECT generation, state FROM gripline_cluster_crypto_generations
+		WHERE kind='pseudonym' AND generation=ANY($1::int[])`, generations)
+	if err != nil {
+		return mapDBError(err)
+	}
+	loaded := make(map[int]string, len(generations))
+	for rows.Next() {
+		var generation int
+		var state string
+		if err := rows.Scan(&generation, &state); err != nil {
+			return mapDBError(err)
+		}
+		loaded[generation] = state
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return mapDBError(err)
+	}
+	rows.Close()
+	var configured int
+	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_cluster_crypto_generations WHERE kind='pseudonym'`).Scan(&configured); err != nil {
+		return mapDBError(err)
+	}
+	// Legacy/test authorities may not have initialized cluster pseudonym
+	// generations yet. Once the authority has a generation catalog, every
+	// candidate must name a catalogued generation; otherwise a stale or forged
+	// alias could create durable source state outside the loaded ring.
+	if configured == 0 {
+		return nil
+	}
+	for generation, state := range loaded {
+		if state != "active" && state != "loaded" {
+			return fmt.Errorf("%w: pseudonym generation %d is %s", ErrSourceAliasGenerationUnavailable, generation, state)
+		}
+	}
+	if len(loaded) != len(generations) {
+		return fmt.Errorf("%w: candidate set is not fully loaded", ErrSourceAliasGenerationUnavailable)
+	}
+	return nil
+}
+
+func reclaimStaleSourceAliasIdentities(ctx context.Context, tx pgx.Tx, now time.Time, required int, retention time.Duration) (int, error) {
+	if required <= 0 {
+		return 0, nil
+	}
+	if retention <= 0 {
+		retention = defaultSourceAliasRetention
+	}
+	var evicted int
+	query := `WITH reclaimable AS (
+		SELECT a.canonical_source_id
+		FROM gripline_source_aliases a
+		GROUP BY a.canonical_source_id
+		HAVING bool_and(a.last_seen_at < $1)
+		   AND NOT ` + sourceIdentityReferencePredicate("a.canonical_source_id") + `
+		ORDER BY min(a.last_seen_at), a.canonical_source_id
+		LIMIT $2
+	), deleted AS (
+		DELETE FROM gripline_source_aliases a
+		USING reclaimable r
+		WHERE a.canonical_source_id=r.canonical_source_id
+		RETURNING a.canonical_source_id
+	)
+	SELECT COUNT(DISTINCT canonical_source_id) FROM deleted`
+	if err := tx.QueryRow(ctx, query, now.Add(-retention), required).Scan(&evicted); err != nil {
+		return 0, mapDBError(err)
+	}
+	return evicted, nil
+}
+
+func (s *Store) refreshSourceAliasCardinality(ctx context.Context) {
+	if s == nil || s.pool == nil {
+		return
+	}
+	var identities, rows int64
+	if err := s.pool.QueryRow(ctx, `SELECT COUNT(DISTINCT canonical_source_id), COUNT(*) FROM gripline_source_aliases`).Scan(&identities, &rows); err != nil {
+		return
+	}
+	s.metrics.sourceAliasCanonicalIdentities.Store(identities)
+	s.metrics.sourceAliasRows.Store(rows)
 }
 
 // maybeTouchSourceAliases keeps alias recency useful without putting a write,

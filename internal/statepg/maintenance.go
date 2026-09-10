@@ -416,6 +416,9 @@ func (s *Store) maintainSourceAliases(ctx context.Context) (int, error) {
 		return 0, mapDBError(err)
 	}
 	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT singleton FROM gripline_source_alias_identity_guard WHERE singleton=TRUE FOR UPDATE`); err != nil {
+		return 0, mapDBError(err)
+	}
 	now, err := dbNow(ctx, tx)
 	if err != nil {
 		return 0, err
@@ -431,24 +434,29 @@ func (s *Store) maintainSourceAliases(ctx context.Context) (int, error) {
 			OR (
 				EXISTS (SELECT 1 FROM gripline_cluster_crypto_generations g
 					WHERE g.kind='pseudonym' AND g.generation=a.generation AND g.state='retired')
-				AND EXISTS (SELECT 1 FROM gripline_source_aliases retained
-					WHERE retained.canonical_source_id=a.canonical_source_id
-					  AND retained.generation<>a.generation)
+				AND ` + usableRetainedSourceAliasPredicate("a.canonical_source_id", "a.generation") + `
 			)
 		)
 		ORDER BY a.last_seen_at, a.alias
 		LIMIT $2 FOR UPDATE SKIP LOCKED
+	), deleted AS (
+		DELETE FROM gripline_source_aliases a
+		USING doomed d
+		WHERE a.alias=d.alias
+		RETURNING a.canonical_source_id
 	)
-	DELETE FROM gripline_source_aliases a USING doomed d WHERE a.alias=d.alias`
-	tag, err := tx.Exec(ctx, query, now.Add(-s.maintenance.SourceAliasRetention), batchSize)
-	if err != nil {
+	SELECT COUNT(*), COUNT(DISTINCT canonical_source_id) FROM deleted`
+	var deletedRows, evictedIdentities int64
+	if err := tx.QueryRow(ctx, query, now.Add(-s.maintenance.SourceAliasRetention), batchSize).Scan(&deletedRows, &evictedIdentities); err != nil {
 		return 0, mapDBError(err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, mapDBError(err)
 	}
-	recordMaintenanceBatch(ctx, int(tag.RowsAffected()))
-	return int(tag.RowsAffected()), nil
+	s.metrics.sourceAliasSafeEvictions.Add(evictedIdentities)
+	s.refreshSourceAliasCardinality(ctx)
+	recordMaintenanceBatch(ctx, int(deletedRows))
+	return int(deletedRows), nil
 }
 
 func (s *Store) maintainSourceScopes(ctx context.Context) (int, error) {

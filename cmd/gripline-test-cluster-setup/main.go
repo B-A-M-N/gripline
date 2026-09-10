@@ -41,6 +41,7 @@ func main() {
 	seedReferenceState := flag.Bool("seed-reference-state", false, "seed valid policy and representative non-secret authority state")
 	seedMaintenanceFixture := flag.Bool("seed-maintenance-fixture", false, "seed one expired disposable row for the runtime maintenance qualification")
 	capacityMode := flag.Bool("capacity-mode", false, "use high test-only resource ceilings for persistent capacity load")
+	resourceDenialMode := flag.Bool("resource-denial-mode", false, "retain a one-request credential cap for the source-churn denial proof")
 	flag.Parse()
 	if *keyringPath == "" || *policyPath == "" || *verifierPath == "" {
 		fatal("-keyring, -policy, and -verifier are required")
@@ -99,6 +100,11 @@ func main() {
 		configured.LaneLimits.MaxActiveLanesPerCredential = 1024
 		configured.LaneLimits.MaxProvisionalLanes = 1024
 		configured.LaneLimits.Security.EnableAutomaticBlock = false
+		if *resourceDenialMode {
+			configured.Limits.Normal.ConcurrencyCap = 1
+			configured.Limits.Constrained.ConcurrencyCap = 1
+			configured.Limits.Emergency.ConcurrencyCap = 1
+		}
 	} else {
 		configured.Limits.Normal.ConcurrencyCap = 5
 		configured.Limits.Constrained.ConcurrencyCap = 5
@@ -108,6 +114,16 @@ func main() {
 	if *candidatePath != "" {
 		candidate := *configured
 		candidate.Revision = 2
+		if *resourceDenialMode {
+			// The initial capacity-mode policy is intentionally constrained to
+			// one in-flight request for the resource-denial proof. Keep the
+			// canary artifact usable for the later capacity phase; the harness
+			// rolls it back before the killed-node lifecycle checks.
+			candidate.Limits.Normal.ConcurrencyCap = 1024
+			candidate.Limits.Constrained.ConcurrencyCap = 1024
+			candidate.Limits.Emergency.ConcurrencyCap = 1024
+			candidate.Global.ConcurrencyCap = 4096
+		}
 		writePolicy(*candidatePath, &candidate, private)
 	}
 	if *dsn != "" && *seedReferenceState {

@@ -370,10 +370,11 @@ provider-account settlement remain operator deployment evidence.
 This table is the authoritative status for the latest clustered-authority
 review. “Local PostgreSQL verified” means the repository proof was exercised
 against the disposable authority in this environment; hosted exact-commit
-release evidence is still a separate step. The current local candidate is
-`b1f1d453a067cb45700be321db6c7dbff6e308d5`; its local qualification record
-must remain distinct from hosted exact-SHA evidence. The hosted exact-SHA
-release record remains pending and must not be conflated with local evidence.
+release evidence is still a separate step. The retained local qualification
+record is for `1693af3dfbed44c5f745f5f1257a6dfae72ac21e`; the current worktree
+contains unqualified follow-up changes and must not be represented by that
+record. The hosted exact-SHA release record remains pending and must not be
+conflated with local evidence.
 
 | Release state | Status |
 |---|---|
@@ -386,9 +387,9 @@ release record remains pending and must not be conflated with local evidence.
 
 | Requirement | Current status | Implementation / proof | Limitation or evidence still required |
 |---|---|---|---|
-| Source-alias contention | IMPLEMENTED — local PostgreSQL verified | Pre-auth `ResolveSourceAliases` is read-only and returns a provisional active pseudonym on a miss; `BindAuthenticatedSource` performs the only durable registration after credential match. Established aliases use a Store-owned bounded deduplicating touch queue/batch worker, and `TestPostgresSourceAliasResolutionReadMostly` plus the invalid-credential binder regression cover the read-heavy and no-bind paths. | Hosted exact-commit evidence remains a release step. |
-| Source-alias lifecycle | IMPLEMENTED — local PostgreSQL verified | `SourceAliasRetention` defaults to 168h; maintenance deletes only stale aliases without live source-state references, and dormant old-generation aliases do not block pseudonym retirement while live referenced old state remains protected. PostgreSQL integration tests cover reference-aware alias/scope cleanup and retirement safety. | Hosted exact-commit evidence remains a release step. |
-| Source-churn qualification | IMPLEMENTED — local harness gate added | `scripts/qualification/source-churn.sh` drives 10,000 invalid-source requests, authenticated first-seen sources, bounded source-scope overflow, pseudonym rotation overlap, and stale-alias maintenance, emitting typed telemetry and manifest assertions. | Hosted exact-commit evidence remains a release step. |
+| Source-alias contention | IMPLEMENTED — follow-up pending fresh qualification | Pre-auth `ResolveSourceAliases` is read-only and returns a provisional active pseudonym on a miss; `BindAuthenticatedSource` performs the only durable registration after credential authentication. A PostgreSQL identity guard atomically enforces the configured distinct-canonical bound, reclaims only stale unreferenced identities, and emits cardinality/saturation/denial/eviction metrics. | The follow-up worktree changes require a fresh exact-SHA local and hosted record. |
+| Source-alias lifecycle | IMPLEMENTED — follow-up pending fresh qualification | `SourceAliasRetention` defaults to 168h; maintenance deletes only stale aliases without live source-state references, and dormant old-generation aliases do not block pseudonym retirement while live referenced old state remains protected. Retirement and maintenance now require a retained alias whose generation is `active` or `loaded`; source-novelty observation keys are included in the shared reference predicate. | The follow-up worktree changes require a fresh exact-SHA local and hosted record. |
+| Source-churn qualification | IMPLEMENTED — follow-up pending fresh qualification | `scripts/qualification/source-churn.sh` records complete invalid-response receipts, revoked-known and valid-resource-denied cases, authenticated over-bound denial, hard alias row/identity bounds, pseudonym rotation overlap, source-scope overflow, and stale-alias maintenance. Manifest verification and semantic tamper tests require the new measurements. | The follow-up worktree changes require a fresh exact-SHA local and hosted record. |
 | Source-alias conflicts | IMPLEMENTED — local PostgreSQL verified | `ErrSourceAliasConflict` is typed; all distinct owners are queried and conflicts fail closed without mutation. The integration test seeds two owners and verifies row counts are unchanged. | Hosted exact-commit evidence remains a release step. |
 | Capacity reference gate | IMPLEMENTED — local harness verified | `capacity.sh` defaults to 16 workers, a 2s authority timeout, and 16 PostgreSQL connections per node; the harness emits typed total/success/ratio/RPS/p50/p95/p99/source-failure/timeout/retry/deadlock measurements, and `verify-manifest.py` requires them. Two retained real local PostgreSQL three-node 16-worker runs passed 1461/1461 and 1259/1259 with zero source failures, authority timeouts, and deadlocks. Membership ownership uses `FOR KEY SHARE`, allowing heartbeat timestamp updates without weakening replacement fencing; `TestPostgresNodeOwnershipSharedLocksAndReplacementFencing` covers that regression. The full local exact-commit manifest also passed with capacity-load green. | The Docker HA writer and exact-commit release manifest still require hosted qualification. |
 | Doctor readiness semantics | IMPLEMENTED — local command tests verified | Cluster/policy 403 responses are blocking unknown state; policy reads use `policy.read`, mutations retain `policy.install`. Full command cases cover 403, unavailable authority, incomplete crypto, and non-blocking maintenance warnings. | Hosted exact-commit evidence remains a release step. |
@@ -420,10 +421,8 @@ The source lifecycle follow-up adds an authenticated-only durable source-alias
 binding boundary, reference-aware alias and source-scope maintenance, bounded
 alias-touch batching, and a dedicated source-churn qualification gate. Release
 tag syntax and tagged-commit/main ancestry now run in an Ubuntu preflight before
-the self-hosted qualification job. The committed candidate is the exact SHA
-named in the release-readiness table. The full local short qualification run
-for that exact SHA passed all 11 required gates, including source-churn,
-capacity-load, soak, and HTTP/2; its manifest is retained under the qualification
-result directory. Local qualification, remote publication, and hosted exact-SHA
-evidence remain separate records. The final hosted evidence record remains
-pending.
+the self-hosted qualification job. The prior exact-SHA manifest remains the
+last retained local qualification record; the current follow-up changes are
+pending a fresh frozen-candidate run. Local qualification, remote publication,
+and hosted exact-SHA evidence remain separate records. The final hosted
+evidence record remains pending.

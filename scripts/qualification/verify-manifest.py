@@ -18,7 +18,7 @@ REQUIRED_ASSERTIONS = {
     "http2": ("alpn_h2_negotiated", "stream_limit_enforced", "continuation_case_passed", "cancellation_recovered"),
     "sdk": ("python_provider_passed", "typescript_provider_passed", "retry_429_passed", "server_error_passed", "cancellation_passed", "connection_reuse_passed", "parallel_passed"),
     "exact-cost": ("openai_exact_deltas", "anthropic_exact_deltas", "cache_dimensions_exact", "zero_conservative_fallbacks"),
-    "source-churn": ("invalid_source_misses_read_only", "preauth_state_bounded", "backend_isolated", "authenticated_sources_registered", "source_scope_overflow_bounded", "rotation_overlap_continuous", "stale_alias_maintenance_succeeded"),
+    "source-churn": ("invalid_source_misses_read_only", "invalid_source_receipt_complete", "preauth_state_bounded", "backend_isolated", "authenticated_sources_registered", "source_scope_overflow_bounded", "rotation_overlap_continuous", "stale_alias_maintenance_succeeded"),
     "soak": ("cluster_ha_recovery", "runtime_bounds_held", "maintenance_succeeded", "promotion_traffic_succeeded", "database_outage_recovered"),
     "capacity-load": ("load_completed", "concurrency_bound_enforced", "resource_state_bounded"),
 }
@@ -34,6 +34,12 @@ REQUIRED_MEASUREMENTS = {
     "exact-cost": {"verified_cases": int, "conservative_settlements": int},
     "source-churn": {
         "invalid_sources": int,
+        "invalid_requests_attempted": int,
+        "invalid_requests_completed": int,
+        "invalid_401": int,
+        "invalid_429": int,
+        "invalid_transport_errors": int,
+        "invalid_unexpected_statuses": int,
         "aliases_before": int,
         "aliases_after_invalid": int,
         "adaptive_rows_after_invalid": int,
@@ -45,9 +51,32 @@ REQUIRED_MEASUREMENTS = {
         "preauth_source_table_entries_peak": int,
         "preauth_source_table_bound": int,
         "backend_hits_from_invalid": int,
+        "revoked_requests_attempted": int,
+        "revoked_requests_completed": int,
+        "revoked_401": int,
+        "revoked_403": int,
+        "revoked_transport_errors": int,
+        "revoked_unexpected_statuses": int,
+        "revoked_aliases_before": int,
+        "revoked_aliases_after": int,
+        "resource_denied_attempted": int,
+        "resource_denied_completed": int,
+        "resource_denied_authorized": int,
+        "resource_denied_denials": int,
+        "resource_denied_transport_errors": int,
+        "resource_denied_unexpected_statuses": int,
         "authenticated_aliases_created": int,
         "authenticated_source_requests": int,
         "authenticated_source_failures": int,
+        "authenticated_over_bound_attempted": int,
+        "authenticated_over_bound_successes": int,
+        "authenticated_over_bound_denials": int,
+        "source_alias_identity_bound": int,
+        "source_alias_identities_after_over_bound": int,
+        "source_alias_rows_after_over_bound": int,
+        "source_alias_capacity_denials": int,
+        "source_alias_saturations": int,
+        "source_alias_safe_evictions": int,
         "source_scope_bound": int,
         "source_scopes_peak": int,
         "source_scope_overflows": int,
@@ -104,10 +133,20 @@ def verify_source_churn_measurements(measurements: dict) -> None:
     """Enforce the source-churn gate's security and boundedness contract."""
     if measurements["invalid_sources"] <= 0:
         fail("source-churn invalid source count must be positive")
+    if measurements["invalid_requests_attempted"] != measurements["invalid_sources"] or measurements["invalid_requests_completed"] != measurements["invalid_requests_attempted"]:
+        fail("source-churn invalid request receipt is incomplete")
+    if measurements["invalid_transport_errors"] != 0 or measurements["invalid_unexpected_statuses"] != 0:
+        fail("source-churn invalid request receipt contains transport errors or unexpected statuses")
+    if measurements["invalid_requests_completed"] != measurements["invalid_401"] + measurements["invalid_429"]:
+        fail("source-churn invalid request receipt contains a status outside the denial set")
     if measurements["aliases_before"] != 0 or measurements["aliases_after_invalid"] != 0:
         fail("source-churn invalid requests created durable aliases")
     if measurements["backend_hits_from_invalid"] != 0:
         fail("source-churn invalid requests reached the backend")
+    if measurements["revoked_requests_completed"] != measurements["revoked_requests_attempted"] or measurements["revoked_401"] + measurements["revoked_403"] != measurements["revoked_requests_attempted"] or measurements["revoked_transport_errors"] != 0 or measurements["revoked_unexpected_statuses"] != 0 or measurements["revoked_aliases_before"] != measurements["revoked_aliases_after"]:
+        fail("source-churn revoked known-credential requests were not denied without alias binding")
+    if measurements["resource_denied_attempted"] != 2 or measurements["resource_denied_completed"] != 2 or measurements["resource_denied_authorized"] != 1 or measurements["resource_denied_denials"] != 1 or measurements["resource_denied_transport_errors"] != 0 or measurements["resource_denied_unexpected_statuses"] != 0:
+        fail("source-churn valid resource-denied receipt is incomplete")
 
     if measurements["adaptive_rows_after_invalid"] != (
         measurements["adaptive_subjects_after_invalid"]
@@ -135,6 +174,14 @@ def verify_source_churn_measurements(measurements: dict) -> None:
         fail("source-churn authenticated source requests failed")
     if measurements["authenticated_aliases_created"] < measurements["authenticated_source_requests"]:
         fail("source-churn authenticated aliases are incomplete")
+    if measurements["authenticated_over_bound_attempted"] != 2 or measurements["authenticated_over_bound_successes"] != 1 or measurements["authenticated_over_bound_denials"] != 1:
+        fail("source-churn authenticated over-bound proof is incomplete")
+    if measurements["source_alias_identity_bound"] < measurements["authenticated_source_requests"] + 3:
+        fail("source-churn alias bound is smaller than its qualification fixture")
+    if measurements["source_alias_identities_after_over_bound"] > measurements["source_alias_identity_bound"]:
+        fail("source-churn canonical source identity cardinality exceeded its hard bound")
+    if measurements["source_alias_capacity_denials"] < 1 or measurements["source_alias_saturations"] < 1 or measurements["source_alias_safe_evictions"] < 1:
+        fail("source-churn source alias telemetry did not prove saturation, denial, and safe eviction")
 
     if measurements["source_scope_bound"] <= 0:
         fail("source-churn source-scope bound must be positive")

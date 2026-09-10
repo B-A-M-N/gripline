@@ -24,7 +24,22 @@ func sourceIdentityReferencePredicate(sourceExpression string) string {
 			WHERE subject=` + sourceExpression + `)
 		OR EXISTS (SELECT 1 FROM gripline_adaptive_baselines
 			WHERE subject=` + sourceExpression + `)
+		OR EXISTS (SELECT 1 FROM gripline_adaptive_window_keys
+			WHERE detector='source_novelty_source' AND observation_key=` + sourceExpression + `)
 	)`
+}
+
+// usableRetainedSourceAliasPredicate identifies a retained alias whose
+// pseudonym generation is still loaded by the authority. Retired-generation
+// rows remain useful for cleanup history, but cannot prove cryptographic
+// continuity for another generation's retirement.
+func usableRetainedSourceAliasPredicate(sourceExpression, excludedGenerationExpression string) string {
+	return `EXISTS (SELECT 1 FROM gripline_source_aliases retained
+		JOIN gripline_cluster_crypto_generations g
+		  ON g.kind='pseudonym' AND g.generation=retained.generation
+		WHERE retained.canonical_source_id=` + sourceExpression + `
+		  AND retained.generation<>` + excludedGenerationExpression + `
+		  AND g.state IN ('active','loaded'))`
 }
 
 func resourceScopeSourceSQL() string {

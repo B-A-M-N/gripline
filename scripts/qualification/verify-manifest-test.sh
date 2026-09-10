@@ -206,7 +206,7 @@ assertions = {
     "http2": ["alpn_h2_negotiated", "stream_limit_enforced", "continuation_case_passed", "cancellation_recovered"],
     "sdk": ["python_provider_passed", "typescript_provider_passed", "retry_429_passed", "server_error_passed", "cancellation_passed", "connection_reuse_passed", "parallel_passed"],
     "exact-cost": ["openai_exact_deltas", "anthropic_exact_deltas", "cache_dimensions_exact", "zero_conservative_fallbacks"],
-    "source-churn": ["invalid_source_misses_read_only", "preauth_state_bounded", "backend_isolated", "authenticated_sources_registered", "source_scope_overflow_bounded", "rotation_overlap_continuous", "stale_alias_maintenance_succeeded"],
+    "source-churn": ["invalid_source_misses_read_only", "invalid_source_receipt_complete", "preauth_state_bounded", "backend_isolated", "authenticated_sources_registered", "source_scope_overflow_bounded", "rotation_overlap_continuous", "stale_alias_maintenance_succeeded"],
     "soak": ["cluster_ha_recovery", "runtime_bounds_held", "maintenance_succeeded", "promotion_traffic_succeeded", "database_outage_recovered"],
     "capacity-load": ["load_completed", "concurrency_bound_enforced", "resource_state_bounded"],
 }
@@ -221,6 +221,12 @@ measurements = {
     "exact-cost": {"verified_cases": 4, "conservative_settlements": 0},
     "source-churn": {
         "invalid_sources": 10000,
+        "invalid_requests_attempted": 10000,
+        "invalid_requests_completed": 10000,
+        "invalid_401": 10000,
+        "invalid_429": 0,
+        "invalid_transport_errors": 0,
+        "invalid_unexpected_statuses": 0,
         "aliases_before": 0,
         "aliases_after_invalid": 0,
         "adaptive_rows_after_invalid": 0,
@@ -232,9 +238,32 @@ measurements = {
         "preauth_source_table_entries_peak": 64,
         "preauth_source_table_bound": 64,
         "backend_hits_from_invalid": 0,
+        "revoked_requests_attempted": 8,
+        "revoked_requests_completed": 8,
+        "revoked_401": 0,
+        "revoked_403": 8,
+        "revoked_transport_errors": 0,
+        "revoked_unexpected_statuses": 0,
+        "revoked_aliases_before": 16,
+        "revoked_aliases_after": 16,
+        "resource_denied_attempted": 2,
+        "resource_denied_completed": 2,
+        "resource_denied_authorized": 1,
+        "resource_denied_denials": 1,
+        "resource_denied_transport_errors": 0,
+        "resource_denied_unexpected_statuses": 0,
         "authenticated_aliases_created": 16,
         "authenticated_source_requests": 16,
         "authenticated_source_failures": 0,
+        "authenticated_over_bound_attempted": 2,
+        "authenticated_over_bound_successes": 1,
+        "authenticated_over_bound_denials": 1,
+        "source_alias_identity_bound": 19,
+        "source_alias_identities_after_over_bound": 19,
+        "source_alias_rows_after_over_bound": 19,
+        "source_alias_capacity_denials": 1,
+        "source_alias_saturations": 1,
+        "source_alias_safe_evictions": 1,
         "source_scope_bound": 16,
         "source_scopes_peak": 16,
         "source_scope_overflows": 1,
@@ -317,4 +346,12 @@ expect_reject source-churn-semantic-alias
 write_full_fixture
 mutate_source_churn_measurement source_scopes_peak 17
 expect_reject source-churn-semantic-scope
+
+write_full_fixture
+mutate_source_churn_measurement invalid_requests_completed 9999
+expect_reject source-churn-semantic-receipt
+
+write_full_fixture
+	mutate_source_churn_measurement source_alias_identities_after_over_bound 20
+expect_reject source-churn-semantic-alias-bound
 echo "qualification manifest: semantic and hash tamper rejection passed"

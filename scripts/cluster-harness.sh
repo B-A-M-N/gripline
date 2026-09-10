@@ -96,6 +96,8 @@ load_user_agent="${GRIPLINE_CLUSTER_HARNESS_LOAD_USER_AGENT:-gripline-qualificat
 backend_work_delay="${GRIPLINE_CLUSTER_HARNESS_WORK_DELAY:-2s}"
 source_churn_enabled="${GRIPLINE_CLUSTER_HARNESS_SOURCE_CHURN:-0}"
 source_scope_limit="${GRIPLINE_CLUSTER_HARNESS_SOURCE_SCOPE_LIMIT:-4096}"
+source_alias_identity_limit="${GRIPLINE_CLUSTER_HARNESS_MAX_SOURCE_ALIAS_IDENTITIES:-4096}"
+resource_denial_mode="${GRIPLINE_CLUSTER_HARNESS_RESOURCE_DENIAL:-0}"
 preauth_max_sources="${GRIPLINE_CLUSTER_HARNESS_PREAUTH_MAX_SOURCES:-10000}"
 maintenance_bin="${GRIPLINE_CLUSTER_HARNESS_MAINTENANCE_BIN:-}"
 source_churn_authenticated_sources=0
@@ -103,10 +105,12 @@ source_churn_secrets=()
 ingress_extra=""
 if [[ "$load_mode" == capacity ]]; then
 	# The disposable load balancer is the only trusted proxy in this fixture.
-	# Capacity workers bind distinct loopback addresses so the source-scoped
-	# authority rows measure independent clients instead of one artificial hot
-	# source bucket. Same-source contention remains covered by statepg tests.
-	ingress_extra=', "trusted_proxies": ["127.0.0.1/32"]'
+	# Capacity workers bind distinct loopback addresses. Trust the complete
+	# loopback range because the LB appends each worker's loopback peer to the
+	# forwarding chain; otherwise that transport hop would replace the intended
+	# qualification source identity. Same-source contention remains covered by
+	# statepg tests.
+	ingress_extra=', "trusted_proxies": ["127.0.0.0/8"]'
 fi
 
 write_artifact() {
@@ -184,6 +188,9 @@ setup_args=(
 if [[ "$load_mode" == capacity ]]; then
 	setup_args+=(-capacity-mode)
 fi
+if [[ "$resource_denial_mode" == "1" ]]; then
+	setup_args+=(-resource-denial-mode)
+fi
 if [[ "${GRIPLINE_CLUSTER_HARNESS_COMPRESSED_RETENTION:-0}" == "1" ]]; then
 	setup_args+=(-seed-maintenance-fixture)
 fi
@@ -226,7 +233,7 @@ for node in a b c; do
   "authority": {
     "backend": "postgres", "dsn_env": "GRIPLINE_CLUSTER_DSN", "node_id": "cluster-${node}",
 	    "lease_ttl": "${lease_ttl}", "renew_every": "${renew_every}", "connect_timeout": "10s", "operation_timeout": "${operation_timeout}",
-	    "max_conns": ${max_conns}, "min_conns": 1${maintenance_config}
+	    "max_conns": ${max_conns}, "min_conns": 1, "max_source_alias_identities": ${source_alias_identity_limit}${maintenance_config}
   },
   "deployment": {"allow_ephemeral_state": false}
 }
@@ -386,14 +393,26 @@ if [[ "$source_churn_enabled" == "1" ]]; then
 	source_churn_workers="${GRIPLINE_CLUSTER_HARNESS_SOURCE_CHURN_WORKERS:-32}"
 	source_churn_adaptive_subject_bound="${GRIPLINE_CLUSTER_HARNESS_ADAPTIVE_MAX_SUBJECTS:-65536}"
 	source_churn_adaptive_key_bound="${GRIPLINE_CLUSTER_HARNESS_ADAPTIVE_MAX_KEYS:-256}"
-	if ! [[ "$source_churn_invalid_sources" =~ ^[1-9][0-9]*$ && "$source_churn_authenticated_sources" =~ ^[1-9][0-9]*$ && "$source_churn_workers" =~ ^[1-9][0-9]*$ && "$source_scope_limit" =~ ^[1-9][0-9]*$ && "$preauth_max_sources" =~ ^[1-9][0-9]*$ && "$source_churn_adaptive_subject_bound" =~ ^[1-9][0-9]*$ && "$source_churn_adaptive_key_bound" =~ ^[1-9][0-9]*$ ]]; then
+	if ! [[ "$source_churn_invalid_sources" =~ ^[1-9][0-9]*$ && "$source_churn_authenticated_sources" =~ ^[1-9][0-9]*$ && "$source_churn_workers" =~ ^[1-9][0-9]*$ && "$source_scope_limit" =~ ^[1-9][0-9]*$ && "$source_alias_identity_limit" =~ ^[1-9][0-9]*$ && "$preauth_max_sources" =~ ^[1-9][0-9]*$ && "$source_churn_adaptive_subject_bound" =~ ^[1-9][0-9]*$ && "$source_churn_adaptive_key_bound" =~ ^[1-9][0-9]*$ ]]; then
 		echo "cluster harness: source churn bounds must be positive integers" >&2
+		exit 2
+	fi
+	if (( source_alias_identity_limit < source_churn_authenticated_sources + 3 )); then
+		echo "cluster harness: source alias identity bound must allow authenticated sources plus three churn fixtures" >&2
 		exit 2
 	fi
 	for index in $(seq 0 $((source_churn_authenticated_sources - 1))); do
 		source_churn_secret="source-churn-secret-${index}-0123456789"
 		provision "source-churn-credential-${index}" "$source_churn_secret"
 		source_churn_secrets+=("$source_churn_secret")
+	done
+	source_churn_revoked_secret="source-churn-revoked-secret-0123456789"
+	provision source-churn-revoked-credential "$source_churn_revoked_secret"
+	source_churn_overbound_secrets=()
+	for index in 0 1; do
+		source_churn_secret="source-churn-overbound-secret-${index}-0123456789"
+		provision "source-churn-overbound-credential-${index}" "$source_churn_secret"
+		source_churn_overbound_secrets+=("$source_churn_secret")
 	done
 	source_sql() { psql "$dsn" -X -Atqc "$1"; }
 	source_metric_sum() {
@@ -425,9 +444,13 @@ if [[ "$source_churn_enabled" == "1" ]]; then
 			octet3=$((((i + 1) / 256) % 256))
 			octet4=$(((i + 1) % 256))
 			ip="10.${octet2}.${octet3}.${octet4}"
-			code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${lb_port}/v1/messages" \
-				-H "X-Forwarded-For: ${ip}" -H "Authorization: Bearer invalid-source-churn-secret" -d '{}' 2>/dev/null || true)"
-			printf '%s\n' "${code:-000}" >>"$file"
+			if code="$(curl --connect-timeout 2 --max-time 5 -sS -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${lb_port}/v1/messages" \
+				-H "X-Forwarded-For: ${ip}" -H "Authorization: Bearer invalid-source-churn-secret" -d '{}' 2>/dev/null)"; then
+				code="${code:-000}"
+			else
+				code=000
+			fi
+			printf '%s\n' "$code" >>"$file"
 		done
 	}
 	source_churn_invalid_pids=()
@@ -438,8 +461,12 @@ if [[ "$source_churn_enabled" == "1" ]]; then
 	for pid in "${source_churn_invalid_pids[@]}"; do wait "$pid" || true; done
 	source_churn_invalid_results="$harness_dir/source-churn-invalid.tsv"
 	cat "$source_churn_invalid_dir"/*.tsv >"$source_churn_invalid_results"
-	source_churn_invalid_200="$(awk '$1 == 200 {n++} END {print n+0}' "$source_churn_invalid_results")"
-	source_churn_invalid_5xx="$(awk '$1 ~ /^5/ {n++} END {print n+0}' "$source_churn_invalid_results")"
+	source_churn_invalid_requests_attempted="$source_churn_invalid_sources"
+	source_churn_invalid_requests_completed="$(awk '$1 != 000 {n++} END {print n+0}' "$source_churn_invalid_results")"
+	source_churn_invalid_401="$(awk '$1 == 401 {n++} END {print n+0}' "$source_churn_invalid_results")"
+	source_churn_invalid_429="$(awk '$1 == 429 {n++} END {print n+0}' "$source_churn_invalid_results")"
+	source_churn_invalid_transport_errors="$(awk '$1 == 000 {n++} END {print n+0}' "$source_churn_invalid_results")"
+	source_churn_invalid_unexpected_statuses="$(awk '$1 != 000 && $1 != 401 && $1 != 429 {n++} END {print n+0}' "$source_churn_invalid_results")"
 	source_churn_aliases_after_invalid="$(source_sql 'SELECT COUNT(*) FROM gripline_source_aliases')"
 	source_churn_adaptive_subjects_after_invalid="$(source_sql 'SELECT COUNT(*) FROM gripline_adaptive_window_subjects')"
 	source_churn_adaptive_keys_after_invalid="$(source_sql 'SELECT COUNT(*) FROM gripline_adaptive_window_keys')"
@@ -449,8 +476,40 @@ if [[ "$source_churn_enabled" == "1" ]]; then
 	source_churn_backend_after_invalid=0
 	if [[ -f "$harness_dir/backend-capture.log" ]]; then source_churn_backend_after_invalid="$(wc -l <"$harness_dir/backend-capture.log")"; fi
 	source_churn_backend_hits_from_invalid=$((source_churn_backend_after_invalid - source_churn_backend_before))
-	if [[ "$source_churn_invalid_200" != 0 || "$source_churn_invalid_5xx" != 0 || "$source_churn_aliases_after_invalid" != "$source_churn_aliases_before" || "$source_churn_adaptive_subjects_after_invalid" -gt "$source_churn_adaptive_subject_bound" || "$source_churn_adaptive_keys_after_invalid" -gt $((source_churn_adaptive_subject_bound * source_churn_adaptive_key_bound)) || "$source_churn_adaptive_baselines_after_invalid" -gt "$source_churn_adaptive_subject_bound" || "$source_churn_backend_hits_from_invalid" != 0 ]]; then
+	if [[ "$source_churn_invalid_requests_completed" != "$source_churn_invalid_requests_attempted" || "$source_churn_invalid_transport_errors" != 0 || "$source_churn_invalid_unexpected_statuses" != 0 || $((source_churn_invalid_401 + source_churn_invalid_429)) != "$source_churn_invalid_requests_completed" || "$source_churn_aliases_after_invalid" != "$source_churn_aliases_before" || "$source_churn_adaptive_subjects_after_invalid" -gt "$source_churn_adaptive_subject_bound" || "$source_churn_adaptive_keys_after_invalid" -gt $((source_churn_adaptive_subject_bound * source_churn_adaptive_key_bound)) || "$source_churn_adaptive_baselines_after_invalid" -gt "$source_churn_adaptive_subject_bound" || "$source_churn_backend_hits_from_invalid" != 0 ]]; then
 		echo "cluster harness: invalid source churn violated read-only/isolated behavior" >&2
+		exit 1
+	fi
+
+	source_churn_revoked_revoke_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((base + 20))/admin/credentials/revoke" \
+		-H "Authorization: Bearer ${operator_token}" -H 'Content-Type: application/json' \
+		-H 'Idempotency-Key: source-churn-revoke-known' \
+		--data '{"credential_id":"source-churn-revoked-credential","reason":"source churn revoked-known proof"}')"
+	if [[ "$source_churn_revoked_revoke_code" != 200 ]]; then
+		echo "cluster harness: revoke-known source-churn fixture failed with ${source_churn_revoked_revoke_code}" >&2
+		exit 1
+	fi
+	source_churn_revoked_aliases_before="$(source_sql 'SELECT COUNT(*) FROM gripline_source_aliases')"
+	source_churn_revoked_requests=8
+	source_churn_revoked_dir="$harness_dir/source-churn-revoked"
+	mkdir -p "$source_churn_revoked_dir"
+	for index in $(seq 1 "$source_churn_revoked_requests"); do
+		if code="$(curl --connect-timeout 2 --max-time 5 -sS -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${lb_port}/v1/messages" \
+			-H "X-Forwarded-For: 13.0.0.${index}" -H "Authorization: Bearer ${source_churn_revoked_secret}" -d '{}' 2>/dev/null)"; then
+			code="${code:-000}"
+		else
+			code=000
+		fi
+		printf '%s\n' "$code" >"$source_churn_revoked_dir/$index"
+	done
+	source_churn_revoked_completed="$(awk '$1 != 000 {n++} END {print n+0}' "$source_churn_revoked_dir"/*)"
+	source_churn_revoked_401="$(awk '$1 == 401 {n++} END {print n+0}' "$source_churn_revoked_dir"/*)"
+	source_churn_revoked_403="$(awk '$1 == 403 {n++} END {print n+0}' "$source_churn_revoked_dir"/*)"
+	source_churn_revoked_transport_errors="$(awk '$1 == 000 {n++} END {print n+0}' "$source_churn_revoked_dir"/*)"
+	source_churn_revoked_unexpected_statuses="$(awk '$1 != 000 && $1 != 401 && $1 != 403 {n++} END {print n+0}' "$source_churn_revoked_dir"/*)"
+	source_churn_revoked_aliases_after="$(source_sql 'SELECT COUNT(*) FROM gripline_source_aliases')"
+	if [[ "$source_churn_revoked_completed" != "$source_churn_revoked_requests" || $((source_churn_revoked_401 + source_churn_revoked_403)) != "$source_churn_revoked_requests" || "$source_churn_revoked_transport_errors" != 0 || "$source_churn_revoked_unexpected_statuses" != 0 || "$source_churn_revoked_aliases_after" != "$source_churn_revoked_aliases_before" ]]; then
+		echo "cluster harness: revoked known-credential churn was not denied without alias binding" >&2
 		exit 1
 	fi
 
@@ -475,10 +534,33 @@ if [[ "$source_churn_enabled" == "1" ]]; then
 		echo "cluster harness: authenticated first-seen source churn did not register cleanly" >&2
 		exit 1
 	fi
-	stale_alias_before=0
-	source_sql "INSERT INTO gripline_source_aliases (canonical_source_id, alias, generation, created_at, last_seen_at) VALUES ('source-churn-stale', 'source-churn-stale-v1', 1, CURRENT_TIMESTAMP - INTERVAL '8 days', CURRENT_TIMESTAMP - INTERVAL '8 days') ON CONFLICT (alias) DO NOTHING" >/dev/null
-	if [[ "$(source_sql "SELECT COUNT(*) FROM gripline_source_aliases WHERE alias='source-churn-stale-v1'")" == 1 ]]; then
-		stale_alias_before=1
+	source_churn_resource_denied_dir="$harness_dir/source-churn-resource-denied"
+	mkdir -p "$source_churn_resource_denied_dir"
+	source_churn_resource_denied_worker() {
+		local index=$1 code
+		if code="$(curl --connect-timeout 2 --max-time 8 -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${lb_port}/v1/work" \
+			-H 'X-Forwarded-For: 11.0.0.1' -H "Authorization: Bearer ${source_churn_secrets[0]}" 2>/dev/null)"; then
+			code="${code:-000}"
+		else
+			code=000
+		fi
+		printf '%s\n' "$code" >"$source_churn_resource_denied_dir/$index"
+	}
+	source_churn_resource_denied_pids=()
+	for index in 1 2; do
+		source_churn_resource_denied_worker "$index" &
+		source_churn_resource_denied_pids+=("$!")
+	done
+	for pid in "${source_churn_resource_denied_pids[@]}"; do wait "$pid" || true; done
+	source_churn_resource_denied_attempted=2
+	source_churn_resource_denied_completed="$(awk '$1 != 000 {n++} END {print n+0}' "$source_churn_resource_denied_dir"/*)"
+	source_churn_resource_denied_authorized="$(awk '$1 == 200 {n++} END {print n+0}' "$source_churn_resource_denied_dir"/*)"
+	source_churn_resource_denied_denials="$(awk '$1 == 429 {n++} END {print n+0}' "$source_churn_resource_denied_dir"/*)"
+	source_churn_resource_denied_transport_errors="$(awk '$1 == 000 {n++} END {print n+0}' "$source_churn_resource_denied_dir"/*)"
+	source_churn_resource_denied_unexpected_statuses="$(awk '$1 != 000 && $1 != 200 && $1 != 429 {n++} END {print n+0}' "$source_churn_resource_denied_dir"/*)"
+	if [[ "$source_churn_resource_denied_completed" != "$source_churn_resource_denied_attempted" || "$source_churn_resource_denied_authorized" != 1 || "$source_churn_resource_denied_denials" != 1 || "$source_churn_resource_denied_transport_errors" != 0 || "$source_churn_resource_denied_unexpected_statuses" != 0 ]]; then
+		echo "cluster harness: valid resource-denied source-churn proof did not produce one authorization and one denial" >&2
+		exit 1
 	fi
 	source_churn_overflow_code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${lb_port}/v1/messages" \
 		-H 'X-Forwarded-For: 12.0.0.1' -H "Authorization: Bearer ${secret_one}" -d '{}' 2>/dev/null || true)"
@@ -490,6 +572,36 @@ if [[ "$source_churn_enabled" == "1" ]]; then
 		echo "cluster harness: source-scope overflow behavior failed" >&2
 		exit 1
 	fi
+	stale_alias_before=0
+	source_sql "INSERT INTO gripline_source_aliases (canonical_source_id, alias, generation, created_at, last_seen_at) VALUES ('source-churn-stale', 'source-churn-stale-v1', 1, CURRENT_TIMESTAMP - INTERVAL '8 days', CURRENT_TIMESTAMP - INTERVAL '8 days') ON CONFLICT (alias) DO NOTHING" >/dev/null
+	source_sql "INSERT INTO gripline_adaptive_window_subjects (detector, subject, last_seen_at) VALUES ('source_novelty_source', 'source-churn-stale', CURRENT_TIMESTAMP - INTERVAL '8 days') ON CONFLICT (detector, subject) DO NOTHING" >/dev/null
+	source_sql "INSERT INTO gripline_adaptive_window_keys (detector, subject, observation_key, observed_at) VALUES ('source_novelty_source', 'source-churn-stale', 'source-churn-stale', CURRENT_TIMESTAMP - INTERVAL '8 days') ON CONFLICT (detector, subject, observation_key) DO NOTHING" >/dev/null
+	if [[ "$(source_sql "SELECT COUNT(*) FROM gripline_source_aliases WHERE alias='source-churn-stale-v1'")" == 1 ]]; then
+		stale_alias_before=1
+	fi
+	source_churn_overbound_first_code="$(curl --connect-timeout 2 --max-time 5 -sS -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${lb_port}/v1/messages" \
+		-H 'X-Forwarded-For: 12.0.0.2' -H "Authorization: Bearer ${source_churn_overbound_secrets[0]}" -d '{}' 2>/dev/null || true)"
+	if source_churn_overbound_code="$(curl --connect-timeout 2 --max-time 5 -sS -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${lb_port}/v1/messages" \
+		-H 'X-Forwarded-For: 12.0.0.3' -H "Authorization: Bearer ${source_churn_overbound_secrets[1]}" -d '{}' 2>/dev/null)"; then
+		source_churn_overbound_code="${source_churn_overbound_code:-000}"
+	else
+		source_churn_overbound_code=000
+	fi
+	source_churn_authenticated_over_bound_requests=2
+	source_churn_authenticated_over_bound_successes=0
+	if [[ "$source_churn_overbound_first_code" == 200 ]]; then source_churn_authenticated_over_bound_successes=1; fi
+	source_churn_authenticated_over_bound_denials=0
+	if [[ "$source_churn_overbound_code" == 503 ]]; then source_churn_authenticated_over_bound_denials=1; fi
+	source_churn_authenticated_over_bound_unexpected=0
+	if [[ "$source_churn_overbound_code" != 503 ]]; then source_churn_authenticated_over_bound_unexpected=1; fi
+	source_churn_source_alias_identities_after_over_bound="$(source_sql 'SELECT COUNT(DISTINCT canonical_source_id) FROM gripline_source_aliases')"
+	source_churn_source_alias_rows_after_over_bound="$(source_sql 'SELECT COUNT(*) FROM gripline_source_aliases')"
+	if [[ "$source_churn_overbound_first_code" != 200 || "$source_churn_overbound_code" != 503 || "$source_churn_authenticated_over_bound_unexpected" != 0 || "$source_churn_source_alias_identities_after_over_bound" -gt "$source_alias_identity_limit" ]]; then
+		echo "cluster harness: authenticated source churn did not fail closed at the durable alias bound (first=${source_churn_overbound_first_code} second=${source_churn_overbound_code} identities=${source_churn_source_alias_identities_after_over_bound} rows=${source_churn_source_alias_rows_after_over_bound} bound=${source_alias_identity_limit})" >&2
+		exit 1
+	fi
+	source_sql "DELETE FROM gripline_adaptive_window_keys WHERE detector='source_novelty_source' AND subject='source-churn-stale' AND observation_key='source-churn-stale'" >/dev/null
+	source_sql "DELETE FROM gripline_adaptive_window_subjects WHERE detector='source_novelty_source' AND subject='source-churn-stale'" >/dev/null
 fi
 
 # The public data plane must not expose the verifier-management path, and the
@@ -678,9 +790,9 @@ test "$pepper_replay_code" = 200
 provision cluster-credential-three "$secret_three"
 pepper_counts="$(curl -fsS "http://127.0.0.1:$((base + 22))/admin/credentials/pepper-status" -H "Authorization: Bearer ${operator_token}")"
 expected_pepper_one_count=2
-if [[ "$source_churn_enabled" == "1" ]]; then
-	expected_pepper_one_count=$((expected_pepper_one_count + source_churn_authenticated_sources))
-fi
+	if [[ "$source_churn_enabled" == "1" ]]; then
+		expected_pepper_one_count=$((expected_pepper_one_count + source_churn_authenticated_sources + 3))
+	fi
 printf '%s' "$pepper_counts" | rg -q "\"1\":${expected_pepper_one_count}"
 printf '%s' "$pepper_counts" | rg -q '"2":1'
 test "$(curl_data_code "http://127.0.0.1:$((base + 12))/v1/messages" "$secret_three")" = 200
@@ -743,12 +855,23 @@ if [[ "$source_churn_enabled" == "1" ]]; then
 	if [[ "$source_churn_source_scopes_after_rotation" -gt "$source_churn_source_scopes_peak" ]]; then
 		source_churn_source_scopes_peak="$source_churn_source_scopes_after_rotation"
 	fi
-	source_churn_resolution_failures="$(source_metric_sum postgres_source_alias_resolution_failures_total)"
+	source_churn_source_resolution_failures_total="$(source_metric_sum postgres_source_alias_resolution_failures_total)"
+	source_churn_expected_source_resolution_failures=1
+	source_churn_resolution_failures=$((source_churn_source_resolution_failures_total - source_churn_expected_source_resolution_failures))
 	source_churn_authority_timeouts="$(source_metric_sum postgres_authority_timeouts_total)"
+	source_churn_source_alias_capacity_denials="$(source_metric_sum postgres_source_alias_capacity_denials_total)"
+	source_churn_source_alias_saturations="$(source_metric_sum postgres_source_alias_saturations_total)"
+	source_churn_source_alias_safe_evictions="$(source_metric_sum postgres_source_alias_safe_evictions_total)"
 	if [[ -n "${GRIPLINE_CLUSTER_HARNESS_SOURCE_CHURN_EVIDENCE_FILE:-}" ]]; then
 		cat >"$GRIPLINE_CLUSTER_HARNESS_SOURCE_CHURN_EVIDENCE_FILE" <<EOF
 {
   "invalid_sources": ${source_churn_invalid_sources},
+  "invalid_requests_attempted": ${source_churn_invalid_requests_attempted},
+  "invalid_requests_completed": ${source_churn_invalid_requests_completed},
+  "invalid_401": ${source_churn_invalid_401},
+  "invalid_429": ${source_churn_invalid_429},
+  "invalid_transport_errors": ${source_churn_invalid_transport_errors},
+  "invalid_unexpected_statuses": ${source_churn_invalid_unexpected_statuses},
   "aliases_before": ${source_churn_aliases_before},
   "aliases_after_invalid": ${source_churn_aliases_after_invalid},
   "adaptive_rows_after_invalid": ${source_churn_adaptive_rows_after_invalid},
@@ -760,9 +883,32 @@ if [[ "$source_churn_enabled" == "1" ]]; then
   "preauth_source_table_entries_peak": ${source_churn_preauth_entries_peak},
   "preauth_source_table_bound": ${preauth_max_sources},
   "backend_hits_from_invalid": ${source_churn_backend_hits_from_invalid},
-  "authenticated_aliases_created": ${source_churn_source_aliases_created},
+  "revoked_requests_attempted": ${source_churn_revoked_requests},
+  "revoked_requests_completed": ${source_churn_revoked_completed},
+  "revoked_401": ${source_churn_revoked_401},
+  "revoked_403": ${source_churn_revoked_403},
+  "revoked_transport_errors": ${source_churn_revoked_transport_errors},
+  "revoked_unexpected_statuses": ${source_churn_revoked_unexpected_statuses},
+  "revoked_aliases_before": ${source_churn_revoked_aliases_before},
+  "revoked_aliases_after": ${source_churn_revoked_aliases_after},
+  "resource_denied_attempted": ${source_churn_resource_denied_attempted},
+  "resource_denied_completed": ${source_churn_resource_denied_completed},
+  "resource_denied_authorized": ${source_churn_resource_denied_authorized},
+  "resource_denied_denials": ${source_churn_resource_denied_denials},
+  "resource_denied_transport_errors": ${source_churn_resource_denied_transport_errors},
+  "resource_denied_unexpected_statuses": ${source_churn_resource_denied_unexpected_statuses},
+	"authenticated_aliases_created": ${source_churn_aliases_before_valid},
   "authenticated_source_requests": ${source_churn_valid_successes},
   "authenticated_source_failures": ${source_churn_valid_failures},
+  "authenticated_over_bound_attempted": ${source_churn_authenticated_over_bound_requests},
+  "authenticated_over_bound_successes": ${source_churn_authenticated_over_bound_successes},
+  "authenticated_over_bound_denials": ${source_churn_authenticated_over_bound_denials},
+  "source_alias_identity_bound": ${source_alias_identity_limit},
+  "source_alias_identities_after_over_bound": ${source_churn_source_alias_identities_after_over_bound},
+  "source_alias_rows_after_over_bound": ${source_churn_source_alias_rows_after_over_bound},
+  "source_alias_capacity_denials": ${source_churn_source_alias_capacity_denials},
+  "source_alias_saturations": ${source_churn_source_alias_saturations},
+  "source_alias_safe_evictions": ${source_churn_source_alias_safe_evictions},
   "source_scope_bound": ${source_scope_limit},
   "source_scopes_peak": ${source_churn_source_scopes_peak},
   "source_scope_overflows": ${source_churn_source_overflows},
@@ -888,15 +1034,18 @@ printf '2\n' >"$policy_epoch_file"
 	for port in $((base + 10)) $((base + 11)) $((base + 12)); do
 		wait_assertion_policy "$port" "$secret_four" 2 2
 	done
-rollback_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((base + 20))/admin/policy/rollback" \
-	-H "Authorization: Bearer ${operator_token}" -H 'Content-Type: application/json' \
-	-H 'Idempotency-Key: cluster-policy-rollback' \
-	--data '{"revision":1,"reason":"cluster rollback canary"}')"
-test "$rollback_code" = 200
-printf '3\n' >"$policy_epoch_file"
-	for port in $((base + 10)) $((base + 11)) $((base + 12)); do
-		wait_assertion_policy "$port" "$secret_four" 1 3
-	done
+rollback_code=000
+if [[ "$load_mode" == security || "$source_churn_enabled" != "1" ]]; then
+	rollback_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((base + 20))/admin/policy/rollback" \
+		-H "Authorization: Bearer ${operator_token}" -H 'Content-Type: application/json' \
+		-H 'Idempotency-Key: cluster-policy-rollback' \
+		--data '{"revision":1,"reason":"cluster rollback canary"}')"
+	test "$rollback_code" = 200
+	printf '3\n' >"$policy_epoch_file"
+		for port in $((base + 10)) $((base + 11)) $((base + 12)); do
+			wait_assertion_policy "$port" "$secret_four" 1 3
+		done
+fi
 
 # Run load only after deterministic lifecycle checks have converged. Security
 # mode intentionally exercises hard limits. Capacity mode raises only the
@@ -969,8 +1118,13 @@ if [[ "$load_seconds" -gt 0 ]]; then
 		for worker in "${!capacity_secrets[@]}"; do
 			secret="${capacity_secrets[$worker]}"
 			source_address="127.0.0.$((worker + 2))"
+			capacity_source_headers=()
+			if [[ "$source_churn_enabled" == "1" ]]; then
+				capacity_source_headers=(-H "X-Forwarded-For: 11.0.0.$((worker + 1))")
+			fi
 			curl -fsS -o /dev/null -X POST "http://127.0.0.1:${lb_port}/v1/messages" \
 				--interface "$source_address" \
+				"${capacity_source_headers[@]}" \
 				-H "Authorization: Bearer ${secret}" -H "User-Agent: ${load_user_agent}" -d '{}'
 		done
 		for node in a b c; do
@@ -990,6 +1144,9 @@ if [[ "$load_seconds" -gt 0 ]]; then
 			-user-agent "$load_user_agent"
 			-local-address-prefix "127.0.0."
 		)
+		if [[ "$source_churn_enabled" == "1" ]]; then
+			load_args+=( -forwarded-for-prefix "11.0.0." )
+		fi
 		"$harness_dir/load" "${load_args[@]}" >"$load_dir/capacity.json"
 		for node in a b c; do
 			case "$node" in
@@ -1085,6 +1242,20 @@ PY
 		if (( capacity_validation_rc != 0 )); then
 			exit "$capacity_validation_rc"
 		fi
+	fi
+	if [[ "$source_churn_enabled" == "1" ]]; then
+		# Source churn starts with a one-request fixture to prove a real
+		# resource denial. The revision-2 canary is the high-ceiling capacity
+		# policy, so capacity load runs only after that policy converges.
+		rollback_code="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((base + 20))/admin/policy/rollback" \
+			-H "Authorization: Bearer ${operator_token}" -H 'Content-Type: application/json' \
+			-H 'Idempotency-Key: cluster-policy-rollback' \
+			--data '{"revision":1,"reason":"cluster rollback canary"}')"
+		test "$rollback_code" = 200
+		printf '3\n' >"$policy_epoch_file"
+		for port in $((base + 10)) $((base + 11)) $((base + 12)); do
+			wait_assertion_policy "$port" "$secret_four" 1 3
+		done
 	fi
 fi
 

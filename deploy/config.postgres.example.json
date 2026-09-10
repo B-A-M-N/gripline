@@ -105,6 +105,7 @@
     "operation_timeout": "2s",
     "max_conns": 16,
     "min_conns": 2,
+    "max_source_alias_identities": 4096,
     "maintenance": {
       "interval": "1m",
       "batch_size": 1024,

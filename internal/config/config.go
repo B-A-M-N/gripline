@@ -130,10 +130,13 @@ type AuthoritySection struct {
 	ConnectTimeout Duration `json:"connect_timeout,omitempty"`
 	// OperationTimeout is the default bound for runtime-owned remote
 	// reconciliation and other ordinary authority operations.
-	OperationTimeout Duration           `json:"operation_timeout,omitempty"`
-	MaxConns         int32              `json:"max_conns,omitempty"`
-	MinConns         int32              `json:"min_conns,omitempty"`
-	Maintenance      MaintenanceSection `json:"maintenance,omitempty"`
+	OperationTimeout Duration `json:"operation_timeout,omitempty"`
+	MaxConns         int32    `json:"max_conns,omitempty"`
+	MinConns         int32    `json:"min_conns,omitempty"`
+	// MaxSourceAliasIdentities bounds distinct canonical source identities in
+	// the shared PostgreSQL alias authority. Zero uses its conservative default.
+	MaxSourceAliasIdentities int                `json:"max_source_alias_identities,omitempty"`
+	Maintenance              MaintenanceSection `json:"maintenance,omitempty"`
 }
 
 // MaintenanceSection exposes PostgreSQL historical-data retention to the
@@ -851,7 +854,7 @@ func (c *Config) Validate() error {
 	// authority, and lease timing is part of the cluster's safety contract.
 	switch strings.ToLower(strings.TrimSpace(c.Authority.Backend)) {
 	case "", "standalone":
-		if c.Authority.DSNEnv != "" || c.Authority.NodeID != "" || c.Authority.LeaseTTL.D() != 0 || c.Authority.RenewEvery.D() != 0 || c.Authority.ConnectTimeout.D() != 0 || c.Authority.OperationTimeout.D() != 0 || c.Authority.Maintenance.configured() {
+		if c.Authority.DSNEnv != "" || c.Authority.NodeID != "" || c.Authority.LeaseTTL.D() != 0 || c.Authority.RenewEvery.D() != 0 || c.Authority.ConnectTimeout.D() != 0 || c.Authority.OperationTimeout.D() != 0 || c.Authority.MaxSourceAliasIdentities != 0 || c.Authority.Maintenance.configured() {
 			return fmt.Errorf("authority.dsn_env, node_id, lease timings require authority.backend=postgres")
 		}
 	case "postgres":
@@ -879,7 +882,7 @@ func (c *Config) Validate() error {
 		if c.Authority.ConnectTimeout.D() < 0 || c.Authority.OperationTimeout.D() < 0 {
 			return fmt.Errorf("authority connect/operation timeouts cannot be negative")
 		}
-		if c.Authority.MaxConns < 0 || c.Authority.MinConns < 0 || (c.Authority.MaxConns > 0 && c.Authority.MinConns > c.Authority.MaxConns) {
+		if c.Authority.MaxConns < 0 || c.Authority.MinConns < 0 || c.Authority.MaxSourceAliasIdentities < 0 || (c.Authority.MaxConns > 0 && c.Authority.MinConns > c.Authority.MaxConns) {
 			return fmt.Errorf("authority min/max connection bounds are invalid")
 		}
 		if c.Authority.Maintenance.BatchSize < 0 || c.Authority.Maintenance.MaxBatchesPerPass < 0 || c.Authority.Maintenance.MaxRowsPerPass < 0 {

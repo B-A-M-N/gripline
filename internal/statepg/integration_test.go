@@ -2076,6 +2076,101 @@ func TestPostgresSourceAliasBindingConcurrentFirstWriters(t *testing.T) {
 	}
 }
 
+func TestPostgresSourceAliasCardinalityBoundReclaimsOnlySafeIdentities(t *testing.T) {
+	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("GRIPLINE_TEST_POSTGRES_DSN is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	resetIntegrationAuthority(t, ctx, dsn)
+	store, err := Open(ctx, Options{
+		DSN: dsn, NodeID: "source-alias-capacity", LeaseTTL: 10 * time.Second,
+		RenewEvery: 2 * time.Second, OperationTimeout: 10 * time.Second,
+		MaxSourceAliasIdentities: 2,
+		Maintenance:              MaintenanceOptions{SourceAliasRetention: time.Hour},
+	})
+	if err != nil {
+		t.Fatalf("open bounded source alias authority: %v", err)
+	}
+	defer store.Close()
+
+	bind := func(alias string) error {
+		_, err := store.BindAuthenticatedSource(ctx,
+			[]SourcePseudonymAlias{{Alias: alias, Generation: 1}},
+			SourcePseudonymAlias{Alias: alias, Generation: 1})
+		return err
+	}
+	if err := bind("capacity-source-a"); err != nil {
+		t.Fatalf("bind first bounded source: %v", err)
+	}
+	if err := bind("capacity-source-b"); err != nil {
+		t.Fatalf("bind second bounded source: %v", err)
+	}
+	if err := bind("capacity-source-c"); !errors.Is(err, ErrSourceAliasCapacity) {
+		t.Fatalf("third source bind error=%v, want ErrSourceAliasCapacity", err)
+	}
+	var identities, rows int
+	if err := store.pool.QueryRow(ctx, `SELECT COUNT(DISTINCT canonical_source_id), COUNT(*) FROM gripline_source_aliases`).Scan(&identities, &rows); err != nil {
+		t.Fatalf("count bounded source aliases: %v", err)
+	}
+	if identities != 2 || rows > 2 {
+		t.Fatalf("bounded source aliases identities=%d rows=%d, want 2 identities and at most 2 rows", identities, rows)
+	}
+
+	if _, err := store.pool.Exec(ctx, `UPDATE gripline_source_aliases
+		SET last_seen_at=CURRENT_TIMESTAMP - INTERVAL '2 hours'
+		WHERE canonical_source_id='capacity-source-a'`); err != nil {
+		t.Fatalf("age reclaimable source identity: %v", err)
+	}
+	if err := bind("capacity-source-c"); err != nil {
+		t.Fatalf("bind after safe stale reclamation: %v", err)
+	}
+	if metrics := store.Metrics(); metrics.SourceAliasSafeEvictions < 1 || metrics.SourceAliasSaturations < 2 {
+		t.Fatalf("bounded alias metrics=%+v, want saturation and safe eviction", metrics)
+	}
+	if err := store.pool.QueryRow(ctx, `SELECT COUNT(DISTINCT canonical_source_id), COUNT(*) FROM gripline_source_aliases`).Scan(&identities, &rows); err != nil {
+		t.Fatalf("count reclaimed source aliases: %v", err)
+	}
+	if identities != 2 || rows > 2 {
+		t.Fatalf("reclaimed source aliases identities=%d rows=%d, want 2 and at most 2", identities, rows)
+	}
+
+	store.Close()
+	resetIntegrationAuthority(t, ctx, dsn)
+	liveStore, err := Open(ctx, Options{
+		DSN: dsn, NodeID: "source-alias-capacity-live", LeaseTTL: 10 * time.Second,
+		RenewEvery: 2 * time.Second, OperationTimeout: 10 * time.Second,
+		MaxSourceAliasIdentities: 1,
+		Maintenance:              MaintenanceOptions{SourceAliasRetention: time.Hour},
+	})
+	if err != nil {
+		t.Fatalf("open referenced bounded source authority: %v", err)
+	}
+	defer liveStore.Close()
+	if _, err := liveStore.pool.Exec(ctx, `INSERT INTO gripline_source_aliases
+		(canonical_source_id, alias, generation, created_at, last_seen_at)
+		VALUES ('capacity-live-source', 'capacity-live-source-v1', 1,
+			CURRENT_TIMESTAMP - INTERVAL '2 hours', CURRENT_TIMESTAMP - INTERVAL '2 hours')`); err != nil {
+		t.Fatalf("seed referenced bounded source alias: %v", err)
+	}
+	if _, err := liveStore.pool.Exec(ctx, `INSERT INTO gripline_resource_source_scopes (scope_id, last_used_at)
+		VALUES ('capacity-live-source', CURRENT_TIMESTAMP - INTERVAL '2 hours')`); err != nil {
+		t.Fatalf("seed referenced source scope: %v", err)
+	}
+	if _, err := liveStore.BindAuthenticatedSource(ctx,
+		[]SourcePseudonymAlias{{Alias: "capacity-live-source-new", Generation: 1}},
+		SourcePseudonymAlias{Alias: "capacity-live-source-new", Generation: 1}); !errors.Is(err, ErrSourceAliasCapacity) {
+		t.Fatalf("referenced source bind error=%v, want ErrSourceAliasCapacity", err)
+	}
+	if err := liveStore.pool.QueryRow(ctx, `SELECT COUNT(DISTINCT canonical_source_id), COUNT(*) FROM gripline_source_aliases`).Scan(&identities, &rows); err != nil {
+		t.Fatalf("count referenced bounded source aliases: %v", err)
+	}
+	if identities != 1 || rows != 1 {
+		t.Fatalf("referenced bounded source aliases identities=%d rows=%d, want 1/1", identities, rows)
+	}
+}
+
 func TestPostgresSourceAliasMissesAreReadOnly(t *testing.T) {
 	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
 	if dsn == "" {
@@ -2192,6 +2287,21 @@ func TestPostgresSourceAliasMaintenanceRespectsReferences(t *testing.T) {
 		zeroTime(activeEvidence.ExpiresAt), raw); err != nil {
 		t.Fatalf("seed source reference evidence: %v", err)
 	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO gripline_adaptive_window_subjects
+		(detector, subject, last_seen_at)
+		VALUES ('source_novelty_source', 'source-novelty-subject', $1)`, old); err != nil {
+		t.Fatalf("seed source novelty reference subject: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO gripline_adaptive_window_keys
+		(detector, subject, observation_key, observed_at)
+		VALUES ('source_novelty_source', 'source-novelty-subject', 'source-novelty-referenced', $1)`, old); err != nil {
+		t.Fatalf("seed source novelty reference key: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO gripline_source_aliases
+		(canonical_source_id, alias, generation, created_at, last_seen_at)
+		VALUES ('source-novelty-referenced', 'source-novelty-referenced-v1', 1, $1, $1)`, old); err != nil {
+		t.Fatalf("seed source novelty reference alias: %v", err)
+	}
 
 	stats, err := store.RunMaintenance(ctx)
 	if err != nil {
@@ -2200,18 +2310,155 @@ func TestPostgresSourceAliasMaintenanceRespectsReferences(t *testing.T) {
 	if stats.SourceAliasesDeleted != 1 || stats.ResourceSourceScopesDeleted != 1 {
 		t.Fatalf("source maintenance stats=%+v, want one alias and one source scope deleted", stats)
 	}
-	var unreferenced, referenced, scopes int
+	var unreferenced, referenced, novelty, scopes int
 	if err := store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_source_aliases WHERE alias='source-unreferenced-v1'`).Scan(&unreferenced); err != nil {
 		t.Fatalf("count unreferenced source alias: %v", err)
 	}
 	if err := store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_source_aliases WHERE alias='source-referenced-v1'`).Scan(&referenced); err != nil {
 		t.Fatalf("count referenced source alias: %v", err)
 	}
+	if err := store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_source_aliases WHERE alias='source-novelty-referenced-v1'`).Scan(&novelty); err != nil {
+		t.Fatalf("count source novelty referenced alias: %v", err)
+	}
 	if err := store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_resource_source_scopes WHERE scope_id='source-scope-idle'`).Scan(&scopes); err != nil {
 		t.Fatalf("count idle source scope: %v", err)
 	}
-	if unreferenced != 0 || referenced != 1 || scopes != 0 {
-		t.Fatalf("source cleanup counts unreferenced=%d referenced=%d scopes=%d, want 0/1/0", unreferenced, referenced, scopes)
+	if unreferenced != 0 || referenced != 1 || novelty != 1 || scopes != 0 {
+		t.Fatalf("source cleanup counts unreferenced=%d referenced=%d novelty=%d scopes=%d, want 0/1/1/0", unreferenced, referenced, novelty, scopes)
+	}
+}
+
+func TestPostgresPseudonymRetirementRequiresUsableRetainedGeneration(t *testing.T) {
+	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("GRIPLINE_TEST_POSTGRES_DSN is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resetIntegrationAuthority(t, ctx, dsn)
+	store := openIntegrationStore(t, ctx, dsn, "pseudonym-retirement-three-generations")
+	defer store.Close()
+	if _, err := store.pool.Exec(ctx, `INSERT INTO gripline_cluster_crypto
+		(singleton, signer_active_kid, signer_fingerprint, signer_active_fingerprint,
+		 pepper_active_version, pepper_fingerprint, pepper_active_fingerprint,
+		 pseudonym_version, pseudonym_fingerprint, pseudonym_active_fingerprint,
+		 generation_epoch, updated_at)
+		VALUES (TRUE, 1, 'signer-1', 'signer-1', 1, 'pepper-1', 'pepper-1',
+		 3, 'pseudonym-3', 'pseudonym-3', 1, CURRENT_TIMESTAMP)`); err != nil {
+		t.Fatalf("seed three-generation crypto identity: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO gripline_cluster_crypto_generations
+		(kind, generation, fingerprint, state, updated_at)
+		VALUES ('pseudonym', 1, 'pseudonym-1', 'retired', CURRENT_TIMESTAMP),
+		       ('pseudonym', 2, 'pseudonym-2', 'loaded', CURRENT_TIMESTAMP),
+		       ('pseudonym', 3, 'pseudonym-3', 'active', CURRENT_TIMESTAMP)`); err != nil {
+		t.Fatalf("seed three pseudonym generations: %v", err)
+	}
+	old := time.Now().UTC().Add(-2 * time.Hour)
+	if _, err := store.pool.Exec(ctx, `INSERT INTO gripline_source_aliases
+		(canonical_source_id, alias, generation, created_at, last_seen_at)
+		VALUES ('three-generation-source', 'three-generation-source-v1', 1, $1, $1),
+		       ('three-generation-source', 'three-generation-source-v2', 2, $1, $1)`, old); err != nil {
+		t.Fatalf("seed old pseudonym aliases: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO gripline_adaptive_window_subjects
+		(detector, subject, last_seen_at)
+		VALUES ('source_novelty_source', 'three-generation-subject', $1)`, old); err != nil {
+		t.Fatalf("seed source novelty continuity subject: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO gripline_adaptive_window_keys
+		(detector, subject, observation_key, observed_at)
+		VALUES ('source_novelty_source', 'three-generation-subject', 'three-generation-source', $1)`, old); err != nil {
+		t.Fatalf("seed source novelty continuity reference: %v", err)
+	}
+	store.cryptoReady.Store(true)
+	request := CryptoRetirementRequest{
+		Kind: CryptoKindPseudonym, Generation: 2, Fingerprint: "pseudonym-2",
+		NotBefore: time.Now().Add(-time.Second), OperationID: "retire-three-generation-v2-blocked",
+		Actor: "integration-test", Reason: "require usable retained generation",
+	}
+	if _, err := store.RetireCryptoGeneration(ctx, request); err == nil {
+		t.Fatal("retirement without active/loaded replacement alias must be blocked")
+	} else {
+		var blocked CryptoRetirementBlockedError
+		if !errors.As(err, &blocked) || blocked.References != 1 {
+			t.Fatalf("retirement without usable replacement error=%v, want one blocked reference", err)
+		}
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO gripline_source_aliases
+		(canonical_source_id, alias, generation, created_at, last_seen_at)
+		VALUES ('three-generation-source', 'three-generation-source-v3', 3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`); err != nil {
+		t.Fatalf("seed active replacement alias: %v", err)
+	}
+	request.OperationID = "retire-three-generation-v2-allowed"
+	if _, err := store.RetireCryptoGeneration(ctx, request); err != nil {
+		t.Fatalf("retirement with active replacement alias: %v", err)
+	}
+	store.maintenance.SourceAliasRetention = time.Hour
+	cleanup, err := store.RunMaintenance(ctx)
+	if err != nil {
+		t.Fatalf("cleanup old retired pseudonym aliases: %v", err)
+	}
+	if cleanup.SourceAliasesDeleted != 2 {
+		t.Fatalf("three-generation alias cleanup stats=%+v, want v1 and v2 removed", cleanup)
+	}
+	var v1, v2, v3, novelty int
+	for alias, target := range map[string]*int{
+		"three-generation-source-v1": &v1,
+		"three-generation-source-v2": &v2,
+		"three-generation-source-v3": &v3,
+	} {
+		if err := store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_source_aliases WHERE alias=$1`, alias).Scan(target); err != nil {
+			t.Fatalf("count three-generation alias %s: %v", alias, err)
+		}
+	}
+	if err := store.pool.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_adaptive_window_keys WHERE observation_key='three-generation-source'`).Scan(&novelty); err != nil {
+		t.Fatalf("count source novelty continuity key: %v", err)
+	}
+	if v1 != 0 || v2 != 0 || v3 != 1 || novelty != 1 {
+		t.Fatalf("three-generation cleanup aliases v1/v2/v3=%d/%d/%d novelty=%d, want 0/0/1/1", v1, v2, v3, novelty)
+	}
+}
+
+func TestPostgresV13MigrationBackfillsSourceNoveltyAliases(t *testing.T) {
+	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("GRIPLINE_TEST_POSTGRES_DSN is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resetIntegrationAuthority(t, ctx, dsn)
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect v13 migration authority: %v", err)
+	}
+	defer pool.Close()
+	if _, err := pool.Exec(ctx, `UPDATE gripline_schema SET version=13 WHERE singleton=TRUE`); err != nil {
+		t.Fatalf("mark authority as v13: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO gripline_adaptive_window_subjects
+		(detector, subject, last_seen_at)
+		VALUES ('source_novelty_source', 'migration-source-subject', CURRENT_TIMESTAMP)`); err != nil {
+		t.Fatalf("seed v13 source novelty subject: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO gripline_adaptive_window_keys
+		(detector, subject, observation_key, observed_at)
+		VALUES ('source_novelty_source', 'migration-source-subject', 'v7.migration-source', CURRENT_TIMESTAMP)`); err != nil {
+		t.Fatalf("seed v13 source novelty key: %v", err)
+	}
+	migrated, err := Open(ctx, Options{DSN: dsn, Migrate: true})
+	if err != nil {
+		t.Fatalf("migrate v13 authority: %v", err)
+	}
+	migrated.Close()
+	var canonical, alias string
+	var generation int
+	if err := pool.QueryRow(ctx, `SELECT canonical_source_id, alias, generation
+		FROM gripline_source_aliases WHERE alias='v7.migration-source'`).Scan(&canonical, &alias, &generation); err != nil {
+		t.Fatalf("read source novelty migration alias: %v", err)
+	}
+	if canonical != "v7.migration-source" || alias != canonical || generation != 7 {
+		t.Fatalf("source novelty migration alias=%s/%s/%d, want v7.migration-source/v7.migration-source/7", canonical, alias, generation)
 	}
 }
 
@@ -2437,9 +2684,10 @@ func resetIntegrationAuthority(t *testing.T, ctx context.Context, dsn string) {
 		gripline_cluster_crypto,
 		gripline_cluster_crypto_generations,
 		gripline_cluster_crypto_acks,
-		gripline_policy_node_state,
-		gripline_source_aliases,
-		gripline_membership`
+			gripline_policy_node_state,
+			gripline_source_aliases,
+			gripline_source_alias_identity_guard,
+			gripline_membership`
 	if _, err := pool.Exec(ctx, "TRUNCATE TABLE "+tables+" RESTART IDENTITY CASCADE"); err != nil {
 		t.Fatalf("reset integration authority: %v", err)
 	}

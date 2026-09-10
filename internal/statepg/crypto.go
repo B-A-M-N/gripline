@@ -808,8 +808,7 @@ func requireCryptoRetirementSafety(ctx context.Context, tx pgx.Tx, req CryptoRet
 			FROM gripline_source_aliases old
 			WHERE old.generation=$1
 			  AND ` + sourceIdentityReferencePredicate("old.canonical_source_id") + `
-			  AND NOT EXISTS (SELECT 1 FROM gripline_source_aliases retained
-				WHERE retained.canonical_source_id=old.canonical_source_id AND retained.generation<>$1)`
+			  AND NOT ` + usableRetainedSourceAliasPredicate("old.canonical_source_id", "$1")
 		if err := tx.QueryRow(ctx, query, req.Generation).Scan(&count); err != nil {
 			return mapDBError(err)
 		}
