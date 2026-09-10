@@ -377,8 +377,8 @@ release record remains pending and must not be conflated with local evidence.
 
 | Release state | Status |
 |---|---|
-| Local audited candidate | `b1f1d453a067cb45700be321db6c7dbff6e308d5` |
-| Local repository qualification | pending for this candidate commit |
+| Local audited candidate | `1693af3dfbed44c5f745f5f1257a6dfae72ac21e` |
+| Local repository qualification | PASS — exact-SHA manifest verified all 11 required gates |
 | Remote publication | pending |
 | Hosted exact-SHA Layer 1 | pending |
 | Hosted exact-SHA Layer 2 / 24h | pending |
@@ -421,6 +421,9 @@ binding boundary, reference-aware alias and source-scope maintenance, bounded
 alias-touch batching, and a dedicated source-churn qualification gate. Release
 tag syntax and tagged-commit/main ancestry now run in an Ubuntu preflight before
 the self-hosted qualification job. The committed candidate is the exact SHA
-named in the release-readiness table; local qualification, remote publication,
-and hosted exact-SHA evidence remain separate records. The final hosted
-evidence record remains pending.
+named in the release-readiness table. The full local short qualification run
+for that exact SHA passed all 11 required gates, including source-churn,
+capacity-load, soak, and HTTP/2; its manifest is retained under the qualification
+result directory. Local qualification, remote publication, and hosted exact-SHA
+evidence remain separate records. The final hosted evidence record remains
+pending.
