@@ -50,7 +50,7 @@ func adminPolicyStatus(svc *control.Service, manager *policy.Manager) http.Handl
 			adminMethodNotAllowed(w)
 			return
 		}
-		if _, err := svc.AuthorizeCapability(r.Context(), bearer(r.Header.Get("Authorization")), control.CapPolicyInstall); err != nil {
+		if _, err := svc.AuthorizeCapability(r.Context(), bearer(r.Header.Get("Authorization")), control.CapPolicyRead); err != nil {
 			writeAdminError(w, err)
 			return
 		}
@@ -590,6 +590,26 @@ func adminMethodNotAllowed(w http.ResponseWriter) {
 }
 
 func writeAdminError(w http.ResponseWriter, err error) {
+	var retirementTooEarly statepg.CryptoRetirementTooEarlyError
+	if errors.As(err, &retirementTooEarly) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"kind": retirementTooEarly.Kind, "generation": retirementTooEarly.Generation,
+			"safe_after": retirementTooEarly.SafeAfter.UTC().Format(time.RFC3339),
+		})
+		return
+	}
+	var retirementBlocked statepg.CryptoRetirementBlockedError
+	if errors.As(err, &retirementBlocked) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"kind": retirementBlocked.Kind, "generation": retirementBlocked.Generation,
+			"references": retirementBlocked.References, "detail": retirementBlocked.Detail,
+		})
+		return
+	}
 	switch {
 	case errors.Is(err, control.ErrUnauthenticated):
 		http.Error(w, "unauthorized", http.StatusUnauthorized)

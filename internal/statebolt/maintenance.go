@@ -15,8 +15,10 @@ import (
 )
 
 // RecoveryManifest binds a backup to the exact bytes that were validated.
-// Operators can verify the manifest before restoring, and automation can
-// refuse a backup whose hash no longer matches its sidecar.
+// It is an integrity and restore-compatibility sidecar, not an authenticated
+// provenance statement. Operators must protect the backup and sidecar with
+// their storage/access-control boundary, or add a detached signature, before
+// treating them as release or cross-system recovery evidence.
 type RecoveryManifest struct {
 	FormatVersion             int       `json:"format_version"`
 	SchemaVersion             uint64    `json:"schema_version"`
@@ -101,9 +103,9 @@ func (s *Store) BackupWithManifest(path, manifestPath string) error {
 	return errors.New("statebolt: recovery metadata is required; use BackupWithRecoveryManifest")
 }
 
-// BackupWithRecoveryManifest creates a consistent backup plus a manifest that
-// binds the database to the policy and public signing/key-version metadata the
-// deployment must restore alongside it.
+// BackupWithRecoveryManifest creates a consistent backup plus an unsigned
+// manifest that binds the database to the policy and public signing/key-version
+// metadata the deployment must restore alongside it.
 func (s *Store) BackupWithRecoveryManifest(path, manifestPath string, metadata RecoveryMetadata) error {
 	if err := validateRecoveryMetadata(metadata); err != nil {
 		return err

@@ -77,6 +77,12 @@ def main() -> int:
         failures.append(f"unexpected_4xx={unexpected_4xx}")
     if unexpected_statuses:
         failures.append(f"unexpected_statuses={unexpected_statuses}")
+    source_resolution_failures = int(result.get("source_resolution_failures", 0))
+    authority_timeouts = int(result.get("authority_timeouts", 0))
+    if source_resolution_failures:
+        failures.append(f"source resolution failures={source_resolution_failures}")
+    if authority_timeouts:
+        failures.append(f"authority timeouts={authority_timeouts}")
     latency = result.get("latency", {})
     if not latency.get("all") or not latency.get("successful"):
         failures.append("structured latency is incomplete")
@@ -104,6 +110,8 @@ def main() -> int:
             "max_transaction_retries_per_1000": max_retries_per_1000,
             "max_deadlocks": max_deadlocks,
             "transaction_retries_per_1000": retries_per_1000,
+            "source_resolution_failures": source_resolution_failures,
+            "authority_timeouts": authority_timeouts,
         }
     with open(path, "w", encoding="utf-8") as stream:
         json.dump(result, stream, indent=2, sort_keys=True)

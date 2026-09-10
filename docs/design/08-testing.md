@@ -72,9 +72,12 @@ specific benchmark. Neither is an operator-specific capacity claim.
 
 The qualification suite records `workers` for the security soak and
 `capacity_workers` independently. The reference suite defaults the capacity
-gate to two persistent clients so its bounded contention budget remains
-reproducible; `--capacity-workers` may be raised for an explicit stress
-profile without silently changing the release gate's workload.
+gate to 16 persistent clients with a 2-second PostgreSQL authority-operation
+budget; `--capacity-workers` may be raised for an explicit stress profile
+without silently changing the release gate's workload. The disposable
+capacity fixture raises concurrency ceilings and disables request-rate gauges
+so the reference measures active/active admission headroom rather than a
+shared quota-bucket exhaustion test.
 
 The security harness runs a configurable short sustained load phase
 (`GRIPLINE_CLUSTER_HARNESS_LOAD_SECONDS` and
@@ -95,10 +98,11 @@ writes raw HTTP/1.1 framing and header cases to a TCP socket and checks that
 parser ambiguity never creates more than one backend request or leaks a
 client-controlled carrier. `scripts/qualification/http2.sh` starts the real
 TLS listener with local PKI and executes the HTTP/2 cases with `nghttp`, the
-repository cancellation/recovery client, and `h2load`. When the host does not
-provide `h2load`, the gate builds its pinned Debian fixture and runs the actual
-`nghttp2-client` binary in a host-networked container; it also checks bounded
-oversized-header rejection and authenticated HTTP/2 error metrics.
+repository cancellation/recovery client, and `h2load`. Both protocol clients
+run from the pinned Debian fixture (`nghttp2-client=1.52.0-1+deb12u2`) in a
+host-networked container; no ambient host package is part of the certified
+gate. It also checks bounded oversized-header rejection and authenticated
+HTTP/2 error metrics.
 `scripts/security-http2-harness.sh` remains the URL-driven operator
 deployment check. `scripts/fuzz-smoke.sh` runs short parser fuzzing in
 PR/security CI and a longer scheduled budget.

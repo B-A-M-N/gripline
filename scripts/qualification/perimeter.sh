@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "$repo_dir/scripts/qualification/assertions.sh"
+
 # Repository-owned network-perimeter lab. Containers are placed on distinct
 # public/private/control/database networks; the private service requires a
 # client certificate signed by the lab CA, and only the gateway identity can
@@ -158,14 +161,14 @@ if [[ "$mode" == clustered ]]; then
 else
 	docker run -d --name "${lab}-gateway" --network "${lab}-public" --ip "$public_ip" --network-alias gateway.internal \
 		-v "$work_dir:/fixture" debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 \
-		/fixture/gripline -config /fixture/gateway.json >/dev/null
+		/fixture/gripline serve --config /fixture/gateway.json >/dev/null
 fi
 docker network connect --ip "$private_ip" "${lab}-private" "${lab}-gateway"
 if [[ "$mode" == clustered ]]; then
 	docker network connect "${lab}-db" "${lab}-gateway"
 	docker exec "${lab}-gateway" env GRIPLINE_DB_DSN="$db_dsn" /fixture/gripline migrate apply --config /fixture/gateway.json >/dev/null
 	docker exec "${lab}-gateway" /fixture/cluster-setup -keyring /fixture/keyring.json -policy /fixture/policy.json -verifier /fixture/verifier.key >/dev/null
-	docker exec -d "${lab}-gateway" env GRIPLINE_DB_DSN="$db_dsn" sh -c 'exec /fixture/gripline -config /fixture/gateway.json > /fixture/gateway.log 2>&1' >/dev/null
+	docker exec -d "${lab}-gateway" env GRIPLINE_DB_DSN="$db_dsn" sh -c 'exec /fixture/gripline serve --config /fixture/gateway.json > /fixture/gateway.log 2>&1' >/dev/null
 fi
 docker run -d --name "${lab}-control" --network "${lab}-control" --network-alias control.internal \
 	-v "$work_dir/control.conf:/etc/nginx/nginx.conf:ro" -v "$work_dir:/tls:ro" nginx:alpine@sha256:72ba65eb42c10344912a84ff42408db7d34f2feb642204570ab8fc5ffd29f1d3 >/dev/null
@@ -181,6 +184,8 @@ docker network connect "${lab}-private" "${lab}-control-client"
 
 credential_secret="perimeter-qualification-secret-0123456789abcdef"
 operator_token="perimeter-qualification-operator-0123456789abcdef"
+register_qualification_secret "$credential_secret"
+register_qualification_secret "$operator_token"
 for _ in $(seq 1 60); do
 	if docker exec "${lab}-attacker" curl --fail --silent --connect-timeout 2 http://gateway.internal:8585/readyz >/dev/null 2>&1; then break; fi
 	sleep 0.25
@@ -255,4 +260,7 @@ if docker exec "${lab}-attacker" curl --fail --silent --connect-timeout 2 http:/
 	echo "perimeter qualification: public attacker reached PostgreSQL network" >&2
 	exit 1
 fi
+emit_qualification_assertions \
+	'{"mtls_identity_separation":true,"raw_credential_denied":true,"public_isolation":true,"control_isolation":true,"database_isolation":true}' \
+	"{\"mode\":\"$mode\"}"
 echo "perimeter qualification (${mode}): mTLS identity separation, raw-credential denial, public isolation, control isolation, and database isolation passed"

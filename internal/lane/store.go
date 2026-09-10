@@ -96,6 +96,14 @@ type PolicyAwareRepository interface {
 	RecordCleanAuthorizedAndPromoteWithPolicy(ctx context.Context, credID, laneID string, riskScore int, criteria PromotionCriteria, now time.Time, policy PolicyContext, meta TransitionMetadata) (*LaneRecord, bool, error)
 }
 
+// ChangeAwareRepository returns lane-retention deletions from the same
+// authoritative borrow mutation. Built-in repositories implement this seam so
+// callers do not need a second pre/post lane-set read on every admission just
+// to discover which expired lane resources need cleanup.
+type ChangeAwareRepository interface {
+	BorrowOrCreateWithPolicyChanges(ctx context.Context, credID, candidateID string, features Features, policy PolicyContext) (*LaneRecord, bool, []string, error)
+}
+
 // ReadRepository is the strict read contract for authoritative lane state.
 // Not-found and backend failure are distinct, and callers can cancel remote
 // reads with the request context.

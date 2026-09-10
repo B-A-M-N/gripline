@@ -220,11 +220,20 @@ func (c *ControlPlane) RecordAdmission(e Event) {
 func (c *ControlPlane) RecordAdmissionContext(ctx context.Context, e Event) error {
 	e.Kind = EventAdmission
 	e.At = time.Now()
-	posture, postureErr := c.PostureContext(ctx)
-	if postureErr == nil {
-		e.Posture = posture.String()
-	} else {
-		e.Posture = "UNAVAILABLE"
+	var postureErr error
+	// Admission already read the authoritative posture before it reached the
+	// audit defer. Reuse that decision when it is present; reading the same
+	// singleton again here needlessly doubles control-plane traffic under load.
+	// Direct callers that do not supply a posture retain the old authoritative
+	// lookup behavior.
+	if e.Posture == "" {
+		posture, err := c.PostureContext(ctx)
+		postureErr = err
+		if err == nil {
+			e.Posture = posture.String()
+		} else {
+			e.Posture = "UNAVAILABLE"
+		}
 	}
 	c.mu.Lock()
 	recorder := c.admissionRecorder

@@ -20,6 +20,16 @@ type adaptiveBaseline struct {
 	count int
 }
 
+func (s *sharedAdaptiveStore) windowCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	count := 0
+	for _, keys := range s.windows {
+		count += len(keys)
+	}
+	return count
+}
+
 func (s *sharedAdaptiveStore) ObserveWindow(_ context.Context, obs adaptive.WindowObservation) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -76,6 +86,18 @@ func TestDistributedSourceNoveltyAggregatesAcrossNodes(t *testing.T) {
 	got := nodeB.ObserveAdmissionContext(context.Background(), base)
 	if len(got) != 1 || got[0].Code != "NEW_SOURCE" {
 		t.Fatalf("second node did not observe the shared novelty window: %v", got)
+	}
+}
+
+func TestDistributedWindowObservationGateSkipsRapidDuplicates(t *testing.T) {
+	base := time.Now()
+	store := &sharedAdaptiveStore{}
+	p := NewDistributedSourceNoveltyProducer(func() time.Time { return base }, store)
+	behavior := AdmissionBehavior{Subjects: SubjectContext{CredentialID: "cred-1", SourceID: "source-a"}}
+	p.ObserveAdmissionContext(context.Background(), behavior)
+	p.ObserveAdmissionContext(context.Background(), behavior)
+	if got := store.windowCount(); got != 1 {
+		t.Fatalf("rapid duplicate window observations=%d, want one authoritative observation", got)
 	}
 }
 

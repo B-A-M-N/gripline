@@ -58,6 +58,7 @@ func adminMetrics(svc *control.Service, dp *proxy.DataPlane, governor resource.A
 			writeMetric("backend_failures_total", m.BackendFailures)
 			writeMetric("backend_4xx_total", m.Backend4xx)
 			writeMetric("backend_5xx_total", m.Backend5xx)
+			writeMetric("entropy_failures_total", m.EntropyFailures)
 			writeMetric("active_streams", m.ActiveStreams)
 			writeMetric("evidence_events_total", m.EvidenceEvents)
 			writeMetric("usage_sessions_total", m.UsageSessions)
@@ -135,6 +136,7 @@ func adminMetrics(svc *control.Service, dp *proxy.DataPlane, governor resource.A
 			a := postgres.Metrics()
 			writeMetric("postgres_transaction_attempts_total", a.TransactionAttempts)
 			writeMetric("postgres_transaction_errors_total", a.TransactionErrors)
+			writeMetric("postgres_authority_timeouts_total", a.AuthorityTimeouts)
 			writeMetric("postgres_transaction_latency_seconds_total", a.TransactionLatency.Seconds())
 			writeMetric("postgres_serialization_retries_total", a.SerializationRetries)
 			writeMetric("postgres_deadlock_retries_total", a.DeadlockRetries)
@@ -144,7 +146,14 @@ func adminMetrics(svc *control.Service, dp *proxy.DataPlane, governor resource.A
 			writeMetric("postgres_transaction_retries_lane_risk_total", a.TransactionRetriesLaneRisk)
 			writeMetric("postgres_transaction_retries_credential_total", a.TransactionRetriesCredential)
 			writeMetric("postgres_transaction_retries_resource_total", a.TransactionRetriesResource)
+			writeMetric("postgres_transaction_retries_source_alias_total", a.TransactionRetriesSourceAlias)
 			writeMetric("postgres_transaction_retries_other_total", a.TransactionRetriesOther)
+			writeMetric("postgres_source_alias_resolutions_total", a.SourceAliasAttempts)
+			writeMetric("postgres_source_alias_registrations_total", a.SourceAliasRegistrations)
+			writeMetric("postgres_source_alias_conflicts_total", a.SourceAliasConflicts)
+			writeMetric("postgres_source_alias_resolution_failures_total", a.SourceAliasFailures)
+			writeMetric("postgres_source_alias_resolution_seconds", a.SourceAliasResolutionLatency.Seconds())
+			writeMetric("postgres_source_alias_resolution_seconds_total", a.SourceAliasResolutionLatency.Seconds())
 			writeMetric("postgres_reservation_attempts_total", a.ReservationAttempts)
 			writeMetric("postgres_reservations_granted_total", a.ReservationsGranted)
 			writeMetric("postgres_reservation_failures_total", a.ReservationFailures)
@@ -184,6 +193,7 @@ func adminMetrics(svc *control.Service, dp *proxy.DataPlane, governor resource.A
 		writeMetric("adaptive_persistence_healthy", adaptiveHealthy)
 		if term != nil {
 			writeMetric("evidence_append_failures_total", term.EvidenceAppendFailures())
+			writeMetric("baseline_finalize_failures_total", term.BaselineFinalizeFailures())
 		}
 		if observer != nil {
 			m := observer.Stats()

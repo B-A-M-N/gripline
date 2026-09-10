@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"sync/atomic"
 	"time"
 
@@ -240,6 +241,10 @@ type Dependencies struct {
 
 	RiskNow func() time.Time
 	LaneNow func() time.Time
+	// RequestIDReader is the entropy source for request identifiers. Production
+	// defaults to crypto/rand.Reader; the seam exists so entropy failure is
+	// testable without changing the fail-closed request behavior.
+	RequestIDReader io.Reader
 
 	// Concurrency is the hard-limit seam: acquire and release concurrency for a
 	// scope. Implementations bound per scope, keyed by scope id. INV-9: hard
@@ -335,7 +340,7 @@ type PolicySnapshotProvider interface {
 // Terminator is the credential-termination admission engine.
 type Terminator struct {
 	dep  Dependencies
-	rand func() string // injectable request-id generator for deterministic tests
+	rand func() (string, error) // injectable request-id generator for deterministic tests
 	// pol is the COMPILED policy snapshot taken at New (P0.10). Compile
 	// deep-copies every reference-bearing field (the EvidenceRules map), so
 	// later mutation of the caller's *policy.Policy — including its rule
@@ -347,8 +352,9 @@ type Terminator struct {
 	pol         *policy.CompiledPolicy
 	policyEpoch uint64
 	// pruneCounter triggers pruning every N admissions (optimization only).
-	pruneCounter          *atomic.Int64
-	evidenceAppendFailure *atomic.Uint64
+	pruneCounter            *atomic.Int64
+	evidenceAppendFailure   *atomic.Uint64
+	baselineFinalizeFailure *atomic.Uint64
 }
 
 // New builds a Terminator and validates the critical seams for the requested
@@ -423,14 +429,19 @@ func New(dep Dependencies) (*Terminator, error) {
 	if err != nil {
 		return nil, fmt.Errorf("terminator: compile policy: %w", err)
 	}
+	requestIDReader := dep.RequestIDReader
+	if requestIDReader == nil {
+		requestIDReader = rand.Reader
+	}
 	return &Terminator{
-		dep:                   dep,
-		policies:              dep.Policies,
-		rand:                  newRequestID,
-		pol:                   compiled,
-		policyEpoch:           initialPolicyEpoch,
-		pruneCounter:          &atomic.Int64{},
-		evidenceAppendFailure: &atomic.Uint64{},
+		dep:                     dep,
+		policies:                dep.Policies,
+		rand:                    func() (string, error) { return newRequestIDWithReader(requestIDReader) },
+		pol:                     compiled,
+		policyEpoch:             initialPolicyEpoch,
+		pruneCounter:            &atomic.Int64{},
+		evidenceAppendFailure:   &atomic.Uint64{},
+		baselineFinalizeFailure: &atomic.Uint64{},
 	}, nil
 }
 
@@ -442,6 +453,16 @@ func (t *Terminator) EvidenceAppendFailures() uint64 {
 		return 0
 	}
 	return t.evidenceAppendFailure.Load()
+}
+
+// BaselineFinalizeFailures reports durable lane-promotion writes that failed
+// after an otherwise successful request. The admission result remains
+// unchanged, but operators can detect when learning progress is stalled.
+func (t *Terminator) BaselineFinalizeFailures() uint64 {
+	if t == nil || t.baselineFinalizeFailure == nil {
+		return 0
+	}
+	return t.baselineFinalizeFailure.Load()
 }
 
 func (t *Terminator) currentPolicySnapshot() (*policy.CompiledPolicy, uint64) {
@@ -508,22 +529,43 @@ func (t *Terminator) adaptivePersistenceFailed() bool {
 	return false
 }
 
-// newRequestID returns a unique, non-secret request id (§71): 128 bits of
-// CSPRNG entropy so ids are globally unique across nodes and restarts — a
-// process-local timestamp+counter collides across replicas and is
-// predictable (an attacker-guessable jti is replay ammunition).
-func newRequestID() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		panic("terminator: entropy unavailable for request id: " + err.Error())
+func newRequestIDWithReader(reader io.Reader) (string, error) {
+	if reader == nil {
+		return "", errors.New("terminator: request id entropy reader is nil")
 	}
-	return "req_" + base64.RawURLEncoding.EncodeToString(b[:])
+	var b [16]byte
+	if _, err := io.ReadFull(reader, b[:]); err != nil {
+		return "", fmt.Errorf("terminator: entropy unavailable for request id: %w", err)
+	}
+	return "req_" + base64.RawURLEncoding.EncodeToString(b[:]), nil
 }
 
 // NewRequestID creates a request identifier at the outer request boundary.
 // The proxy uses it before any authentication, spooling, or adapter work so
 // early failures can still be correlated with their decision record.
-func NewRequestID() string { return newRequestID() }
+func NewRequestID() (string, error) { return newRequestIDWithReader(rand.Reader) }
+
+// NewRequestIDWithReader is the injectable-reader variant used by failure
+// tests and tightly controlled embedders. It never substitutes a timestamp or
+// counter when entropy is unavailable.
+func NewRequestIDWithReader(reader io.Reader) (string, error) {
+	return newRequestIDWithReader(reader)
+}
+
+func (t *Terminator) generateRequestID() (string, error) {
+	if t != nil && t.rand != nil {
+		return t.rand()
+	}
+	return NewRequestID()
+}
+
+func entropyFailureOutcome(err error) *Outcome {
+	return &Outcome{
+		Authorized: false,
+		Reason:     "entropy_unavailable",
+		DenialErr:  fmt.Errorf("terminator: request security identity unavailable: %w", err),
+	}
+}
 
 // Admit runs the admission-state pipeline (P0.10) for a request's secret
 // carriers and normalized feature set. The ordering is:
@@ -595,7 +637,11 @@ func (t *Terminator) AdmitSource(headers map[string][]string, feat lane.Features
 // the returned Outcome's reservation is SETTLED with actuals after execution
 // (proxy lifecycle). Admit/AdmitSource delegate here with {Requests: 1}.
 func (t *Terminator) AdmitUsage(headers map[string][]string, feat lane.Features, src TrustedSource, est resource.UsageEstimate) *Outcome {
-	return t.AdmitUsageContext(context.Background(), t.rand(), headers, feat, src, est)
+	requestID, err := t.generateRequestID()
+	if err != nil {
+		return entropyFailureOutcome(err)
+	}
+	return t.AdmitUsageContext(context.Background(), requestID, headers, feat, src, est)
 }
 
 // AdmitUsageWithRequestID is the request-boundary variant of AdmitUsage. The
@@ -619,7 +665,7 @@ func (t *Terminator) AdmitUsageContext(ctx context.Context, reqID string, header
 	// Keep the existing implementation's receiver-local policy references while
 	// ensuring every request uses the one snapshot selected above. The view
 	// shares mutable counters and dependencies but has no independent authority.
-	view := &Terminator{dep: t.dep, rand: t.rand, pol: compiled, policyEpoch: policyEpoch, pruneCounter: t.pruneCounter, evidenceAppendFailure: t.evidenceAppendFailure}
+	view := &Terminator{dep: t.dep, rand: t.rand, pol: compiled, policyEpoch: policyEpoch, pruneCounter: t.pruneCounter, evidenceAppendFailure: t.evidenceAppendFailure, baselineFinalizeFailure: t.baselineFinalizeFailure}
 	return view.admitUsageWithRequestID(ctx, reqID, headers, feat, src, est)
 }
 
@@ -631,7 +677,11 @@ func (t *Terminator) AdmitUsageWithRequestIDContext(ctx context.Context, reqID s
 
 func (t *Terminator) admitUsageWithRequestID(ctx context.Context, reqID string, headers map[string][]string, feat lane.Features, src TrustedSource, est resource.UsageEstimate) *Outcome {
 	if reqID == "" {
-		reqID = t.rand()
+		var err error
+		reqID, err = t.generateRequestID()
+		if err != nil {
+			return entropyFailureOutcome(err)
+		}
 	}
 	now := t.dep.RiskNow()
 	out := &Outcome{RequestID: reqID}
@@ -757,6 +807,7 @@ func (t *Terminator) admitUsageWithRequestID(ctx context.Context, reqID string, 
 	tr.CredentialRevBefore = cred.Revision
 	tr.CredentialRevAfter = cred.Revision
 	controlEmergency := false
+	posture := control.Normal
 	postureAt := time.Time{}
 	postureAuthority := t.dep.Posture
 	if postureAuthority == nil && t.dep.Control != nil {
@@ -764,7 +815,6 @@ func (t *Terminator) admitUsageWithRequestID(ctx context.Context, reqID string, 
 	}
 	if postureAuthority != nil {
 		var controlErr error
-		var posture control.Posture
 		if snapshotAuthority, ok := postureAuthority.(control.PostureSnapshotAuthority); ok {
 			posture, postureAt, controlErr = snapshotAuthority.PostureSnapshotContext(ctx)
 		} else {
@@ -797,6 +847,7 @@ func (t *Terminator) admitUsageWithRequestID(ctx context.Context, reqID string, 
 				LaneID:       out.Context.LaneID,
 				Authorized:   out.Authorized,
 				Reason:       out.Reason,
+				Posture:      posture.String(),
 			})
 		}()
 	}
@@ -811,23 +862,27 @@ func (t *Terminator) admitUsageWithRequestID(ctx context.Context, reqID string, 
 
 	// 4. Classify lane.
 	var lanesBefore, lanesAfter []string
+	changeAwareLanes := false
 	if t.dep.Lanes != nil {
-		if reader, ok := t.dep.Lanes.(lane.ReadRepository); ok {
-			lanesBefore, err = reader.ListIDs(ctx, cred.CredentialID)
-			if err != nil {
-				out.Authorized = false
-				out.Reason = "lane_unavailable"
-				out.DenialErr = err
-				out.Degraded = true
-				out.Adaptive = AdaptiveDegraded
-				return out
+		_, changeAwareLanes = t.dep.Lanes.(lane.ChangeAwareRepository)
+		if !changeAwareLanes {
+			if reader, ok := t.dep.Lanes.(lane.ReadRepository); ok {
+				lanesBefore, err = reader.ListIDs(ctx, cred.CredentialID)
+				if err != nil {
+					out.Authorized = false
+					out.Reason = "lane_unavailable"
+					out.DenialErr = err
+					out.Degraded = true
+					out.Adaptive = AdaptiveDegraded
+					return out
+				}
+			} else {
+				lanesBefore = t.dep.Lanes.ListLaneIDs(cred.CredentialID)
 			}
-		} else {
-			lanesBefore = t.dep.Lanes.ListLaneIDs(cred.CredentialID)
 		}
 	}
-	laneID, laneRec, laneNew, lerr := t.classifyLane(ctx, cred.CredentialID, feat)
-	if t.dep.Lanes != nil {
+	laneID, laneRec, laneNew, deletedLanes, changesReturned, lerr := t.classifyLane(ctx, cred.CredentialID, feat)
+	if t.dep.Lanes != nil && !changesReturned {
 		if reader, ok := t.dep.Lanes.(lane.ReadRepository); ok {
 			lanesAfter, err = reader.ListIDs(ctx, cred.CredentialID)
 			if err != nil {
@@ -843,7 +898,11 @@ func (t *Terminator) admitUsageWithRequestID(ctx context.Context, reqID string, 
 		}
 	}
 	if lerr == nil {
-		cleanupRemovedLaneResources(ctx, t.dep.Resource, lanesBefore, lanesAfter)
+		if changesReturned {
+			cleanupRemovedLaneResources(ctx, t.dep.Resource, deletedLanes, nil)
+		} else {
+			cleanupRemovedLaneResources(ctx, t.dep.Resource, lanesBefore, lanesAfter)
+		}
 	}
 	tr.LaneID = laneID
 	tr.LaneNew = laneNew

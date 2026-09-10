@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestManagerPrepareActivateRollback(t *testing.T) {
@@ -161,6 +162,48 @@ func TestManagerRefreshesSharedPolicyEpochWithoutArtifactChange(t *testing.T) {
 	}
 	if epoch, ok := m.PolicyEpoch(); !ok || epoch != 8 {
 		t.Fatalf("refreshed policy epoch: %d, %v", epoch, ok)
+	}
+}
+
+func TestManagerAcknowledgesUnchangedManifestOnce(t *testing.T) {
+	active, err := Compile(Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := manifestFor(active, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acknowledgements := 0
+	m, err := NewManager(Default(), Options{
+		LoadManifest: func() (Manifest, error) { return manifest, nil },
+		LoadArtifact: func(PolicyRef) (*CompiledPolicy, error) { return active, nil },
+		AcknowledgeContext: func(context.Context, Manifest) error {
+			acknowledgements++
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acknowledgements != 1 {
+		t.Fatalf("initial acknowledgement count=%d, want 1", acknowledgements)
+	}
+	manifest.UpdatedAt = manifest.UpdatedAt.Add(time.Minute)
+	for i := 0; i < 3; i++ {
+		if err := m.Reconcile(context.Background()); err != nil {
+			t.Fatalf("reconcile unchanged lifecycle state: %v", err)
+		}
+	}
+	if acknowledgements != 1 {
+		t.Fatalf("timestamp-only acknowledgement count=%d, want 1", acknowledgements)
+	}
+	manifest.ActivationEpoch++
+	if err := m.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile changed lifecycle state: %v", err)
+	}
+	if acknowledgements != 2 {
+		t.Fatalf("lifecycle-change acknowledgement count=%d, want 2", acknowledgements)
 	}
 }
 

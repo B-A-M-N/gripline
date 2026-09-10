@@ -1,10 +1,19 @@
 package evidence
 
 import (
+	"errors"
+	"io"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestMintWithReaderFailsClosedWhenEntropyUnavailable(t *testing.T) {
+	_, err := MintWithReader(DefaultTable(), "NEW_ASN", "cred_1", time.Now(), 1, strings.NewReader("short"))
+	if err == nil || !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("entropy failure=%v, want wrapped io.ErrUnexpectedEOF", err)
+	}
+}
 
 func TestEvidenceValidWithActiveTTL(t *testing.T) {
 	now := time.Now()

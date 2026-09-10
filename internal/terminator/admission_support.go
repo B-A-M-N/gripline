@@ -78,14 +78,18 @@ func (t *Terminator) finalizeBaseline(ctx context.Context, b *BaselineToken) {
 	}
 	meta := lane.TransitionMetadata{RequestID: b.RequestID, PolicyRevision: b.PolicyRevision, EvidenceCodes: b.EvidenceCodes}
 	lanePolicy := lanePolicyContext(pol)
+	var err error
 	if aware, ok := t.dep.Lanes.(lane.PolicyAwareRepository); ok {
-		_, _, _ = aware.RecordCleanAuthorizedAndPromoteWithPolicy(ctx, b.CredentialID, b.LaneID, b.LaneRisk, promCrit, now, lanePolicy, meta)
+		_, _, err = aware.RecordCleanAuthorizedAndPromoteWithPolicy(ctx, b.CredentialID, b.LaneID, b.LaneRisk, promCrit, now, lanePolicy, meta)
 	} else if aware, ok := t.dep.Lanes.(lane.MetadataAwareRepository); ok {
-		_, _, _ = aware.RecordCleanAuthorizedAndPromoteWithMetadata(b.CredentialID, b.LaneID, b.LaneRisk, promCrit, now, meta)
+		_, _, err = aware.RecordCleanAuthorizedAndPromoteWithMetadata(b.CredentialID, b.LaneID, b.LaneRisk, promCrit, now, meta)
 	} else if aware, ok := t.dep.Lanes.(lane.RequestAwareRepository); ok {
-		_, _, _ = aware.RecordCleanAuthorizedAndPromoteWithRequestID(b.CredentialID, b.LaneID, b.LaneRisk, promCrit, now, b.RequestID)
+		_, _, err = aware.RecordCleanAuthorizedAndPromoteWithRequestID(b.CredentialID, b.LaneID, b.LaneRisk, promCrit, now, b.RequestID)
 	} else {
-		_, _, _ = t.dep.Lanes.RecordCleanAuthorizedAndPromote(b.CredentialID, b.LaneID, b.LaneRisk, promCrit, now)
+		_, _, err = t.dep.Lanes.RecordCleanAuthorizedAndPromote(b.CredentialID, b.LaneID, b.LaneRisk, promCrit, now)
+	}
+	if err != nil && t.baselineFinalizeFailure != nil {
+		t.baselineFinalizeFailure.Add(1)
 	}
 }
 
@@ -435,9 +439,9 @@ func cleanupRemovedLaneResources(ctx context.Context, g resource.Authority, befo
 
 // classifyLane assigns/creates a lane for the request, deterministic on the
 // feature vector + policy revision (§26).
-func (t *Terminator) classifyLane(ctx context.Context, credID string, feat lane.Features) (string, *lane.LaneRecord, bool, error) {
+func (t *Terminator) classifyLane(ctx context.Context, credID string, feat lane.Features) (string, *lane.LaneRecord, bool, []string, bool, error) {
 	if t.dep.Lanes == nil {
-		return "lane_" + credID, nil, false, nil
+		return "lane_" + credID, nil, false, nil, false, nil
 	}
 	// P0.21: the lane ID hashes the feature schema AND the classification
 	// universe revision, not just the feature vector. Re-keying classification
@@ -451,16 +455,21 @@ func (t *Terminator) classifyLane(ctx context.Context, credID string, feat lane.
 	classification := lanePolicyContext(t.pol)
 	var rec *lane.LaneRecord
 	var created bool
+	var deleted []string
+	changeAware := false
 	var err error
-	if aware, ok := t.dep.Lanes.(lane.PolicyAwareRepository); ok {
+	if aware, ok := t.dep.Lanes.(lane.ChangeAwareRepository); ok {
+		rec, created, deleted, err = aware.BorrowOrCreateWithPolicyChanges(ctx, credID, laneID, feat, classification)
+		changeAware = true
+	} else if aware, ok := t.dep.Lanes.(lane.PolicyAwareRepository); ok {
 		rec, created, err = aware.BorrowOrCreateWithPolicy(ctx, credID, laneID, feat, classification)
 	} else {
 		rec, created, err = t.dep.Lanes.BorrowOrCreate(credID, laneID, feat, classification.Classification)
 	}
 	if err != nil {
-		return laneID, nil, false, err
+		return laneID, nil, false, deleted, changeAware, err
 	}
-	return rec.LaneID, rec, created, nil
+	return rec.LaneID, rec, created, deleted, changeAware, nil
 }
 
 // laneTag derives a deterministic tag for lane IDs from the feature schema

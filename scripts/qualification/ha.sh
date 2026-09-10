@@ -7,6 +7,7 @@ set -euo pipefail
 # standby from the promoted authority.
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "$repo_dir/scripts/qualification/assertions.sh"
 fixture_dir="$repo_dir/scripts/qualification/fixtures/postgres-ha"
 source "$fixture_dir/ports.sh"
 project="gripline-ha-${$}"
@@ -164,6 +165,8 @@ live_backend_port="$(pick_free_port 25700 25800)"
 live_admin_port="$(pick_free_port 25800 25900)"
 live_secret="ha-live-qualification-secret-0123456789abcdef"
 live_operator="ha-live-qualification-operator-0123456789abcdef"
+register_qualification_secret "$live_secret"
+register_qualification_secret "$live_operator"
 live_config="$work_dir/live-config.json"
 writer_dsn="postgres://gripline:gripline@127.0.0.1:${writer_port}/gripline?sslmode=disable"
 cat >"$live_config" <<EOF
@@ -188,7 +191,7 @@ EOF
 	>"$work_dir/pg-writer.log" 2>&1 & live_pids+=("$!")
 GRIPLINE_HA_WRITER_DSN="$writer_dsn" "$work_dir/gripline" keys export --config "$live_config" >"$work_dir/live-keys.json"
 "$work_dir/backend" -listen "127.0.0.1:${live_backend_port}" -keys "$work_dir/live-keys.json" -audience ha-live-qualification >"$work_dir/live-backend.log" 2>&1 & live_pids+=("$!")
-GRIPLINE_HA_WRITER_DSN="$writer_dsn" "$work_dir/gripline" -config "$live_config" >"$work_dir/live-gripline.log" 2>&1 & live_pids+=("$!")
+GRIPLINE_HA_WRITER_DSN="$writer_dsn" "$work_dir/gripline" serve --config "$live_config" >"$work_dir/live-gripline.log" 2>&1 & live_pids+=("$!")
 for _ in $(seq 1 60); do
 	if curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${live_port}/readyz" 2>/dev/null | rg -qx 200; then break; fi
 	sleep 0.25
@@ -280,4 +283,8 @@ done
 	echo "ha qualification: rejoined standby lost complete reference state" >&2
 	exit 1
 }
+state_hash="$(printf '%s' "$final_expected_state" | sha256sum | awk '{print $1}')"
+emit_qualification_assertions \
+	'{"promotion_completed":true,"state_fingerprint_equal":true,"live_writer_continuity":true,"rejoin_state_preserved":true}' \
+	"{\"state_fingerprint_sha256\":\"$state_hash\",\"rejoin_role\":\"standby\"}"
 echo "ha qualification: primary/replica promotion, security-state preservation, and rejoin passed"

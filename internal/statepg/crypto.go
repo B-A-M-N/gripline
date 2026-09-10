@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/B-A-M-N/gripline/internal/control"
+	"github.com/B-A-M-N/gripline/internal/protocollimits"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -17,10 +18,6 @@ const (
 	CryptoKindSigner    = "signer"
 	CryptoKindPepper    = "pepper"
 	CryptoKindPseudonym = "pseudonym"
-	// Signer assertions can remain valid for the configured policy TTL plus a
-	// bounded clock-skew allowance. The authority persists this horizon when a
-	// signer is superseded so retirement does not depend on a client clock.
-	cryptoSignerRetirementHorizon = 35 * time.Second
 )
 
 // CryptoGeneration is one loaded cluster capability. Its fingerprint binds
@@ -67,6 +64,32 @@ var (
 	ErrCryptoActivationBarrier = errors.New("statepg: crypto activation barrier not satisfied")
 	ErrCryptoIdentityStale     = errors.New("statepg: local crypto identity is stale")
 )
+
+// CryptoRetirementTooEarlyError tells an operator exactly when authority-owned
+// signer overlap has elapsed. SafeAfter is authoritative database time, not a
+// client-supplied estimate.
+type CryptoRetirementTooEarlyError struct {
+	Kind       string
+	Generation int
+	SafeAfter  time.Time
+}
+
+func (e CryptoRetirementTooEarlyError) Error() string {
+	return fmt.Sprintf("statepg: crypto generation %s/%d cannot retire before %s", e.Kind, e.Generation, e.SafeAfter.UTC().Format(time.RFC3339))
+}
+
+// CryptoRetirementBlockedError reports durable references that must be
+// migrated before a pepper or pseudonym generation can be retired.
+type CryptoRetirementBlockedError struct {
+	Kind       string
+	Generation int
+	References int
+	Detail     string
+}
+
+func (e CryptoRetirementBlockedError) Error() string {
+	return fmt.Sprintf("statepg: %s generation %d remains referenced by %d item(s): %s", e.Kind, e.Generation, e.References, e.Detail)
+}
 
 type cryptoObservation struct {
 	signerKID, pepperVersion, pseudonymVersion int
@@ -597,12 +620,17 @@ func (s *Store) activateCryptoGenerationOnce(ctx context.Context, req CryptoActi
 	if previousGeneration > 0 && previousGeneration != req.Generation {
 		retireAfter := now
 		if req.Kind == CryptoKindSigner {
-			retireAfter = now.Add(cryptoSignerRetirementHorizon)
+			retireAfter = now.Add(protocollimits.SignerRetirementHorizon)
 		}
-		if _, err := tx.Exec(ctx, `UPDATE gripline_cluster_crypto_generations
+		result, err := tx.Exec(ctx, `UPDATE gripline_cluster_crypto_generations
 			SET state='loaded', superseded_at=$1, retire_after=$2, updated_at=$1
-			WHERE kind=$3 AND generation=$4 AND state='active'`, now, retireAfter, req.Kind, previousGeneration); err != nil {
+			WHERE kind=$3 AND generation=$4 AND state='active'`, now, retireAfter, req.Kind, previousGeneration)
+		if err != nil {
 			return CryptoIdentity{}, mapDBError(err)
+		}
+		rows := result.RowsAffected()
+		if rows != 1 {
+			return CryptoIdentity{}, fmt.Errorf("statepg: crypto activation expected to supersede exactly one active %s/%d generation, affected %d rows", req.Kind, previousGeneration, rows)
 		}
 	}
 	if _, err := tx.Exec(ctx, `UPDATE gripline_cluster_crypto_generations
@@ -698,7 +726,7 @@ func (s *Store) retireCryptoGenerationOnce(ctx context.Context, req CryptoRetire
 		safeAfter = *authorityRetireAfter
 	}
 	if now.Before(safeAfter) {
-		return CryptoIdentity{}, fmt.Errorf("statepg: crypto generation %s/%d cannot retire before %s", req.Kind, req.Generation, safeAfter.UTC().Format(time.RFC3339))
+		return CryptoIdentity{}, CryptoRetirementTooEarlyError{Kind: req.Kind, Generation: req.Generation, SafeAfter: safeAfter}
 	}
 	if cryptoGenerationIsActive(shared, req.Kind, req.Generation) {
 		return CryptoIdentity{}, fmt.Errorf("statepg: cannot retire active crypto generation %s/%d", req.Kind, req.Generation)
@@ -772,7 +800,7 @@ func requireCryptoRetirementSafety(ctx context.Context, tx pgx.Tx, req CryptoRet
 			return mapDBError(err)
 		}
 		if count != 0 {
-			return fmt.Errorf("statepg: pepper generation %d is still used by %d credential(s)", req.Generation, count)
+			return CryptoRetirementBlockedError{Kind: req.Kind, Generation: req.Generation, References: count, Detail: "credentials"}
 		}
 	case CryptoKindPseudonym:
 		var count int
@@ -804,7 +832,7 @@ func requireCryptoRetirementSafety(ctx context.Context, tx pgx.Tx, req CryptoRet
 			return mapDBError(err)
 		}
 		if count != 0 {
-			return fmt.Errorf("statepg: pseudonym generation %d still has %d source state reference(s); migrate aliases before retirement", req.Generation, count)
+			return CryptoRetirementBlockedError{Kind: req.Kind, Generation: req.Generation, References: count, Detail: "source state; migrate aliases before retirement"}
 		}
 	}
 	return nil

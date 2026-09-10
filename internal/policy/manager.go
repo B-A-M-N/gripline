@@ -49,10 +49,54 @@ type Manager struct {
 	loadArtifact                      func(PolicyRef) (*CompiledPolicy, error)
 	loadArtifactContext               func(context.Context, PolicyRef) (*CompiledPolicy, error)
 	acknowledgeContext                func(context.Context, Manifest) error
+	acknowledgedState                 *manifestState
 	lastRevision                      int
 	// published is the immutable data-plane view. A nil pointer means the
 	// durable authority could not be reconciled and admissions must fail closed.
 	published atomic.Pointer[Snapshot]
+}
+
+// manifestState is the policy lifecycle state that must be acknowledged by a
+// node. UpdatedAt is deliberately excluded: an operator-side write timestamp
+// changing without changing the active/candidate/previous policy does not
+// require another acknowledgement transaction.
+type manifestState struct {
+	SchemaVersion   int
+	ActivationEpoch uint64
+	Active          PolicyRef
+	Candidate       *PolicyRef
+	Previous        *PolicyRef
+}
+
+func manifestStateOf(manifest Manifest) manifestState {
+	state := manifestState{
+		SchemaVersion:   manifest.SchemaVersion,
+		ActivationEpoch: manifest.ActivationEpoch,
+		Active:          manifest.Active,
+	}
+	if manifest.Candidate != nil {
+		candidate := *manifest.Candidate
+		state.Candidate = &candidate
+	}
+	if manifest.Previous != nil {
+		previous := *manifest.Previous
+		state.Previous = &previous
+	}
+	return state
+}
+
+func (s manifestState) equal(other *manifestState) bool {
+	if other == nil || s.SchemaVersion != other.SchemaVersion || s.ActivationEpoch != other.ActivationEpoch || s.Active != other.Active {
+		return false
+	}
+	return policyRefEqual(s.Candidate, other.Candidate) && policyRefEqual(s.Previous, other.Previous)
+}
+
+func policyRefEqual(a, b *PolicyRef) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
 }
 
 // Manifest is the durable lifecycle marker. Implementations should write it
@@ -499,10 +543,12 @@ func (m *Manager) refreshDurableLocked(ctx context.Context) error {
 			m.knownGood[previous.Revision] = previous
 		}
 	}
-	if m.acknowledgeContext != nil {
+	state := manifestStateOf(manifest)
+	if m.acknowledgeContext != nil && !state.equal(m.acknowledgedState) {
 		if err := m.acknowledgeContext(usableContext(ctx), manifest); err != nil {
 			return fmt.Errorf("policy: acknowledge shared state: %w", err)
 		}
+		m.acknowledgedState = &state
 	}
 	return nil
 }

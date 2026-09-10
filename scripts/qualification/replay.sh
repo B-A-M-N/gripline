@@ -4,6 +4,7 @@ set -euo pipefail
 # Start two independent verifier-like processes against one PostgreSQL replay
 # authority and race the same namespaced claim. Exactly one process may win.
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "$repo_dir/scripts/qualification/assertions.sh"
 fixture_dir="$repo_dir/scripts/qualification/fixtures/replay"
 source "$repo_dir/scripts/qualification/fixtures/postgres-ha/ports.sh"
 project="gripline-replay-${$}"
@@ -66,4 +67,7 @@ for pid in "${claim_pids[@]}"; do wait "$pid"; done
 accepted="$(rg -l '"accepted":true' "$work_dir"/*.json | wc -l)"
 [[ "$accepted" == 1 ]] || { echo "replay qualification: accepted=$accepted, want exactly one" >&2; exit 1; }
 GOCACHE="${GOCACHE:-/tmp/gripline-go-cache}" GRIPLINE_REPLAY_POSTGRES_DSN="$dsn" go test ./internal/replay -run TestPostgresReplayGuardParallelAcrossInstances -count=1
+emit_qualification_assertions \
+	'{"parallel_claim_single_winner":true,"independent_processes_used":true}' \
+	"{\"accepted_winners\":$accepted}"
 echo "replay qualification: two independent processes and parallel PostgreSQL claims produced exactly one winner"

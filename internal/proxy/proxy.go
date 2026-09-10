@@ -252,6 +252,10 @@ type Config struct {
 	// terminator returns, including early denials. It is separate from the
 	// completion observer because the response may stream for an arbitrary time.
 	Admission AdmissionObserver
+	// RequestIDGenerator creates the ingress correlation id before any request
+	// work. Production defaults to terminator.NewRequestID; the error return is
+	// surfaced as a controlled 503 when the CSPRNG is unavailable.
+	RequestIDGenerator func() (string, error)
 
 	// MaxBodyBytes caps the request body (BETA-08). Inference prompts can be
 	// large but are not unbounded. Oversized bodies are rejected with 413
@@ -425,6 +429,7 @@ type MetricsSnapshot struct {
 	BackendFailures              uint64
 	Backend4xx                   uint64
 	Backend5xx                   uint64
+	EntropyFailures              uint64
 	ActiveStreams                uint64
 	EvidenceEvents               uint64
 	UsageSessions                uint64
@@ -447,6 +452,7 @@ type proxyMetrics struct {
 	degraded, resourceDenials, policyDenials, payloadTooLarge atomic.Uint64
 	spoolRejects, completionFailures, backendFailures         atomic.Uint64
 	backend4xx, backend5xx, activeStreams, evidenceEvents     atomic.Uint64
+	entropyFailures                                           atomic.Uint64
 	usageSessions, usageInputTokens, usageOutputTokens        atomic.Uint64
 	usageCombinedTokens, usageCostMicrounits                  atomic.Uint64
 	usageConservativeSettlements                              atomic.Uint64
@@ -467,8 +473,9 @@ func (d *DataPlane) Metrics() MetricsSnapshot {
 		SpoolRejects: d.metrics.spoolRejects.Load(), CompletionFailures: d.metrics.completionFailures.Load(),
 		BackendFailures: d.metrics.backendFailures.Load(), Backend4xx: d.metrics.backend4xx.Load(),
 		Backend5xx: d.metrics.backend5xx.Load(), ActiveStreams: d.metrics.activeStreams.Load(),
-		EvidenceEvents: d.metrics.evidenceEvents.Load(),
-		UsageSessions:  d.metrics.usageSessions.Load(), UsageInputTokens: d.metrics.usageInputTokens.Load(),
+		EntropyFailures: d.metrics.entropyFailures.Load(),
+		EvidenceEvents:  d.metrics.evidenceEvents.Load(),
+		UsageSessions:   d.metrics.usageSessions.Load(), UsageInputTokens: d.metrics.usageInputTokens.Load(),
 		UsageOutputTokens: d.metrics.usageOutputTokens.Load(), UsageCombinedTokens: d.metrics.usageCombinedTokens.Load(),
 		UsageCostMicrounits:          d.metrics.usageCostMicrounits.Load(),
 		UsageConservativeSettlements: d.metrics.usageConservativeSettlements.Load(),
@@ -584,7 +591,19 @@ func New(cfg Config) (*DataPlane, error) {
 // re-inject the signed assertion on the trusted hop → forward to the FIXED
 // backend (P0.7) → stream back.
 func (d *DataPlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	requestID := terminator.NewRequestID()
+	requestIDGenerator := d.cfg.RequestIDGenerator
+	if requestIDGenerator == nil {
+		requestIDGenerator = terminator.NewRequestID
+	}
+	requestID, requestIDErr := requestIDGenerator()
+	if requestIDErr != nil {
+		d.metrics.entropyFailures.Add(1)
+		d.metrics.admissions.Add(1)
+		d.metrics.denials.Add(1)
+		w.Header().Set("X-Gripline-Reason", "entropy_unavailable")
+		http.Error(w, "internal security unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	w.Header().Set("X-Gripline-Request-ID", requestID)
 	var observed bool
 	observeAdmission := func(out *terminator.Outcome) {
@@ -1213,7 +1232,7 @@ func (d *DataPlane) writeDenial(w http.ResponseWriter, out *terminator.Outcome) 
 			code = http.StatusTooManyRequests
 		case "invalid_credential", "credential_expired", "bad", "invalid_authentication":
 			code = http.StatusUnauthorized
-		case "backend_error", "internal_identity_failure", "resource_unavailable", "source_resolution_failed", "spool_capacity_exhausted", "internal_error":
+		case "backend_error", "internal_identity_failure", "resource_unavailable", "source_resolution_failed", "spool_capacity_exhausted", "internal_error", "entropy_unavailable":
 			code = http.StatusServiceUnavailable
 		case "bad_request":
 			code = http.StatusBadRequest

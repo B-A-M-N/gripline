@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/B-A-M-N/gripline/internal/protocollimits"
 )
 
 // AssertionSigner is the seam the terminator uses to mint internal identity.
@@ -150,7 +152,7 @@ var (
 func (s *Signer) Issue(c Claims, ttl time.Duration) (*Assertion, error) {
 	// INV-10 / P0.28: internal assertions are hard-capped at 30s. The signer
 	// refuses a longer lifetime even if policy is somehow misconfigured upward.
-	if ttl <= 0 || ttl > maxAssertionTTLSeconds*time.Second {
+	if ttl <= 0 || ttl > protocollimits.MaxAssertionTTL {
 		return nil, fmt.Errorf("terminator: TTL out of bounds (INV-10): %v", ttl)
 	}
 	if c.JTI == "" {
@@ -294,13 +296,13 @@ func ParseAndVerify(encoded string, pub ed25519.PublicKey, expectedAudience stri
 	if now.Unix() >= c.ExpiresAt {
 		return nil, ErrExpired
 	}
-	if now.Unix() < c.IssuedAt-5 { // allow small clock skew; never future-mint
+	if now.Unix() < c.IssuedAt-int64(protocollimits.AssertionClockSkew/time.Second) { // allow small clock skew; never future-mint
 		return nil, ErrNotYetValid
 	}
 	// Defensive bound: a signed assertion claiming a lifetime beyond the
 	// maximum supported TTL is rejected even if correctly signed — protects
 	// against signer-key misuse minting long-lived identities.
-	if c.ExpiresAt-c.IssuedAt > maxAssertionTTLSeconds {
+	if c.ExpiresAt-c.IssuedAt > int64(protocollimits.MaxAssertionTTL/time.Second) {
 		return nil, ErrTTLTooLong
 	}
 	if c.ExpiresAt <= c.IssuedAt {
@@ -333,11 +335,6 @@ const maxEncodedAssertionBytes = 8192
 const assertionIssuer = "gripline"
 
 const assertionWireVersion = "v1"
-
-// maxAssertionTTLSeconds is the defensive upper bound on accepted assertion
-// lifetimes (INV-10, P0.28): the stated invariant is ≤30s, so both Issue and
-// ParseAndVerify hard-cap here.
-const maxAssertionTTLSeconds = 30
 
 // Errors returned by assertion verification.
 var (

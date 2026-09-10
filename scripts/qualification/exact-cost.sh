@@ -5,6 +5,7 @@ set -euo pipefail
 # same bounded usage envelopes as the SDK lab; the real gateway settles them
 # in exact mode without a provider account.
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "$repo_dir/scripts/qualification/assertions.sh"
 work_dir="$(mktemp -d)"
 gateway_pid=""
 backend_pid=""
@@ -25,6 +26,9 @@ backend_port=$((base_port + 8))
 secret="exact-cost-qualification-secret-0123456789abcdef"
 operator_token="exact-cost-qualification-operator-0123456789abcdef"
 pepper="$(openssl rand -base64 32 | tr -d '\n')"
+register_qualification_secret "$secret"
+register_qualification_secret "$operator_token"
+register_qualification_secret "$pepper"
 
 GOCACHE="${GOCACHE:-/tmp/gripline-go-cache}" go build -trimpath -o "$work_dir/gripline" ./cmd/gripline
 GRIPLINE_LOCAL_BACKEND_PORT="$backend_port" python3 "$repo_dir/qualification/sdk/local_backend.py" >/dev/null 2>&1 &
@@ -52,7 +56,7 @@ start_gateway() {
   "deployment": {"allow_ephemeral_state":false}
 }
 EOF
-	"$work_dir/gripline" -config "$config" >"$work_dir/gateway-${mode}.log" 2>&1 &
+	"$work_dir/gripline" serve --config "$config" >"$work_dir/gateway-${mode}.log" 2>&1 &
 	gateway_pid=$!
 	for _ in $(seq 1 60); do
 	if curl -fsS "http://127.0.0.1:${gateway_port}/readyz" >/dev/null 2>&1; then break; fi
@@ -106,4 +110,7 @@ run_case anthropic-messages 12 3 2 5 /v1/messages '{"model":"local-qualification
 run_case anthropic-cache 55 10 2 12 /v1/messages '{"model":"local-qualification-cache","messages":[{"role":"user","content":"hello"}]}'
 stop_gateway
 
+emit_qualification_assertions \
+	'{"openai_exact_deltas":true,"anthropic_exact_deltas":true,"cache_dimensions_exact":true,"zero_conservative_fallbacks":true}' \
+	'{"verified_cases":4,"conservative_settlements":0}'
 echo "exact-cost qualification: OpenAI, Anthropic, cache dimensions, exact deltas, and zero conservative fallbacks passed"

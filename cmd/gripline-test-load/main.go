@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"sort"
@@ -119,6 +120,7 @@ func main() {
 	workers := flag.Int("workers", 16, "concurrent persistent clients")
 	timeout := flag.Duration("timeout", 10*time.Second, "per-request timeout")
 	userAgent := flag.String("user-agent", "", "optional deterministic User-Agent header")
+	localAddressPrefix := flag.String("local-address-prefix", "", "optional IPv4 prefix for per-worker source addresses, for example 127.0.0.")
 	flag.Parse()
 	credentials := []string{*secret}
 	if *secrets != "" {
@@ -133,18 +135,26 @@ func main() {
 		fatal("url, secret, duration, workers, and timeout must be valid")
 	}
 
-	transport := &http.Transport{
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          *workers * 2,
-		MaxIdleConnsPerHost:   *workers * 2,
-		MaxConnsPerHost:       *workers * 2,
-		IdleConnTimeout:       90 * time.Second,
-		ResponseHeaderTimeout: *timeout,
-		TLSHandshakeTimeout:   *timeout,
-		ExpectContinueTimeout: time.Second,
+	clients := make([]*http.Client, *workers)
+	transports := make([]*http.Transport, *workers)
+	for worker := 0; worker < *workers; worker++ {
+		localAddress := ""
+		if *localAddressPrefix != "" {
+			localAddress = fmt.Sprintf("%s%d", *localAddressPrefix, worker+2)
+			parsed := net.ParseIP(localAddress)
+			if parsed == nil || parsed.To4() == nil {
+				fatal("local-address-prefix must produce valid IPv4 addresses; worker %d produced %q", worker, localAddress)
+			}
+		}
+		transport := newLoadTransport(*workers, *timeout, localAddress)
+		transports[worker] = transport
+		clients[worker] = &http.Client{Transport: transport}
 	}
-	client := &http.Client{Transport: transport}
-	defer transport.CloseIdleConnections()
+	defer func() {
+		for _, transport := range transports {
+			transport.CloseIdleConnections()
+		}
+	}()
 
 	// #nosec G404 -- deterministic reservoir sampling only; this is never used for security or credential material.
 	stats := &samples{counts: make(map[string]int64), rng: rand.New(rand.NewSource(1))}
@@ -156,6 +166,7 @@ func main() {
 		wg.Add(1)
 		go func(worker int) {
 			defer wg.Done()
+			client := clients[worker]
 			credential := credentials[worker%len(credentials)]
 			for time.Now().Before(deadline) {
 				ctx, cancel := context.WithTimeout(context.Background(), *timeout)
@@ -254,6 +265,24 @@ func main() {
 	}
 	if err := json.NewEncoder(os.Stdout).Encode(output); err != nil {
 		fatal("encode result: %v", err)
+	}
+}
+
+func newLoadTransport(workers int, timeout time.Duration, localAddress string) *http.Transport {
+	dialer := &net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}
+	if localAddress != "" {
+		dialer.LocalAddr = &net.TCPAddr{IP: net.ParseIP(localAddress)}
+	}
+	return &http.Transport{
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          workers * 2,
+		MaxIdleConnsPerHost:   workers * 2,
+		MaxConnsPerHost:       workers * 2,
+		IdleConnTimeout:       90 * time.Second,
+		ResponseHeaderTimeout: timeout,
+		TLSHandshakeTimeout:   timeout,
+		ExpectContinueTimeout: time.Second,
+		DialContext:           dialer.DialContext,
 	}
 }
 

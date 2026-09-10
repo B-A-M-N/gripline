@@ -6,6 +6,7 @@ set -euo pipefail
 # target before that mutation must recover the earlier policy/security state.
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "$repo_dir/scripts/qualification/assertions.sh"
 fixture_dir="$repo_dir/scripts/qualification/fixtures/pitr"
 source "$repo_dir/scripts/qualification/fixtures/postgres-ha/ports.sh"
 project="gripline-pitr-${$}"
@@ -40,6 +41,10 @@ pepper_one="$(openssl rand -base64 32 | tr -d '\n')"
 pepper_two="$(openssl rand -base64 32 | tr -d '\n')"
 pseudonym_one="$(openssl rand -base64 32 | tr -d '\n')"
 pseudonym_two="$(openssl rand -base64 32 | tr -d '\n')"
+register_qualification_secret "$pepper_one"
+register_qualification_secret "$pepper_two"
+register_qualification_secret "$pseudonym_one"
+register_qualification_secret "$pseudonym_two"
 GOCACHE="${GOCACHE:-/tmp/gripline-go-cache}" go run ./cmd/gripline-test-cluster-setup \
 	-reset-dsn "$dsn" -keyring "$work_dir/keyring.json" -policy "$work_dir/policy.json" -verifier "$work_dir/verifier.key" \
 	-seed-reference-state \
@@ -181,7 +186,7 @@ assert_ready() {
 	local name=$1
 	local port=$((25500 + ${#name}))
 	local pid
-	GRIPLINE_PITR_READY_DSN="$restore_dsn" "$work_dir/gripline" -config "$work_dir/config-${name}.json" >"$work_dir/${name}.log" 2>&1 &
+	GRIPLINE_PITR_READY_DSN="$restore_dsn" "$work_dir/gripline" serve --config "$work_dir/config-${name}.json" >"$work_dir/${name}.log" 2>&1 &
 	pid=$!
 	for _ in $(seq 1 40); do
 		if [[ "$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port}/readyz" 2>/dev/null || true)" == 200 ]]; then
@@ -206,7 +211,7 @@ assert_not_ready() {
 	local port=$((25500 + ${#name}))
 	local pid
 	local observed=0
-	GRIPLINE_PITR_READY_DSN="$restore_dsn" "$work_dir/gripline" -config "$work_dir/config-${name}.json" >"$work_dir/${name}.log" 2>&1 &
+	GRIPLINE_PITR_READY_DSN="$restore_dsn" "$work_dir/gripline" serve --config "$work_dir/config-${name}.json" >"$work_dir/${name}.log" 2>&1 &
 	pid=$!
 	for _ in $(seq 1 40); do
 		case "$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port}/readyz" 2>/dev/null || true)" in
@@ -238,4 +243,8 @@ write_readiness_config missing-schema
 "${compose[@]}" exec -T restore psql -U gripline -d gripline -X -v ON_ERROR_STOP=1 -c 'DROP TABLE gripline_schema' >/dev/null
 assert_not_ready missing-schema
 
+restored_state_hash="$(printf '%s' "$restored_state" | sha256sum | awk '{print $1}')"
+emit_qualification_assertions \
+	'{"target_point_restored":true,"recovered_state_fingerprint_equal":true,"baseline_ready":true,"missing_signer_fail_closed":true,"missing_pepper_fail_closed":true,"missing_pseudonym_fail_closed":true,"missing_policy_fail_closed":true,"missing_schema_fail_closed":true}' \
+	"{\"target_point\":\"$target\",\"recovered_state_fingerprint_sha256\":\"$restored_state_hash\",\"readiness_fail_closed_cases\":5}"
 echo "pitr qualification: base backup, WAL archive, target-time restore, complete security-state validation, and fail-closed readiness cases passed"

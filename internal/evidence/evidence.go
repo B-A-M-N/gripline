@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"time"
 )
 
@@ -161,18 +162,20 @@ func (e Evidence) NonEvictable() bool {
 	return false
 }
 
-// idRandom returns a CSPRNG-derived evidence id (P0.15): unconvergeable and
-// un-predictable, so evidence ids can never be guessed, forged, or collided by
-// an attacker who can observe timestamps or request ordering. A timestamp-derived
-// id (ev_<UnixNano>) is attacker-influenceable and must never be the default.
-func idRandom() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		// Entropy failure is unrecoverable for a security-identity surface; the
-		// process must not mint forgeable evidence on a degraded RNG.
-		panic("evidence: entropy unavailable for evidence id: " + err.Error())
+// randomEvidenceID returns a CSPRNG-derived evidence id (P0.15):
+// unconvergeable and un-predictable, so evidence ids can never be guessed,
+// forged, or collided by an attacker who can observe timestamps or request
+// ordering. A timestamp-derived id (ev_<UnixNano>) is attacker-influenceable
+// and must never be the default.
+func randomEvidenceID(reader io.Reader) (string, error) {
+	if reader == nil {
+		return "", errors.New("evidence: entropy reader is nil")
 	}
-	return "ev_" + base64.RawURLEncoding.EncodeToString(b[:])
+	var b [16]byte
+	if _, err := io.ReadFull(reader, b[:]); err != nil {
+		return "", fmt.Errorf("evidence: entropy unavailable for evidence id: %w", err)
+	}
+	return "ev_" + base64.RawURLEncoding.EncodeToString(b[:]), nil
 }
 
 // Mint is the ONLY sanctioned way to produce evidence for the risk engine
@@ -183,7 +186,19 @@ func idRandom() string {
 // this same path; gating WHO may call it for those codes is a control-plane
 // authorization concern enforced at the API that exposes Mint.
 func Mint(table Table, code string, subjectID string, now time.Time, policyRevision int) (Evidence, error) {
-	return mintID(table, code, subjectID, now, policyRevision, idRandom)
+	return MintWithReader(table, code, subjectID, now, policyRevision, rand.Reader)
+}
+
+// MintWithReader is Mint with an explicit entropy source for deterministic
+// failure tests. It generates the id before entering mintID so an entropy
+// failure is returned as an ordinary mint error rather than a request-path
+// panic.
+func MintWithReader(table Table, code string, subjectID string, now time.Time, policyRevision int, reader io.Reader) (Evidence, error) {
+	id, err := randomEvidenceID(reader)
+	if err != nil {
+		return Evidence{}, err
+	}
+	return mintID(table, code, subjectID, now, policyRevision, func() string { return id })
 }
 
 // MintID is Mint with an explicit evidence-id generator, so callers can supply a
@@ -192,7 +207,7 @@ func Mint(table Table, code string, subjectID string, now time.Time, policyRevis
 // refuses to mint rather than silently reverting to an insecure id.
 func MintID(table Table, code string, subjectID string, now time.Time, policyRevision int, idgen func() string) (Evidence, error) {
 	if idgen == nil {
-		return Evidence{}, errors.New("evidence: nil id generator (must supply CSPRNG or explicit dd)")
+		return Evidence{}, errors.New("evidence: nil id generator (must supply CSPRNG or explicit id)")
 	}
 	return mintID(table, code, subjectID, now, policyRevision, idgen)
 }

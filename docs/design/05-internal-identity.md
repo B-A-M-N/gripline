@@ -45,9 +45,28 @@ configured public key(s), `exp`/`iat` window, `aud`, `iss`, and enables stale
 `cred_rev` rejection by sensitive services. Expired and wrong-audience
 assertions never validate (spec §104 property list).
 
-Provider backends should use the public [`verify`](../../verify/) package rather
-than importing `internal/terminator`. It consumes only the JSON public-key
-publication emitted by `gripline keys export`, rejects duplicate claim/header
+Provider backends should use `verify.NewProduction` from the public
+[`verify`](../../verify/) package rather than importing `internal/terminator`:
+
+```go
+keys, err := verify.LoadKeySet(keyFile)
+if err != nil { return err }
+verifier, err := verify.NewProduction(verify.ProductionOptions{
+    KeySet: keys,
+    Audience: "fi-inference",
+    Transport: verify.RequireMTLS(verify.MTLSOptions{AllowedDNSNames: []string{"gripline.internal"}}),
+    Replay: verify.NewMemoryReplayGuard(100_000),
+    ContextCredentialRevisions: revisions,
+    ContextPolicyEpochs: policyEpochs,
+})
+if err != nil { return err }
+handler := verifier.Middleware(protectedHandler)
+```
+
+`verify.New` is a lower-level compatibility constructor for narrowly scoped
+fixtures; it does not require the production freshness and transport controls.
+The production constructor consumes only the JSON public-key publication
+emitted by `gripline keys export`, rejects duplicate claim/header
 carriers, requires `kid`, and strips the assertion after verification. The
 wire format is explicitly `v1.base64url(payload).base64url(signature)`;
 unversioned or unknown-version tokens are rejected. Changing it requires a

@@ -19,6 +19,7 @@ type SourceNoveltyProducer struct {
 	cooldown    time.Duration
 	maxSubjects int
 	distributed adaptive.Store
+	windowGate  distributedObservationGate
 	stateMu     sync.Mutex
 	stateErr    error
 
@@ -110,10 +111,14 @@ func (p *SourceNoveltyProducer) observeAdmissionDistributed(ctx context.Context,
 		return nil
 	}
 	subject := behavior.Subjects.CredentialID
+	now := p.now()
 	var signals []Signal
 	var observedErr error
 	observe := func(detector, key string, threshold int, code string) {
 		if key == "" {
+			return
+		}
+		if !p.windowGate.allow(detector, subject, key, now) {
 			return
 		}
 		emitted, err := p.distributed.ObserveWindow(ctx, adaptive.WindowObservation{

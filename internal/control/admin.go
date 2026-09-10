@@ -141,6 +141,8 @@ const (
 	CapEvidence Capability = "evidence.operator"
 	// CapPolicyInstall: policy install / rollback.
 	CapPolicyInstall Capability = "policy.install"
+	// CapPolicyRead: read immutable active/candidate policy metadata.
+	CapPolicyRead Capability = "policy.read"
 	// CapAuditRead: read operator and automatic security audit history.
 	CapAuditRead Capability = "audit.read"
 	// CapClusterRead: read shared membership and crypto-generation status.
@@ -215,7 +217,7 @@ func NewTokenAuthenticator(tokens map[string]*Identity) (*TokenAuthenticator, er
 func ParseCapability(s string) (Capability, error) {
 	capability := Capability(s)
 	switch capability {
-	case CapCredentialLifecycle, CapLaneLifecycle, CapPosture, CapEvidence, CapPolicyInstall, CapAuditRead, CapClusterRead, CapCryptoLifecycle:
+	case CapCredentialLifecycle, CapLaneLifecycle, CapPosture, CapEvidence, CapPolicyInstall, CapPolicyRead, CapAuditRead, CapClusterRead, CapCryptoLifecycle:
 		return capability, nil
 	default:
 		return "", fmt.Errorf("control: unknown capability %q", s)

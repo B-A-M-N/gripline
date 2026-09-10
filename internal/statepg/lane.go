@@ -85,40 +85,50 @@ func (s *Store) BorrowOrCreate(credID, candidateID string, features lane.Feature
 }
 
 func (s *Store) BorrowOrCreateWithPolicy(ctx context.Context, credID, candidateID string, features lane.Features, policy lane.PolicyContext) (*lane.LaneRecord, bool, error) {
-	ctx, cancel := s.operationContext(ctx)
-	defer cancel()
-	if err := ctx.Err(); err != nil {
-		return nil, false, err
-	}
-	var out *lane.LaneRecord
-	var created bool
-	err := s.withTransactionRetry(ctx, "lane borrow/create", func() error {
-		var err error
-		out, created, err = s.borrowOrCreateWithPolicyOnce(ctx, credID, candidateID, features, policy)
-		return err
-	})
+	out, created, _, err := s.BorrowOrCreateWithPolicyChanges(ctx, credID, candidateID, features, policy)
 	return out, created, err
 }
 
-func (s *Store) borrowOrCreateWithPolicyOnce(ctx context.Context, credID, candidateID string, features lane.Features, policy lane.PolicyContext) (*lane.LaneRecord, bool, error) {
+// BorrowOrCreateWithPolicyChanges is the change-aware form of
+// BorrowOrCreateWithPolicy. The returned deletions were committed by the same
+// lane transaction and let admission clean matching resource rows without a
+// second authoritative lane-set read.
+func (s *Store) BorrowOrCreateWithPolicyChanges(ctx context.Context, credID, candidateID string, features lane.Features, policy lane.PolicyContext) (*lane.LaneRecord, bool, []string, error) {
+	ctx, cancel := s.operationContext(ctx)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, false, nil, err
+	}
+	var out *lane.LaneRecord
+	var created bool
+	var deleted []string
+	err := s.withTransactionRetry(ctx, "lane borrow/create", func() error {
+		var err error
+		out, created, deleted, err = s.borrowOrCreateWithPolicyOnce(ctx, credID, candidateID, features, policy)
+		return err
+	})
+	return out, created, deleted, err
+}
+
+func (s *Store) borrowOrCreateWithPolicyOnce(ctx context.Context, credID, candidateID string, features lane.Features, policy lane.PolicyContext) (*lane.LaneRecord, bool, []string, error) {
 	tx, err := begin(ctx, s.pool)
 	if err != nil {
-		return nil, false, err
+		return nil, false, nil, err
 	}
 	defer tx.Rollback(ctx)
 	if err := s.requireNodeOwnership(ctx, tx, false); err != nil {
-		return nil, false, err
+		return nil, false, nil, err
 	}
 	authorityNow, err := dbNow(ctx, tx)
 	if err != nil {
-		return nil, false, err
+		return nil, false, nil, err
 	}
 	if err := s.lockLaneGuard(ctx, tx, credID, authorityNow); err != nil {
-		return nil, false, err
+		return nil, false, nil, err
 	}
 	records, err := loadLanes(ctx, tx, credID, true)
 	if err != nil {
-		return nil, false, err
+		return nil, false, nil, err
 	}
 	limits := policy.Limits
 	if limits.MaxActiveLanesPerCredential <= 0 {
@@ -127,25 +137,25 @@ func (s *Store) borrowOrCreateWithPolicyOnce(ctx context.Context, credID, candid
 	result, domainErr := lane.ApplyBorrowOrCreate(records, credID, candidateID, features, policy.Classification, limits, authorityNow)
 	for _, id := range result.Deletes {
 		if _, err := tx.Exec(ctx, `DELETE FROM gripline_lanes WHERE credential_id=$1 AND lane_id=$2`, credID, id); err != nil {
-			return nil, false, err
+			return nil, false, nil, err
 		}
 	}
 	if domainErr != nil {
 		if err := tx.Commit(ctx); err != nil {
-			return nil, false, err
+			return nil, false, nil, err
 		}
-		return nil, false, domainErr
+		return nil, false, append([]string(nil), result.Deletes...), domainErr
 	}
 	if result.Upsert == nil {
-		return nil, false, errors.New("statepg: lane reducer returned no record")
+		return nil, false, append([]string(nil), result.Deletes...), errors.New("statepg: lane reducer returned no record")
 	}
 	if err := putLane(ctx, tx, result.Upsert); err != nil {
-		return nil, false, err
+		return nil, false, nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return nil, false, err
+		return nil, false, nil, err
 	}
-	return result.Upsert, result.Created, nil
+	return result.Upsert, result.Created, append([]string(nil), result.Deletes...), nil
 }
 
 func (s *Store) Get(credID, laneID string) (*lane.LaneRecord, bool) {

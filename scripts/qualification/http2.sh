@@ -4,6 +4,7 @@ set -euo pipefail
 # Start a real TLS-enabled Gripline process with a local provider-shaped
 # backend, then run the protocol harness against the actual ALPN/HTTP2 stack.
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "$repo_dir/scripts/qualification/assertions.sh"
 work_dir="$(mktemp -d)"
 gateway_pid=""
 backend_pid=""
@@ -15,7 +16,7 @@ cleanup() {
 	rm -rf "$work_dir"
 }
 trap cleanup EXIT
-for command_name in go openssl curl python3 nghttp docker; do
+for command_name in go openssl curl python3 docker; do
 	command -v "$command_name" >/dev/null || { echo "HTTP2 qualification: $command_name is required" >&2; exit 2; }
 done
 h2load_image="gripline-qualification-h2load-$$"
@@ -25,6 +26,11 @@ cat >"$work_dir/h2load" <<EOF
 exec docker run --rm --network host -v "$work_dir:/fixture:ro" -v "$work_dir:$work_dir:ro" "$h2load_image" sh -c 'cp /fixture/server.pem /usr/local/share/ca-certificates/gripline-qualification.crt && update-ca-certificates >/dev/null && exec h2load "\$@"' h2load-wrapper "\$@"
 EOF
 chmod 0755 "$work_dir/h2load"
+cat >"$work_dir/nghttp" <<EOF
+#!/usr/bin/env bash
+exec docker run --rm --network host -v "$work_dir:/fixture:ro" -v "$work_dir:$work_dir:ro" "$h2load_image" sh -c 'cp /fixture/server.pem /usr/local/share/ca-certificates/gripline-qualification.crt && update-ca-certificates >/dev/null && exec nghttp "\$@"' nghttp-wrapper "\$@"
+EOF
+chmod 0755 "$work_dir/nghttp"
 export PATH="$work_dir:$PATH"
 
 gateway_port=$((19300 + ($$ % 500)))
@@ -32,6 +38,8 @@ backend_port=$((gateway_port + 1))
 admin_port=$((gateway_port + 2))
 secret="http2-qualification-secret-0123456789abcdef0123456789"
 operator_token="http2-qualification-operator-0123456789abcdef0123456789"
+register_qualification_secret "$secret"
+register_qualification_secret "$operator_token"
 pepper="$(openssl rand -base64 32 | tr -d '\n')"
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=127.0.0.1' \
 	-addext 'subjectAltName=IP:127.0.0.1,DNS:localhost' -keyout "$work_dir/server.key" -out "$work_dir/server.pem" >/dev/null 2>&1
@@ -53,7 +61,7 @@ cat >"$work_dir/config.json" <<EOF
   "deployment": {"allow_ephemeral_state": false}
 }
 EOF
-"$work_dir/gripline" -config "$work_dir/config.json" >"$work_dir/gateway.log" 2>&1 &
+"$work_dir/gripline" serve --config "$work_dir/config.json" >"$work_dir/gateway.log" 2>&1 &
 gateway_pid=$!
 for _ in $(seq 1 60); do
 	if curl --cacert "$work_dir/server.pem" -fsS "https://127.0.0.1:${gateway_port}/readyz" >/dev/null 2>&1; then break; fi
@@ -67,4 +75,7 @@ metrics="$(curl -fsS "http://127.0.0.1:${admin_port}/admin/metrics" -H "Authoriz
 h2_errors="$(printf '%s\n' "$metrics" | awk '$1 == "gripline_http2_errors_total" {print $2}')"
 [[ "$h2_errors" =~ ^[0-9]+$ ]] || { echo "HTTP2 qualification: missing HTTP/2 error metric" >&2; exit 1; }
 h2load_version="$(h2load --version | head -1)"
+emit_qualification_assertions \
+	'{"alpn_h2_negotiated":true,"stream_limit_enforced":true,"continuation_case_passed":true,"cancellation_recovered":true}' \
+	"{\"advertised_max_streams\":64,\"http2_errors\":$h2_errors,\"h2load_version\":\"$h2load_version\"}"
 echo "HTTP2 qualification: direct TLS/ALPN, stream bounds, cancellation/recovery, header-table churn, CONTINUATION, error metrics, and pinned h2load (${h2load_version}) cases passed"

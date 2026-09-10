@@ -92,14 +92,24 @@ func (s *Store) BorrowOrCreate(credID, newLaneID string, cand lane.Features, ctx
 // BorrowOrCreateWithPolicy applies the immutable request policy inside the
 // same bbolt transaction as the lane mutation.
 func (s *Store) BorrowOrCreateWithPolicy(ctx context.Context, credID, newLaneID string, cand lane.Features, policy lane.PolicyContext) (*lane.LaneRecord, bool, error) {
+	out, created, _, err := s.BorrowOrCreateWithPolicyChanges(ctx, credID, newLaneID, cand, policy)
+	return out, created, err
+}
+
+// BorrowOrCreateWithPolicyChanges is the change-aware form of
+// BorrowOrCreateWithPolicy. Retention deletions are committed with the lane
+// mutation and returned so their corresponding resource rows can be cleaned up
+// without a second lane-set read.
+func (s *Store) BorrowOrCreateWithPolicyChanges(ctx context.Context, credID, newLaneID string, cand lane.Features, policy lane.PolicyContext) (*lane.LaneRecord, bool, []string, error) {
 	if err := contextErr(ctx); err != nil {
-		return nil, false, err
+		return nil, false, nil, err
 	}
 	if err := checkLaneIDs(credID, newLaneID); err != nil {
-		return nil, false, err
+		return nil, false, nil, err
 	}
 	var out *lane.LaneRecord
 	var created bool
+	var deleted []string
 	var domainErr error
 	err := s.update(func(tx *bolt.Tx) error {
 		records, err := loadLanesTx(tx, credID)
@@ -117,6 +127,7 @@ func (s *Store) BorrowOrCreateWithPolicy(ctx context.Context, credID, newLaneID 
 		if err := applyLaneDeletesTx(tx, credID, res.Deletes); err != nil {
 			return err
 		}
+		deleted = append([]string(nil), res.Deletes...)
 		if reduceErr != nil {
 			domainErr = reduceErr
 			return nil
@@ -133,12 +144,12 @@ func (s *Store) BorrowOrCreateWithPolicy(ctx context.Context, credID, newLaneID 
 		return nil
 	})
 	if err != nil {
-		return nil, false, err
+		return nil, false, nil, err
 	}
 	if domainErr != nil {
-		return nil, false, domainErr
+		return nil, false, deleted, domainErr
 	}
-	return out, created, nil
+	return out, created, deleted, nil
 }
 
 // Get implements lane.Repository.

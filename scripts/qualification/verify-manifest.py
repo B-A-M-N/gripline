@@ -9,6 +9,48 @@ import pathlib
 import sys
 
 
+REQUIRED_ASSERTIONS = {
+    "postgres-ha": ("promotion_completed", "state_fingerprint_equal", "live_writer_continuity", "rejoin_state_preserved"),
+    "postgres-pitr": ("target_point_restored", "recovered_state_fingerprint_equal", "baseline_ready", "missing_signer_fail_closed", "missing_pepper_fail_closed", "missing_pseudonym_fail_closed", "missing_policy_fail_closed", "missing_schema_fail_closed"),
+    "perimeter": ("mtls_identity_separation", "raw_credential_denied", "public_isolation", "control_isolation", "database_isolation"),
+    "clustered-perimeter": ("mtls_identity_separation", "raw_credential_denied", "public_isolation", "control_isolation", "database_isolation"),
+    "replay": ("parallel_claim_single_winner", "independent_processes_used"),
+    "http2": ("alpn_h2_negotiated", "stream_limit_enforced", "continuation_case_passed", "cancellation_recovered"),
+    "sdk": ("python_provider_passed", "typescript_provider_passed", "retry_429_passed", "server_error_passed", "cancellation_passed", "connection_reuse_passed", "parallel_passed"),
+    "exact-cost": ("openai_exact_deltas", "anthropic_exact_deltas", "cache_dimensions_exact", "zero_conservative_fallbacks"),
+    "soak": ("cluster_ha_recovery", "runtime_bounds_held", "maintenance_succeeded", "promotion_traffic_succeeded", "database_outage_recovered"),
+    "capacity-load": ("load_completed", "concurrency_bound_enforced", "resource_state_bounded"),
+}
+
+REQUIRED_MEASUREMENTS = {
+    "postgres-ha": {"state_fingerprint_sha256": str, "rejoin_role": str},
+    "postgres-pitr": {"target_point": str, "recovered_state_fingerprint_sha256": str, "readiness_fail_closed_cases": int},
+    "perimeter": {"mode": str},
+    "clustered-perimeter": {"mode": str},
+    "replay": {"accepted_winners": int},
+    "http2": {"advertised_max_streams": int, "http2_errors": int, "h2load_version": str},
+    "sdk": {"providers_tested": int, "minimum_sessions_per_provider": int},
+    "exact-cost": {"verified_cases": int, "conservative_settlements": int},
+    "soak": {"duration_seconds": int, "workers": int, "post_promotion_recovery_ms": int},
+    "capacity-load": {
+        "duration_seconds": int,
+        "workers": int,
+        "authority_operation_timeout_ms": int,
+        "total_requests": int,
+        "successful_requests": int,
+        "success_ratio": (int, float),
+        "successful_rps": (int, float),
+        "p50_ms": (int, float),
+        "p95_ms": (int, float),
+        "p99_ms": (int, float),
+        "source_resolution_failures": int,
+        "authority_timeouts": int,
+        "transaction_retries": int,
+        "deadlocks": int,
+    },
+}
+
+
 def fail(message: str) -> None:
     raise SystemExit(f"qualification manifest: {message}")
 
@@ -71,7 +113,11 @@ def main() -> None:
         fail("evidence object is required")
 
     for gate_name in required:
-        if not isinstance(gate_name, str) or gates.get(gate_name) != "pass":
+        if not isinstance(gate_name, str):
+            fail(f"required gate name is not a string: {gate_name}")
+        if gate_name not in REQUIRED_ASSERTIONS:
+            fail(f"unknown required gate schema: {gate_name}")
+        if gates.get(gate_name) != "pass":
             fail(f"required gate did not pass: {gate_name}")
         entry = evidence.get(gate_name)
         if not isinstance(entry, dict):
@@ -87,6 +133,24 @@ def main() -> None:
             fail(f"{gate_name} record identity does not match manifest")
         if record.get("result") != "pass" or record.get("exit_code") != 0:
             fail(f"{gate_name} record is not a passing result")
+        assertions = record.get("assertions")
+        if not isinstance(assertions, dict):
+            fail(f"{gate_name} gate-specific assertions are required")
+        for assertion in REQUIRED_ASSERTIONS.get(gate_name, ()):
+            if assertions.get(assertion) is not True:
+                fail(f"{gate_name} assertion is missing or unsatisfied: {assertion}")
+        measurements = record.get("measurements")
+        if not isinstance(measurements, dict):
+            fail(f"{gate_name} measurements object is required")
+        for measurement, expected_type in REQUIRED_MEASUREMENTS.get(gate_name, {}).items():
+            value = measurements.get(measurement)
+            if not isinstance(value, expected_type) or isinstance(value, bool):
+                fail(f"{gate_name} measurement is missing or has the wrong type: {measurement}")
+        if gate_name == "capacity-load":
+            if measurements.get("workers") != manifest.get("capacity_workers"):
+                fail("capacity-load worker measurement does not match manifest capacity_workers")
+            if measurements.get("authority_operation_timeout_ms") != 2000:
+                fail("capacity-load authority timeout must be the 2000ms reference budget")
 
         record_log = record.get("log")
         manifest_log = entry.get("log")

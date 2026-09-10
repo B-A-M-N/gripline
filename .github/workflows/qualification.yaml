@@ -31,14 +31,13 @@ jobs:
           python3 --version
           node --version
           npm --version
-      - name: Install HTTP/2 clients
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes nghttp2-client
       - name: Repository-owned reference qualification suite
         env:
           GRIPLINE_QUALIFICATION_RESULT_DIR: qualification-results
         run: bash scripts/qualification/suite.sh --soak-duration 30s --workers 8
+      - name: Scan qualification evidence for secrets
+        if: always()
+        run: python3 scripts/qualification/scan-evidence.py qualification-results
       - if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -62,6 +61,9 @@ jobs:
         env:
           GRIPLINE_QUALIFICATION_RESULT_DIR: qualification-long-soak-results
         run: bash scripts/qualification/suite.sh --only-soak --soak-duration "${{ inputs.soak_duration || '24h' }}" --workers 24
+      - name: Scan long-soak evidence for secrets
+        if: always()
+        run: python3 scripts/qualification/scan-evidence.py qualification-long-soak-results
       - if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:

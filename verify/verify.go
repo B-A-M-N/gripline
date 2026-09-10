@@ -23,6 +23,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/B-A-M-N/gripline/internal/protocollimits"
 )
 
 const (
@@ -31,7 +33,6 @@ const (
 	// AssertionWireVersion is the frozen version prefix for assertion tokens.
 	AssertionWireVersion = "v1"
 	issuer               = "gripline"
-	maxTTLSeconds        = 30
 	maxScopes            = 8
 	maxPayloadBytes      = 4096
 	maxTokenBytes        = 8192
@@ -657,14 +658,14 @@ func (v *Verifier) verifyEncodedContext(ctx context.Context, encoded string) (*C
 	if requiresLane(c.Scope) && c.LaneID == "" {
 		return nil, ErrBadAssertion
 	}
-	if c.PolicyRev < 1 || c.CredRev < 1 || c.ExpiresAt <= c.IssuedAt || c.ExpiresAt-c.IssuedAt > maxTTLSeconds {
+	if c.PolicyRev < 1 || c.CredRev < 1 || c.ExpiresAt <= c.IssuedAt || c.ExpiresAt-c.IssuedAt > int64(protocollimits.MaxAssertionTTL/time.Second) {
 		return nil, ErrBadAssertion
 	}
 	now := v.now()
 	if now.Unix() >= c.ExpiresAt {
 		return nil, ErrExpired
 	}
-	if now.Unix() < c.IssuedAt-5 {
+	if now.Unix() < c.IssuedAt-int64(protocollimits.AssertionClockSkew/time.Second) {
 		return nil, ErrNotYetValid
 	}
 	if v.contextRevisions != nil || v.revisions != nil {

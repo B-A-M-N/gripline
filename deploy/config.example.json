@@ -50,7 +50,7 @@
   "admin": {
     "listen": "127.0.0.1:9090",
     "operator_tokens": {
-      "${GRIPLINE_OPERATOR_TOKEN}": "ops:posture.control,credential.lifecycle,lane.lifecycle,evidence.operator,policy.install,audit.read"
+      "${GRIPLINE_OPERATOR_TOKEN}": "ops:posture.control,credential.lifecycle,lane.lifecycle,evidence.operator,policy.read,policy.install,audit.read"
     }
   },
 

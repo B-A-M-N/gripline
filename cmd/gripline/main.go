@@ -40,6 +40,15 @@ var (
 func main() {
 	serve, cfgPath, err := runCLIInvocation(os.Args[1:])
 	if err != nil {
+		var exitErr *cliExitError
+		if errors.As(err, &exitErr) {
+			os.Exit(exitErr.Code)
+		}
+		var userErr *cliUserError
+		if errors.As(err, &userErr) {
+			fmt.Fprintf(os.Stderr, "gripline: %s\n", userErr.Message)
+			os.Exit(2)
+		}
 		log.Fatalf("gripline: %v", err)
 	}
 	if !serve {

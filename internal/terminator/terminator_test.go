@@ -5,6 +5,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -706,7 +708,10 @@ func TestNewSignerValidatesKeySize(t *testing.T) {
 func TestRequestIDEntropy(t *testing.T) {
 	seen := make(map[string]bool)
 	for i := 0; i < 1000; i++ {
-		id := newRequestID()
+		id, err := NewRequestID()
+		if err != nil {
+			t.Fatalf("request id entropy: %v", err)
+		}
 		if len(id) != len("req_")+22 { // 128 bits base64url raw = 22 chars
 			t.Fatalf("id %q has unexpected length %d", id, len(id))
 		}
@@ -714,5 +719,12 @@ func TestRequestIDEntropy(t *testing.T) {
 			t.Fatalf("duplicate request id %q", id)
 		}
 		seen[id] = true
+	}
+}
+
+func TestRequestIDEntropyFailureReturnsError(t *testing.T) {
+	_, err := NewRequestIDWithReader(strings.NewReader("short"))
+	if err == nil || !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("entropy failure=%v, want wrapped io.ErrUnexpectedEOF", err)
 	}
 }

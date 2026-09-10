@@ -11,7 +11,7 @@ keep="${GRIPLINE_QUALIFICATION_KEEP:-0}"
 soak_duration="30s"
 capacity_duration="30s"
 workers="${GRIPLINE_CLUSTER_SOAK_WORKERS:-8}"
-capacity_workers="${GRIPLINE_CAPACITY_WORKERS:-2}"
+capacity_workers="${GRIPLINE_CAPACITY_WORKERS:-16}"
 only_soak=0
 
 while [[ $# -gt 0 ]]; do
@@ -66,6 +66,8 @@ if [[ -n "$(find "$result_dir" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
 	exit 2
 fi
 work_dir="$(mktemp -d)"
+denylist="$work_dir/evidence-denylist.txt"
+: >"$denylist"
 cleanup() {
 	if [[ "$keep" == 1 ]]; then
 		echo "qualification suite logs retained: $work_dir" >&2
@@ -102,16 +104,29 @@ run_gate() {
 	local name=$1 script=$2
 	shift 2
 	local started ended started_epoch ended_epoch rc log
+	local assertions_file="$work_dir/$name-assertions.json"
 	started="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 	started_epoch="$(date +%s)"
 	log="$work_dir/${name}.log"
 	rc=0
 	if [[ "$name" == "soak" ]]; then
-		GRIPLINE_SOAK_EVIDENCE_FILE="$result_dir/soak-telemetry.json" bash "$repo_dir/scripts/qualification/${script}" "$@" >"$log" 2>&1 || rc=$?
+		GRIPLINE_SOAK_EVIDENCE_FILE="$result_dir/soak-telemetry.json" GRIPLINE_QUALIFICATION_ASSERTIONS_FILE="$assertions_file" GRIPLINE_QUALIFICATION_DENYLIST_FILE="$denylist" bash "$repo_dir/scripts/qualification/${script}" "$@" >"$log" 2>&1 || rc=$?
 	elif [[ "$name" == "capacity-load" ]]; then
-		GRIPLINE_CLUSTER_HARNESS_CAPACITY_EVIDENCE_FILE="$result_dir/capacity-load-telemetry.json" bash "$repo_dir/scripts/qualification/${script}" "$@" >"$log" 2>&1 || rc=$?
+		GRIPLINE_CLUSTER_HARNESS_CAPACITY_EVIDENCE_FILE="$result_dir/capacity-load-telemetry.json" GRIPLINE_QUALIFICATION_ASSERTIONS_FILE="$assertions_file" GRIPLINE_QUALIFICATION_DENYLIST_FILE="$denylist" bash "$repo_dir/scripts/qualification/${script}" "$@" >"$log" 2>&1 || rc=$?
 	else
-		bash "$repo_dir/scripts/qualification/${script}" "$@" >"$log" 2>&1 || rc=$?
+		GRIPLINE_QUALIFICATION_ASSERTIONS_FILE="$assertions_file" GRIPLINE_QUALIFICATION_DENYLIST_FILE="$denylist" bash "$repo_dir/scripts/qualification/${script}" "$@" >"$log" 2>&1 || rc=$?
+	fi
+	local assertions_json='{}' measurements_json='{}'
+	if [[ -s "$assertions_file" ]]; then
+		if ! assertions_json="$(python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); assert isinstance(value,dict) and isinstance(value.get("assertions"),dict); print(json.dumps(value["assertions"], separators=(",",":")))' "$assertions_file" 2>/dev/null)"; then
+			echo "qualification suite: $name emitted invalid assertions" >&2
+			rc=1
+		else
+			measurements_json="$(python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); assert isinstance(value,dict) and isinstance(value.get("measurements",{}),dict); print(json.dumps(value.get("measurements",{}), separators=(",",":")))' "$assertions_file" 2>/dev/null)" || { echo "qualification suite: $name emitted invalid measurements" >&2; rc=1; }
+		fi
+	elif [[ "$rc" == 0 ]]; then
+		echo "qualification suite: $name completed without gate-specific assertions" >&2
+		rc=1
 	fi
 	ended="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 	ended_epoch="$(date +%s)"
@@ -137,13 +152,13 @@ run_gate() {
   "duration_seconds": ${duration_seconds[$name]},
   "result": "${status[$name]}",
   "exit_code": ${rc},
-  "assertions": {
+  "assertions": $assertions_json,
+  "measurements": $measurements_json,
+  "process": {
     "gate_process_completed": true,
     "exit_code_zero": $([[ "$rc" == 0 ]] && echo true || echo false)
   },
-  "measurements": {
-    "sanitized_summary": "${summary_json}"
-	},
+  "summary": "${summary_json}",
   "log": {"path": "${sanitized_log_file}", "sha256": "${log_sha256[$name]}"}$(if [[ -n "$telemetry_file" ]]; then printf ',\n  "telemetry": {"path": "%s", "sha256": "%s"}' "$telemetry_file" "$(sha256sum "$result_dir/$telemetry_file" | awk '{print $1}')"; fi)
 }
 EOF
@@ -201,14 +216,18 @@ manifest_evidence_json() {
 	done
 }
 
+if ! python3 "$repo_dir/scripts/qualification/scan-evidence.py" "$result_dir" "$denylist"; then
+	echo "qualification suite: evidence secret scan failed" >&2
+	overall=1
+fi
+
 required_gates='["postgres-ha", "postgres-pitr", "perimeter", "clustered-perimeter", "replay", "http2", "sdk", "exact-cost", "soak", "capacity-load"]'
 if [[ "$only_soak" == 1 ]]; then
 	required_gates='["soak"]'
 fi
-# http2.sh always wraps h2load in the pinned repository-owned container. The
-# host package, when present, is only used for nghttp and is never the load
-# generator whose result is certified.
-h2load_provenance="pinned Docker fixture: scripts/qualification/fixtures/http2/Dockerfile (runtime version is in http2-log.txt)"
+# http2.sh wraps both protocol clients in the pinned repository-owned
+# container; no host package or ambient load generator is part of the gate.
+h2load_provenance="pinned Docker fixture: scripts/qualification/fixtures/http2/Dockerfile (nghttp2-client=1.52.0-1+deb12u2)"
 
 cat >"$result_dir/manifest.json" <<EOF
 {
@@ -240,7 +259,7 @@ cat >"$result_dir/manifest.json" <<EOF
     "nginx": "nginx:alpine@sha256:72ba65eb42c10344912a84ff42408db7d34f2feb642204570ab8fc5ffd29f1d3",
     "curl": "curlimages/curl:8.10.1@sha256:d9b4541e214bcd85196d6e92e2753ac6d0ea699f0af5741f8c6cccbfcf00ef4b",
     "debian": "debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171",
-    "h2load": "scripts/qualification/fixtures/http2/Dockerfile (nghttp2-client)"
+    "h2load": "scripts/qualification/fixtures/http2/Dockerfile (nghttp2-client=1.52.0-1+deb12u2)"
   },
   "evidence": {
 $(manifest_evidence_json)
@@ -253,7 +272,7 @@ $(manifest_evidence_json)
     "docker": "$(safe_version docker version --format '{{.Server.Version}}')",
     "openssl": "$(safe_version openssl version)",
     "curl": "$(safe_version curl --version)",
-    "nghttp": "$(safe_version nghttp --version)",
+    "nghttp": "$(json_escape "$h2load_provenance")",
     "h2load": "$(json_escape "$h2load_provenance")",
     "psql": "$(safe_version psql --version)",
     "kernel": "$(safe_version uname -sr)",
@@ -261,6 +280,11 @@ $(manifest_evidence_json)
   }
 }
 EOF
+
+if ! python3 "$repo_dir/scripts/qualification/scan-evidence.py" "$result_dir" "$denylist"; then
+	echo "qualification suite: final evidence secret scan failed" >&2
+	overall=1
+fi
 
 (cd "$result_dir" && sha256sum manifest.json >manifest.sha256)
 if ! bash "$repo_dir/scripts/qualification/verify-manifest.sh" "$result_dir" "$commit"; then

@@ -19,6 +19,7 @@ type EnumerationProducer struct {
 	maxSubjects int
 	threshold   int // distinct endpoints before signal
 	distributed adaptive.Store
+	windowGate  distributedObservationGate
 	stateMu     sync.Mutex
 	stateErr    error
 
@@ -57,6 +58,9 @@ func (p *EnumerationProducer) ObserveAdmission(behavior AdmissionBehavior) []Sig
 func (p *EnumerationProducer) ObserveAdmissionContext(ctx context.Context, behavior AdmissionBehavior) []Signal {
 	if p.distributed != nil {
 		if behavior.Subjects.CredentialID == "" || behavior.EndpointFamily == "" {
+			return nil
+		}
+		if !p.windowGate.allow("enumeration", behavior.Subjects.CredentialID, behavior.EndpointFamily, p.now()) {
 			return nil
 		}
 		emitted, err := p.distributed.ObserveWindow(ctx, adaptive.WindowObservation{

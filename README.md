@@ -93,6 +93,8 @@ cp deploy/config.example.json config.json
 export GRIPLINE_PEPPER_V1="$(openssl rand -base64 32)"   # verifier pepper (>=32 bytes entropy)
 export GRIPLINE_OPERATOR_TOKEN="$(openssl rand -base64 32)" # admin bearer token (>=32 bytes)
 export GRIPLINE_PSEUDONYM_KEY="$(openssl rand -base64 32)"  # trusted-ingress key (>=32 bytes)
+export GRIPLINE_CONFIG="$PWD/config.json"
+export GRIPLINE_OPERATOR_TOKEN_FILE="$PWD/operator-token"
 
 # Before starting, edit config.json for your backend and point its TLS and
 # persistent state/keyring paths at files/directories this deployment owns.
@@ -101,15 +103,15 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=localhost' \
   -keyout tls/key.pem -out tls/cert.pem >/dev/null 2>&1
 printf '%s' "$GRIPLINE_OPERATOR_TOKEN" > operator-token
 chmod 600 operator-token
-./gripline -config config.json &
+./gripline serve &
 curl --fail --silent --insecure https://127.0.0.1:8443/readyz
 
 # After readiness: publish backend verification keys, provision a credential,
 # configure the backend with verification-keys.json, then send inference traffic.
-./gripline keys export --config config.json > verification-keys.json
+./gripline keys export > verification-keys.json
 openssl rand -base64 32 > provider-key
 chmod 600 provider-key
-./gripline credential add --config config.json --id <cred> --account <acct> --reason "provision" --secret-stdin --token-file operator-token < provider-key
+./gripline credential add <cred> --account <acct> -r "provision" < provider-key
 ```
 
 `deploy/config.example.json` is the standalone/bbolt configuration. The
@@ -145,6 +147,12 @@ PITR, replication, and failover are exercised by the repository-owned reference
 qualification lab; the operator's managed PostgreSQL product and backup service
 remain deployment responsibilities.
 
+Standalone recovery manifests are integrity/compatibility sidecars: they bind a
+backup to its SHA-256 and required public/configuration metadata, but they are
+not authenticated provenance. Protect the backup and sidecar with the
+deployment's access-control and immutable-storage boundary, or add a detached
+signature, before using them as cross-system recovery or release evidence.
+
 Provider metering overlays are available as separate examples:
 [`deploy/usage.openai.example.json`](deploy/usage.openai.example.json) and
 [`deploy/usage.anthropic.example.json`](deploy/usage.anthropic.example.json).
@@ -164,33 +172,43 @@ The repository-owned `scripts/qualification/exact-cost.sh` gate proves exact
 OpenAI/Anthropic/cache pricing and zero conservative fallbacks on bounded
 provider-shaped responses.
 
-Operator lifecycle:
+Operator lifecycle (set context once):
 
 ```bash
-gripline status     --config /etc/gripline/config.json   # what is durable / on / off, honestly
-gripline credential list   --config c.json --token-file /run/secrets/gripline-operator
-gripline credential add   --config c.json --id <cred> --account <acct> --reason "provision" --secret-stdin --token-file /run/secrets/gripline-operator < /run/secrets/provider-key
-gripline credential revoke --config c.json --id <cred> --reason "..." --token "$GRIPLINE_OPERATOR_TOKEN"
-gripline lane list         --config c.json --credential <cred> --token-file /run/secrets/gripline-operator
-gripline lane unblock      --config c.json --credential <cred> --id <lane> --reason "..." --token-file /run/secrets/gripline-operator
-gripline audit list        --config c.json --token-file /run/secrets/gripline-operator
-gripline audit export      --config c.json --token-file /run/secrets/gripline-operator > audit.jsonl
-gripline audit security list   --config c.json --token-file /run/secrets/gripline-operator
-gripline audit security export --config c.json --token-file /run/secrets/gripline-operator > security.jsonl
-gripline keys export       --config c.json   # public backend verification material only
-gripline policy verify     --config c.json   # verify the configured signed policy artifact
-gripline credential pepper-status --config c.json --token-file /run/secrets/gripline-operator
+export GRIPLINE_CONFIG=/etc/gripline/config.json
+export GRIPLINE_OPERATOR_TOKEN_FILE=/run/secrets/gripline-operator
+
+gripline doctor
+gripline status                         # configured capability/persistence posture
+gripline credential
+gripline credential list
+gripline credential add cred1 --account acct1 -r "provision" < /run/secrets/provider-key
+gripline credential revoke cred1 -r "compromised"
+gripline lane list cred1
+gripline lane unblock cred1 lane1 -r "operator review"
+gripline audit
+gripline audit export > audit.jsonl
+gripline audit security
+gripline audit security export > security.jsonl
+gripline keys export > verification-keys.json  # fixed JSON artifact
+gripline policy
+gripline policy verify
+gripline credential pepper-status
 gripline version
 
-# Cluster crypto lifecycle (authenticated live control plane; every mutation
-# requires a reason, fingerprint, and stable operation ID):
-gripline crypto status --config c.json --token-file /run/secrets/gripline-operator
-gripline crypto signer-prepare --config c.json --offline
-gripline crypto activate --config c.json --kind pepper --generation <n> --fingerprint <fp> --reason "..." --operation-id <id> --token-file /run/secrets/gripline-operator
-gripline crypto activate --config c.json --kind pseudonym --generation <n> --fingerprint <fp> --reason "..." --operation-id <id> --token-file /run/secrets/gripline-operator
-gripline crypto activate --config c.json --kind signer --generation <n> --fingerprint <fp> --reason "..." --operation-id <id> --token-file /run/secrets/gripline-operator
-gripline crypto retire --config c.json --kind <kind> --generation <n> --fingerprint <fp> --not-before <RFC3339> --reason "..." --operation-id <id> --token-file /run/secrets/gripline-operator
+# Cluster crypto lifecycle; fingerprints and operation IDs are resolved or
+# generated by the CLI. Advanced recovery forms are documented below.
+gripline crypto
+gripline crypto signer-prepare --offline
+gripline crypto activate signer 4 -r "rotation"
+gripline crypto retire signer 3 -r "overlap complete"
 ```
+
+Advanced and legacy compatibility forms remain available: `-config`, `-c`,
+explicit `--config`, `--token`, `--operation-id`, `--fingerprint`, and
+`--not-before`. Prefer the one-time environment context and token file above;
+raw bearer tokens on the command line can leak through shell history and
+process inspection.
 
 Lifecycle and audit commands use the running private admin listener by default;
 `--offline` is an explicit stopped-database maintenance mode for credential and
@@ -314,8 +332,8 @@ from the Gripline specification (v0.1.0):
 
 ### Provider backend integration
 
-Protected Go services can import the public [`verify/`](verify/) package. It
-loads the public JSON produced by `gripline keys export`, verifies the exact
+Protected Go services should use the fail-closed `NewProduction` constructor
+in the public [`verify/`](verify/) package. It loads the public JSON produced by `gripline keys export`, verifies the exact
 audience and issuer, enforces the short TTL and revision claims, rejects
 duplicate carriers/claims, and removes the assertion after successful
 verification. It never receives signing keys or reusable credentials.
@@ -327,6 +345,26 @@ verifier's conformance tests cover valid, expired, wrong-audience,
 wrong-key-generation, stale-revision, tampered, duplicate, and malformed
 assertions. Providers using another language should implement those vectors
 before accepting production traffic.
+
+```go
+keys, err := verify.LoadKeySet(keyFile)
+if err != nil { log.Fatal(err) }
+verifier, err := verify.NewProduction(verify.ProductionOptions{
+    KeySet: keys,
+    Audience: "fi-inference",
+    Transport: verify.RequireMTLS(verify.MTLSOptions{AllowedDNSNames: []string{"gripline.internal"}}),
+    Replay: verify.NewMemoryReplayGuard(100_000),
+    ContextCredentialRevisions: revisions,
+    ContextPolicyEpochs: policyEpochs,
+})
+if err != nil { log.Fatal(err) }
+handler := verifier.Middleware(protectedHandler)
+```
+
+`verify.New` remains a lower-level compatibility constructor for narrowly
+scoped fixtures; production backends should use `NewProduction` so transport
+trust, replay protection, credential freshness, and policy-epoch freshness are
+provided explicitly.
 
 ## Status
 

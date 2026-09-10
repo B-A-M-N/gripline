@@ -92,6 +92,14 @@ max_conns="${GRIPLINE_CLUSTER_HARNESS_MAX_CONNS:-8}"
 operation_timeout="${GRIPLINE_CLUSTER_HARNESS_OPERATION_TIMEOUT:-2s}"
 load_timeout="${GRIPLINE_CLUSTER_HARNESS_LOAD_TIMEOUT:-10s}"
 load_user_agent="${GRIPLINE_CLUSTER_HARNESS_LOAD_USER_AGENT:-gripline-qualification-load/1}"
+ingress_extra=""
+if [[ "$load_mode" == capacity ]]; then
+	# The disposable load balancer is the only trusted proxy in this fixture.
+	# Capacity workers bind distinct loopback addresses so the source-scoped
+	# authority rows measure independent clients instead of one artificial hot
+	# source bucket. Same-source contention remains covered by statepg tests.
+	ingress_extra=', "trusted_proxies": ["127.0.0.1/32"]'
+fi
 
 write_artifact() {
 	if [[ -n "${GRIPLINE_CLUSTER_HARNESS_ARTIFACT_FILE:-}" ]]; then
@@ -202,8 +210,8 @@ for node in a b c; do
   },
   "identity": {"audience": "${audience}"},
   "secrets": {"pepper_versions": {"1": "${pepper_one_b64}", "2": "${pepper_two_b64}"}},
-  "ingress": {"pseudonym_keys": {"1": "${pseudonym_one_b64}", "2": "${pseudonym_two_b64}"}},
-  "admin": {"listen": "127.0.0.1:${admin_port}", "operator_tokens": {"${operator_token}": "harness:posture.control,credential.lifecycle,lane.lifecycle,policy.install,audit.read,cluster.read,crypto.lifecycle"}},
+	"ingress": {"pseudonym_keys": {"1": "${pseudonym_one_b64}", "2": "${pseudonym_two_b64}"}${ingress_extra}},
+  "admin": {"listen": "127.0.0.1:${admin_port}", "operator_tokens": {"${operator_token}": "harness:posture.control,credential.lifecycle,lane.lifecycle,policy.read,policy.install,audit.read,cluster.read,crypto.lifecycle"}},
   "paths": {"signer_keyring": "${harness_dir}/keyring.json"},
   "policy": {"file": "${harness_dir}/policy.json", "verifier_key_file": "${harness_dir}/policy-verifier.key"},
   "authority": {
@@ -227,7 +235,7 @@ if [[ -z "$signer_fingerprint" ]]; then
 fi
 
 for node in a b c; do
-	"$harness_dir/gripline" -config "$harness_dir/config-${node}.json" >"$harness_dir/gripline-${node}.log" 2>&1 &
+"$harness_dir/gripline" serve --config "$harness_dir/config-${node}.json" >"$harness_dir/gripline-${node}.log" 2>&1 &
 	pids+=("$!")
 done
 write_artifact
@@ -405,10 +413,32 @@ for port in $((base + 10)) $((base + 11)) $((base + 12)); do
 done
 
 retire_not_before="$(date -u -d '1 second ago' '+%Y-%m-%dT%H:%M:%SZ')"
-retire_code="$(curl -sS -o "$harness_dir/signer-retirement-body" -w '%{http_code}' "http://127.0.0.1:$((base + 20))/admin/crypto/retire" \
-	-H "Authorization: Bearer ${operator_token}" -H 'Content-Type: application/json' \
-	-H 'Idempotency-Key: cluster-signer-retire-old' \
-	--data "{\"kind\":\"signer\",\"generation\":1,\"fingerprint\":\"${old_signer_fingerprint}\",\"not_before\":\"${retire_not_before}\",\"reason\":\"cluster signer overlap expired\"}")"
+retire_code=409
+for _ in $(seq 1 "${GRIPLINE_CLUSTER_HARNESS_RETIRE_ATTEMPTS:-120}"); do
+	retire_code="$(curl -sS -o "$harness_dir/signer-retirement-body" -w '%{http_code}' "http://127.0.0.1:$((base + 20))/admin/crypto/retire" \
+		-H "Authorization: Bearer ${operator_token}" -H 'Content-Type: application/json' \
+		-H 'Idempotency-Key: cluster-signer-retire-old' \
+		--data "{\"kind\":\"signer\",\"generation\":1,\"fingerprint\":\"${old_signer_fingerprint}\",\"not_before\":\"${retire_not_before}\",\"reason\":\"cluster signer overlap expired\"}")"
+	if [[ "$retire_code" == "200" ]]; then
+		break
+	fi
+	if [[ "$retire_code" != "409" ]] || ! rg -q '"safe_after"' "$harness_dir/signer-retirement-body"; then
+		cat "$harness_dir/signer-retirement-body" >&2
+		exit 1
+	fi
+	retire_safe_after="$(sed -n 's/.*"safe_after":"\([^"]*\)".*/\1/p' "$harness_dir/signer-retirement-body")"
+	retire_safe_after_epoch="$(date -u -d "$retire_safe_after" '+%s' 2>/dev/null || true)"
+	if [[ ! "$retire_safe_after_epoch" =~ ^[0-9]+$ ]]; then
+		cat "$harness_dir/signer-retirement-body" >&2
+		exit 1
+	fi
+	retire_wait=$((retire_safe_after_epoch - $(date -u '+%s') + 1))
+	if (( retire_wait > 0 )); then
+		sleep "$retire_wait"
+	else
+		sleep 0.1
+	fi
+done
 if [[ "$retire_code" != "200" ]]; then
 	cat "$harness_dir/signer-retirement-body" >&2
 	exit 1
@@ -729,8 +759,11 @@ if [[ "$load_seconds" -gt 0 ]]; then
 		# identifies itself as a stable qualification client; prewarming avoids
 		# turning throughput measurement into a new-lane/security-classification
 		# test.
-		for secret in "${capacity_secrets[@]}"; do
+		for worker in "${!capacity_secrets[@]}"; do
+			secret="${capacity_secrets[$worker]}"
+			source_address="127.0.0.$((worker + 2))"
 			curl -fsS -o /dev/null -X POST "http://127.0.0.1:${lb_port}/v1/messages" \
+				--interface "$source_address" \
 				-H "Authorization: Bearer ${secret}" -H "User-Agent: ${load_user_agent}" -d '{}'
 		done
 		for node in a b c; do
@@ -741,7 +774,16 @@ if [[ "$load_seconds" -gt 0 ]]; then
 			esac
 			curl -fsS "http://127.0.0.1:${admin_port}/admin/metrics" -H "Authorization: Bearer ${operator_token}" >"$load_dir/metrics-before-${node}.prom"
 		done
-		"$harness_dir/load" -url "http://127.0.0.1:${lb_port}/v1/messages" -secrets "$capacity_secret_list" -duration "${load_seconds}s" -workers "$load_workers" -timeout "$load_timeout" -user-agent "$load_user_agent" >"$load_dir/capacity.json"
+		load_args=(
+			-url "http://127.0.0.1:${lb_port}/v1/messages"
+			-secrets "$capacity_secret_list"
+			-duration "${load_seconds}s"
+			-workers "$load_workers"
+			-timeout "$load_timeout"
+			-user-agent "$load_user_agent"
+			-local-address-prefix "127.0.0."
+		)
+		"$harness_dir/load" "${load_args[@]}" >"$load_dir/capacity.json"
 		for node in a b c; do
 			case "$node" in
 				a) admin_port=$((base + 20));;
@@ -763,6 +805,12 @@ if [[ "$load_seconds" -gt 0 ]]; then
 		serialization_retries="$(fleet_metric_delta postgres_serialization_retries_total)"
 		deadlock_retries="$(fleet_metric_delta postgres_deadlock_retries_total)"
 		transaction_retries="$(awk -v serialization="$serialization_retries" -v deadlock="$deadlock_retries" 'BEGIN {printf "%.0f", serialization + deadlock}')"
+		authority_timeouts="$(fleet_metric_delta postgres_authority_timeouts_total)"
+		source_alias_resolutions="$(fleet_metric_delta postgres_source_alias_resolutions_total)"
+		source_alias_registrations="$(fleet_metric_delta postgres_source_alias_registrations_total)"
+		source_alias_conflicts="$(fleet_metric_delta postgres_source_alias_conflicts_total)"
+		source_alias_failures="$(fleet_metric_delta postgres_source_alias_resolution_failures_total)"
+		source_alias_latency="$(fleet_metric_delta postgres_source_alias_resolution_seconds_total)"
 		adaptive_window_retries="$(fleet_metric_delta postgres_transaction_retries_adaptive_window_total)"
 		adaptive_baseline_retries="$(fleet_metric_delta postgres_transaction_retries_adaptive_baseline_total)"
 		lane_borrow_retries="$(fleet_metric_delta postgres_transaction_retries_lane_borrow_total)"
@@ -775,6 +823,12 @@ if [[ "$load_seconds" -gt 0 ]]; then
   "serialization_retries": ${serialization_retries},
   "deadlock_retries": ${deadlock_retries},
   "transaction_retries": ${transaction_retries},
+  "authority_timeouts": ${authority_timeouts},
+  "source_alias_resolutions": ${source_alias_resolutions},
+  "source_alias_registrations": ${source_alias_registrations},
+  "source_alias_conflicts": ${source_alias_conflicts},
+  "source_alias_failures": ${source_alias_failures},
+  "source_alias_resolution_seconds": ${source_alias_latency},
   "operation_retries": {
     "adaptive_window": ${adaptive_window_retries},
     "adaptive_baseline": ${adaptive_baseline_retries},
@@ -786,6 +840,31 @@ if [[ "$load_seconds" -gt 0 ]]; then
   }
 }
 EOF
+		python3 - "$load_dir/capacity.json" "$load_dir/postgres-metrics.json" "$operation_timeout" <<'PY'
+import json
+import re
+import sys
+
+load_path, postgres_path, timeout_text = sys.argv[1:]
+with open(load_path, encoding="utf-8") as stream:
+    load = json.load(stream)
+with open(postgres_path, encoding="utf-8") as stream:
+    postgres = json.load(stream)
+match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)(ms|s|m|h)", timeout_text)
+if not match:
+    raise SystemExit(f"unsupported operation timeout {timeout_text!r}")
+value = float(match.group(1))
+scale = {"ms": 1, "s": 1000, "m": 60000, "h": 3600000}[match.group(2)]
+load["authority_operation_timeout_ms"] = int(value * scale)
+load["source_resolution_failures"] = int(float(postgres.get("source_alias_failures", 0)))
+load["authority_timeouts"] = int(float(postgres.get("authority_timeouts", 0)))
+load["transaction_retries"] = int(float(postgres.get("transaction_retries", 0)))
+load["deadlocks"] = int(float(postgres.get("deadlock_retries", 0)))
+load["source_alias_resolution_seconds"] = float(postgres.get("source_alias_resolution_seconds", 0.0))
+with open(load_path, "w", encoding="utf-8") as stream:
+    json.dump(load, stream, indent=2, sort_keys=True)
+    stream.write("\n")
+PY
 		printf 'cluster harness: capacity load metrics=%s pg_pool_wait_seconds=%s transaction_retries=%s transaction_latency_seconds=%s\n' \
 			"$(cat "$load_dir/capacity.json")" \
 			"$(fleet_metric_delta postgres_pool_empty_acquire_wait_seconds)" \

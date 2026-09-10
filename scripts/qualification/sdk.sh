@@ -5,6 +5,7 @@ set -euo pipefail
 # front of it, install the official Python and TypeScript SDKs, and exercise
 # both OpenAI and Anthropic paths without provider accounts.
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "$repo_dir/scripts/qualification/assertions.sh"
 work_dir="$(mktemp -d)"
 gateway_pid=""
 backend_pid=""
@@ -25,6 +26,9 @@ backend_port=$((base_port + 8))
 secret="sdk-qualification-secret-0123456789abcdef0123456789"
 operator_token="sdk-qualification-operator-0123456789abcdef0123456789"
 pepper="$(openssl rand -base64 32 | tr -d '\n')"
+register_qualification_secret "$secret"
+register_qualification_secret "$operator_token"
+register_qualification_secret "$pepper"
 
 GOCACHE="${GOCACHE:-/tmp/gripline-go-cache}" go build -trimpath -o "$work_dir/gripline" ./cmd/gripline
 GRIPLINE_LOCAL_BACKEND_PORT="$backend_port" python3 "$repo_dir/qualification/sdk/local_backend.py" >/dev/null 2>&1 &
@@ -72,7 +76,7 @@ for index in "${!providers[@]}"; do
   "deployment": {"allow_ephemeral_state": false}
 }
 EOF
-	"$work_dir/gripline" -config "$config" >"$work_dir/gateway-${provider}.log" 2>&1 &
+	"$work_dir/gripline" serve --config "$config" >"$work_dir/gateway-${provider}.log" 2>&1 &
 	gateway_pid=$!
 	for _ in $(seq 1 60); do
 		if curl -fsS "http://127.0.0.1:${gateway_port}/readyz" >/dev/null 2>&1; then break; fi
@@ -195,4 +199,7 @@ EOF
 	wait "$gateway_pid" >/dev/null 2>&1 || true
 	gateway_pid=""
 done
+emit_qualification_assertions \
+	'{"python_provider_passed":true,"typescript_provider_passed":true,"retry_429_passed":true,"server_error_passed":true,"cancellation_passed":true,"connection_reuse_passed":true,"parallel_passed":true}' \
+	'{"providers_tested":2,"minimum_sessions_per_provider":20}'
 echo "SDK qualification: official Python/TypeScript provider clients, tools, large input, retry/429, 5xx, cancellation, reuse, and parallel cases passed"

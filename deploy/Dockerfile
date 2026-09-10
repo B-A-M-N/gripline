@@ -42,4 +42,4 @@ VOLUME ["/var/lib/gripline"]
 EXPOSE 8443 9090
 
 ENTRYPOINT ["/usr/local/bin/gripline"]
-CMD ["-config", "/etc/gripline/config.json"]
+CMD ["serve", "--config", "/etc/gripline/config.json"]

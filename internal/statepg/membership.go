@@ -156,10 +156,11 @@ func (s *Store) heartbeatNode(ctx context.Context) error {
 	return nil
 }
 
-// requireNodeOwnership is used inside authority transactions. A shared row
-// lock lets current-owner mutations proceed concurrently, while the
-// replacement path's FOR UPDATE lock still waits for every in-flight owner
-// transaction before it advances the node epoch.
+// requireNodeOwnership is used inside authority transactions. A key-share row
+// lock lets current-owner mutations proceed concurrently with the heartbeat's
+// non-key last_seen_at update, while the replacement path's FOR UPDATE lock
+// still waits for every in-flight owner transaction before it advances the
+// node epoch.
 func (s *Store) requireNodeOwnership(ctx context.Context, tx pgx.Tx, allowDraining bool) error {
 	return s.requireNodeMembership(ctx, tx, allowDraining, true)
 }
@@ -180,7 +181,7 @@ func (s *Store) requireNodeMembership(ctx context.Context, tx pgx.Tx, allowDrain
 	var state string
 	var lastSeen, now time.Time
 	err := tx.QueryRow(ctx, `SELECT state, last_seen_at, CURRENT_TIMESTAMP FROM gripline_membership
-		WHERE node_id=$1 AND instance_id=$2 AND node_epoch=$3 FOR SHARE`, s.nodeID, s.instanceID, s.nodeEpoch).
+		WHERE node_id=$1 AND instance_id=$2 AND node_epoch=$3 FOR KEY SHARE`, s.nodeID, s.instanceID, s.nodeEpoch).
 		Scan(&state, &lastSeen, &now)
 	if errors.Is(err, pgx.ErrNoRows) {
 		s.fenced.Store(true)

@@ -20,6 +20,12 @@ func (failingStore) Snapshot([]evidence.SubjectKey, time.Time) ([]evidence.Evide
 	return nil, evidence.ErrEvidenceStoreUnavailable
 }
 
+type failingLaneRepository struct{ lane.Repository }
+
+func (failingLaneRepository) RecordCleanAuthorizedAndPromote(string, string, int, lane.PromotionCriteria, time.Time) (*lane.LaneRecord, bool, error) {
+	return nil, false, errors.New("lane authority unavailable")
+}
+
 func baselineTestTerminator(t *testing.T, ev evidence.Store) (*Terminator, string, *lane.Store) {
 	t.Helper()
 	now := time.Now()
@@ -113,6 +119,28 @@ func TestBaselineFinalizeAfterAdmissionBudget(t *testing.T) {
 	rec, _ := store.Get("cred_base", ids[0])
 	if rec.AuthorizedCleanRequests != 1 {
 		t.Fatalf("long-stream baseline was not recorded: got %d", rec.AuthorizedCleanRequests)
+	}
+}
+
+func TestBaselineFinalizeFailureIsCountedWithoutChangingAdmission(t *testing.T) {
+	term, raw, store := baselineTestTerminator(t, evidence.NewMemoryStore())
+	term.dep.Lanes = failingLaneRepository{Repository: store}
+
+	out := term.Admit(bearerHeaders(raw), lane.Features{NetworkASN: "AS1"})
+	if !out.Authorized {
+		t.Fatalf("lane persistence failure must not change admission authorization: %s", out.Reason)
+	}
+	if !out.FinalizeBaseline() {
+		t.Fatal("baseline token should be spent even when deferred persistence fails")
+	}
+	if got := term.BaselineFinalizeFailures(); got != 1 {
+		t.Fatalf("baseline finalize failures=%d, want 1", got)
+	}
+	if _, ok := store.Get("cred_base", store.ListLaneIDs("cred_base")[0]); !ok {
+		t.Fatal("admission should still create a lane")
+	}
+	if out.FinalizeBaseline() {
+		t.Fatal("baseline token must remain idempotent after a persistence failure")
 	}
 }
 

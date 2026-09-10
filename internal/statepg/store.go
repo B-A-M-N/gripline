@@ -10,10 +10,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/B-A-M-N/gripline/internal/pgtransport"
+	"github.com/B-A-M-N/gripline/internal/protocollimits"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -46,26 +48,28 @@ type Options struct {
 // Store is the shared transactional authority. Credential, lane, and evidence
 // methods are split across files but use this same pool and transaction model.
 type Store struct {
-	pool             *pgxpool.Pool
-	metrics          authorityMetrics
-	now              func() time.Time
-	nodeID           string
-	instanceID       string
-	nodeEpoch        int64
-	fenced           atomic.Bool
-	leaseTTL         time.Duration
-	maxSourceScopes  int
-	sourceScopeIdle  time.Duration
-	operationTimeout time.Duration
-	maintenance      MaintenanceOptions
-	leaseStop        chan struct{}
-	leaseDone        chan struct{}
-	maintenanceStop  chan struct{}
-	maintenanceDone  chan struct{}
-	membershipStop   chan struct{}
-	membershipDone   chan struct{}
-	cryptoReady      atomic.Bool
-	cryptoObserved   atomic.Value // cryptoObservation
+	pool                 *pgxpool.Pool
+	metrics              authorityMetrics
+	now                  func() time.Time
+	nodeID               string
+	instanceID           string
+	nodeEpoch            int64
+	fenced               atomic.Bool
+	leaseTTL             time.Duration
+	maxSourceScopes      int
+	sourceScopeIdle      time.Duration
+	operationTimeout     time.Duration
+	sourceAliasTouchMu   sync.Mutex
+	sourceAliasLastTouch map[string]time.Time
+	maintenance          MaintenanceOptions
+	leaseStop            chan struct{}
+	leaseDone            chan struct{}
+	maintenanceStop      chan struct{}
+	maintenanceDone      chan struct{}
+	membershipStop       chan struct{}
+	membershipDone       chan struct{}
+	cryptoReady          atomic.Bool
+	cryptoObserved       atomic.Value // cryptoObservation
 }
 
 // Schema version 1 is the original clustered-authority layout. Version 2
@@ -128,6 +132,7 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("statepg: parse DSN: %w", err)
 	}
+	enforcePublicSearchPath(config)
 	if err := validateTransport(config); err != nil {
 		return nil, err
 	}
@@ -164,7 +169,7 @@ func Open(ctx context.Context, opts Options) (*Store, error) {
 		opts.OperationTimeout = 2 * time.Second
 	}
 	maintenance := opts.Maintenance.withDefaults()
-	s := &Store{pool: pool, now: opts.Now, nodeID: opts.NodeID, leaseTTL: opts.LeaseTTL, maxSourceScopes: opts.MaxSourceScopes, sourceScopeIdle: opts.SourceScopeIdle, operationTimeout: opts.OperationTimeout, maintenance: maintenance,
+	s := &Store{pool: pool, now: opts.Now, nodeID: opts.NodeID, leaseTTL: opts.LeaseTTL, maxSourceScopes: opts.MaxSourceScopes, sourceScopeIdle: opts.SourceScopeIdle, operationTimeout: opts.OperationTimeout, sourceAliasLastTouch: make(map[string]time.Time), maintenance: maintenance,
 		leaseStop: make(chan struct{}), leaseDone: make(chan struct{})}
 	if err := s.Ping(connectCtx); err != nil {
 		pool.Close()
@@ -237,6 +242,7 @@ func InspectSchema(ctx context.Context, opts Options) (SchemaStatus, error) {
 	if err != nil {
 		return status, fmt.Errorf("statepg: parse DSN: %w", err)
 	}
+	enforcePublicSearchPath(config)
 	if err := validateTransport(config); err != nil {
 		return status, err
 	}
@@ -372,6 +378,20 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 	// half-created authority schema.
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('gripline-authority-schema'))`); err != nil {
 		return fmt.Errorf("statepg: schema lock: %w", mapDBError(err))
+	}
+	// Existing authorities must be quiescent before any DDL is attempted. In
+	// particular, CREATE INDEX can take a table-level lock and block serving
+	// writes even though the surrounding transaction would eventually roll the
+	// DDL back after discovering a live node. A missing membership table means
+	// this is a new authority, so there is no serving lease to inspect yet.
+	var membershipTable *string
+	if err := tx.QueryRow(ctx, `SELECT to_regclass('public.gripline_membership')`).Scan(&membershipTable); err != nil {
+		return fmt.Errorf("statepg: inspect membership table before migration: %w", mapDBError(err))
+	}
+	if membershipTable != nil {
+		if err := requireMigrationQuiescence(ctx, tx, s.leaseTTL); err != nil {
+			return err
+		}
 	}
 	statements := []string{
 		`CREATE TABLE IF NOT EXISTS gripline_schema (singleton BOOLEAN PRIMARY KEY, version INTEGER NOT NULL)`,
@@ -669,19 +689,6 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 			return fmt.Errorf("statepg: ensure schema: %w", mapDBError(err))
 		}
 	}
-	// The current protocol advertises one exact schema version, so a migration
-	// must not run beside a live node that may still execute the old layout.
-	// Stale rows from a crashed node are ignored after its ownership lease has
-	// expired; such a process cannot pass its own epoch guard once it resumes.
-	var liveNodes int
-	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_membership
-		WHERE state IN ('ready','draining')
-		  AND last_seen_at > CURRENT_TIMESTAMP - ($1::double precision * interval '1 second')`, s.leaseTTL.Seconds()).Scan(&liveNodes); err != nil {
-		return fmt.Errorf("statepg: inspect live nodes before migration: %w", mapDBError(err))
-	}
-	if liveNodes > 0 {
-		return fmt.Errorf("%w: %d live node(s) remain", ErrMigrationRequiresQuiescence, liveNodes)
-	}
 	var version int
 	if err := tx.QueryRow(ctx, `SELECT version FROM gripline_schema WHERE singleton=TRUE`).Scan(&version); err != nil {
 		return fmt.Errorf("statepg: read schema version: %w", err)
@@ -840,6 +847,19 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 		// Version 15 records the authority-owned activation/supersession
 		// timestamps used to enforce safe retirement without trusting a client
 		// clock or a caller-supplied overlap horizon.
+		for _, statement := range []string{
+			`UPDATE gripline_cluster_crypto_generations
+				SET activated_at=CURRENT_TIMESTAMP
+				WHERE state='active' AND activated_at IS NULL`,
+			fmt.Sprintf(`UPDATE gripline_cluster_crypto_generations
+				SET superseded_at=COALESCE(superseded_at, CURRENT_TIMESTAMP),
+					retire_after=CURRENT_TIMESTAMP + INTERVAL '%d seconds'
+				WHERE kind='signer' AND state NOT IN ('active', 'retired') AND retire_after IS NULL`, int(protocollimits.SignerRetirementHorizon/time.Second)),
+		} {
+			if _, err := tx.Exec(ctx, statement); err != nil {
+				return fmt.Errorf("statepg: migrate crypto retirement metadata: %w", mapDBError(err))
+			}
+		}
 		version = 15
 	}
 	if version != currentSchemaVersion {
@@ -850,6 +870,22 @@ func (s *Store) ensureSchema(ctx context.Context) error {
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("statepg: commit schema migration: %w", mapDBError(err))
+	}
+	return nil
+}
+
+// requireMigrationQuiescence checks the existing membership table without
+// creating or locking any Gripline tables beyond the already-held migration
+// advisory lock. DDL must only follow a successful check.
+func requireMigrationQuiescence(ctx context.Context, tx pgx.Tx, leaseTTL time.Duration) error {
+	var liveNodes int
+	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_membership
+		WHERE state IN ('ready','draining')
+		  AND last_seen_at > CURRENT_TIMESTAMP - ($1::double precision * interval '1 second')`, leaseTTL.Seconds()).Scan(&liveNodes); err != nil {
+		return fmt.Errorf("statepg: inspect live nodes before migration: %w", mapDBError(err))
+	}
+	if liveNodes > 0 {
+		return fmt.Errorf("%w: %d live node(s) remain", ErrMigrationRequiresQuiescence, liveNodes)
 	}
 	return nil
 }
@@ -904,6 +940,9 @@ func withTransactionRetryObserved(ctx context.Context, operation string, fn func
 			metrics.transactionLatencyNanos.Add(time.Since(started).Nanoseconds())
 			if lastErr != nil {
 				metrics.transactionErrors.Add(1)
+				if errors.Is(lastErr, context.DeadlineExceeded) {
+					metrics.authorityTimeouts.Add(1)
+				}
 			}
 			var pgErr *pgconn.PgError
 			if errors.As(lastErr, &pgErr) {
@@ -965,4 +1004,28 @@ func zeroTime(t time.Time) any {
 		return nil
 	}
 	return t
+}
+
+// enforcePublicSearchPath is the namespace contract for the authority. DDL,
+// runtime queries, and migration probes intentionally use unqualified table
+// names, so every pool connection must resolve them in public regardless of a
+// search_path supplied by the deployment DSN.
+func enforcePublicSearchPath(config *pgxpool.Config) {
+	if config == nil || config.ConnConfig == nil {
+		return
+	}
+	if config.ConnConfig.RuntimeParams == nil {
+		config.ConnConfig.RuntimeParams = make(map[string]string)
+	}
+	config.ConnConfig.RuntimeParams["search_path"] = "public"
+	previousAfterConnect := config.AfterConnect
+	config.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+		if previousAfterConnect != nil {
+			if err := previousAfterConnect(ctx, conn); err != nil {
+				return err
+			}
+		}
+		_, err := conn.Exec(ctx, `SET search_path TO public`)
+		return err
+	}
 }

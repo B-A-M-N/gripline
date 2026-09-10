@@ -28,6 +28,7 @@ type PoolStats struct {
 type AuthorityMetrics struct {
 	TransactionAttempts                int64
 	TransactionErrors                  int64
+	AuthorityTimeouts                  int64
 	TransactionLatency                 time.Duration
 	SerializationRetries               int64
 	DeadlockRetries                    int64
@@ -37,7 +38,13 @@ type AuthorityMetrics struct {
 	TransactionRetriesLaneRisk         int64
 	TransactionRetriesCredential       int64
 	TransactionRetriesResource         int64
+	TransactionRetriesSourceAlias      int64
 	TransactionRetriesOther            int64
+	SourceAliasAttempts                int64
+	SourceAliasRegistrations           int64
+	SourceAliasConflicts               int64
+	SourceAliasFailures                int64
+	SourceAliasResolutionLatency       time.Duration
 	ReservationAttempts                int64
 	ReservationsGranted                int64
 	ReservationFailures                int64
@@ -68,6 +75,7 @@ type AuthorityMetrics struct {
 type authorityMetrics struct {
 	transactionAttempts                atomic.Int64
 	transactionErrors                  atomic.Int64
+	authorityTimeouts                  atomic.Int64
 	transactionLatencyNanos            atomic.Int64
 	serializationRetries               atomic.Int64
 	deadlockRetries                    atomic.Int64
@@ -77,7 +85,13 @@ type authorityMetrics struct {
 	transactionRetriesLaneRisk         atomic.Int64
 	transactionRetriesCredential       atomic.Int64
 	transactionRetriesResource         atomic.Int64
+	transactionRetriesSourceAlias      atomic.Int64
 	transactionRetriesOther            atomic.Int64
+	sourceAliasAttempts                atomic.Int64
+	sourceAliasRegistrations           atomic.Int64
+	sourceAliasConflicts               atomic.Int64
+	sourceAliasFailures                atomic.Int64
+	sourceAliasResolutionLatencyNanos  atomic.Int64
 	reservationAttempts                atomic.Int64
 	reservationsGranted                atomic.Int64
 	reservationFailures                atomic.Int64
@@ -140,6 +154,8 @@ func (m *authorityMetrics) recordTransactionRetry(operation string) {
 		counter = &m.transactionRetriesCredential
 	case "resource admission", "resource forward", "resource lease expiration", "resource lease release", "resource lease renewal", "resource lease settlement", "resource scope removal":
 		counter = &m.transactionRetriesResource
+	case "source alias resolution", "source alias registration":
+		counter = &m.transactionRetriesSourceAlias
 	default:
 		counter = &m.transactionRetriesOther
 	}
@@ -161,6 +177,7 @@ func (s *Store) Metrics() AuthorityMetrics {
 	return AuthorityMetrics{
 		TransactionAttempts:                s.metrics.transactionAttempts.Load(),
 		TransactionErrors:                  s.metrics.transactionErrors.Load(),
+		AuthorityTimeouts:                  s.metrics.authorityTimeouts.Load(),
 		TransactionLatency:                 time.Duration(s.metrics.transactionLatencyNanos.Load()),
 		SerializationRetries:               s.metrics.serializationRetries.Load(),
 		DeadlockRetries:                    s.metrics.deadlockRetries.Load(),
@@ -170,7 +187,13 @@ func (s *Store) Metrics() AuthorityMetrics {
 		TransactionRetriesLaneRisk:         s.metrics.transactionRetriesLaneRisk.Load(),
 		TransactionRetriesCredential:       s.metrics.transactionRetriesCredential.Load(),
 		TransactionRetriesResource:         s.metrics.transactionRetriesResource.Load(),
+		TransactionRetriesSourceAlias:      s.metrics.transactionRetriesSourceAlias.Load(),
 		TransactionRetriesOther:            s.metrics.transactionRetriesOther.Load(),
+		SourceAliasAttempts:                s.metrics.sourceAliasAttempts.Load(),
+		SourceAliasRegistrations:           s.metrics.sourceAliasRegistrations.Load(),
+		SourceAliasConflicts:               s.metrics.sourceAliasConflicts.Load(),
+		SourceAliasFailures:                s.metrics.sourceAliasFailures.Load(),
+		SourceAliasResolutionLatency:       time.Duration(s.metrics.sourceAliasResolutionLatencyNanos.Load()),
 		ReservationAttempts:                s.metrics.reservationAttempts.Load(),
 		ReservationsGranted:                s.metrics.reservationsGranted.Load(),
 		ReservationFailures:                s.metrics.reservationFailures.Load(),

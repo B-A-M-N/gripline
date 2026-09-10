@@ -16,7 +16,7 @@ Legend:
 - NOT GROUNDED — no code/test/comment in the tree references this finding
   number; i.e. the finding text has no repository representation to verify.
 
-Last verified against the release-candidate worktree on 2026-09-08. The
+Last verified against the release-candidate worktree on 2026-09-09. The
 historical public-beta close-out below is retained for traceability, but the
 current clustered-authority addendum at the end supersedes any older
 single-node/out-of-scope wording.
@@ -101,7 +101,7 @@ single-node/out-of-scope wording.
 
 | # | Verdict | Evidence |
 |---|---------|----------|
-| P0.49–P0.57 | NOT GROUNDED | No code, test, or comment references P0.49 through P0.57; highest numbered P0 in the tree is P0.69. These findings' text cannot be verified against committed code until their requirement text is reconciled with the repo. |
+| P0.49–P0.57 | HISTORICAL LABELS — SEE CURRENT-STATE RECONCILIATION | The original numbered labels are not represented in code, so their old row is retained only as a historical trace. The current implementation status for the architecture/control-plane/gateway requirements is recorded in the release-readiness table below. |
 
 ## Backend + production state + proof (P0.58–P0.69)
 
@@ -197,7 +197,7 @@ claims. The ten release blockers and their current status are:
 | P0-3 stock demo signal | **RESOLVED.** The demo uses only `SourceNovelty`, `ResourceVelocity`, and `Enumeration` producers and contains no `DEMO_*` signal, manual evidence append, or manual lane mutation. A real concurrent HTTP burst exposes stock `CONCURRENCY_OVER_4X_BASELINE`; the web and headless proofs require the real evidence and transition. |
 | P0-4/P0-5 credential provisioning | **RESOLVED.** `terminator.ValidateExternalCredential` is shared by ingress, bootstrap, and live CLI; live add validates the config but never stats/opens the server-owned state file. |
 | P0-6 admin bearer transport | **RESOLVED.** Plaintext admin binds accept numeric loopback only; LAN/private/public binds are rejected and remote access is documented through SSH or a TLS wrapper. |
-| P0-7 live signer rotation | **RESOLVED at the lifecycle seam; route out of beta.** `PrepareRotationWithAudit` persists a prepared candidate, public publication is explicit, `ActivatePreparedWithAudit` requires backend acceptance before activation, and `RetireAfterWithAudit` enforces the TTL/skew horizon. The admin route remains out of beta and is not claimed as shipped. |
+| P0-7 live signer rotation | **RESOLVED and shipped.** `PrepareRotationWithAudit` persists a prepared candidate, authenticated `/admin/crypto/activate` and `/admin/crypto/retire` expose the live lifecycle, `ActivatePreparedWithAudit` requires backend acceptance before activation, and `RetireAfterWithAudit` enforces the TTL/skew horizon. The route and CLI are part of the documented clustered beta surface. |
 | P0-8 key durability | **RESOLVED.** Keyring replacement writes 0600 temporary state, fsyncs file, renames, fsyncs the parent directory, and cleans up failed temporary writes. |
 | P0-9 strict config | **RESOLVED.** Config decoding disallows unknown fields at every nesting level and rejects trailing JSON values. |
 | P0-10 cryptographic buffer hygiene | **RESOLVED (best effort).** Key comparisons use decoded bytes and temporary pepper, pseudonym, verifier, and secret buffers are wiped on owned exit paths; Go string/header copies remain outside the mutable-buffer guarantee. |
@@ -364,6 +364,27 @@ operator-specific deployment record is separate. The lab entrypoints are
 SDK, direct HTTP/2, shared replay, and active/active soak evidence. Managed
 PostgreSQL behavior, cloud network policy/PKI, edge DDoS, observability, and
 provider-account settlement remain operator deployment evidence.
+
+## Current release-readiness reconciliation (2026-09-09)
+
+This table is the authoritative status for the latest clustered-authority
+review. “Local PostgreSQL verified” means the repository proof was exercised
+against the disposable authority in this environment; hosted exact-commit
+release evidence is still a separate step. The verified basis is parent SHA
+`6efabb3ff697c2e7d711e202a2be3b28e9893f17` plus the uncommitted worktree
+changes; a release SHA must be recorded after the tree is committed and the
+hosted gates pass.
+
+| Requirement | Current status | Implementation / proof | Limitation or evidence still required |
+|---|---|---|---|
+| Source-alias contention | IMPLEMENTED — local PostgreSQL verified | `ResolveOrRegisterSource` uses a read-only established-alias path with a bounded asynchronous best-effort recency touch; only first registration or partial generation linkage takes ordered advisory locks and a serializable transaction. `TestPostgresSourceAliasResolutionReadMostly` covers first-use, 32-way established use, three nodes, generation overlap, 2s operation contexts, and bounded recency maintenance. The repeated three-node 16-worker capacity passes had zero source failures. | Hosted exact-commit evidence remains a release step. |
+| Source-alias conflicts | IMPLEMENTED — local PostgreSQL verified | `ErrSourceAliasConflict` is typed; all distinct owners are queried and conflicts fail closed without mutation. The integration test seeds two owners and verifies row counts are unchanged. | Hosted exact-commit evidence remains a release step. |
+| Capacity reference gate | IMPLEMENTED — local harness verified | `capacity.sh` defaults to 16 workers, a 2s authority timeout, and 16 PostgreSQL connections per node; the harness emits typed total/success/ratio/RPS/p50/p95/p99/source-failure/timeout/retry/deadlock measurements, and `verify-manifest.py` requires them. Two retained real local PostgreSQL three-node 16-worker runs passed 1461/1461 and 1259/1259 with zero source failures, authority timeouts, and deadlocks. Membership ownership uses `FOR KEY SHARE`, allowing heartbeat timestamp updates without weakening replacement fencing; `TestPostgresNodeOwnershipSharedLocksAndReplacementFencing` covers that regression. | The Docker HA writer and exact-commit release manifest remain to be produced in hosted qualification. |
+| Doctor readiness semantics | IMPLEMENTED — local command tests verified | Cluster/policy 403 responses are blocking unknown state; policy reads use `policy.read`, mutations retain `policy.install`. Full command cases cover 403, unavailable authority, incomplete crypto, and non-blocking maintenance warnings. | Hosted exact-commit evidence remains a release step. |
+| Crypto active-set integrity | IMPLEMENTED — local unit/PostgreSQL verified | `cryptoGenerationsReady` requires exactly one singleton-matching active signer and pepper, an enabled pseudonym generation when configured, exact fingerprints, and live-node acknowledgements; unit corruption cases cover missing, mismatched, extra, and incomplete rows. The real PostgreSQL suite passed the activation/readiness cases. | Hosted exact-commit evidence remains a release step. |
+| PostgreSQL namespace | IMPLEMENTED — local PostgreSQL verified | `Open` and `InspectSchema` force every pool connection to `search_path=public`, matching unqualified DDL/runtime queries and the conflicting-search-path integration test passed against real PostgreSQL. | Hosted exact-commit evidence remains a release step. |
+| Evidence schema and scanning | IMPLEMENTED — local self-tests verified | Manifest verification requires typed capacity measurements and semantic assertions; `verify-manifest-test.sh` recomputes hashes before tampering assertions, measurements, and gate schema. `scan-evidence-test.sh` covers PEM keys, DSNs, bearers, nested/sensitive JSON, denylist literals, and redacted controls. | Release CI must retain the scanner test and final post-manifest scan. |
+| Race coverage | IMPLEMENTED — local PostgreSQL race verified | CI and release workflows run `GRIPLINE_TEST_POSTGRES_DSN=... go test -race ./internal/statepg -run '^TestPostgres'`; the same race-qualified PostgreSQL suite passed against the disposable local authority. | Hosted exact-commit evidence remains a release step. |
 
 ## Security qualification addendum (2026-09-08)
 

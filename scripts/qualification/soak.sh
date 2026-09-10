@@ -5,6 +5,7 @@ set -euo pipefail
 # Gripline nodes, a process-level load balancer, continuous replica/state
 # checks, and a promotion after the load phase.
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "$repo_dir/scripts/qualification/assertions.sh"
 fixture_dir="$repo_dir/scripts/qualification/fixtures/postgres-ha"
 source "$fixture_dir/ports.sh"
 project="gripline-soak-${$}"
@@ -414,4 +415,7 @@ if [[ -n "${GRIPLINE_SOAK_EVIDENCE_FILE:-}" ]]; then
 }
 EOF
 fi
+emit_qualification_assertions \
+	'{"cluster_ha_recovery":true,"runtime_bounds_held":true,"maintenance_succeeded":true,"promotion_traffic_succeeded":true,"database_outage_recovered":true}' \
+	"{\"duration_seconds\":$duration,\"workers\":$workers,\"post_promotion_recovery_ms\":$promotion_recovery_ms}"
 echo "soak qualification: ${duration_text} self-contained cluster soak, invariant monitoring, outage recovery, live-node promotion traffic, and post-soak promotion passed"

@@ -84,12 +84,17 @@ func main() {
 	configured := policy.Default()
 	if *capacityMode {
 		configured.Learning.AllowNewLanes = true
+		// Capacity qualification measures concurrency headroom. Disable the
+		// request-rate gauges in this disposable fixture rather than turning a
+		// deliberately enormous shared source/global token bucket into the
+		// benchmark's serialization point; production policies still exercise
+		// those gauges normally.
 		configured.Limits.Normal.ConcurrencyCap = 1024
-		configured.Limits.Normal.Requests = policy.BucketConfig{Capacity: 1 << 30, RefillPer: 1 << 30, RefillIn: time.Minute}
+		configured.Limits.Normal.Requests = policy.BucketConfig{}
 		configured.Limits.Constrained.ConcurrencyCap = 1024
-		configured.Limits.Constrained.Requests = policy.BucketConfig{Capacity: 1 << 30, RefillPer: 1 << 30, RefillIn: time.Minute}
+		configured.Limits.Constrained.Requests = policy.BucketConfig{}
 		configured.Limits.Emergency.ConcurrencyCap = 1024
-		configured.Limits.Emergency.Requests = policy.BucketConfig{Capacity: 1 << 30, RefillPer: 1 << 30, RefillIn: time.Minute}
+		configured.Limits.Emergency.Requests = policy.BucketConfig{}
 		configured.Global.ConcurrencyCap = 4096
 		configured.LaneLimits.MaxActiveLanesPerCredential = 1024
 		configured.LaneLimits.MaxProvisionalLanes = 1024

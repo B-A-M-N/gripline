@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -84,11 +85,14 @@ func TestPostgresAuthorityIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cluster status: %v", err)
 	}
-	if !clusterStatus.LocalReady || len(clusterStatus.Nodes) != 3 {
-		t.Fatalf("cluster status local_ready=%v nodes=%d, want ready and three nodes: %+v", clusterStatus.LocalReady, len(clusterStatus.Nodes), clusterStatus)
+	if !clusterStatus.LocalReady || !clusterStatus.LocalMembershipReady || clusterStatus.LiveNodeCount != 3 || len(clusterStatus.Nodes) != 3 {
+		t.Fatalf("cluster status membership=%v/%v live=%d nodes=%d, want ready and three live nodes: %+v", clusterStatus.LocalReady, clusterStatus.LocalMembershipReady, clusterStatus.LiveNodeCount, len(clusterStatus.Nodes), clusterStatus)
 	}
 	if !clusterStatus.Crypto.Initialized || clusterStatus.Crypto.GenerationEpoch < 1 {
 		t.Fatalf("cluster crypto status is not initialized: %+v", clusterStatus.Crypto)
+	}
+	if !clusterStatus.LocalCryptoReady {
+		t.Fatalf("cluster crypto status is not acknowledged by every live node: %+v", clusterStatus)
 	}
 
 	now := time.Now().UTC()
@@ -340,9 +344,9 @@ func TestPostgresServingOpenRequiresExplicitMigration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("connect migration test authority: %v", err)
 	}
-	if _, err := pool.Exec(ctx, `DROP TABLE gripline_schema`); err != nil {
+	if _, err := pool.Exec(ctx, `DROP TABLE gripline_schema, gripline_membership CASCADE`); err != nil {
 		pool.Close()
-		t.Fatalf("remove schema marker: %v", err)
+		t.Fatalf("remove schema and membership tables: %v", err)
 	}
 	pool.Close()
 
@@ -383,11 +387,66 @@ func TestPostgresMigrationRefusesLiveNodes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open serving authority: %v", err)
 	}
-	if _, err := Open(ctx, Options{
-		DSN: dsn, LeaseTTL: 10 * time.Second, OperationTimeout: 10 * time.Second,
-		Migrate: true,
-	}); !errors.Is(err, ErrMigrationRequiresQuiescence) {
-		t.Fatalf("migration beside a live node = %v, want ErrMigrationRequiresQuiescence", err)
+	// Force the migration path to have real catalog work available. The
+	// regression is specifically that this work must not begin while a live
+	// node exists.
+	if _, err := serving.pool.Exec(ctx, `UPDATE gripline_schema SET version=14 WHERE singleton=TRUE`); err != nil {
+		t.Fatalf("mark authority as old schema: %v", err)
+	}
+	if _, err := serving.pool.Exec(ctx, `DROP INDEX gripline_membership_retention_idx`); err != nil {
+		t.Fatalf("remove migration index fixture: %v", err)
+	}
+	var beforeVersion int
+	var beforeIndex bool
+	if err := serving.pool.QueryRow(ctx, `SELECT version FROM gripline_schema WHERE singleton=TRUE`).Scan(&beforeVersion); err != nil {
+		t.Fatalf("read pre-migration schema marker: %v", err)
+	}
+	if err := serving.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname='gripline_membership_retention_idx')`).Scan(&beforeIndex); err != nil {
+		t.Fatalf("read pre-migration index state: %v", err)
+	}
+
+	// Hold a membership row write open while migration is attempted. A
+	// premature CREATE INDEX would wait on this transaction; the quiescence
+	// probe itself is a plain read and must return the live-node error promptly.
+	holder, err := serving.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin concurrent state write: %v", err)
+	}
+	if _, err := holder.Exec(ctx, `UPDATE gripline_membership SET last_seen_at=last_seen_at WHERE node_id=$1`, serving.nodeID); err != nil {
+		holder.Rollback(ctx)
+		t.Fatalf("hold concurrent membership write: %v", err)
+	}
+	migrationCtx, migrationCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer migrationCancel()
+	migrationResult := make(chan error, 1)
+	go func() {
+		_, migrationErr := Open(migrationCtx, Options{
+			DSN: dsn, LeaseTTL: 10 * time.Second, OperationTimeout: 10 * time.Second,
+			Migrate: true,
+		})
+		migrationResult <- migrationErr
+	}()
+	select {
+	case migrationErr := <-migrationResult:
+		if !errors.Is(migrationErr, ErrMigrationRequiresQuiescence) {
+			t.Fatalf("migration beside a live node = %v, want ErrMigrationRequiresQuiescence", migrationErr)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("migration did not reject live node before waiting on unrelated DDL locks")
+	}
+	if err := holder.Rollback(ctx); err != nil {
+		t.Fatalf("release concurrent state write: %v", err)
+	}
+	var afterVersion int
+	var afterIndex bool
+	if err := serving.pool.QueryRow(ctx, `SELECT version FROM gripline_schema WHERE singleton=TRUE`).Scan(&afterVersion); err != nil {
+		t.Fatalf("read post-rejection schema marker: %v", err)
+	}
+	if err := serving.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname='gripline_membership_retention_idx')`).Scan(&afterIndex); err != nil {
+		t.Fatalf("read post-rejection index state: %v", err)
+	}
+	if afterVersion != beforeVersion || afterIndex != beforeIndex {
+		t.Fatalf("live-node migration changed catalog state: before version/index=%d/%v after=%d/%v", beforeVersion, beforeIndex, afterVersion, afterIndex)
 	}
 	serving.Close()
 
@@ -399,6 +458,31 @@ func TestPostgresMigrationRefusesLiveNodes(t *testing.T) {
 		t.Fatalf("migration after nodes stopped: %v", err)
 	}
 	migrated.Close()
+
+	// Two migration processes may both be safe callers; the shared advisory
+	// lock serializes their DDL and both observe a coherent final marker.
+	firstDone := make(chan error, 1)
+	secondDone := make(chan error, 1)
+	go func() {
+		store, err := Open(ctx, Options{DSN: dsn, Migrate: true, OperationTimeout: 10 * time.Second})
+		if store != nil {
+			store.Close()
+		}
+		firstDone <- err
+	}()
+	go func() {
+		store, err := Open(ctx, Options{DSN: dsn, Migrate: true, OperationTimeout: 10 * time.Second})
+		if store != nil {
+			store.Close()
+		}
+		secondDone <- err
+	}()
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first serialized migration: %v", err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second serialized migration: %v", err)
+	}
 }
 
 func TestPostgresMaintenanceCleansBoundedHistoricalRows(t *testing.T) {
@@ -1028,6 +1112,80 @@ func TestPostgresCryptoActivationRequiresLiveNodeAcknowledgements(t *testing.T) 
 	}
 }
 
+func TestPostgresV14MigrationSetsSignerRetirementHorizon(t *testing.T) {
+	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("GRIPLINE_TEST_POSTGRES_DSN is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resetIntegrationAuthority(t, ctx, dsn)
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect migration regression authority: %v", err)
+	}
+	defer pool.Close()
+	if _, err := pool.Exec(ctx, `UPDATE gripline_schema SET version=14 WHERE singleton=TRUE`); err != nil {
+		t.Fatalf("mark authority as v14: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO gripline_cluster_crypto
+		(singleton, signer_active_kid, signer_fingerprint, signer_active_fingerprint,
+		 pepper_active_version, pepper_fingerprint, pepper_active_fingerprint,
+		 pseudonym_version, pseudonym_fingerprint, pseudonym_active_fingerprint,
+		 generation_epoch, updated_at)
+		VALUES (TRUE, 2, 'signer-2', 'signer-2', 1, 'pepper-1', 'pepper-1',
+		 0, 'disabled', 'disabled', 1, CURRENT_TIMESTAMP)`); err != nil {
+		t.Fatalf("seed v14 crypto singleton: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO gripline_cluster_crypto_generations
+		(kind, generation, fingerprint, state, updated_at)
+		VALUES ('signer', 1, 'signer-1', 'loaded', CURRENT_TIMESTAMP),
+		       ('signer', 2, 'signer-2', 'active', CURRENT_TIMESTAMP)`); err != nil {
+		t.Fatalf("seed v14 signer generations: %v", err)
+	}
+
+	migrated, err := Open(ctx, Options{DSN: dsn, Migrate: true})
+	if err != nil {
+		t.Fatalf("migrate v14 authority: %v", err)
+	}
+	migrated.Close()
+
+	var retireAfter *time.Time
+	if err := pool.QueryRow(ctx, `SELECT retire_after FROM gripline_cluster_crypto_generations
+		WHERE kind='signer' AND generation=1`).Scan(&retireAfter); err != nil {
+		t.Fatalf("read migrated signer horizon: %v", err)
+	}
+	if retireAfter == nil || !retireAfter.After(time.Now().UTC()) {
+		t.Fatalf("migrated signer retire_after=%v, want future horizon", retireAfter)
+	}
+
+	store := openIntegrationStore(t, ctx, dsn, "v14-migration-retirement")
+	defer store.Close()
+	store.cryptoReady.Store(true)
+	request := CryptoRetirementRequest{
+		Kind: CryptoKindSigner, Generation: 1, Fingerprint: "signer-1",
+		OperationID: "v14-retirement-too-early", Actor: "migration-test", Reason: "regression",
+	}
+	if _, err := store.RetireCryptoGeneration(ctx, request); err == nil {
+		t.Fatal("immediate retirement of migrated signer must fail")
+	} else {
+		var tooEarly CryptoRetirementTooEarlyError
+		if !errors.As(err, &tooEarly) {
+			t.Fatalf("immediate retirement error=%v, want CryptoRetirementTooEarlyError", err)
+		}
+	}
+	if _, err := pool.Exec(ctx, `UPDATE gripline_cluster_crypto_generations
+		SET retire_after=CURRENT_TIMESTAMP - INTERVAL '1 second'
+		WHERE kind='signer' AND generation=1`); err != nil {
+		t.Fatalf("advance migrated signer horizon: %v", err)
+	}
+	request.OperationID = "v14-retirement-after-horizon"
+	if _, err := store.RetireCryptoGeneration(ctx, request); err != nil {
+		t.Fatalf("retirement after migrated horizon: %v", err)
+	}
+}
+
 func TestPostgresCryptoReadinessRejectsUnreconciledActivation(t *testing.T) {
 	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
 	if dsn == "" {
@@ -1639,6 +1797,12 @@ func TestPostgresNodeOwnershipSharedLocksAndReplacementFencing(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("second current-owner transaction blocked behind shared ownership lock")
 	}
+	heartbeatCtx, heartbeatCancel := context.WithTimeout(ctx, time.Second)
+	heartbeatErr := old.heartbeatNode(heartbeatCtx)
+	heartbeatCancel()
+	if heartbeatErr != nil {
+		t.Fatalf("heartbeat blocked by current-owner key-share locks: %v", heartbeatErr)
+	}
 	if err := secondTx.Rollback(ctx); err != nil {
 		t.Fatalf("rollback second owner transaction: %v", err)
 	}
@@ -1701,6 +1865,197 @@ func TestPostgresNodeOwnershipSharedLocksAndReplacementFencing(t *testing.T) {
 	}
 }
 
+func TestPostgresSourceAliasResolutionReadMostly(t *testing.T) {
+	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("GRIPLINE_TEST_POSTGRES_DSN is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	resetIntegrationAuthority(t, ctx, dsn)
+	prefix := fmt.Sprintf("source-alias-%d", time.Now().UnixNano())
+	stores := []*Store{
+		openSourceAliasIntegrationStore(t, ctx, dsn, prefix+"-a"),
+		openSourceAliasIntegrationStore(t, ctx, dsn, prefix+"-b"),
+		openSourceAliasIntegrationStore(t, ctx, dsn, prefix+"-c"),
+	}
+	for _, store := range stores {
+		defer store.Close()
+	}
+	resolve := func(store *Store, candidates []SourcePseudonymAlias, active SourcePseudonymAlias) (string, error) {
+		requestCtx, requestCancel := context.WithTimeout(ctx, 2*time.Second)
+		defer requestCancel()
+		return store.ResolveOrRegisterSource(requestCtx, candidates, active)
+	}
+	run := func(candidates []SourcePseudonymAlias, active SourcePseudonymAlias, expected string, count int) []string {
+		t.Helper()
+		results := make(chan string, count)
+		errorsCh := make(chan error, count)
+		var group sync.WaitGroup
+		for i := 0; i < count; i++ {
+			store := stores[i%len(stores)]
+			group.Add(1)
+			go func() {
+				defer group.Done()
+				canonical, err := resolve(store, candidates, active)
+				if err != nil {
+					errorsCh <- err
+					return
+				}
+				results <- canonical
+			}()
+		}
+		group.Wait()
+		close(results)
+		close(errorsCh)
+		for err := range errorsCh {
+			t.Fatalf("source alias resolution: %v", err)
+		}
+		values := make([]string, 0, count)
+		for value := range results {
+			values = append(values, value)
+		}
+		if len(values) != count {
+			t.Fatalf("source alias results=%d, want %d", len(values), count)
+		}
+		for _, value := range values {
+			if value != expected {
+				t.Fatalf("canonical source=%q, want %q", value, expected)
+			}
+		}
+		return values
+	}
+
+	v1 := SourcePseudonymAlias{Alias: prefix + "-v1", Generation: 1}
+	run([]SourcePseudonymAlias{v1}, v1, v1.Alias, 3)
+	run([]SourcePseudonymAlias{v1}, v1, v1.Alias, 32)
+	v2 := SourcePseudonymAlias{Alias: prefix + "-v2", Generation: 2}
+	v3 := SourcePseudonymAlias{Alias: prefix + "-v3", Generation: 3}
+	run([]SourcePseudonymAlias{v1, v2, v3}, v3, v1.Alias, 3)
+	run([]SourcePseudonymAlias{v1, v2, v3}, v3, v1.Alias, 32)
+
+	// Established reads may refresh recency, but only through the detached
+	// bounded touch path. The first read must eventually update an old row;
+	// the immediately following read must not synchronously refresh it again.
+	touchAlias := SourcePseudonymAlias{Alias: prefix + "-touch", Generation: 1}
+	run([]SourcePseudonymAlias{touchAlias}, touchAlias, touchAlias.Alias, 1)
+	if _, err := stores[0].pool.Exec(ctx, `UPDATE gripline_source_aliases
+		SET last_seen_at=CURRENT_TIMESTAMP - INTERVAL '2 minutes' WHERE alias=$1`, touchAlias.Alias); err != nil {
+		t.Fatalf("age source alias for recency touch: %v", err)
+	}
+	if _, err := resolve(stores[0], []SourcePseudonymAlias{touchAlias}, touchAlias); err != nil {
+		t.Fatalf("established source alias recency read: %v", err)
+	}
+	touchDeadline := time.Now().Add(2 * time.Second)
+	for {
+		var recent bool
+		if err := stores[0].pool.QueryRow(ctx, `SELECT last_seen_at >= CURRENT_TIMESTAMP - INTERVAL '30 seconds' FROM gripline_source_aliases WHERE alias=$1`, touchAlias.Alias).Scan(&recent); err != nil {
+			t.Fatalf("read touched source alias: %v", err)
+		}
+		if recent {
+			break
+		}
+		if time.Now().After(touchDeadline) {
+			t.Fatal("bounded source alias touch did not refresh recency")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := stores[0].pool.Exec(ctx, `UPDATE gripline_source_aliases
+		SET last_seen_at=CURRENT_TIMESTAMP - INTERVAL '2 minutes' WHERE alias=$1`, touchAlias.Alias); err != nil {
+		t.Fatalf("re-age source alias for throttle check: %v", err)
+	}
+	if _, err := resolve(stores[0], []SourcePseudonymAlias{touchAlias}, touchAlias); err != nil {
+		t.Fatalf("throttled source alias recency read: %v", err)
+	}
+	var stillOld bool
+	if err := stores[0].pool.QueryRow(ctx, `SELECT last_seen_at < CURRENT_TIMESTAMP - INTERVAL '30 seconds' FROM gripline_source_aliases WHERE alias=$1`, touchAlias.Alias).Scan(&stillOld); err != nil {
+		t.Fatalf("read throttled source alias: %v", err)
+	}
+	if !stillOld {
+		t.Fatal("source alias recency touch ran again before its bounded interval")
+	}
+
+	conflictA := prefix + "-conflict-a"
+	conflictB := prefix + "-conflict-b"
+	if _, err := stores[0].pool.Exec(ctx, `INSERT INTO gripline_source_aliases
+		(canonical_source_id, alias, generation, created_at, last_seen_at)
+		VALUES ('owner-a', $1, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+		       ('owner-b', $2, 2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`, conflictA, conflictB); err != nil {
+		t.Fatalf("seed source alias conflict: %v", err)
+	}
+	var before int
+	if err := stores[0].pool.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_source_aliases WHERE alias IN ($1,$2)`, conflictA, conflictB).Scan(&before); err != nil {
+		t.Fatalf("count seeded conflict aliases: %v", err)
+	}
+	_, err := resolve(stores[1], []SourcePseudonymAlias{{Alias: conflictA, Generation: 1}, {Alias: conflictB, Generation: 2}}, SourcePseudonymAlias{Alias: prefix + "-conflict-active", Generation: 3})
+	if !errors.Is(err, ErrSourceAliasConflict) {
+		t.Fatalf("conflicting source aliases error=%v, want ErrSourceAliasConflict", err)
+	}
+	var after int
+	if err := stores[0].pool.QueryRow(ctx, `SELECT COUNT(*) FROM gripline_source_aliases WHERE alias IN ($1,$2)`, conflictA, conflictB).Scan(&after); err != nil {
+		t.Fatalf("count conflict aliases after rejection: %v", err)
+	}
+	if after != before {
+		t.Fatalf("conflict rows changed from %d to %d", before, after)
+	}
+	var attempts, registrations, conflicts, failures int64
+	for _, store := range stores {
+		metrics := store.Metrics()
+		attempts += metrics.SourceAliasAttempts
+		registrations += metrics.SourceAliasRegistrations
+		conflicts += metrics.SourceAliasConflicts
+		failures += metrics.SourceAliasFailures
+	}
+	if attempts < 70 || registrations == 0 || conflicts == 0 || failures == 0 {
+		t.Fatalf("source alias metrics are incomplete: attempts=%d registrations=%d conflicts=%d failures=%d", attempts, registrations, conflicts, failures)
+	}
+}
+
+func TestPostgresSearchPathNamespaceIsExplicit(t *testing.T) {
+	dsn := os.Getenv("GRIPLINE_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("GRIPLINE_TEST_POSTGRES_DSN is not set")
+	}
+	parsed, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatalf("parse PostgreSQL DSN: %v", err)
+	}
+	query := parsed.Query()
+	query.Set("options", "-c search_path=pg_temp")
+	parsed.RawQuery = query.Encode()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resetIntegrationAuthority(t, ctx, dsn)
+	store, err := Open(ctx, Options{DSN: parsed.String(), Migrate: true})
+	if err != nil {
+		t.Fatalf("open authority with conflicting search_path: %v", err)
+	}
+	defer store.Close()
+	var searchPath string
+	if err := store.pool.QueryRow(ctx, `SHOW search_path`).Scan(&searchPath); err != nil {
+		t.Fatalf("show authority search_path: %v", err)
+	}
+	if searchPath != "public" {
+		t.Fatalf("authority search_path=%q, want public", searchPath)
+	}
+	var version int
+	if err := store.pool.QueryRow(ctx, `SELECT version FROM gripline_schema WHERE singleton=TRUE`).Scan(&version); err != nil {
+		t.Fatalf("query public authority schema: %v", err)
+	}
+	if version != SupportedSchemaVersion() {
+		t.Fatalf("schema version=%d, want %d", version, SupportedSchemaVersion())
+	}
+}
+
+func openSourceAliasIntegrationStore(t *testing.T, ctx context.Context, dsn, nodeID string) *Store {
+	t.Helper()
+	store, err := Open(ctx, Options{DSN: dsn, NodeID: nodeID, LeaseTTL: 10 * time.Second, RenewEvery: 2 * time.Second, OperationTimeout: 2 * time.Second, MaxConns: 16})
+	if err != nil {
+		t.Fatalf("open source alias node %s: %v", nodeID, err)
+	}
+	return store
+}
+
 func openIntegrationStore(t *testing.T, ctx context.Context, dsn, nodeID string) *Store {
 	t.Helper()
 	store, err := Open(ctx, Options{DSN: dsn, NodeID: nodeID, LeaseTTL: 10 * time.Second, RenewEvery: 2 * time.Second, MaxSourceScopes: 64})
@@ -1754,6 +2109,7 @@ func resetIntegrationAuthority(t *testing.T, ctx context.Context, dsn string) {
 		gripline_cluster_crypto_generations,
 		gripline_cluster_crypto_acks,
 		gripline_policy_node_state,
+		gripline_source_aliases,
 		gripline_membership`
 	if _, err := pool.Exec(ctx, "TRUNCATE TABLE "+tables+" RESTART IDENTITY CASCADE"); err != nil {
 		t.Fatalf("reset integration authority: %v", err)

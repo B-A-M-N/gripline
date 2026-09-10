@@ -81,9 +81,13 @@ func (c *httpVerifierControl) AcceptPrepared(ctx context.Context, signer *termin
 	if !ok {
 		return fmt.Errorf("prepared signer fingerprint is unavailable")
 	}
+	jti, err := terminator.NewRequestID()
+	if err != nil {
+		return fmt.Errorf("issue signer canary request id: %w", err)
+	}
 	canary, err := signer.IssuePrepared(terminator.Claims{
 		Subject: "gripline-rotation", CredID: "gripline-rotation", Audience: c.audience,
-		JTI: terminator.NewRequestID(), PolicyRev: 1, CredRev: 1, Scope: []string{"inference"},
+		JTI: jti, PolicyRev: 1, CredRev: 1, Scope: []string{"inference"},
 	}, 10*time.Second)
 	if err != nil {
 		return fmt.Errorf("issue signer canary: %w", err)

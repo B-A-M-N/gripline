@@ -27,6 +27,95 @@ const producerStateVersion = 1
 
 const detectorCheckpointInterval = 500 * time.Millisecond
 
+// distributedObservationRefresh bounds how often one node refreshes an
+// already-seen window key in the shared authority. Window detectors care about
+// distinct keys and expiry, not a durable write for every repeated request;
+// retaining the last observation locally for a short interval removes a
+// redundant write hotspot without changing first-seen or post-expiry
+// detection. The gate is deliberately node-local and bounded: another node
+// may still observe the same key, and a restart simply falls back to the
+// authoritative window row.
+const distributedObservationRefresh = time.Second
+const distributedObservationGateCapacity = 65536
+
+type distributedObservationGate struct {
+	mu   sync.Mutex
+	seen map[string]time.Time
+}
+
+func (g *distributedObservationGate) allow(detector, subject, key string, now time.Time) bool {
+	if g == nil || detector == "" || subject == "" || key == "" {
+		return true
+	}
+	compound := detector + "\x00" + subject + "\x00" + key
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.seen == nil {
+		g.seen = make(map[string]time.Time)
+	}
+	if last, ok := g.seen[compound]; ok && now.Sub(last) < distributedObservationRefresh {
+		return false
+	}
+	g.seen[compound] = now
+	if len(g.seen) > distributedObservationGateCapacity {
+		for observed, last := range g.seen {
+			if now.Sub(last) >= distributedObservationRefresh {
+				delete(g.seen, observed)
+			}
+		}
+		for observed := range g.seen {
+			if len(g.seen) <= distributedObservationGateCapacity/2 {
+				break
+			}
+			delete(g.seen, observed)
+		}
+	}
+	return true
+}
+
+type distributedBaselineObservation struct {
+	at    time.Time
+	value float64
+}
+
+type distributedBaselineGate struct {
+	mu   sync.Mutex
+	seen map[string]distributedBaselineObservation
+}
+
+// allow suppresses only an unchanged baseline sample during the short refresh
+// interval. A changed concurrency/token/cost value always reaches the shared
+// reducer immediately so a spike cannot be hidden by the optimization.
+func (g *distributedBaselineGate) allow(subject, metric string, value float64, now time.Time) bool {
+	if g == nil || subject == "" || metric == "" {
+		return true
+	}
+	compound := subject + "\x00" + metric
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.seen == nil {
+		g.seen = make(map[string]distributedBaselineObservation)
+	}
+	if last, ok := g.seen[compound]; ok && last.value == value && now.Sub(last.at) < distributedObservationRefresh {
+		return false
+	}
+	g.seen[compound] = distributedBaselineObservation{at: now, value: value}
+	if len(g.seen) > distributedObservationGateCapacity {
+		for observed, last := range g.seen {
+			if now.Sub(last.at) >= distributedObservationRefresh {
+				delete(g.seen, observed)
+			}
+		}
+		for observed := range g.seen {
+			if len(g.seen) <= distributedObservationGateCapacity/2 {
+				break
+			}
+			delete(g.seen, observed)
+		}
+	}
+	return true
+}
+
 type windowState struct {
 	Keys     map[string]time.Time `json:"keys"`
 	LastSeen time.Time            `json:"last_seen"`

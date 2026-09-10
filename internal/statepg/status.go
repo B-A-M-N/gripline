@@ -53,16 +53,35 @@ type ClusterCryptoStatus struct {
 	Generations                []ClusterCryptoGenerationStatus `json:"generations,omitempty"`
 }
 
+// ClusterMaintenanceStatus is the local node's retention-maintenance health.
+// Maintenance is intentionally diagnostic: a failure does not make the data
+// plane fail open or discard requests, but repeated failures must be visible to
+// operators before history growth becomes an outage.
+type ClusterMaintenanceStatus struct {
+	Runs              int64     `json:"runs"`
+	ConsecutiveErrors int64     `json:"consecutive_errors"`
+	BacklogEstimate   int64     `json:"backlog_estimate"`
+	LastSuccess       time.Time `json:"last_success,omitempty"`
+	LastFailure       time.Time `json:"last_failure,omitempty"`
+}
+
 // ClusterStatus is a point-in-time, database-authoritative view of membership
 // and shared cryptographic generations. It is intended for authenticated
 // diagnostics and release automation, not admission decisions.
 type ClusterStatus struct {
-	NodeID     string              `json:"node_id"`
-	InstanceID string              `json:"instance_id,omitempty"`
-	NodeEpoch  int64               `json:"node_epoch,omitempty"`
-	LocalReady bool                `json:"local_ready"`
-	Nodes      []ClusterNodeStatus `json:"nodes"`
-	Crypto     ClusterCryptoStatus `json:"crypto"`
+	NodeID     string `json:"node_id"`
+	InstanceID string `json:"instance_id,omitempty"`
+	NodeEpoch  int64  `json:"node_epoch,omitempty"`
+	// LocalReady is retained for wire compatibility and means local membership
+	// readiness only. Consumers needing complete runtime readiness must inspect
+	// LocalMembershipReady and LocalCryptoReady explicitly.
+	LocalReady           bool                     `json:"local_ready"`
+	LiveNodeCount        int                      `json:"live_node_count"`
+	LocalMembershipReady bool                     `json:"local_membership_ready"`
+	LocalCryptoReady     bool                     `json:"local_crypto_ready"`
+	Nodes                []ClusterNodeStatus      `json:"nodes"`
+	Crypto               ClusterCryptoStatus      `json:"crypto"`
+	Maintenance          ClusterMaintenanceStatus `json:"maintenance"`
 }
 
 // ClusterStatus returns shared membership and crypto state in one bounded
@@ -76,6 +95,12 @@ func (s *Store) ClusterStatus(ctx context.Context) (ClusterStatus, error) {
 	ctx, cancel := s.operationContext(ctx)
 	defer cancel()
 	out.NodeID, out.InstanceID, out.NodeEpoch = s.nodeID, s.instanceID, s.nodeEpoch
+	metrics := s.Metrics()
+	out.Maintenance = ClusterMaintenanceStatus{
+		Runs: metrics.MaintenanceRuns, ConsecutiveErrors: metrics.MaintenanceConsecutiveErrors,
+		BacklogEstimate: metrics.MaintenanceBacklogEstimate,
+		LastSuccess:     metrics.MaintenanceLastSuccess, LastFailure: metrics.MaintenanceLastFailure,
+	}
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted, AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return out, mapDBError(err)
@@ -101,8 +126,12 @@ func (s *Store) ClusterStatus(ctx context.Context) (ClusterStatus, error) {
 		}
 		node.DrainUntil = drainUntil
 		node.Local = node.NodeID == s.nodeID && node.InstanceID == s.instanceID && node.NodeEpoch == s.nodeEpoch
+		if node.Live {
+			out.LiveNodeCount++
+		}
 		if node.Local {
-			out.LocalReady = node.Live && node.State == "ready" && !s.fenced.Load()
+			out.LocalMembershipReady = node.Live && node.State == "ready" && !s.fenced.Load()
+			out.LocalReady = out.LocalMembershipReady
 		}
 		out.Nodes = append(out.Nodes, node)
 	}
@@ -157,8 +186,47 @@ func (s *Store) ClusterStatus(ctx context.Context) (ClusterStatus, error) {
 		return out, mapDBError(err)
 	}
 	out.Crypto = crypto
+	out.LocalCryptoReady = cryptoGenerationsReady(crypto, out.LiveNodeCount)
 	if err := tx.Commit(ctx); err != nil {
 		return ClusterStatus{}, mapDBError(err)
 	}
 	return out, nil
+}
+
+type expectedCryptoGeneration struct {
+	generation  int
+	fingerprint string
+}
+
+// cryptoGenerationsReady verifies the exact active set represented by the
+// singleton. Merely seeing an active row is insufficient: a stale generation,
+// duplicate kind, or fingerprint mismatch can otherwise make a corrupted
+// authority appear locally ready.
+func cryptoGenerationsReady(crypto ClusterCryptoStatus, liveNodes int) bool {
+	if !crypto.Initialized || crypto.SignerActiveKID < 1 || crypto.PepperActiveVersion < 1 ||
+		crypto.SignerActiveFingerprint == "" || crypto.PepperActiveFingerprint == "" {
+		return false
+	}
+	expected := map[string]expectedCryptoGeneration{
+		"signer": {generation: crypto.SignerActiveKID, fingerprint: crypto.SignerActiveFingerprint},
+		"pepper": {generation: crypto.PepperActiveVersion, fingerprint: crypto.PepperActiveFingerprint},
+	}
+	if crypto.PseudonymActiveVersion > 0 {
+		if crypto.PseudonymActiveFingerprint == "" {
+			return false
+		}
+		expected["pseudonym"] = expectedCryptoGeneration{generation: crypto.PseudonymActiveVersion, fingerprint: crypto.PseudonymActiveFingerprint}
+	}
+	seen := make(map[string]bool, len(expected))
+	for _, generation := range crypto.Generations {
+		if generation.State != "active" {
+			continue
+		}
+		want, ok := expected[generation.Kind]
+		if !ok || seen[generation.Kind] || generation.Generation != want.generation || generation.Fingerprint != want.fingerprint || generation.AcknowledgedNodes != liveNodes {
+			return false
+		}
+		seen[generation.Kind] = true
+	}
+	return len(seen) == len(expected)
 }

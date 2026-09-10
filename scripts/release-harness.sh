@@ -69,6 +69,7 @@ cat > "$harness_dir/config.json" <<EOF
   "tls": {"terminate_tls_upstream": true},
   "backend": {
     "url": "https://127.0.0.1:${backend_port}",
+    "trust_mode": "mtls",
     "tls": {
       "ca_file": "${ca_cert}",
       "client_cert_file": "${client_cert}",
@@ -102,7 +103,7 @@ cat > "$harness_dir/config.json" <<EOF
 }
 EOF
 
-"$harness_dir/gripline" -config "$harness_dir/config.json" >"$harness_dir/gateway.log" 2>&1 &
+"$harness_dir/gripline" serve --config "$harness_dir/config.json" >"$harness_dir/gateway.log" 2>&1 &
 gateway_pid=$!
 
 for _ in $(seq 1 50); do
@@ -269,7 +270,7 @@ curl -fsS "http://127.0.0.1:${gateway_port}/v1/messages" -H "Authorization: Bear
 kill -KILL "$gateway_pid" >/dev/null 2>&1
 wait "$gateway_pid" >/dev/null 2>&1 || true
 gateway_pid=""
-"$harness_dir/gripline" -config "$harness_dir/config.json" >"$harness_dir/gateway-restart.log" 2>&1 &
+"$harness_dir/gripline" serve --config "$harness_dir/config.json" >"$harness_dir/gateway-restart.log" 2>&1 &
 gateway_pid=$!
 for _ in $(seq 1 50); do
 	if curl -fsS "http://127.0.0.1:${gateway_port}/readyz" >/dev/null 2>&1; then break; fi
@@ -283,7 +284,7 @@ kill -TERM "$gateway_pid" >/dev/null 2>&1
 wait "$gateway_pid" >/dev/null 2>&1 || true
 gateway_pid=""
 chmod 0400 "$harness_dir/state.db"
-"$harness_dir/gripline" -config "$harness_dir/config.json" >"$harness_dir/readonly-state.log" 2>&1 &
+"$harness_dir/gripline" serve --config "$harness_dir/config.json" >"$harness_dir/readonly-state.log" 2>&1 &
 gateway_pid=$!
 sleep 1
 if curl -fsS "http://127.0.0.1:$gateway_port/readyz" >/dev/null 2>&1; then
@@ -296,7 +297,7 @@ gateway_pid=""
 chmod 0600 "$harness_dir/state.db"
 
 chmod 000 "$harness_dir/keyring.json"
-"$harness_dir/gripline" -config "$harness_dir/config.json" >"$harness_dir/readonly-signer.log" 2>&1 &
+"$harness_dir/gripline" serve --config "$harness_dir/config.json" >"$harness_dir/readonly-signer.log" 2>&1 &
 gateway_pid=$!
 sleep 1
 if curl -fsS "http://127.0.0.1:$gateway_port/readyz" >/dev/null 2>&1; then
@@ -309,7 +310,7 @@ gateway_pid=""
 chmod 0600 "$harness_dir/keyring.json"
 
 chmod 0500 "$harness_dir/spool"
-"$harness_dir/gripline" -config "$harness_dir/config.json" >"$harness_dir/readonly-spool.log" 2>&1 &
+"$harness_dir/gripline" serve --config "$harness_dir/config.json" >"$harness_dir/readonly-spool.log" 2>&1 &
 gateway_pid=$!
 for _ in $(seq 1 50); do
 	if curl -fsS "http://127.0.0.1:$gateway_port/readyz" >/dev/null 2>&1; then break; fi

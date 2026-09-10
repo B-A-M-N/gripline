@@ -27,14 +27,15 @@ const absoluteCostFloorMicrounits = 50_000 // 0.05 in microunits
 // lane inflates the norm every other lane is judged against. COST_VELOCITY_*
 // is SCOPE_CREDENTIAL, so cost uses the credential baseline.
 type ResourceVelocityProducer struct {
-	mu          sync.Mutex
-	now         func() time.Time
-	alpha       float64 // EMA smoothing factor
-	cooldown    time.Duration
-	maxSubjects int
-	distributed adaptive.Store
-	stateMu     sync.Mutex
-	stateErr    error
+	mu            sync.Mutex
+	now           func() time.Time
+	alpha         float64 // EMA smoothing factor
+	cooldown      time.Duration
+	maxSubjects   int
+	distributed   adaptive.Store
+	admissionGate distributedBaselineGate
+	stateMu       sync.Mutex
+	stateErr      error
 
 	// concurrencyBaseline tracks per-lane concurrency EMA (ScopeLane).
 	concurrencyBaseline map[string]*baseline
@@ -92,8 +93,12 @@ func (p *ResourceVelocityProducer) ObserveAdmissionContext(ctx context.Context, 
 		if behavior.Subjects.CredentialID == "" || behavior.Concurrency <= 0 {
 			return nil
 		}
+		lane := laneSubject(behavior.Subjects)
+		if !p.admissionGate.allow(lane, "concurrency", float64(behavior.Concurrency), p.now()) {
+			return nil
+		}
 		signal, err := p.distributed.ObserveBaseline(ctx, adaptive.BaselineObservation{
-			Detector: "resource_velocity", Subject: laneSubject(behavior.Subjects), Metric: "concurrency",
+			Detector: "resource_velocity", Subject: lane, Metric: "concurrency",
 			Value: float64(behavior.Concurrency), Alpha: p.alpha, Cooldown: p.cooldown,
 			Threshold4: 4, Threshold10: 10, Code4: "CONCURRENCY_OVER_4X_BASELINE",
 			Code10: "CONCURRENCY_OVER_10X_BASELINE", ConcurrencyRamp: true,

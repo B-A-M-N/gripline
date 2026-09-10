@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +19,41 @@ import (
 	"github.com/B-A-M-N/gripline/internal/secret"
 	"github.com/B-A-M-N/gripline/internal/terminator"
 )
+
+func TestDataPlaneEntropyFailureReturnsControlled503(t *testing.T) {
+	signer, _ := terminator.GenerateSigner()
+	backendHits := atomic.Int32{}
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backendHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+	backendURL, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dp, err := New(Config{
+		Terminator:         buildTerminator(t, signer),
+		BackendURL:         backendURL,
+		Audience:           testAudience,
+		RequestIDGenerator: func() (string, error) { return "", errors.New("entropy unavailable") },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "http://gripline.local/v1/messages", strings.NewReader(`{}`))
+	dp.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("X-Gripline-Reason") != "entropy_unavailable" {
+		t.Fatalf("entropy failure response=%d reason=%q body=%q", rec.Code, rec.Header().Get("X-Gripline-Reason"), rec.Body.String())
+	}
+	if backendHits.Load() != 0 {
+		t.Fatal("backend received request after request-id entropy failure")
+	}
+	if got := dp.Metrics().EntropyFailures; got != 1 {
+		t.Fatalf("entropy failures metric=%d, want 1", got)
+	}
+}
 
 const testAudience = "fi-inference"
 

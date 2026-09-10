@@ -30,7 +30,7 @@ func TestAcceptanceAdminPolicyLifecycleUsesSignedDurableAuthority(t *testing.T) 
 	cfg := writeStatefulConfig(t, dir, "http://127.0.0.1:1", true)
 	cfg.Policy.VerifierKeyFile = verifierPath
 	const token = "op-tok-restart-0123456789abcdef0123456789abcdef"
-	cfg.Admin.OperatorTokens[token] = "operator:policy.install"
+	cfg.Admin.OperatorTokens[token] = "operator:policy.read,policy.install"
 
 	rt, err := BuildRuntime(cfg)
 	if err != nil {
