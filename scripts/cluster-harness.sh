@@ -580,8 +580,12 @@ if [[ "$source_churn_enabled" == "1" ]]; then
 	fi
 	stale_alias_before=0
 	source_sql "INSERT INTO gripline_source_aliases (canonical_source_id, alias, generation, created_at, last_seen_at) VALUES ('source-churn-stale', 'source-churn-stale-v1', 1, CURRENT_TIMESTAMP - INTERVAL '8 days', CURRENT_TIMESTAMP - INTERVAL '8 days') ON CONFLICT (alias) DO NOTHING" >/dev/null
-	source_sql "INSERT INTO gripline_adaptive_window_subjects (detector, subject, last_seen_at) VALUES ('source_novelty_source', 'source-churn-stale', CURRENT_TIMESTAMP - INTERVAL '8 days') ON CONFLICT (detector, subject) DO NOTHING" >/dev/null
-	source_sql "INSERT INTO gripline_adaptive_window_keys (detector, subject, observation_key, observed_at) VALUES ('source_novelty_source', 'source-churn-stale', 'source-churn-stale', CURRENT_TIMESTAMP - INTERVAL '8 days') ON CONFLICT (detector, subject, observation_key) DO NOTHING" >/dev/null
+	# Keep the reference rows current while the alias itself is stale. This
+	# prevents compressed retention from deleting the references before the
+	# bound assertion; the rows are removed immediately after that assertion so
+	# the later maintenance check still proves safe reclamation.
+	source_sql "INSERT INTO gripline_adaptive_window_subjects (detector, subject, last_seen_at) VALUES ('source_novelty_source', 'source-churn-stale', CURRENT_TIMESTAMP) ON CONFLICT (detector, subject) DO NOTHING" >/dev/null
+	source_sql "INSERT INTO gripline_adaptive_window_keys (detector, subject, observation_key, observed_at) VALUES ('source_novelty_source', 'source-churn-stale', 'source-churn-stale', CURRENT_TIMESTAMP) ON CONFLICT (detector, subject, observation_key) DO NOTHING" >/dev/null
 	if [[ "$(source_sql "SELECT COUNT(*) FROM gripline_source_aliases WHERE alias='source-churn-stale-v1'")" == 1 ]]; then
 		stale_alias_before=1
 	fi
