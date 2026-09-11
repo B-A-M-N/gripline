@@ -1275,7 +1275,11 @@ fi
 # in the release gate.
 postgres_container="${GRIPLINE_TEST_POSTGRES_CONTAINER:-}"
 if [[ "${GRIPLINE_CLUSTER_HARNESS_SKIP_OUTAGE:-0}" != "1" && -z "$postgres_container" ]] && command -v docker >/dev/null 2>&1; then
-	postgres_container="$(docker ps --filter 'ancestor=postgres:16' --format '{{.ID}}' | head -n 1 || true)"
+	# GitHub service containers and local fixtures may expose the same pinned
+	# image as either postgres:16 or postgres:16@sha256:<digest>. Match the
+	# running image reference directly so the required outage proof does not
+	# silently depend on Docker's tag-only ancestor filter.
+	postgres_container="$(docker ps --format '{{.ID}}\t{{.Image}}' | awk -F '\t' '$2 ~ /^postgres:16(@sha256:[0-9a-f]{64})?$/ {print $1; exit}' || true)"
 fi
 if [[ -z "$postgres_container" ]]; then
 	if [[ "${GRIPLINE_CLUSTER_HARNESS_REQUIRE_DB_OUTAGE:-0}" == "1" ]]; then
