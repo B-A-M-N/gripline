@@ -2,6 +2,13 @@
 set -euo pipefail
 
 fuzz_time="${GRIPLINE_FUZZ_TIME:-5s}"
+
+if [[ -z "${GOCACHE:-}" ]]; then
+  fuzz_cache_root="${RUNNER_TEMP:-/tmp}/gripline-fuzz-gocache"
+  mkdir -p "$fuzz_cache_root"
+  export GOCACHE="$fuzz_cache_root"
+fi
+
 go test ./verify -run '^$' -fuzz '^FuzzVerifyAssertionEnvelope$' -fuzztime="$fuzz_time"
 go test ./verify -run '^$' -fuzz '^FuzzLoadKeySet$' -fuzztime="$fuzz_time"
 go test ./adapter/usage -run '^$' -fuzz '^FuzzJSONProviderUsage$' -fuzztime="$fuzz_time"
