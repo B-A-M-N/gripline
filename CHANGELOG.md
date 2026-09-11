@@ -6,6 +6,12 @@ All notable changes to Gripline are documented here. The format follows
 
 ## [Unreleased]
 
+### Release qualification
+
+- Long qualification workflows now set explicit 24-hour/72-hour job budgets;
+  manifest provenance attestation runs in the downstream release job with
+  fresh GitHub credentials after the long soak.
+
 ### Public-beta hardening (re-review pass)
 
 This release closes the findings of the pre-beta re-review. The theme: the

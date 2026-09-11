@@ -93,6 +93,12 @@ The soak uses compressed historical retention only for its disposable fixture;
 live coordination state keeps a longer window, and the explicit maintenance
 tool exercises retention under traffic. Operator-specific capacity remains a
 separate deployment layer.
+Hosted long qualifications set explicit job budgets: the release workflow
+allows 1560 minutes for its 24-hour exact-SHA run, and the generic reference
+workflow allows 1560 or 4500 minutes for its 24-hour or 72-hour run. The
+qualification job verifies the exact-SHA manifest locally; provenance
+attestation is deferred to the downstream release job so post-soak proof uses
+fresh GitHub credentials.
 The release harness also invokes `scripts/security-http-harness.sh`, which
 writes raw HTTP/1.1 framing and header cases to a TCP socket and checks that
 parser ambiguity never creates more than one backend request or leaks a
