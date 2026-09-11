@@ -134,11 +134,20 @@ table_counts() {
 }
 monitor() {
 	last_maintenance=0
+	replica_policy_seen=0
 	while [[ -z "$harness_pid" ]] || kill -0 "$harness_pid" >/dev/null 2>&1; do
 		if [[ ! -f "$promotion_file" ]] && ! "${compose[@]}" exec -T replica psql -U gripline -d gripline -X -Atqc 'SELECT pg_is_in_recovery()' 2>/dev/null | grep -qx t; then echo replica-not-in-recovery >"$monitor_failure"; return 1; fi
 		schema="$("${compose[@]}" exec -T replica psql -U gripline -d gripline -X -Atqc "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='gripline_policy_manifest')" 2>/dev/null || true)"
 		if [[ "$schema" != t ]]; then sleep 5; continue; fi
-		if ! "${compose[@]}" exec -T replica psql -U gripline -d gripline -X -Atqc 'SELECT singleton FROM gripline_policy_manifest WHERE singleton=TRUE' 2>/dev/null | grep -qx t; then echo replica-policy-missing >"$monitor_failure"; return 1; fi
+		if ! "${compose[@]}" exec -T replica psql -U gripline -d gripline -X -Atqc 'SELECT singleton FROM gripline_policy_manifest WHERE singleton=TRUE' 2>/dev/null | grep -qx t; then
+			# PostgreSQL can replay the schema relation before the seeded singleton
+			# row. Treat that initial replication window as convergence; once the
+			# policy has been observed, disappearance is a real invariant failure.
+			if [[ "$replica_policy_seen" == 1 ]]; then echo replica-policy-missing >"$monitor_failure"; return 1; fi
+			sleep 5
+			continue
+		fi
+		replica_policy_seen=1
 		if [[ -s "$harness_artifact" ]]; then
 			base="$(awk -F= '$1 == "base" {print $2}' "$harness_artifact")"
 			token="$(awk -F= '$1 == "operator_token" {print $2}' "$harness_artifact")"
