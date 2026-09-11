@@ -61,6 +61,12 @@ if [[ "$external_maintenance_enabled" == 1 ]]; then
 	[[ "$external_maintenance_interval" =~ ^[1-9][0-9]*$ ]] || { echo "soak qualification: external maintenance interval must be positive" >&2; exit 2; }
 fi
 [[ "$handoff_timeout" =~ ^[1-9][0-9]*$ ]] || { echo "soak qualification: handoff timeout must be positive" >&2; exit 2; }
+# The cluster harness publishes its pause marker only after the requested load
+# phase has completed. Give that phase its full duration, then retain the
+# handoff grace period for setup/scheduling delays. The previous loop used
+# only handoff_timeout, so every 24h/72h run failed after ten minutes before
+# the requested soak could reach failover.
+handoff_wait_timeout=$((duration + handoff_timeout))
 cleanup() {
 	if [[ -n "$harness_pid" ]]; then kill -TERM "$harness_pid" >/dev/null 2>&1 || true; wait "$harness_pid" >/dev/null 2>&1 || true; fi
 	if [[ -n "$monitor_pid" ]]; then kill "$monitor_pid" >/dev/null 2>&1 || true; wait "$monitor_pid" >/dev/null 2>&1 || true; fi
@@ -233,7 +239,7 @@ for _ in $(seq 1 120); do
 done
 [[ -s "$harness_artifact" ]] || { echo "soak qualification: cluster harness did not publish its runtime fixture" >&2; cat "$work_dir/harness.log" >&2; exit 1; }
 
-for _ in $(seq 1 $((handoff_timeout * 4))); do
+for _ in $(seq 1 $((handoff_wait_timeout * 4))); do
 	[[ -f "$pause_file" ]] && break
 	if ! kill -0 "$harness_pid" >/dev/null 2>&1; then cat "$work_dir/harness.log" >&2; exit 1; fi
 	sleep 0.25

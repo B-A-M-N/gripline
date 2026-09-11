@@ -80,6 +80,12 @@ the downstream release job (or the generic workflow's downstream
 `long-soak-attestation` job), which receives fresh GitHub credentials after the
 soak completes.
 
+The soak coordinator waits for the complete requested load duration before the
+cluster harness enters its failover handoff, then allows an additional
+handoff-grace interval for setup and scheduling delays. A 24-hour or 72-hour
+qualification therefore cannot be rejected by the handoff wait before its
+requested load phase has completed.
+
 Long qualification runs require a repository-scoped self-hosted Linux runner
 with the labels `self-hosted`, `linux`, and `gripline-qualification`. The
 runner must provide Docker/Compose, Go, Python 3, Node/npm, curl, OpenSSL,
