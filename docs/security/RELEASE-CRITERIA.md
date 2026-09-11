@@ -76,7 +76,8 @@ runner. The release workflow gives its 24-hour exact-SHA qualification job a
 1560-minute timeout (26 hours), while the generic long-soak job allows 1560
 minutes for `24h` and 4500 minutes for `72h`. The long-running job locally
 scans and verifies the manifest; build-provenance attestation is performed by
-the downstream release job, which receives fresh GitHub credentials after the
+the downstream release job (or the generic workflow's downstream
+`long-soak-attestation` job), which receives fresh GitHub credentials after the
 soak completes.
 
 Long qualification runs require a repository-scoped self-hosted Linux runner
